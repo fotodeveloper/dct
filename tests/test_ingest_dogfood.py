@@ -1,6 +1,9 @@
-"""End-to-end dogfood test: ingest dct's own spec file into an in-memory DB.
+"""End-to-end test: ingest a realistically sized spec into an in-memory DB.
 
-Copies the real spec into a tmp dir to avoid mutating repo state. Asserts:
+Uses the bundled fixture spec (tests/fixtures/sample-spec.md — 16 H2 sections,
+prose only) so the test is self-contained in any checkout; the original
+version ingested an internal design doc that is not shipped in the public
+repo, which broke CI. Asserts:
 - parser produces a non-trivial section count,
 - ingest creates the plan row + sections + (for a spec, few to no checkpoints),
 - idempotency: re-running ingest makes no further DB writes.
@@ -13,12 +16,11 @@ from dct.core.plans import classify as classify_mod
 from dct.core.plans.ingest import ingest_file
 from dct.core.projects import create_project
 
-REPO_ROOT = Path(__file__).resolve().parent.parent
-SPEC_FILE = REPO_ROOT / "docs" / "superpowers" / "specs" / "2026-04-17-plans-roadmaps-decisions-design.md"
+SPEC_FILE = Path(__file__).resolve().parent / "fixtures" / "sample-spec.md"
 
 
 def test_ingest_our_own_spec(engine, tmp_path, monkeypatch):
-    """Run the v0.2 pipeline on our v0.2 design spec — one round-trip."""
+    """Run the full ingest pipeline on the fixture spec — one round-trip."""
     monkeypatch.setattr(classify_mod, "classify_uncertain", lambda *a, **kw: None)
 
     assert SPEC_FILE.is_file(), f"Spec not found: {SPEC_FILE}"
@@ -30,7 +32,7 @@ def test_ingest_our_own_spec(engine, tmp_path, monkeypatch):
     )
 
     # Copy spec into the cloned project layout so kind_from_path picks 'spec'.
-    spec_dir = target_project / "docs" / "superpowers" / "specs"
+    spec_dir = target_project / "docs" / "specs"
     spec_dir.mkdir(parents=True)
     dest = spec_dir / SPEC_FILE.name
     shutil.copy2(SPEC_FILE, dest)
@@ -41,14 +43,11 @@ def test_ingest_our_own_spec(engine, tmp_path, monkeypatch):
     )
 
     assert report["is_first_import"] is True
-    assert report["sections_created"] >= 15  # spec has 16 top-level H2 sections
+    assert report["sections_created"] >= 15  # fixture has 16 H2 sections
     assert isinstance(report["source_hash"], str)
     assert len(report["source_hash"]) == 64  # sha256 hex
 
-    # The file must end up with ULID anchors regardless of whether they
-    # were injected in this test run (the live spec may have been dogfooded
-    # into production DB earlier — ULIDs already on disk in git working tree)
-    # or are being injected now (fresh clone without prior ingest).
+    # The fixture ships without anchors, so this first ingest must inject them.
     content = dest.read_text(encoding="utf-8")
     assert "<!-- dct:plan:" in content
     assert "<!-- dct:section:" in content
@@ -71,7 +70,7 @@ def test_ingest_produces_queryable_plan(engine, tmp_path, monkeypatch):
     target.mkdir()
     create_project(engine, slug="proj2", name="P2", path=str(target))
 
-    spec_dir = target / "docs" / "superpowers" / "specs"
+    spec_dir = target / "docs" / "specs"
     spec_dir.mkdir(parents=True)
     dest = spec_dir / SPEC_FILE.name
     shutil.copy2(SPEC_FILE, dest)
