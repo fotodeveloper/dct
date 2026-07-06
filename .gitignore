@@ -1,0 +1,18 @@
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+.venv/
+*.db
+.eggs/
+*.egg
+.pytest_cache/
+.mypy_cache/
+.gstack/
+.DS_Store
+.claude/settings.local.json
+.superpowers/
+# internal design history — excluded from the public repo (decision 2026-07-06)
+docs/superpowers/

@@ -1,0 +1,106 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}dct{% endblock %}</title>
+  <script>
+    /* apply saved theme before first paint (no flash) */
+    (function () {
+      try {
+        var t = localStorage.getItem("dct-theme");
+        if (t) document.documentElement.setAttribute("data-theme", t);
+      } catch (e) {}
+    })();
+  </script>
+  <link rel="stylesheet" href="{{ url_for('static', filename='app.css') }}">
+  <script src="{{ url_for('static', filename='vendor/htmx.min.js') }}"></script>
+</head>
+<body>
+  <aside class="sidebar">
+    <h1 class="brand"><a href="/"><span class="brand-mark">▍</span>dct</a></h1>
+    <p class="brand-sub">deterministic context tracker</p>
+
+    <nav class="projects" aria-label="Projects">
+      <a class="proj proj-all {% if not current_slug %}is-active{% endif %}" href="/">All projects</a>
+      {% for p in projects %}
+        <a class="proj {% if current_slug == p.slug %}is-active{% endif %}"
+           href="/p/{{ p.slug }}">
+          <span class="proj-slug">{{ p.slug }}</span>
+          {% if p.current_version %}<span class="proj-ver">{{ p.current_version }}</span>{% endif %}
+        </a>
+        {% if current_slug == p.slug %}
+        <nav class="section-nav" aria-label="{{ p.slug }} sections">
+          {% set sections = [
+            ('projects', 'projects.home', 'Overview'),
+            ('items', 'items.list', 'Items'),
+            ('sprints', 'sprints.list', 'Sprints'),
+            ('plans', 'plans.list', 'Plans'),
+            ('changelog', 'changelog.list', 'Changelog'),
+            ('decisions', 'decisions.list', 'Decisions'),
+            ('handoffs', 'handoffs.list', 'Handoffs'),
+            ('analytics', 'analytics.dashboard', 'Analytics'),
+          ] %}
+          {% for key, endpoint, label in sections %}
+            <a class="section-link {% if current_section == key %}is-active{% endif %}"
+               href="{{ url_for(endpoint, slug=p.slug) }}">{{ label }}</a>
+          {% endfor %}
+        </nav>
+        {% endif %}
+      {% endfor %}
+    </nav>
+  </aside>
+
+  <div id="main">
+    <header class="topbar">
+      <nav class="crumbs" aria-label="Breadcrumb">
+        {% set _seclink = {
+          'items': ('items.list', 'items'), 'sprints': ('sprints.list', 'sprints'),
+          'plans': ('plans.list', 'plans'), 'changelog': ('changelog.list', 'changelog'),
+          'decisions': ('decisions.list', 'decisions'), 'handoffs': ('handoffs.list', 'handoffs'),
+          'analytics': ('analytics.dashboard', 'analytics'),
+        } %}
+        <a href="/">dct</a>
+        {% if current_slug %}
+          <span class="sep">/</span>
+          <a href="{{ url_for('projects.home', slug=current_slug) }}">{{ current_slug }}</a>
+        {% endif %}
+        {% if current_slug and current_section in _seclink %}
+          <span class="sep">/</span>
+          <a href="{{ url_for(_seclink[current_section][0], slug=current_slug) }}">{{ _seclink[current_section][1] }}</a>
+        {% endif %}
+        {% block crumb_leaf %}{% endblock %}
+      </nav>
+      <div class="topbar-actions">
+        <span class="live" title="Live — the view refreshes when the database changes">
+          <span class="live-dot" aria-hidden="true"></span>live
+        </span>
+        <button class="theme-toggle" type="button" aria-label="Toggle dark mode" title="Toggle light/dark">
+          <span class="theme-sun" aria-hidden="true">☀</span>
+          <span class="theme-moon" aria-hidden="true">☾</span>
+        </button>
+      </div>
+    </header>
+    <main class="content">{% block content %}{% endblock %}</main>
+  </div>
+
+  <script src="{{ url_for('static', filename='app.js') }}"></script>
+  <script>
+    /* theme toggle — event-delegated so it survives htmx #main swaps; theme
+       lives on <html> which is never swapped */
+    document.addEventListener("click", function (e) {
+      if (!e.target.closest(".theme-toggle")) return;
+      var next = document.documentElement.getAttribute("data-theme") === "dark" ? "light" : "dark";
+      document.documentElement.setAttribute("data-theme", next);
+      try { localStorage.setItem("dct-theme", next); } catch (err) {}
+    });
+    /* live refresh via SSE change-token */
+    const _es = new EventSource("/events");
+    _es.addEventListener("stale", () => {
+      document.body.classList.add("just-refreshed");
+      if (window.htmx) htmx.ajax("GET", window.location.href, {target:"#main", select:"#main"});
+      setTimeout(() => document.body.classList.remove("just-refreshed"), 1200);
+    });
+  </script>
+</body>
+</html>

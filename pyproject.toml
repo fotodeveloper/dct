@@ -1,0 +1,51 @@
+[project]
+name = "dctracker"
+description = "Deterministic Context Tracker (dct) — cross-project tracking, changelog, and release tooling for Claude Code."
+version = "0.8.0"
+requires-python = ">=3.11"
+license = "MIT"
+authors = [{ name = "fotodeveloper", email = "dev@fotodeveloper.com" }]
+readme = "README.md"
+keywords = ["claude-code", "mcp", "tracking", "changelog", "sprints", "developer-tools", "cli"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development",
+]
+dependencies = ["sqlalchemy>=2.0", "python-ulid>=2.0"]
+
+[project.urls]
+Homepage = "https://dctools.dev"
+Repository = "https://github.com/fotodeveloper/dct"
+Changelog = "https://github.com/fotodeveloper/dct/blob/main/changelog.md"
+
+[project.optional-dependencies]
+pg = ["psycopg[binary]"]
+mcp = ["mcp[cli]"]
+web = ["flask>=3.0", "markdown>=3.5"]
+dev = ["pytest", "pytest-cov"]
+all = ["psycopg[binary]", "mcp[cli]", "flask>=3.0", "markdown>=3.5", "pytest", "pytest-cov"]
+
+[project.scripts]
+dct = "dct.cli:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+
+[tool.ruff.lint]
+# E701 (one-line `if x: y`) and E741 (short names like `l`) are accepted house
+# style in compact CLI/test code; everything else in ruff's default set applies.
+ignore = ["E701", "E741"]
+
+[tool.setuptools.packages.find]
+include = ["dct*"]
+
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"

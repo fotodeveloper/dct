@@ -1,0 +1,63 @@
+{% extends "base.html" %}
+{% from "partials/_bars.html" import bars %}
+{% block content %}
+<link rel="stylesheet" href="{{ url_for('static', filename='vendor/uPlot.min.css') }}">
+
+<section class="analytics" data-slug="{{ slug }}">
+  <nav class="tabs">
+    <a class="tab" href="#health">Backlog Health</a>
+    <a class="tab" href="#velocity">Velocity</a>
+  </nav>
+
+  <div id="health" class="tab-panel">
+    <h2>Backlog Health — {{ project.name }}</h2>
+    <div class="dist-grid">
+      {{ bars("By type", health.by_type) }}
+      {{ bars("By priority", health.by_priority) }}
+      {{ bars("By status", health.by_status) }}
+      {{ bars("Aging", health.aging) }}
+    </div>
+
+    <div class="cp-stats">
+      <h4>Checkpoints</h4>
+      <p>
+        pending {{ health.checkpoints.pending }} ·
+        done {{ health.checkpoints.done }} ·
+        rejected {{ health.checkpoints.rejected }} ·
+        completion {{ '%.0f' % (health.checkpoints.completion_rate * 100) }}%
+      </p>
+    </div>
+
+    {% if health.hotspots.components or health.hotspots.files %}
+    <div class="hotspots">
+      <h4>Hotspots (&ge;2 open)</h4>
+      <ul>
+        {% for h in health.hotspots.components %}
+        <li>component: {{ h.name }} ({{ h.count }})</li>
+        {% endfor %}
+        {% for h in health.hotspots.files %}
+        <li>file: {{ h.name }} ({{ h.count }})</li>
+        {% endfor %}
+      </ul>
+    </div>
+    {% endif %}
+  </div>
+
+  <div id="velocity" class="tab-panel">
+    <h2>Velocity</h2>
+    <div id="velocity-chart" class="uplot-mount"></div>
+    <script id="velocity-data" type="application/json">{{ velocity | tojson }}</script>
+
+    {% if velocity.release_cadence %}
+    <h4>Release cadence</h4>
+    <ul>
+      {% for r in velocity.release_cadence %}
+      <li>{{ r.version }} — {{ r.released_at }}</li>
+      {% endfor %}
+    </ul>
+    {% endif %}
+  </div>
+</section>
+
+<script src="{{ url_for('static', filename='vendor/uPlot.iife.min.js') }}"></script>
+{% endblock %}

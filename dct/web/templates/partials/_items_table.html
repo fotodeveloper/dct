@@ -1,0 +1,23 @@
+<table class="items">
+  <thead>
+    <tr><th>#</th><th>type</th><th>pri</th><th>status</th><th>cp</th><th>component</th><th>tags</th><th>title</th></tr>
+  </thead>
+  <tbody>
+    {% for it in items %}
+    <tr class="status-{{ it.status }} pri-{{ it.priority }}">
+      <td class="c-id">{{ it.id }}</td>
+      <td><span class="badge type-{{ it.item_type }}">{{ it.item_type }}</span></td>
+      <td><span class="badge pri-{{ it.priority }}">{{ it.priority }}</span></td>
+      <td><span class="badge status-{{ it.status }}">{{ it.status }}</span></td>
+      <td class="cp">{% if it.cp[1] %}<span class="cp-mini"><span class="cp-mini-fill" style="width: {{ (100 * it.cp[0] / it.cp[1]) }}%"></span></span>{% endif %}<span class="cp-num">{{ it.cp[0] }}/{{ it.cp[1] }}</span></td>
+      <td class="c-component">{{ it.component or "" }}</td>
+      <td class="tags">
+        {% for t in it.tags %}<span class="tag">{{ t }}</span>{% endfor %}
+      </td>
+      <td><a href="{{ url_for('items.detail', slug=slug, id=it.id) }}">{{ it.title }}</a></td>
+    </tr>
+    {% else %}
+    <tr><td colspan="8" class="empty">No items match these filters.</td></tr>
+    {% endfor %}
+  </tbody>
+</table>

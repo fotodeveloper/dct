@@ -1,0 +1,91 @@
+{% extends "base.html" %}
+{% block title %}#{{ item.id }} {{ item.title }}{% endblock %}
+{% block crumb_leaf %}<span class="sep">/</span><span class="crumb-here">#{{ item.id }}</span>{% endblock %}
+{% block content %}
+<article class="item-detail">
+  <nav class="item-pager">
+    <a class="back" href="{{ url_for('items.list', slug=slug) }}">&larr; all items</a>
+    <span class="item-pager-sides">
+      {% if prev_item %}
+        <a class="pager-prev" href="{{ url_for('items.detail', slug=slug, id=prev_item.id) }}" title="{{ prev_item.title }}">&larr; #{{ prev_item.id }}</a>
+      {% else %}<span class="pager-end">&larr; start</span>{% endif %}
+      {% if next_item %}
+        <a class="pager-next" href="{{ url_for('items.detail', slug=slug, id=next_item.id) }}" title="{{ next_item.title }}">#{{ next_item.id }} &rarr;</a>
+      {% else %}<span class="pager-end">end &rarr;</span>{% endif %}
+    </span>
+  </nav>
+  <h1>#{{ item.id }} {{ item.title }}</h1>
+
+  <div class="meta">
+    <span class="badge type">{{ item.item_type }}</span>
+    <span class="badge pri-{{ item.priority }}">{{ item.priority }}</span>
+    <span class="badge status-{{ item.status }}">{{ item.status }}</span>
+    {% if item.component %}<span class="badge component">{{ item.component }}</span>{% endif %}
+    {% for t in item.tags %}<span class="tag">{{ t }}</span>{% endfor %}
+  </div>
+
+  {% if item.source_file %}
+  <p class="source">
+    source:
+    <a href="vscode://file/{{ item.source_file }}{% if item.source_lines %}:{{ item.source_lines.split('-')[0] }}{% endif %}">
+      {{ item.source_file }}{% if item.source_lines %}:{{ item.source_lines }}{% endif %}
+    </a>
+  </p>
+  {% endif %}
+
+  {% if item.description %}
+  <section class="description">
+    {{ item.description | render_markdown }}
+  </section>
+  {% endif %}
+
+  {% if item.resolution %}
+  <section class="resolution">
+    <h2>Resolution</h2>
+    {{ item.resolution | render_markdown }}
+  </section>
+  {% endif %}
+
+  <section class="checkpoints">
+    {% set _done = item.progress.done if item.progress else 0 %}
+    {% set _total = item.progress.total if item.progress else (item.checkpoints | length) %}
+    <h2>Checkpoints <span class="muted">{{ _done }}/{{ _total }}</span></h2>
+    {% if _total %}
+    <div class="cp-progress" role="progressbar" aria-valuenow="{{ _done }}" aria-valuemax="{{ _total }}">
+      <span class="cp-progress-fill" style="width: {{ (100 * _done / _total) }}%"></span>
+    </div>
+    {% endif %}
+    {% if item.checkpoints %}
+    <ul class="cp-list">
+      {% for cp in item.checkpoints %}
+      <li class="cp cp-{{ cp.status }}">
+        <span class="cp-status">{{ cp.status }}</span>
+        <span class="cp-text">{{ cp.text }}</span>
+        {% if is_gate(cp.kind) %}
+        <span class="badge gate gate-{{ cp.kind }}">gate: {{ cp.kind }}</span>
+        {% endif %}
+      </li>
+      {% endfor %}
+    </ul>
+    {% else %}
+    <p class="empty">No checkpoints.</p>
+    {% endif %}
+  </section>
+
+  <section class="notes">
+    <h2>Notes</h2>
+    {% if item.notes %}
+    <ol class="timeline">
+      {% for n in item.notes %}
+      <li class="note">
+        <time>{{ n.created_at | to_iso }}</time>
+        <div class="note-body">{{ n.note | render_markdown }}</div>
+      </li>
+      {% endfor %}
+    </ol>
+    {% else %}
+    <p class="empty">No notes.</p>
+    {% endif %}
+  </section>
+</article>
+{% endblock %}

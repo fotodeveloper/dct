@@ -1,0 +1,45 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>Handoffs <span class="slug">/ {{ slug }}</span></h1>
+
+<section class="handoff-group">
+  <h2>Unconsumed <small class="muted">(inbox — {{ unconsumed | length }})</small></h2>
+  {% if unconsumed %}
+  <ul class="handoff-list">
+    {% for h in unconsumed %}
+    <li class="handoff is-open">
+      <div class="handoff-head">
+        {% if h.scope %}<span class="badge scope">{{ h.scope }}</span>{% endif %}
+        <span class="handoff-by">{{ h.created_by }}</span>
+        <span class="handoff-at">{{ h.created_at | to_iso }}</span>
+      </div>
+      <pre class="prompt">{{ h.prompt }}</pre>
+    </li>
+    {% endfor %}
+  </ul>
+  {% else %}<p class="empty">Inbox empty — nothing waiting to be picked up.</p>{% endif %}
+</section>
+
+<section class="handoff-group">
+  <h2>Consumed <small class="muted">(history — {{ consumed | length }})</small></h2>
+  {% if consumed %}
+  <ul class="handoff-list">
+    {% for h in consumed %}
+    <li class="handoff is-consumed">
+      <div class="handoff-head">
+        {% if h.scope %}<span class="badge scope">{{ h.scope }}</span>{% endif %}
+        <span class="handoff-by">{{ h.created_by }}</span>
+        <span class="handoff-at">consumed {{ h.consumed_at | to_iso }}</span>
+      </div>
+      {% if h.prompt %}
+      <details class="handoff-prompt">
+        <summary>prompt</summary>
+        <pre class="prompt">{{ h.prompt }}</pre>
+      </details>
+      {% endif %}
+    </li>
+    {% endfor %}
+  </ul>
+  {% else %}<p class="empty">No consumed handoffs yet.</p>{% endif %}
+</section>
+{% endblock %}

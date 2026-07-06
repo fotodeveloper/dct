@@ -1,0 +1,51 @@
+{% extends "base.html" %}
+{% block title %}{{ project.name }}{% endblock %}
+{% block content %}
+<h1>{{ project.name }} <small class="slug">{{ project.slug }}</small></h1>
+
+<section class="summary">
+  <div class="stat">
+    <span class="label">sprint size</span>
+    <span class="value">{{ review.summary.sprint_size }}</span>
+  </div>
+  <div class="stat">
+    <span class="label">sprint completion</span>
+    <span class="value">{{ review.summary.sprint_completion }}</span>
+  </div>
+  <div class="stat">
+    <span class="label">total open</span>
+    <span class="value">{{ review.summary.total_open_in_project }}</span>
+  </div>
+  <div class="stat">
+    <span class="label">handoffs pending</span>
+    <span class="value">{{ review.summary.handoffs_pending }}</span>
+  </div>
+</section>
+
+<h2>In sprint</h2>
+{% set sp = review.in_sprint %}
+{% if sp.rows %}
+<div class="table-wrap">
+<table class="items">
+  <thead><tr>{% for c in sp.cols %}<th>{{ c }}</th>{% endfor %}</tr></thead>
+  <tbody>
+    {% for row in sp.rows %}
+      <tr>{% for cell in row %}<td>{{ cell }}</td>{% endfor %}</tr>
+    {% endfor %}
+  </tbody>
+</table>
+</div>
+{% else %}
+<p class="empty">No items flagged for the current sprint.</p>
+{% endif %}
+
+<h2>Stale in progress</h2>
+{% set st = review.stale_in_progress %}
+{% if st.rows %}
+<ul class="stale">
+  {% for row in st.rows %}<li>#{{ row[0] }} &mdash; {{ row[2] }}</li>{% endfor %}
+</ul>
+{% else %}
+<p class="empty">Nothing stale.</p>
+{% endif %}
+{% endblock %}

@@ -1,0 +1,16 @@
+{% extends "base.html" %}
+{% from "partials/_plan_section.html" import render_section %}
+{% block crumb_leaf %}<span class="sep">/</span><span class="crumb-here">{{ plan.title }}</span>{% endblock %}
+{% block content %}
+<h1>{{ plan.title }}</h1>
+<div class="plan-meta">
+  <span class="kind">{{ plan.kind }}</span>
+  <span class="badge status-{{ plan.status }}">{{ plan.status }}</span>
+  <span class="rollup">{{ progress.done }}/{{ progress.active }} ({{ progress.percent }}%)</span>
+</div>
+{% if roots %}
+<ul class="plan-tree">
+  {% for section in roots %}{{ render_section(section, children_map) }}{% endfor %}
+</ul>
+{% else %}<p class="empty">No sections.</p>{% endif %}
+{% endblock %}

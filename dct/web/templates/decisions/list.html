@@ -1,0 +1,22 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>Decisions — {{ slug }}</h1>
+{% if decisions %}
+<ul class="decision-list">
+  {% for d in decisions %}
+  <li class="decision status-{{ d.status }}">
+    {% if d.ref_code %}<span class="ref">{{ d.ref_code }}</span>{% endif %}
+    <span class="kind">{{ d.kind }}</span>
+    <span class="title">{{ d.title }}</span>
+    <span class="badge status-{{ d.status }}">{{ d.status }}</span>
+    {% if d.superseded_by %}
+      {% set newer = by_id.get(d.superseded_by) %}
+      <span class="supersede">→ superseded by
+        {% if newer %}{{ newer.ref_code or newer.title }}{% else %}#{{ d.superseded_by }}{% endif %}
+      </span>
+    {% endif %}
+  </li>
+  {% endfor %}
+</ul>
+{% else %}<p class="empty">No decisions.</p>{% endif %}
+{% endblock %}

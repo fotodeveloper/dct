@@ -1,0 +1,22 @@
+{# Renders a flat list of item/plan checkpoints as expandable steps.
+   Imported as a macro so it works inside the recursive render_section macro
+   (a plain {% include %} would NOT see the macro's local `section.checkpoints`). #}
+{% macro checkpoint_steps(checkpoints) %}
+  {% if checkpoints %}
+  <ul class="cp-steps">
+    {% for cp in checkpoints %}
+    <li class="cp cp-{{ cp.status }}">
+      <span class="cp-box">
+        {%- if cp.status == 'done' -%}[x]
+        {%- elif cp.status == 'rejected' -%}[~]
+        {%- else -%}[ ]{%- endif -%}
+      </span>
+      <span class="cp-text">{{ cp.text }}</span>
+      {% if cp.kind and cp.kind not in ('task', 'cc-task') %}
+        <span class="badge gate">{{ cp.kind }}</span>
+      {% endif %}
+    </li>
+    {% endfor %}
+  </ul>
+  {% endif %}
+{% endmacro %}

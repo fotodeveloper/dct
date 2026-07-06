@@ -1,0 +1,24 @@
+{# Recursive section renderer. `children_map` maps parent_section_id -> [section,...].
+   Roots are passed in by the blueprint; each section embeds its own `checkpoints`
+   (from get_plan). Recursion is explicit-argument (no include/context gotcha). #}
+{% from "partials/_checkpoint_steps.html" import checkpoint_steps %}
+{% macro render_section(section, children_map) %}
+<li class="plan-section depth-{{ section.depth }}" id="sec-{{ section.ulid }}">
+  <div class="section-head">
+    <span class="section-type">{{ section.section_type }}</span>
+    <span class="section-heading">{{ section.heading }}</span>
+    {% set done = section.checkpoints | selectattr('status', 'equalto', 'done') | list | length %}
+    {% set total = section.checkpoints | length %}
+    {% if total %}<span class="rollup">{{ done }}/{{ total }}</span>{% endif %}
+    {% if section.needs_llm_review %}<span class="badge warn">needs review</span>{% endif %}
+    {% if section.section_type == 'uncertain' %}<span class="badge warn">uncertain</span>{% endif %}
+  </div>
+  {{ checkpoint_steps(section.checkpoints) }}
+  {% set kids = children_map.get(section.id, []) %}
+  {% if kids %}
+  <ul class="section-children">
+    {% for child in kids %}{{ render_section(child, children_map) }}{% endfor %}
+  </ul>
+  {% endif %}
+</li>
+{% endmacro %}

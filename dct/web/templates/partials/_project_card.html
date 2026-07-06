@@ -1,0 +1,24 @@
+<article class="project-card" data-slug="{{ p.slug }}">
+  <header>
+    <a href="{{ url_for('projects.home', slug=p.slug) }}">{{ p.slug }}</a>
+    <span class="name">{{ p.name }}</span>
+  </header>
+  <div class="counts">
+    <span class="open">open {{ p.open_total }}</span>
+    <span class="pri">P1:{{ p.by_priority.P1 }}</span>
+    <span class="pri">P2:{{ p.by_priority.P2 }}</span>
+    <span class="pri">P3:{{ p.by_priority.P3 }}</span>
+  </div>
+  <div class="counts">
+    <span>in-prog {{ p.in_progress }}</span>
+    {% if p.stale_7d %}
+      <span class="warn">stale {{ p.stale_7d }} &#9888;</span>
+    {% else %}
+      <span>stale 0</span>
+    {% endif %}
+  </div>
+  <div class="counts">
+    <span>handoffs {{ p.unconsumed_handoffs }}</span>
+    <span>clog {{ p.unreleased_changelog }}</span>
+  </div>
+</article>

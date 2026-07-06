@@ -1,0 +1,6 @@
+Vendored third-party assets (no build step — committed as-is).
+
+uPlot 1.6.31 — MIT License — https://github.com/leeoniya/uPlot
+  uPlot.iife.min.js  <- dist/uPlot.iife.min.js  @ tag 1.6.31
+  uPlot.min.css      <- dist/uPlot.min.css       @ tag 1.6.31
+  source: https://raw.githubusercontent.com/leeoniya/uPlot/1.6.31/dist/

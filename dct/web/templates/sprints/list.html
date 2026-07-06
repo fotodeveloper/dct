@@ -1,0 +1,35 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>Sprints — {{ slug }}</h1>
+
+<section class="sprint-model" data-model="current_sprint">
+  <h2>Current sprint <small class="muted">(active)</small></h2>
+  {% if current %}
+  <p><a href="/sprints/{{ current.id }}">{{ current.name }}</a>
+     <span class="badge status-active">active</span></p>
+  {% if current_items %}
+  <ul class="item-list">
+    {% for it in current_items %}
+    <li><a href="/p/{{ slug }}/items/{{ it.id }}">#{{ it.id }} {{ it.title }}</a></li>
+    {% endfor %}
+  </ul>
+  {% else %}<p class="empty">Current sprint is empty.</p>{% endif %}
+  {% else %}<p class="empty">No current (active) sprint.</p>{% endif %}
+</section>
+
+<section class="sprint-model" data-model="item_sprints">
+  <h2>All sprints <small class="muted">(item_sprints)</small></h2>
+  {% if sprints %}
+  <ul class="sprint-list">
+    {% for s in sprints %}
+    <li>
+      <a href="/sprints/{{ s.id }}">{{ s.name }}</a>
+      {% if s.code %}<span class="code">{{ s.code }}</span>{% endif %}
+      <span class="badge status-{{ s.status }}">{{ s.status }}</span>
+      <span class="kind">{{ s.kind }}</span>
+    </li>
+    {% endfor %}
+  </ul>
+  {% else %}<p class="empty">No sprints.</p>{% endif %}
+</section>
+{% endblock %}

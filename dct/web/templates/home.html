@@ -1,0 +1,20 @@
+{% extends "base.html" %}
+{% block title %}Radar{% endblock %}
+{% block content %}
+<h1>Radar</h1>
+
+<section class="radar-totals">
+  <span>open {{ radar.totals.open_total }}</span>
+  <span>in-prog {{ radar.totals.in_progress }}</span>
+  <span>stale {{ radar.totals.stale_7d }}</span>
+  <span>handoffs {{ radar.totals.unconsumed_handoffs }}</span>
+</section>
+
+<section class="radar-grid">
+  {% for p in radar.projects %}
+    {% include "partials/_project_card.html" %}
+  {% else %}
+    <p class="empty">No projects registered yet. Run <code>dct project add</code>.</p>
+  {% endfor %}
+</section>
+{% endblock %}

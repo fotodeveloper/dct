@@ -1,0 +1,15 @@
+{% macro bars(title, data) %}
+<div class="bars">
+  <h4 class="bars-title">{{ title }}</h4>
+  {% set maxv = (data.values() | max) if data else 0 %}
+  {% for label, count in data.items() %}
+  <div class="bar-row">
+    <span class="bar-label">{{ label }}</span>
+    <span class="bar-track">
+      <span class="bar-fill" style="width: {{ (100 * count / maxv) if maxv else 0 }}%"></span>
+    </span>
+    <span class="bar-count">{{ count }}</span>
+  </div>
+  {% endfor %}
+</div>
+{% endmacro %}

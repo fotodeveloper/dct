@@ -1,0 +1,44 @@
+{% extends "base.html" %}
+{% block title %}Items — {{ slug }}{% endblock %}
+{% block content %}
+<h1>Items <span class="muted">/ {{ slug }}</span></h1>
+
+<form id="item-filters" class="filters"
+      hx-get="{{ url_for('items.list', slug=slug) }}"
+      hx-target="#items-table"
+      hx-trigger="change, keyup delay:300ms from:input[name='q']"
+      hx-push-url="true">
+  <select name="type">
+    <option value="">type: any</option>
+    {% for t in type_options %}
+    <option value="{{ t }}" {% if filters.item_type == t %}selected{% endif %}>{{ t }}</option>
+    {% endfor %}
+  </select>
+  <select name="priority">
+    <option value="">priority: any</option>
+    {% for p in priority_options %}
+    <option value="{{ p }}" {% if filters.priority == p %}selected{% endif %}>{{ p }}</option>
+    {% endfor %}
+  </select>
+  <select name="status">
+    <option value="">status: any</option>
+    {% for s in status_options %}
+    <option value="{{ s }}" {% if filters.status == s %}selected{% endif %}>{{ s }}</option>
+    {% endfor %}
+  </select>
+  <input type="text" name="component" placeholder="component"
+         value="{{ filters.component or '' }}">
+  <input type="text" name="tag" placeholder="tag" value="{{ tag }}">
+  <input type="search" name="q" placeholder="search title/description"
+         value="{{ filters.search or '' }}">
+  <select name="sort" class="sort-select" aria-label="Sort">
+    {% for val, label in sort_options %}
+    <option value="{{ val }}" {% if sort == val %}selected{% endif %}>sort: {{ label }}</option>
+    {% endfor %}
+  </select>
+</form>
+
+<div id="items-table">
+  {% include "partials/_items_table.html" %}
+</div>
+{% endblock %}

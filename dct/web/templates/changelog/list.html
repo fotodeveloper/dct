@@ -1,0 +1,23 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>Changelog — {{ slug }} <small class="muted">({{ unreleased_count }} unreleased)</small></h1>
+{% for version, entries in version_groups %}
+<section class="clog-version">
+  <h2>{{ version if version else "Unreleased" }}</h2>
+  <ul class="clog-entries">
+    {% for e in entries %}
+    <li class="clog-entry cat-{{ e.category }}">
+      <span class="badge cat cat-{{ e.category }}">{{ e.category }}</span>
+      {% if e.component %}<span class="component">{{ e.component }}</span>{% endif %}
+      <span class="entry">{{ e.entry }}</span>
+      {% if e.related_item_id %}
+        <a class="rel" href="/p/{{ slug }}/items/{{ e.related_item_id }}">#{{ e.related_item_id }}</a>
+      {% endif %}
+    </li>
+    {% endfor %}
+  </ul>
+</section>
+{% else %}
+<p class="empty">No changelog entries.</p>
+{% endfor %}
+{% endblock %}

@@ -1,0 +1,15 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>Plans — {{ slug }}</h1>
+{% if plans %}
+<ul class="plan-list">
+  {% for p in plans %}
+  <li>
+    <a href="/plans/{{ p.id }}">{{ p.title }}</a>
+    <span class="kind">{{ p.kind }}</span>
+    <span class="badge status-{{ p.status }}">{{ p.status }}</span>
+  </li>
+  {% endfor %}
+</ul>
+{% else %}<p class="empty">No plans.</p>{% endif %}
+{% endblock %}

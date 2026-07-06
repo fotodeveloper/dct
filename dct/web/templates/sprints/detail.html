@@ -1,0 +1,37 @@
+{% extends "base.html" %}
+{% from "partials/_checkpoint_steps.html" import checkpoint_steps %}
+{% block crumb_leaf %}<span class="sep">/</span><span class="crumb-here">«{{ sprint.name }}»</span>{% endblock %}
+{% block content %}
+<h1>Sprint «{{ sprint.name }}»</h1>
+<div class="sprint-meta">
+  {% if sprint.code %}<span class="code">code {{ sprint.code }}</span>{% endif %}
+  <span class="badge status-{{ sprint.status }}">{{ sprint.status }}</span>
+  <span class="kind">{{ sprint.kind }}</span>
+</div>
+{% if sprint.goal %}<p class="goal">goal: {{ sprint.goal }}</p>{% endif %}
+{% if sprint.started_at %}<p class="muted">started {{ sprint.started_at }}</p>{% endif %}
+<p class="rollup">completion {{ cp_done }}/{{ cp_total }}</p>
+
+<h2>Items <small class="muted">(via item_sprints)</small></h2>
+{% if rows %}
+<ul class="member-items">
+  {% for row in rows %}
+  <li class="member">
+    <div class="member-head">
+      <a class="member-id" href="{{ url_for('items.detail', slug=slug, id=row.item.id) }}">#{{ row.item.id }}</a>
+      <span class="badge type-{{ row.item.item_type }}">{{ row.item.item_type }}</span>
+      <span class="badge pri-{{ row.item.priority }}">{{ row.item.priority }}</span>
+      <span class="badge status-{{ row.item.status }}">{{ row.item.status }}</span>
+      <a class="member-title" href="{{ url_for('items.detail', slug=slug, id=row.item.id) }}">{{ row.item.title }}</a>
+    </div>
+    {% if row.checkpoints %}
+    <details class="steps" open>
+      <summary>{{ row.checkpoints | length }} steps</summary>
+      {{ checkpoint_steps(row.checkpoints) }}
+    </details>
+    {% endif %}
+  </li>
+  {% endfor %}
+</ul>
+{% else %}<p class="empty">No member items.</p>{% endif %}
+{% endblock %}
