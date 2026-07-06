@@ -22,6 +22,33 @@ dct is built for exactly this:
 - **Append-only ledger** — notes, checkpoints, and handoffs are soft-deleted, never dropped. Nothing is lost.
 - **Session handoffs** — end a session with a handoff prompt; the next one picks up exactly where you left off.
 
+## The session loop: `/handoff` → `/pickup`
+
+The pair you will use most. AI coding sessions end; your context shouldn't.
+
+**Ending a session — `/handoff`** flags the items you were working on as the
+current sprint and stores a short prompt for whoever comes next (usually:
+you, tomorrow). **Starting a session — `/pickup`** reads the newest unconsumed
+handoff, shows the sprint with checkpoint progress, and proposes the first
+action — so the session starts *in the middle of the work*, not from a cold
+"what were we doing?". Illustrative session start:
+
+```text
+> /pickup
+Handoff (2026-07-05, scope: sprint-15):
+  "Theme tokens are merged; wire the toggle into settings next.
+   The Safari session fix (#12) still awaits review."
+Sprint: 3 items — #12 in_progress [2/4], #31 open, #7 open
+Proposed first action: #12 — wire the theme toggle into settings.
+```
+
+Handoffs are database rows, not files: several can coexist per project
+(`scope` tags disambiguate parallel workstreams), consuming one preserves it
+in the ledger, and an unconsumed one can be amended in place. Surfaces:
+`/handoff` and `/pickup` skills in Claude Code, `create_handoff` /
+`list_handoffs` / `consume_handoff` / `update_handoff` over MCP,
+`dct handoff update` in the CLI.
+
 ## Features
 
 - **Centralized tracking** — one database for all your projects

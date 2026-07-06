@@ -192,7 +192,7 @@ regression tests in `tests/test_version.py::TestDetectVersion`.
 ## Conventions
 
 - Code and docs: English
-- Communication: Polish
+- Communication: match the user's language
 - Commit format: conventional commits (`feat:`, `fix:`, `refactor:`)
 - All changes need a changelog entry before committing
 - Tests: pytest with in-memory SQLite fixture
@@ -395,7 +395,8 @@ Write code with anonymous placeholders from the first keystroke:
 **Intentionally exempt** (not rewriteable without harming content):
 
 - `changelog.md` — shipped history, rewriting breaks chronology
-- `docs/superpowers/specs/*.md` — dated design specs (historical record)
+- `docs/superpowers/` — internal design history; kept out of the public repo
+  entirely (gitignored), so it is exempt by absence
 - Commit messages and tags already in git history
 
 If a leak lands in those: note it, move on. Only anonymize going forward.
