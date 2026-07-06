@@ -1,8 +1,10 @@
 """Identifier helpers — ULID generation for plans/sections/checkpoints/decisions.
 
-Why ULID (not UUID4): time-sortable (newer rows sort later naturally in DB),
-shorter stringified form (26 chars vs 36), Crockford base32 so no I/L/O/U
-ambiguity. See spec `docs/superpowers/specs/2026-04-17-plans-roadmaps-decisions-design.md` §6.
+Why ULID (not UUID4): time-sortable at millisecond granularity (newer rows
+sort later naturally in DB), shorter stringified form (26 chars vs 36),
+Crockford base32 so no I/L/O/U ambiguity. Strict ordering within one
+millisecond is NOT guaranteed — intra-plan ordering uses explicit sort_order
+columns instead.
 """
 
 import re

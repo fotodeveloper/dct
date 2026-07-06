@@ -30,15 +30,17 @@ def test_new_ulid_uniqueness():
     assert first != second
 
 
-def test_new_ulid_monotonic_within_ms():
-    """ULIDs sort in creation order (time-based prefix). Sequential calls
-    within the same millisecond still preserve order through the randomness
-    component; across milliseconds the timestamp drives the order."""
-    # 100 ULIDs generated back-to-back should sort lexicographically to
-    # creation order. This is the key property that makes ULIDs preferable
-    # to UUID4 for our plan sections.
+def test_new_ulid_time_ordered_across_milliseconds():
+    """ULIDs are time-sortable: the 10-char timestamp prefix is non-decreasing
+    in generation order. Within one millisecond the ULID spec leaves ordering
+    to the random component — python-ulid does NOT guarantee strict
+    monotonicity there (measured ~2 inversions per 10k adjacent pairs), and
+    dct does not rely on it: explicit sort_order columns drive intra-plan
+    ordering. Asserting full lexicographic order made this test flaky."""
     values = [new_ulid() for _ in range(100)]
-    assert values == sorted(values)
+    stamps = [v[:10] for v in values]
+    assert stamps == sorted(stamps)
+    assert len(set(values)) == len(values)
 
 
 def test_is_valid_ulid_accepts_real_ulid():
