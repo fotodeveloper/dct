@@ -125,9 +125,10 @@ user-facing feature in a fresh session), `security`, `approval`, `review`;
 unknown kinds are conservatively treated as gates.
 
 Rule: every new user-facing feature item ends with a `kind='dogfood'`
-checkpoint. Exceptions: internal refactors/docs/CI (no user-facing surface)
-and bug fixes with a regression test (the test IS the validation). When in
-doubt, add the gate — rejecting is always available.
+checkpoint. Exceptions: internal refactors/docs/CI (no user-facing surface),
+bug fixes with a regression test (the test IS the validation), and features
+behind a not-yet-enabled flag (gate deferred until the flip). When in doubt,
+add the gate — rejecting is always available.
 
 ## OSS hygiene
 
