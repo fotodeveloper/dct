@@ -126,6 +126,33 @@ Each Claude Code session spawns its own `dct server` subprocess, inheriting the 
 
 Project paths are stored canonically (`os.path.realpath`), and detection canonicalizes both sides before matching, so CWD detection works under symlinked roots (e.g. `/tmp` → `/private/tmp`) instead of silently failing.
 
+## Project registration & version detection
+
+Two layers, one entry point:
+
+- **`dct init`** — global, one-time bootstrap (MCP registration, skill/hook
+  symlinks, consent-gated hook wiring). Idempotent, safe to re-run.
+- **`dct project add <slug> <path>`** — per-project registration; inserts a
+  projects row and auto-detects `current_version` when `--version` is absent.
+- **`dct project rename <slug> [--slug X] [--name Y] [--path P]`** — in-place
+  rename; `project_id` and all FKs (items, changelog, checkpoints, handoffs)
+  are preserved. Slug collisions with live projects are rejected.
+
+The `/dct-init` skill orchestrates both layers interactively (probes bootstrap
+state, permissions allowlist, project-local conflicts, version-sync scripts,
+then registers the CWD project) — it never re-implements the CLI, only drives it.
+
+Version detection order (first hit wins): `VERSION` file →
+`pyproject.toml` `[project].version` → `package.json` → `Cargo.toml` →
+`src-tauri/tauri.conf.json`. Malformed files are skipped silently so
+registration never fails on unrelated parse errors. No match: a tty gets an
+interactive prompt (`0.0.1 / 0.1.0 / 1.0.0` shortcuts, default `0.1.0`);
+non-tty registers `current_version=NULL` with a warning to run
+`dct project set-version <slug> <v>` later (a NULL version would otherwise
+crash `/release` much later — the detect-or-ask flow closes that trap).
+Helper: `dct/core/version.py::detect_version`; tests:
+`tests/test_version.py::TestDetectVersion`.
+
 ## PostgreSQL setup
 
 SQLite (the default) needs zero setup. To use PostgreSQL instead:
