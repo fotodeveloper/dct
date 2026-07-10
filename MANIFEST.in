@@ -1,0 +1,7 @@
+# Sdist contents — CI publishes via `python -m build` (sdist → wheel), so every
+# packaged asset must be grafted here as well as declared in package-data.
+graft dct/skills
+graft dct/hooks
+graft dct/web/templates
+graft dct/web/static
+global-exclude *.py[cod] .DS_Store

@@ -94,7 +94,7 @@ Remember the returned `id`.
 
 ### Step 6b: CC task-list mirror cleanup (v0.4.0)
 
-If the TaskCreate mirror hook (`hooks/dct-task-mirror.sh`) is active, the
+If the TaskCreate mirror hook (`dct/hooks/dct-task-mirror.sh`) is active, the
 current session may have spawned a session-scoped item with checkpoints
 mirrored from TaskCreate/TodoWrite calls. These items have the tag
 `cc-task-list` and title `"CC task list — session <id>"`.

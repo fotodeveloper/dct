@@ -9,8 +9,8 @@ from pathlib import Path
 
 from dct.config import Config
 
-SKILLS_DIR = Path(__file__).resolve().parent.parent / "skills"
-HOOKS_DIR = Path(__file__).resolve().parent.parent / "hooks"
+SKILLS_DIR = Path(__file__).resolve().parent / "skills"
+HOOKS_DIR = Path(__file__).resolve().parent / "hooks"
 CLAUDE_SKILLS_DIR = Path.home() / ".claude" / "skills"
 CLAUDE_HOOKS_DIR = Path.home() / ".claude" / "hooks"
 CLAUDE_JSON = Path.home() / ".claude.json"
@@ -31,11 +31,17 @@ HOOK_WIRING = [
      "matcher": "TodoWrite|TaskCreate", "timeout": None},
 ]
 
-SKILL_NAMES = [
-    "track", "track-list", "track-update", "track-resolve",
-    "clog", "commit", "release", "dct-import", "dct-init",
-    "handoff", "pickup",
-]
+def discover_skills() -> list[str]:
+    """Skill directories shipped inside the package (each holds a SKILL.md).
+
+    Derived from the filesystem on every call — dct/skills/ is the single
+    source of truth. Never reintroduce a hardcoded name list: a stale one
+    silently dropped plan-status and plan-resolve-uncertain from every
+    install for two releases.
+    """
+    if not SKILLS_DIR.is_dir():
+        return []
+    return sorted(p.name for p in SKILLS_DIR.iterdir() if (p / "SKILL.md").is_file())
 
 
 def register_mcp(config: Config) -> tuple[bool, str]:
@@ -78,11 +84,12 @@ def register_mcp(config: Config) -> tuple[bool, str]:
 def install_hook(config: Config | None = None) -> bool:
     """Symlink dct hooks into ~/.claude/hooks/ (single source of truth, #224).
 
-    Installs four hooks as SYMLINKS to the dct repo's hooks/ directory (like
-    install_skills), so a fix in the repo is live immediately without reinstall.
+    Installs four hooks as SYMLINKS to the packaged dct/hooks/ directory (like
+    install_skills) — site-packages for a wheel install, the repo working tree
+    for an editable one, where a repo fix is live immediately without reinstall.
     Copies drift from source — a stale installed copy is exactly what masked the
     #223 clog-count bug timeline. The installed name is `dct-`-prefixed while the
-    repo source is not (e.g. hooks/check-changelog.sh → dct-check-changelog.sh):
+    packaged source is not (e.g. dct/hooks/check-changelog.sh → dct-check-changelog.sh):
     - dct-check-changelog.sh (PreToolUse) — blocks commits without changelog
     - dct-check-changelog-on-stop.sh (Stop) — reminds user at session end
     - dct-plan-autoscan.sh (PostToolUse, v0.2.0) — re-scans plan-like MD files
@@ -226,16 +233,18 @@ def wire_hooks_into_settings(settings_path: Path | None = None) -> dict:
 
 
 def install_skills(config: Config) -> bool:
-    """Symlink skills from dct repo to ~/.claude/skills/."""
+    """Symlink every packaged skill (dct/skills/*) into ~/.claude/skills/.
+
+    Sources come from the installed package — site-packages for a wheel
+    install, the repo working tree for an editable one (where a repo fix is
+    live without reinstall).
+    """
     CLAUDE_SKILLS_DIR.mkdir(parents=True, exist_ok=True)
     installed = 0
 
-    for name in SKILL_NAMES:
+    for name in discover_skills():
         src = SKILLS_DIR / name
         dst = CLAUDE_SKILLS_DIR / name
-
-        if not src.exists():
-            continue
 
         # Remove existing symlink or directory
         if dst.is_symlink():

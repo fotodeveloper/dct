@@ -8,7 +8,7 @@ authors = [{ name = "fotodeveloper", email = "dev@fotodeveloper.com" }]
 readme = "README.md"
 keywords = ["claude-code", "mcp", "tracking", "changelog", "sprints", "developer-tools", "cli"]
 classifiers = [
-    "Development Status :: 4 - Beta",
+    "Development Status :: 5 - Production/Stable",
     "Environment :: Console",
     "Intended Audience :: Developers",
     "Operating System :: OS Independent",
@@ -42,6 +42,19 @@ pythonpath = ["."]
 # E701 (one-line `if x: y`) and E741 (short names like `l`) are accepted house
 # style in compact CLI/test code; everything else in ruff's default set applies.
 ignore = ["E701", "E741"]
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.package-data]
+dct = [
+    "skills/**/*.md",
+    "hooks/*.sh",
+    "web/templates/*",
+    "web/templates/**/*",
+    "web/static/*",
+    "web/static/**/*",
+]
 
 [tool.setuptools.packages.find]
 include = ["dct*"]

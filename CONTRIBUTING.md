@@ -59,11 +59,11 @@ When adding or changing an `@mcp.tool()`:
 
 ## Hooks and skills
 
-- Hooks (`hooks/*.sh`) must follow the five rules in
+- Hooks (`dct/hooks/*.sh`) must follow the five rules in
   [docs/hooks.md](docs/hooks.md) — no prompts without a tty, consume stdin,
   degrade gracefully, meaningful exit codes, strip message content before
   flag inspection.
-- Skills (`skills/*/SKILL.md`) are Claude Code slash commands; keep their
+- Skills (`dct/skills/*/SKILL.md`) are Claude Code slash commands; keep their
   frontmatter `description` trigger-rich and the body imperative.
 
 ## Release process

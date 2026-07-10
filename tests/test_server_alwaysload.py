@@ -39,7 +39,7 @@ def test_cold_tools_stay_deferred():
 
 
 def test_pickup_tools_are_hot():
-    """Contract: every tool skills/pickup/SKILL.md calls must be loaded upfront."""
+    """Contract: every tool dct/skills/pickup/SKILL.md calls must be loaded upfront."""
     pickup_tools = {
         "list_projects", "review_sprint", "list_handoffs",
         "consume_handoff", "delete_handoff", "get_item",

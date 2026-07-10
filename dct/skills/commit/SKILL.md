@@ -62,7 +62,7 @@ If project detected:
 
 **Exempt patterns** (no changelog required if ALL staged files match):
 - `.claude/`, `.claude-plugin/`, `.github/`, `.cursor/`, `.vscode/`, `.gstack/`
-- `docs/`, `scripts/`, `tests/`, `skills/`, `test_*.py`, `conftest.py`
+- `docs/`, `scripts/`, `tests/`, `dct/skills/`, `test_*.py`, `conftest.py`
 - `CLAUDE.md`, `CLAUDE.local.md`, `AGENTS.md`, `README.md`, `LICENSE*`
 - `changelog.md`, `CHANGELOG*`, `.gitignore`
 - Config files: `pyproject.toml`, `Cargo.toml`, `package.json`, `biome.json`, `tsconfig*.json`

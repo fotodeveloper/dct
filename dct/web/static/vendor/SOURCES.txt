@@ -1,5 +1,9 @@
 Vendored third-party assets (no build step — committed as-is).
 
+htmx 1.9.12 — BSD 2-Clause License — https://github.com/bigskysoftware/htmx
+  htmx.min.js        <- dist/htmx.min.js         @ tag v1.9.12
+  source: https://unpkg.com/htmx.org@1.9.12/dist/htmx.min.js
+
 uPlot 1.6.31 — MIT License — https://github.com/leeoniya/uPlot
   uPlot.iife.min.js  <- dist/uPlot.iife.min.js  @ tag 1.6.31
   uPlot.min.css      <- dist/uPlot.min.css       @ tag 1.6.31

@@ -6,10 +6,10 @@ file presence, syntax, and contract compliance.
 """
 
 import subprocess
-from pathlib import Path
 
+from dct.setup import HOOKS_DIR
 
-HOOK_PATH = Path(__file__).resolve().parent.parent / "hooks" / "dct-task-mirror.sh"
+HOOK_PATH = HOOKS_DIR / "dct-task-mirror.sh"
 
 
 def test_hook_file_exists():

@@ -6,11 +6,12 @@ bash syntax check, and respects its exit-0-on-no-op contract.
 """
 
 import subprocess
-from pathlib import Path
+
+from dct.setup import HOOKS_DIR
 
 import pytest
 
-HOOK_PATH = Path(__file__).resolve().parent.parent / "hooks" / "dct-plan-autoscan.sh"
+HOOK_PATH = HOOKS_DIR / "dct-plan-autoscan.sh"
 
 
 def test_hook_file_exists():

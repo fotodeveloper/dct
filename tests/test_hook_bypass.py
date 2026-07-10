@@ -8,11 +8,12 @@ early on various guards we can trigger by crafting the input.
 import json
 import os
 import subprocess
-from pathlib import Path
 
 import pytest
 
-HOOK_PATH = Path(__file__).resolve().parent.parent / "hooks" / "check-changelog.sh"
+from dct.setup import HOOKS_DIR
+
+HOOK_PATH = HOOKS_DIR / "check-changelog.sh"
 
 
 def _run_hook(command: str, env_overrides: dict | None = None) -> subprocess.CompletedProcess:

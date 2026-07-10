@@ -1,6 +1,6 @@
 # Assistant fallback workflows
 
-Skills in `skills/` are **the preferred** way to drive dct from Claude Code.
+Skills in `dct/skills/` are **the preferred** way to drive dct from Claude Code.
 But skill names can be renamed, disabled per-session, or missing in future
 versions. Do not couple logic to skill existence — the workflows below
 describe what each skill does so an assistant can perform the steps manually
@@ -60,4 +60,4 @@ via MCP tools when the named skill is unavailable.
 7. Report: `✓ #<id> → <status>`.
 
 These prose descriptions are the authoritative behavior. Skill files in
-`skills/` are shortcuts. If they diverge — fix the skill, not this doc.
+`dct/skills/` are shortcuts. If they diverge — fix the skill, not this doc.

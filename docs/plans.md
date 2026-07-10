@@ -102,7 +102,7 @@ The parser first applies regex patterns (high confidence, instant, no cost):
 
 ## Hook-driven passive sync
 
-`hooks/dct-plan-autoscan.sh` is a PostToolUse hook installed by `dct init`. It fires after `Edit`/`Write`/`MultiEdit` on files matching the discovery patterns.
+`dct/hooks/dct-plan-autoscan.sh` is a PostToolUse hook installed by `dct init`. It fires after `Edit`/`Write`/`MultiEdit` on files matching the discovery patterns.
 
 ```bash
 # ~/.claude/settings.json — wire the hook

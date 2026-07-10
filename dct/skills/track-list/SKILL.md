@@ -90,7 +90,7 @@ Trigger automatically when rows.length ≥ 20 AND at least one file has ≥2 ite
 | Path                     | Open | P1 | Titles                              |
 |--------------------------|------|----|-------------------------------------|
 | dct/server.py            | 4    | 0  | #22, #6, #14, #20                   |
-| skills/track-list/SKILL.md | 3  | 0  | #6, #14, #19                        |
+| dct/skills/track-list/SKILL.md | 3 | 0 | #6, #14, #19                      |
 | dct/core/items.py        | 2    | 0  | #4, #23 (resolved)                  |
 ```
 

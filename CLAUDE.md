@@ -50,6 +50,8 @@ dct/export.py            — Keep a Changelog MD export
 dct/setup.py             — Init workflow: MCP registration, skill/hook symlinks,
                            settings.json hook auto-wiring (`dct hooks wire`)
 dct/web/                 — Read-only Flask dashboard (dct web)
+dct/skills/              — Packaged Claude Code skills (symlinked by dct init)
+dct/hooks/               — Packaged Claude Code hooks (symlinked by dct init)
 ```
 
 Invariants:
@@ -71,7 +73,7 @@ Invariants:
 
 ## Hook conventions
 
-Hooks (`hooks/*.sh`) run without a tty and must never hang or block the host
+Hooks (`dct/hooks/*.sh`) run without a tty and must never hang or block the host
 operation. The five rules — full versions with code samples in
 [docs/hooks.md](docs/hooks.md):
 
@@ -81,7 +83,7 @@ operation. The five rules — full versions with code samples in
 4. Exit codes carry meaning: `0` pass-through, `2` block with structured reason.
 5. Strip `-m "message"` content before inspecting commit flags.
 
-Reference implementation: `hooks/check-changelog.sh`.
+Reference implementation: `dct/hooks/check-changelog.sh`.
 
 ## MCP tool conventions
 
@@ -140,7 +142,7 @@ enforcement: [docs/maintainers.md](docs/maintainers.md).
 
 ## Skill fallbacks
 
-Skills in `skills/` are the preferred way to drive dct, but assistants must
+Skills in `dct/skills/` are the preferred way to drive dct, but assistants must
 not couple logic to skill existence. Step-by-step MCP-only equivalents for
 `/release`, `/commit`, `/track`, `/clog`, `/track-resolve` live in
 [docs/assistant-fallbacks.md](docs/assistant-fallbacks.md) — those prose
