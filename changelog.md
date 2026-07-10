@@ -1,6 +1,41 @@
 # Changelog
 
 
+## [1.0.0] - 2026-07-11
+
+### Added
+
+- Sprint lifecycle: new 'deferred' status (keeps started_at, frees the one-active-per-project slot, hidden from current-sprint views, listable via status='deferred') + explicit transition whitelist in update_sprint — reopen completed/abandoned→active clears ended_at, illegal transitions raise with allowed targets, create_sprint rejects 'deferred' (#292) (sprints)
+- New update_sprint MCP tool — edit sprint name/code/kind/goal and drive validated status transitions, incl. deferred→active reactivation respecting the ≤1-active cap; docstrings of create_sprint/list_sprints synced with the 'deferred' status (#292) (mcp)
+- New 'dct sprint' CLI subcommand: list/show/create/update plus defer/activate/complete verb aliases mapping onto the validated update path (#292) (cli)
+- Auto-wire dct hooks into ~/.claude/settings.json: `dct init` now offers consent-gated wiring (tty prompt; `--wire-hooks`/`--no-wire-hooks` for non-interactive), new `dct hooks wire` subcommand re-runs it any time; merge is idempotent (global probe by script basename respects custom user placement), preserves all user hooks, backs the file up before first write and aborts without writing on malformed JSON; manual reference moved from README to docs/hooks.md (also fixes README's wrong task-mirror event — PreToolUse TodoWrite|TaskCreate per the hook's own header) (setup)
+- GitHub publication scaffolding: CI workflow (ruff + pytest matrix on Python 3.11/3.12/3.13), PyPI publish workflow (trusted publishing via OIDC on v* tags, test-gated), CONTRIBUTING.md (dev setup, quality gates, MCP docstring contract, hook/skill conventions), issue templates and PR template; codebase made ruff-clean (unused imports/variables removed, E701/E741 accepted as house style in pyproject) (release)
+- README: install-straight-from-GitHub variant documented (`uv tool install 'dctracker[mcp,pg] @ git+https://github.com/fotodeveloper/dct'`) — verified mechanically via uvx against a local git source (readme)
+- Packaging regression tests: assets live in-package, every asset file is covered by a package-data glob and a MANIFEST.in graft, skill discovery matches the directory contents (locks out hardcoded-list drift) (tests)
+
+### Changed
+
+- Agent-facing instructions synced with the sprint lifecycle: MCP server INSTRUCTIONS gained a lifecycle/update_sprint section (defer instead of completing unfinished sprints), CLAUDE.md-snippet (→ ~/.claude/dct-reference.md) tool list updated (47 tools, +list_sprints/update_sprint) with a park-sprint recipe, repo CLAUDE.md tool count corrected (#292) (docs)
+- Rebrand to Deterministic Context Tracker (family ADR #39): PyPI distribution renamed dct → dctracker (CLI command and Python import stay `dct`), pyproject gains [project.urls] (dctools.dev), keywords and classifiers; brand strings updated in README, CLAUDE.md, CLI banner/argparse, MCP server instructions and web-viewer sidebar; version lookup reads dctracker metadata (branding)
+- Docs overhaul for OSS release: README restructured from a 480-line all-in-one reference into a 239-line user guide (badges, "Why dct?", first-run walkthrough, troubleshooting, top-10 MCP table); deep-dive content split into docs/architecture.md, docs/plans.md and docs/mcp-tools.md (full 48-tool catalogue); internal issue-number citations and private-slug leaks removed from README, CLAUDE.md and skills; .gitignore excludes local CC artifacts and internal design history (docs)
+- README: added web-viewer screenshot (docs/assets/web-viewer.png, captured from a throwaway demo database with fictional projects) and fixed the changelog CLI usage examples — `dct clog` subcommands take the project via `--project` flag (auto-detected from CWD), not as a positional argument (long-standing doc drift caught while seeding the demo) (docs)
+- README gains a dedicated "session loop" section — /handoff → /pickup workflow with an illustrative session start, scope tags, ledger semantics and all surfaces (skills/MCP/CLI); CLAUDE.md fixed for public cloning: communication convention no longer hardcodes the author's language ("match the user's language") and the OSS-hygiene exempt list reflects that internal design history is excluded from the repo (docs)
+- CLAUDE.md slimmed from 471 to 146 lines (-73% context cost for every contributor session): skill fallback workflows moved to docs/assistant-fallbacks.md, OSS-hygiene/release rules to new docs/maintainers.md, hook rules and architecture prose replaced with links to their existing docs/ homes; project-registration and version-detection details merged into docs/architecture.md; kept in full: MCP docstring contract, bug-find protocol, gate-checkpoint semantics, conventions (docs)
+- README value proposition: new "The release loop: /clog → /commit → /release" section with terminal example, changelog-first bullet in "Why dct?", sprint benefits spelled out in the session loop and Features list (readme)
+- README cold-reader pass: value-led tagline (Claude Code first, any MCP-capable assistant supported), "Your first session" walkthrough after init, Contributing section linking CONTRIBUTING.md, local-first + first-class PostgreSQL note in "Why dct?", trimmed MCP-surface listing in the session loop (readme)
+- PyPI classifier bumped to "Development Status :: 5 - Production/Stable" for the 1.0.0 release (packaging)
+
+### Fixed
+
+- update_sprint now strips and rejects blank sprint names, matching create_sprint — previously a sprint's name could be blanked to whitespace or stored untrimmed via update (sprints)
+- CLI `dct sprint create --status` help now lists all legal creation statuses (planned/active/completed/abandoned), matching the MCP create_sprint docstring instead of understating them as only planned/active (cli)
+- Test suite is now self-contained in any checkout: the ingest end-to-end tests ingested an internal design doc excluded from the public repo, which failed CI on a fresh clone — replaced with a bundled anonymized fixture spec (tests/fixtures/sample-spec.md, same structure: 16 H2 prose sections, zero checkboxes) (tests)
+- Flaky ULID test: test_new_ulid_monotonic_within_ms asserted strict lexicographic order for same-millisecond ULIDs — a guarantee python-ulid does not make (~2 inversions per 10k adjacent pairs measured) and dct does not rely on (sort_order columns drive intra-plan ordering); the test now asserts the real contract (non-decreasing timestamp prefixes + uniqueness, stress-verified 1000×) and dct/core/ids.py documents the boundary (tests)
+- README web-viewer install command referenced the foreign PyPI package `dct[web]` — corrected to `dctracker[web,mcp,pg]` / `pipx install 'dctracker[web]'` (readme)
+- PyPI/wheel installs now ship skills, hooks and the web viewer's templates/static — skills/ and hooks/ moved inside the package (dct/skills, dct/hooks) and all assets declared via package-data + MANIFEST.in (sdist and wheel verified). Previously a wheel carried none of them: `dct init` silently installed zero skills/hooks and `dct web` crashed on missing templates (packaging)
+- `dct init` installs all 13 skills — the skill list is discovered from dct/skills/ at runtime (discover_skills), replacing a hardcoded 11-name list that silently omitted plan-status and plan-resolve-uncertain (setup)
+- Vendored-assets manifest (dct/web/static/vendor/SOURCES.txt) now lists htmx 1.9.12 (BSD 2-Clause) — it documented only uPlot while htmx.min.js shipped undeclared (web)
+
 ## [0.8.0] - 2026-06-30
 
 ### Changed
