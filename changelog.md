@@ -1,6 +1,26 @@
 # Changelog
 
 
+## [1.1.0] - 2026-07-15
+
+### Added
+
+- get_handoff tool; list_handoffs returns 200-char prompt previews (server)
+- update nudge (cached PyPI check) + dct upgrade with symlink refresh (cli)
+
+### Changed
+
+- MCP write ops return minimal acks (id, status, progress) instead of full-record echoes; full context via get_item/get_handoff (server)
+- alwaysLoad trimmed to 10 mid-session tools; docstrings deduped; project-resolution + id-normalization rules centralized in server instructions (server)
+- pickup/handoff fast path: merged dialogs, parallel batches, draft embedded in approval dialog (skills)
+- commit/release fast path: parallel preflight, merged release dialogs, single-command staging+commit and commit+tag, release asks to push the tag (PyPI publish note) (skills)
+- task-mirror and stop-hook Python work backgrounded/cached (sub-50ms fast paths) (hooks)
+- skill descriptions: [dct] prefix, English triggers with any-language note; init/import/plan-resolve-uncertain hidden from model inventory (skills)
+
+### Fixed
+
+- First run on a pristine machine no longer crashes: engine bootstrap now provisions the parent directory of file-backed SQLite URLs before DDL (raw 'unable to open database file' OperationalError when ~/.claude did not exist yet); create=False read-only path still provisions nothing (db)
+
 ## [1.0.0] - 2026-07-11
 
 ### Added

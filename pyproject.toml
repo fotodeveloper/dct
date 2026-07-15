@@ -1,7 +1,7 @@
 [project]
 name = "dctracker"
 description = "Deterministic Context Tracker (dct) — cross-project tracking, changelog, and release tooling for Claude Code."
-version = "1.0.0"
+version = "1.1.0"
 requires-python = ">=3.11"
 license = "MIT"
 authors = [{ name = "fotodeveloper", email = "dev@fotodeveloper.com" }]
