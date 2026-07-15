@@ -23,6 +23,32 @@ def test_bootstrap_engine_create_true_makes_tables(tmp_path, monkeypatch):
     assert "items" in names
 
 
+def test_bootstrap_engine_create_true_provisions_parent_dirs(tmp_path, monkeypatch):
+    """First run on a pristine HOME (#360): the default sqlite path's parent
+    directory does not exist yet — create=True must provision it instead of
+    crashing with a raw 'unable to open database file' OperationalError."""
+    db_file = tmp_path / "not" / "yet" / "there" / "dct.db"
+    cfg = Config(database_url=f"sqlite:///{db_file}")
+    monkeypatch.setattr(engine_mod, "load_config", lambda: cfg)
+
+    engine = bootstrap_engine(create=True)
+
+    insp = sa.inspect(engine)
+    assert "projects" in set(insp.get_table_names())
+    assert db_file.parent.is_dir()
+
+
+def test_bootstrap_engine_memory_urls_skip_dir_provisioning(monkeypatch):
+    """Memory sqlite URLs have no file path — provisioning must not crash on
+    them ('sqlite://' has no database, 'sqlite:///:memory:' a pseudo-path)."""
+    for url in ("sqlite://", "sqlite:///:memory:"):
+        cfg = Config(database_url=url)
+        monkeypatch.setattr(engine_mod, "load_config", lambda cfg=cfg: cfg)
+        engine = bootstrap_engine(create=True)
+        insp = sa.inspect(engine)
+        assert "projects" in set(insp.get_table_names())
+
+
 def test_bootstrap_engine_create_false_runs_no_ddl(tmp_path, monkeypatch):
     """create=False must return a usable Engine WITHOUT invoking create_tables.
 
@@ -47,3 +73,14 @@ def test_bootstrap_engine_create_false_runs_no_ddl(tmp_path, monkeypatch):
     # And the fresh DB really has no dct tables.
     insp = sa.inspect(engine)
     assert "projects" not in set(insp.get_table_names())
+
+
+def test_bootstrap_engine_create_false_provisions_nothing(tmp_path, monkeypatch):
+    """create=False must not even create directories — the read-only web viewer
+    relies on bootstrap_engine(create=False) never mutating the filesystem."""
+    db_file = tmp_path / "ro" / "dct.db"
+    cfg = Config(database_url=f"sqlite:///{db_file}")
+    monkeypatch.setattr(engine_mod, "load_config", lambda: cfg)
+
+    bootstrap_engine(create=False)
+    assert not (tmp_path / "ro").exists()

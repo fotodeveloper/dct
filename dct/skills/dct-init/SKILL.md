@@ -1,7 +1,8 @@
 ---
 name: dct-init
+disable-model-invocation: true
 description: |
-  Initialize dct for the current project — dual-mode: runs global bootstrap if
+  [dct] Initialize dct for the current project — dual-mode: runs global bootstrap if
   missing, then registers the current directory as a dct project. Interactive
   via AskUserQuestion for path / slug / name / version (with smart defaults from
   detect_version). Also offers to inject `mcp__dct__*` into the Claude Code

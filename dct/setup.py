@@ -232,12 +232,51 @@ def wire_hooks_into_settings(settings_path: Path | None = None) -> dict:
     }
 
 
-def install_skills(config: Config) -> bool:
+def prune_dangling_symlinks() -> list[str]:
+    """Remove dangling symlinks under ~/.claude/skills and ~/.claude/hooks whose
+    targets point into the dct package but no longer exist (#356).
+
+    Only DANGLING links (``entry.exists()`` is False after following the link)
+    whose resolved target lies inside the packaged ``dct/skills`` or ``dct/hooks``
+    source tree are removed — a live link, or a broken link to some other tool,
+    is left untouched. Complements ``install_skills`` / ``install_hook`` after a
+    ``dct upgrade`` that dropped a skill or hook from the package.
+
+    Returns the list of removed link paths (strings), sorted for determinism.
+    """
+    removed: list[str] = []
+    for base, source in ((CLAUDE_SKILLS_DIR, SKILLS_DIR), (CLAUDE_HOOKS_DIR, HOOKS_DIR)):
+        if not base.is_dir():
+            continue
+        source_real = os.path.realpath(source)
+        for entry in sorted(base.iterdir()):
+            # Only dangling symlinks: a live link resolves and .exists() is True.
+            if not entry.is_symlink() or entry.exists():
+                continue
+            # os.path.realpath resolves a dangling link to its (absent) target,
+            # normalizing /var→/private/var symlinks on both sides.
+            target_real = os.path.realpath(entry)
+            if target_real == source_real or target_real.startswith(source_real + os.sep):
+                # Re-verify it is STILL a symlink immediately before unlinking:
+                # narrows the TOCTOU window so a path that stopped being a symlink
+                # between the scan and here (e.g. a regular file swapped in) is
+                # never removed. Tolerate a concurrent unlink (FileNotFoundError).
+                try:
+                    if os.path.islink(entry):
+                        entry.unlink()
+                        removed.append(str(entry))
+                except FileNotFoundError:
+                    pass
+    return removed
+
+
+def install_skills(config: Config | None = None) -> bool:
     """Symlink every packaged skill (dct/skills/*) into ~/.claude/skills/.
 
     Sources come from the installed package — site-packages for a wheel
     install, the repo working tree for an editable one (where a repo fix is
-    live without reinstall).
+    live without reinstall). ``config`` is accepted for call-site symmetry with
+    the other install_* helpers but is unused (default ``None``).
     """
     CLAUDE_SKILLS_DIR.mkdir(parents=True, exist_ok=True)
     installed = 0

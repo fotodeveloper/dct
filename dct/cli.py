@@ -1,6 +1,7 @@
 """CLI entry point for dct (Deterministic Context Tracker)."""
 
 import argparse
+import atexit
 import os
 import signal
 import socket
@@ -749,20 +750,33 @@ def cmd_internal_task_mirror(args):
     appends each todo as a `kind='cc-task'` checkpoint. Non-blocking —
     safe to fail silently (hook is fire-and-forget).
 
+    Owns the config gate and project autodetect (the shell hook is a lean
+    dispatcher that only drains stdin and backgrounds this worker — #354):
+      - reads [mirror].task_to_dct; anything but 'auto' is a silent no-op;
+      - detects the project from CWD, silent no-op when the CWD is not a
+        registered dct project.
+
     Intentionally named with an underscore prefix — not user-facing, just
     the target of the task-mirror hook. Re-expose via the `dct` entry point
     so the venv-installed Python is used (hooks cannot reliably find it).
 
     Args:
-        session-id: Claude Code session_id (from hook payload .session_id).
+        session-id: Claude Code session_id. Empty → read payload .session_id.
         project: dct project slug. Empty → autodetect from CWD.
     """
     import json
+    from dct.config import load_config
 
     try:
         payload = json.load(sys.stdin)
     except json.JSONDecodeError:
         return  # fire-and-forget: swallow, exit clean
+
+    # Config gate (moved off the shell fast-path). auto → mirror; ask/off/
+    # anything else → silent no-op.
+    mode = getattr(load_config().mirror, "task_to_dct", "auto") or "auto"
+    if mode != "auto":
+        return
 
     tool_input = payload.get("tool_input") or {}
     todos: list[str] = []
@@ -788,11 +802,22 @@ def cmd_internal_task_mirror(args):
 
     from dct.core.items import list_items, create_item
     from dct.core.checkpoints import add_checkpoint
+    from dct.core.projects import get_project_by_path
 
     engine = _get_engine()
 
-    project_slug = args.project or _detect_project(engine)
-    session_id = args.session_id or "unknown"
+    # Silent project autodetect — a fire-and-forget worker must never raise
+    # or exit non-zero when the CWD is not a registered project.
+    project_slug = args.project
+    if not project_slug:
+        import os
+
+        detected = get_project_by_path(engine, os.getcwd())
+        if not detected:
+            return
+        project_slug = detected["slug"]
+
+    session_id = args.session_id or payload.get("session_id") or "unknown"
     title = f"CC task list — session {session_id}"
 
     existing = [
@@ -1039,6 +1064,65 @@ def cmd_server(args):
     mcp.run()
 
 
+# ── Upgrade ──────────────────────────────────────────────────────────────────
+
+def cmd_upgrade(args):
+    """Upgrade the installed dct package and refresh its Claude Code symlinks.
+
+    Detects the install method (editable / uv tool / pipx / pip), runs the
+    matching upgrade, re-links skills + hooks (idempotent) and prunes dangling
+    links for skills/hooks dropped from the new package, then prints the effect
+    matrix so the user knows what takes effect when.
+    """
+    import subprocess
+    from dct.update import detect_install_method, upgrade_command, dist_pkg
+
+    method = detect_install_method()
+
+    if method == "editable":
+        print("dct is installed as an editable / dev checkout — no package upgrade to run.")
+        print("Pull the repo to update:")
+        print("    git -C <dct-repo> pull")
+        print("    uv pip install -e '<dct-repo>[mcp]'   # only if dependencies changed")
+    else:
+        cmd = upgrade_command(method)
+        print(f"Detected install method: {method}")
+        print(f"Upgrading {dist_pkg()} …  ({' '.join(cmd)})")
+        result = subprocess.run(cmd)
+        if result.returncode != 0:
+            print(f"✗ Upgrade command failed (exit {result.returncode})", file=sys.stderr)
+            sys.exit(result.returncode)
+
+    # Refresh Claude Code integration: re-link current skills/hooks (idempotent),
+    # then remove links to skills/hooks that the new package no longer ships.
+    from dct.setup import install_hook, install_skills, prune_dangling_symlinks
+
+    linked_ok = True
+    removed: list[str] = []
+    try:
+        install_skills()
+        install_hook()
+        removed = prune_dangling_symlinks()
+    except Exception as e:  # never let link maintenance abort the command
+        linked_ok = False
+        print(f"  ⚠ Skills/hooks re-link failed: {e}", file=sys.stderr)
+        print("    Run `dct init` to repair the Claude Code integration.", file=sys.stderr)
+
+    if linked_ok:
+        print("  ✓ Skills and hooks re-linked")
+        if removed:
+            print(f"  ✓ Removed {len(removed)} dangling link(s):")
+            for path in removed:
+                print(f"      - {path}")
+
+    print("\nWhat takes effect when:")
+    print("  Now (this shell):            dct CLI, hooks, skill bodies")
+    print("  Next session / /mcp reconnect: skill descriptions, MCP server code")
+    print("  Next engine bootstrap:       database schema migrations")
+    print("\nRecommend running `dct upgrade` at a session boundary — an old running")
+    print("MCP server against a freshly migrated schema is an edge best avoided.")
+
+
 # ── Project detect (for hooks) ───────────────────────────────────────────────
 
 def cmd_project_detect(args):
@@ -1253,6 +1337,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     # server (MCP stdio entry point)
     sub.add_parser("server", help="Start the MCP server (stdio transport)")
+
+    # upgrade (self-update + symlink refresh — #356)
+    sub.add_parser(
+        "upgrade",
+        help="Upgrade dct (auto-detects uv tool / pipx / pip; guides editable installs) "
+             "and refresh skill/hook symlinks",
+    )
 
     # project
     p_project = sub.add_parser("project", help="Manage projects")
@@ -1512,6 +1603,7 @@ def build_parser() -> argparse.ArgumentParser:
 COMMAND_MAP = {
     "init": cmd_init,
     "server": cmd_server,
+    "upgrade": cmd_upgrade,
     "add": cmd_add,
     "list": cmd_list,
     "show": cmd_show,
@@ -1585,6 +1677,83 @@ SPRINT_COMMAND_MAP = {
 }
 
 
+# ── Passive update nudge (#356) ──────────────────────────────────────────────
+
+# (command, subcommand) pairs that hooks / tooling call non-interactively — a
+# nudge on stderr would corrupt their machine-read output, so never surface it.
+_NUDGE_HOOK_SUBCOMMANDS = frozenset({
+    ("project", "detect"),
+    ("project", "manages-changelog"),
+    ("clog", "count"),
+    ("config", "get"),
+})
+
+
+def _nudge_suppressed(args) -> bool:
+    """True when the passive update nudge must NOT be printed for this command.
+
+    Suppressed for: any underscore-prefixed command (internal, e.g. _task-mirror),
+    any underscore-prefixed subcommand, and the hook-driven machine-output pairs
+    in ``_NUDGE_HOOK_SUBCOMMANDS`` (project detect / manages-changelog, clog
+    count, config get). The caller additionally gates on ``stderr.isatty()``.
+    """
+    cmd = getattr(args, "command", None) or ""
+    if not cmd or cmd.startswith("_"):
+        return True
+    sub = (
+        getattr(args, "project_command", None)
+        or getattr(args, "clog_command", None)
+        or getattr(args, "config_command", None)
+    )
+    if isinstance(sub, str) and sub.startswith("_"):
+        return True
+    return (cmd, sub) in _NUDGE_HOOK_SUBCOMMANDS
+
+
+NUDGE_JOIN_TIMEOUT = 1.5  # bounded wait for the background PyPI probe at exit
+
+
+def _register_probe_join(thread) -> None:
+    """Join the background update probe (bounded) at interpreter exit.
+
+    The probe runs in a daemon thread, so a short-lived CLI command would
+    otherwise exit before it finishes and the cache would never populate. Joining
+    at ``atexit`` — AFTER the command's own work is done — lets quick commands
+    still warm the cache without the probe blocking the command. Offline worst
+    case is bounded by the probe's ``NETWORK_TIMEOUT`` (2s) racing this 1.5s join;
+    the daemon flag guarantees the process still exits either way. No-op when the
+    probe was not started this invocation (``thread is None``).
+    """
+    if thread is None:
+        return
+    atexit.register(thread.join, NUDGE_JOIN_TIMEOUT)
+
+
+def _maybe_nudge(args) -> None:
+    """Print the cached update notice to stderr for interactive human commands.
+
+    Also kicks off the non-blocking background cache refresh and registers a
+    bounded ``atexit`` join so a short command still populates the cache before
+    the interpreter exits. Entirely best-effort: any failure (or a non-tty,
+    suppressed, or opted-out command) is silent and never affects the command's
+    own output or exit code.
+    """
+    try:
+        if not sys.stderr.isatty() or _nudge_suppressed(args):
+            return
+        from dct.config import load_config
+        from dct.update import check_for_update, get_cached_notice
+
+        cfg = load_config()  # single load; both halves honor [update] check
+        thread = check_for_update(cfg)  # background refresh; returns immediately
+        _register_probe_join(thread)    # bounded join at exit, after command work
+        notice = get_cached_notice(config=cfg)
+        if notice:
+            print(notice, file=sys.stderr)
+    except Exception:
+        pass  # a passive nicety must never break a command
+
+
 def main():
     parser = build_parser()
     args = parser.parse_args()
@@ -1592,6 +1761,8 @@ def main():
     if not args.command:
         parser.print_help()
         sys.exit(0)
+
+    _maybe_nudge(args)
 
     if args.command == "project":
         handler = PROJECT_COMMAND_MAP.get(args.project_command)

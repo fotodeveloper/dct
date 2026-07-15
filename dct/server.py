@@ -18,63 +18,63 @@ from mcp.server.fastmcp import FastMCP
 
 from dct.core.engine import bootstrap_engine
 
-mcp = FastMCP(
-    "dct",
-    instructions=(
+_INSTRUCTIONS = (
         "Deterministic Context Tracker — cross-project work tracking.\n\n"
-        "RESOURCES:\n"
-        "- items: features, todos, issues, ideas, improvements (status: open/in_progress/resolved/wont_fix)\n"
-        "- checkpoints: acceptance criteria tied to items (status: pending/done/rejected) — ledger\n"
-        "- notes: append-only observations on items\n"
-        "- changelog_entries: shipped work, versioned via release_changelog\n"
-        "- session_handoffs: cross-session prompts / context drafts (ledger)\n\n"
+        "RESOURCES (all soft-delete ledgers, never hard-deleted):\n"
+        "- items: features/todos/issues/ideas/improvements (open/in_progress/resolved/wont_fix)\n"
+        "- checkpoints: acceptance criteria on items (pending/done/rejected)\n"
+        "- notes: append-only; changelog_entries: shipped work, versioned via\n"
+        "  release_changelog; session_handoffs: cross-session prompts.\n\n"
         "RESPONSE FORMAT:\n"
-        "- list_* tools return {cols: [...], rows: [[...]]} — compact tabular form.\n"
-        "  `cols` carries full field names once; rows are value arrays in the same order.\n"
-        "  Short/fixed-width fields come first; long free-text (title, description, entry, prompt) last.\n"
-        "- Item cols legend: id, item_type, priority, status, in_current_sprint,\n"
-        "  cp=[done,total] checkpoint progress, component, tags, created_at, title, description.\n"
-        "- Changelog cols legend: id, version, category, component, related_item_id,\n"
-        "  created_at, released_at, entry.\n"
-        "- Checkpoint cols legend: id, status, sort_order, text.\n"
-        "- Handoff cols legend: id, scope, created_by, created_at, consumed_at, prompt.\n"
-        "- get_item returns the full semantic dict with embedded notes, checkpoints, progress.\n"
-        "- On list_* tools, format='markdown' gives a human-readable table (lossy);\n"
-        "  format='dict' gives a list of full-key dicts (use when you need to hand the\n"
-        "  data to a downstream tool that expects the classic shape).\n\n"
-        "WORKFLOW FOR COMPLEX TASKS:\n"
-        "1. list_items or get_item to find/inspect.\n"
-        "2. Item's checkpoints = your TODO list (work in sort_order).\n"
-        "3. REMEMBER the id returned by create_item, add_checkpoint, create_handoff.\n"
-        "4. For feature/improvement items: sketch 3-7 checkpoints with add_checkpoint\n"
-        "   BEFORE starting code. This makes progress trackable.\n"
-        "5. complete_checkpoint(id) as each step finishes — real-time, NOT batched.\n"
-        "6. Irrelevant checkpoint → reject_checkpoint (ledger-preserving); never hard delete.\n"
-        "7. After all checkpoints done/rejected → resolve_item (no auto-transition).\n\n"
-        "SPRINT:\n"
-        "- set_sprint(project, item_ids='22,21,6') atomically replaces the current sprint.\n"
-        "- review_sprint(project, since='last_release') — start/end-of-session dashboard.\n"
-        "- resolve_item auto-clears in_current_sprint (sprint = active work only).\n"
-        "- Lifecycle: planned|active|deferred|completed|abandoned. update_sprint(sprint_id,\n"
-        "  status=...) drives whitelisted transitions: park an unfinished sprint with\n"
-        "  status='deferred' (keeps started_at, frees the one-active-per-project slot),\n"
-        "  reactivate it with status='active'. Never mark an unfinished sprint\n"
-        "  completed/abandoned — defer it.\n\n"
-        "HANDOFFS:\n"
-        "- create_handoff(prompt, created_by, scope?) — leave note for next session.\n"
-        "- Multiple unconsumed per project allowed (parallel sessions / different scopes).\n"
-        "- consume_handoff(id, consumed_by?) marks it read but preserves the row.\n\n"
-        "TOOL-CALL HYGIENE:\n"
-        "- Pass every argument as its own separate top-level parameter. Tools with\n"
-        "  several prose fields (create_decision: context/decision/consequences/\n"
-        "  alternatives; create_handoff: prompt) expect each in its own parameter —\n"
-        "  never nest one field inside another, and never drop the parameter's\n"
-        "  namespace prefix. Free-text tools reject literal tool-call markup and\n"
-        "  explain the fix; a rejection means the call was mis-serialized — re-send\n"
-        "  with the fields split out.\n\n"
-        "ALL tables are soft-delete only (ledger). Nothing is ever hard-deleted."
-    ),
+        "- Write ops return a minimal ack (id + a few post-state scalars), NOT the full\n"
+        "  row. For full context fetch it: get_item(id) (notes, checkpoints, progress),\n"
+        "  get_handoff(id) (untruncated prompt + context_summary).\n"
+        "- list_* return {cols:[...], rows:[[...]]}: cols names the fields once, rows are\n"
+        "  value arrays in that order (short fields first, long free-text last). Legends —\n"
+        "  item: id, item_type, priority, status, in_current_sprint, cp=[done,total],\n"
+        "  component, tags, created_at, title, description; changelog: id, version,\n"
+        "  category, component, related_item_id, created_at, released_at, entry;\n"
+        "  checkpoint: id, status, sort_order, text; handoff: id, scope, created_by,\n"
+        "  created_at, consumed_at, prompt (200-char preview). format='markdown' (lossy)\n"
+        "  or 'dict' (full-key dicts) opt in.\n\n"
+        "PROJECT RESOLUTION (any `project` param): '<slug>' = that project; '' = CWD\n"
+        "auto-detect; '' with an unregistered CWD = list_* tools (list_items,\n"
+        "list_handoffs) span ALL projects, while project-required tools — every write\n"
+        "op AND review_sprint — error. Pass an explicit slug when unsure.\n\n"
+        "ID NORMALIZATION: '#42', '42', 'ITEM-42', '0042' all mean item_id=42.\n\n"
+        "WORKFLOW:\n"
+        "1. list_items / get_item to find/inspect; an item's checkpoints are your TODO\n"
+        "   list (sort_order). REMEMBER ids from create_item/add_checkpoint/create_handoff.\n"
+        "2. For feature/improvement items sketch 3-7 checkpoints BEFORE coding.\n"
+        "3. complete_checkpoint(id) as each step finishes (real-time, NOT batched);\n"
+        "   reject_checkpoint irrelevant ones. Then resolve_item (no auto-transition).\n\n"
+        "SPRINT & HANDOFFS:\n"
+        "- set_sprint(project, item_ids='22,21,6') atomically replaces the sprint;\n"
+        "  resolve_item auto-clears in_current_sprint (sprint = active work only).\n"
+        "- Lifecycle planned|active|deferred|completed|abandoned via update_sprint: park\n"
+        "  unfinished as 'deferred' (frees the one-active slot), reactivate 'active';\n"
+        "  never complete/abandon an unfinished one. review_sprint = session dashboard.\n"
+        "- create_handoff(prompt, created_by, scope?) notes next session (multiple\n"
+        "  unconsumed ok); consume_handoff(id) marks read, preserving the row.\n\n"
+        "TOOL-CALL HYGIENE: pass every argument as its own top-level parameter — never\n"
+        "nest one prose field in another. Free-text tools reject literal tool-call markup;\n"
+        "a rejection means re-send with the fields split out."
 )
+
+# Passive update notice (#356): append a one-line "newer release available" hint
+# from the cached PyPI probe when present. Guarded so a missing module / cache /
+# config can NEVER break server start; this path does ZERO network I/O (pure cache
+# read via get_cached_notice).
+try:
+    from dct.update import get_cached_notice
+
+    _update_notice = get_cached_notice()
+    if _update_notice:
+        _INSTRUCTIONS += f"\n\nUPDATE: {_update_notice}"
+except Exception:
+    pass
+
+mcp = FastMCP("dct", instructions=_INSTRUCTIONS)
 
 _engine = None
 
@@ -155,6 +155,44 @@ def _reject_toolcall_markup(**fields) -> dict | None:
     return None
 
 
+# ── Slim-ack helpers (#351) ───────────────────────────────────────────────────
+# Write-op MCP tools return a compact acknowledgement (ids + scalar headers)
+# instead of the full core dict. The calling model rarely needs the free-text it
+# just sent echoed back (description / prompt / entry / rationale / section
+# bodies), and the slim shape spends session context wisely. Core functions still
+# return FULL dicts (CLI + web depend on them) — slimming happens ONLY at this
+# MCP boundary. get_item stays full by design (single-record inspect).
+
+
+def _slim_progress(progress: dict) -> dict:
+    """Project a full checkpoints.get_progress dict onto the ack triple
+    {done, pending, active}. `active` already excludes rejected (same source as
+    get_item.progress) — we only SELECT three keys here, never recompute."""
+    return {k: progress[k] for k in ("done", "pending", "active")}
+
+
+def _item_progress_ack(engine, item_id: int) -> dict:
+    """Slim progress ack for an item, via the shared core computation."""
+    from dct.core.checkpoints import get_progress
+
+    return _slim_progress(get_progress(engine, item_id))
+
+
+def _item_title(engine, item_id: int) -> str | None:
+    """Cheap single-column lookup of an item's title (for checkpoint/note acks)."""
+    import sqlalchemy as sa
+
+    from dct.db import items
+
+    with engine.begin() as conn:
+        row = conn.execute(
+            sa.select(items.c.title).where(
+                items.c.id == item_id, items.c.deleted_at.is_(None)
+            )
+        ).first()
+    return row[0] if row else None
+
+
 # ── Format helpers ────────────────────────────────────────────────────────────
 
 
@@ -189,6 +227,17 @@ def _to_markdown(rows: list[dict], cols: list[str]) -> str:
             cells.append(str(v).replace("|", "\\|").replace("\n", " "))
         lines.append("| " + " | ".join(cells) + " |")
     return "\n".join(lines)
+
+
+def _preview(text, limit: int = 200):
+    """Truncate free text to a preview: first `limit` chars + '…' when longer.
+
+    Non-str values (None) pass through unchanged. A string of exactly `limit`
+    chars is returned as-is; the ellipsis marks that content was dropped.
+    """
+    if isinstance(text, str) and len(text) > limit:
+        return text[:limit] + "…"
+    return text
 
 
 def _format_list(rows: list[dict], cols: list[str], format: str):
@@ -271,26 +320,16 @@ def create_item(
 ) -> dict:
     """Create a tracked item (issue / todo / feature / idea / improvement).
 
-    REMEMBER the returned `id` — you need it for add_checkpoint / update_item /
-    resolve_item / add_note.
+    REMEMBER the returned `id` — needed for add_checkpoint / update_item /
+    resolve_item / add_note. For feature/improvement items, sketch 3-7
+    checkpoints with add_checkpoint before starting work.
 
-    For feature/improvement items: immediately sketch 3-7 checkpoints with
-    add_checkpoint before starting work.
-
-    TYPE SELECTION (natural-language phrases → item_type):
-      - issue: "problem", "bug", "crash", "error", "broken", "doesn't work",
-               "regression" — observable defect in existing code
-      - todo: "task", "action item", "need to", "must do" — generic work
-              that is neither a bug nor a new user-visible capability
-      - feature: "add X", "new capability", "let's build", "we should have" —
-                 new user-visible capability that doesn't exist yet
-      - idea: "maybe", "what if", "consider", "brainstorm", "explore" —
-              exploratory, not yet decided to build
-      - improvement: "refactor", "polish", "cleanup", "tidy up", "make X nicer",
-                     "simplify" — existing thing works but could be better
-
-    When in doubt, pick `todo` (neutral bucket). Do not ask the user about
-    type unless the phrase is genuinely ambiguous.
+    TYPE SELECTION (pick from the user's phrasing; when in doubt use `todo`):
+      - issue: defect in existing code — bug, crash, error, broken, regression
+      - todo: generic work that is neither a bug nor a new capability
+      - feature: new user-visible capability that doesn't exist yet ("add X")
+      - idea: exploratory, not yet decided — "maybe", "what if", "consider"
+      - improvement: existing thing works but could be better — refactor, polish
 
     Args:
         item_type: One of: issue / todo / feature / idea / improvement.
@@ -302,6 +341,11 @@ def create_item(
         source_file: Relative file path.
         source_lines: Line range (e.g. "42-58").
         tags: List of tag strings. Pass as a JSON array, e.g. ["oss","tests"].
+
+    Returns: slim ack {id, project, item_type, priority, status, title} —
+        `project` is the resolved slug (auto-detect safety echo). NOT the full
+        item dict (no description/tags echo); call get_item for the rest.
+        {"error": "..."} on invalid enum, markup, or an unresolvable project.
     """
     if (err := _reject_toolcall_markup(title=title, description=description)):
         return err
@@ -317,7 +361,11 @@ def create_item(
     try:
         project_slug = _resolve_project(project, required=True)
         assert project_slug is not None
-        return _create(_get_engine(), project_slug, item_type, title, priority=priority, **kwargs)
+        d = _create(_get_engine(), project_slug, item_type, title, priority=priority, **kwargs)
+        return {
+            "id": d["id"], "project": project_slug, "item_type": d["item_type"],
+            "priority": d["priority"], "status": d["status"], "title": d["title"],
+        }
     except Exception as e:
         return {"error": str(e)}
 
@@ -339,17 +387,9 @@ def list_items(
     Each row carries a `cp` field with [done, total] checkpoint progress
     computed in a single SQL query (no N+1).
 
-    PROJECT RESOLUTION — IMPORTANT:
-      - `project="<slug>"` — filter to that project (recommended).
-      - `project=""` AND CWD is a registered project — filter to that project.
-      - `project=""` AND CWD is NOT a registered project — returns items
-        ACROSS ALL PROJECTS. This is intentional for cross-project queries
-        but can surprise callers expecting project-scoped output. When in
-        doubt pass an explicit `project` slug.
-
     Args:
-        project: Slug. Empty = CWD auto-detect; falls back to all projects
-            when CWD is unregistered (see PROJECT RESOLUTION above).
+        project: slug; empty = CWD auto-detect, unregistered CWD = cross-project
+            — see server instructions.
         status: Filter by status. Default 'open'. Use '' for all statuses.
         item_type: issue / todo / feature / idea / improvement.
         priority: P1 / P2 / P3 / future.
@@ -413,15 +453,11 @@ def update_item(
     """Update one or more mutable fields on an existing item. Only non-empty
     args are applied; an empty/omitted field is left unchanged.
 
-    Transitioning status to a terminal value (resolved/wont_fix) automatically
-    sets resolved_at AND removes the item from the current sprint (its
-    item_sprints links are soft-removed). Transitioning back to open/in_progress
-    clears resolved_at. NOTE: unlike `resolve_item`, this path does NOT run the
-    gate-checkpoint guard — prefer `resolve_item` for terminal transitions.
-
-    Sprint membership is NOT set here — `in_current_sprint` is a derived,
-    read-only field. Use set_sprint / assign_item_to_sprint /
-    remove_item_from_sprint to change membership.
+    Terminal status (resolved/wont_fix) sets resolved_at AND clears sprint
+    membership; reopening (open/in_progress) clears resolved_at. This path does
+    NOT run the gate-checkpoint guard — prefer resolve_item for terminal moves.
+    Sprint membership is not set here (`in_current_sprint` is read-only) — use
+    set_sprint / assign_item_to_sprint / remove_item_from_sprint.
 
     Args:
         item_id: Target item.
@@ -432,12 +468,16 @@ def update_item(
         resolution: Resolution / rationale note.
         description: Prose context.
 
-    Clearing (nulling) a field — pass the literal '__clear__' to null out a
-    NULLABLE field: component, resolution, description. Do NOT pass the sentinel
-    for title/status/priority — title would be overwritten with an empty string
-    and status/priority would fail enum validation ({"error": ...}).
+    Clearing a field — pass literal '__clear__' to null a NULLABLE field
+    (component, resolution, description). NOT for title/status/priority: title
+    would blank out and status/priority would fail enum validation.
 
-    Returns: updated item dict (full get_item shape) or {"error": "..."}.
+    Returns: slim POST-state ack {id, item_type, status, priority, title,
+        component, in_current_sprint, resolved_at, progress} — scalars reflect
+        the row AFTER the update (a '__clear__'ed component shows null here);
+        progress is {done, pending, active}. NOT the full item dict (no
+        notes/checkpoints/description echo). {"error": "..."} on unknown id or
+        markup.
     """
     if (err := _reject_toolcall_markup(title=title, description=description, resolution=resolution)):
         return err
@@ -455,7 +495,16 @@ def update_item(
 
     try:
         result = _update(_get_engine(), item_id, **kwargs)
-        return result or {"error": f"Item #{item_id} not found"}
+        if not result:
+            return {"error": f"Item #{item_id} not found"}
+        return {
+            "id": result["id"], "item_type": result["item_type"],
+            "status": result["status"], "priority": result["priority"],
+            "title": result["title"], "component": result["component"],
+            "in_current_sprint": result["in_current_sprint"],
+            "resolved_at": result["resolved_at"],
+            "progress": _slim_progress(result["progress"]),
+        }
     except Exception as e:
         return {"error": str(e)}
 
@@ -480,13 +529,21 @@ def resolve_item(item_id: int, status: str = "resolved", resolution: str = "") -
         status: resolved (default) or wont_fix. Any other value is rejected.
         resolution: Free-text resolution note (recommended — feeds audit trail).
 
-    Returns: full updated item dict (get_item shape), or {"error": "..."} when
-        the item is missing or a pending gate blocks the transition.
+    Returns: slim ack {id, status, resolved_at, progress} — progress is
+        {done, pending, active}. NOT the full item dict. {"error": "..."} when
+        the item is missing or a pending gate blocks the transition (the gate
+        message is byte-identical to before).
     """
     from dct.core.items import resolve_item as _resolve
     try:
         result = _resolve(_get_engine(), item_id, status=status, resolution=resolution or None)
-        return result or {"error": f"Item #{item_id} not found"}
+        if not result:
+            return {"error": f"Item #{item_id} not found"}
+        return {
+            "id": result["id"], "status": result["status"],
+            "resolved_at": result["resolved_at"],
+            "progress": _slim_progress(result["progress"]),
+        }
     except Exception as e:
         return {"error": str(e)}
 
@@ -502,13 +559,17 @@ def add_note(item_id: int, note: str) -> dict:
     /track-update treats status/priority transitions as mandatory note points —
     the audit trail is what lets /pickup explain "why #42 moved to P1".
 
-    Returns: note dict with new `id`, or {"error": "..."} if the item does not exist.
+    Returns: slim ack {id, item_id, item_title} — `id` is the new note's id,
+        `item_title` the parent item's title. NOT the note body echo.
+        {"error": "..."} if the item does not exist or the note is empty/markup.
     """
     if (err := _reject_toolcall_markup(note=note)):
         return err
     from dct.core.items import add_note as _add_note
     try:
-        return _add_note(_get_engine(), item_id, note)
+        engine = _get_engine()
+        n = _add_note(engine, item_id, note)
+        return {"id": n["id"], "item_id": n["item_id"], "item_title": _item_title(engine, n["item_id"])}
     except Exception as e:
         return {"error": str(e)}
 
@@ -540,10 +601,20 @@ def add_checkpoint(item_id: int, text: str, kind: str = "task") -> dict:
               User-facing features (new skill, CLI command, MCP tool) MUST
               include a final `kind='dogfood'` checkpoint. See CLAUDE.md
               "Gate checkpoints" section.
+
+    Returns: slim ack {id, item_id, item_title, kind, status, sort_order} —
+        `item_title` is the parent item's title. NOT the checkpoint text echo.
+        {"error": "..."} on empty text or an unknown item_id.
     """
     from dct.core.checkpoints import add_checkpoint as _add
     try:
-        return _add(_get_engine(), item_id, text, kind=kind)
+        engine = _get_engine()
+        cp = _add(engine, item_id, text, kind=kind)
+        return {
+            "id": cp["id"], "item_id": cp["item_id"],
+            "item_title": _item_title(engine, cp["item_id"]),
+            "kind": cp["kind"], "status": cp["status"], "sort_order": cp["sort_order"],
+        }
     except Exception as e:
         return {"error": str(e)}
 
@@ -557,13 +628,22 @@ def complete_checkpoint(checkpoint_id: int) -> dict:
     Completing a pending gate checkpoint (dogfood/security/approval/review)
     satisfies it and clears that block on resolve_item.
 
-    Returns: the updated checkpoint dict, or {"error": "Checkpoint #<id> not found"}
-    when the id is unknown or already deleted.
+    Returns: slim ack {id, item_id, status, progress} — progress is the parent
+        item's {done, pending, active} after the transition. NOT the checkpoint
+        text echo. {"error": "Checkpoint #<id> not found"} when the id is
+        unknown or already deleted.
     """
     from dct.core.checkpoints import set_status
     try:
-        result = set_status(_get_engine(), checkpoint_id, "done")
-        return result or {"error": f"Checkpoint #{checkpoint_id} not found"}
+        engine = _get_engine()
+        result = set_status(engine, checkpoint_id, "done")
+        if not result:
+            return {"error": f"Checkpoint #{checkpoint_id} not found"}
+        return {
+            "id": result["id"], "item_id": result["item_id"],
+            "status": result["status"],
+            "progress": _item_progress_ack(engine, result["item_id"]),
+        }
     except Exception as e:
         return {"error": str(e)}
 
@@ -579,13 +659,22 @@ def reject_checkpoint(checkpoint_id: int) -> dict:
     approval/review) rejecting is the sanctioned "not applicable" skip that
     unblocks resolve_item.
 
-    Returns: the updated checkpoint dict, or {"error": "Checkpoint #<id> not found"}
-    when the id is unknown or already deleted.
+    Returns: slim ack {id, item_id, status, progress} — progress is the parent
+        item's {done, pending, active} after the rejection (which drops out of
+        `active`). NOT the checkpoint text echo. {"error": "Checkpoint #<id>
+        not found"} when the id is unknown or already deleted.
     """
     from dct.core.checkpoints import set_status
     try:
-        result = set_status(_get_engine(), checkpoint_id, "rejected")
-        return result or {"error": f"Checkpoint #{checkpoint_id} not found"}
+        engine = _get_engine()
+        result = set_status(engine, checkpoint_id, "rejected")
+        if not result:
+            return {"error": f"Checkpoint #{checkpoint_id} not found"}
+        return {
+            "id": result["id"], "item_id": result["item_id"],
+            "status": result["status"],
+            "progress": _item_progress_ack(engine, result["item_id"]),
+        }
     except Exception as e:
         return {"error": str(e)}
 
@@ -596,13 +685,22 @@ def reopen_checkpoint(checkpoint_id: int) -> dict:
     or rejected. Re-opening a previously rejected gate makes it pending again and
     re-blocks resolve_item.
 
-    Returns: the updated checkpoint dict, or {"error": "Checkpoint #<id> not found"}
-    when the id is unknown or already deleted.
+    Returns: slim ack {id, item_id, status, progress} — matches its
+        complete/reject_checkpoint siblings; progress is the parent item's
+        {done, pending, active} after re-opening. {"error": "Checkpoint #<id>
+        not found"} when the id is unknown or already deleted.
     """
     from dct.core.checkpoints import set_status
     try:
-        result = set_status(_get_engine(), checkpoint_id, "pending")
-        return result or {"error": f"Checkpoint #{checkpoint_id} not found"}
+        engine = _get_engine()
+        result = set_status(engine, checkpoint_id, "pending")
+        if not result:
+            return {"error": f"Checkpoint #{checkpoint_id} not found"}
+        return {
+            "id": result["id"], "item_id": result["item_id"],
+            "status": result["status"],
+            "progress": _item_progress_ack(engine, result["item_id"]),
+        }
     except Exception as e:
         return {"error": str(e)}
 
@@ -660,10 +758,11 @@ def add_changelog(
         source_lines: Optional line range (e.g. "42-58").
         related_item_id: Tracked-item id to link (0 = none).
 
-    Returns: the created entry dict (full row, incl. `id`, version=null), or
-        {"error": "..."} on failure — empty/whitespace entry, invalid category,
-        literal tool-call markup in `entry`, or an unresolvable project (explicit
-        slug not found, or empty `project` with an unregistered CWD).
+    Returns: slim ack {id, project, category, component} — `project` is the
+        resolved slug, `component` may be null. NOT the entry text echo (nor the
+        full row). {"error": "..."} on failure — empty/whitespace entry, invalid
+        category, literal tool-call markup in `entry`, or an unresolvable project
+        (explicit slug not found, or empty `project` with an unregistered CWD).
     """
     if (err := _reject_toolcall_markup(entry=entry)):
         return err
@@ -678,7 +777,8 @@ def add_changelog(
     try:
         project_slug = _resolve_project(project, required=True)
         assert project_slug is not None
-        return add_entry(_get_engine(), project_slug, category, entry, **kwargs)
+        row = add_entry(_get_engine(), project_slug, category, entry, **kwargs)
+        return {"id": row["id"], "project": project_slug, "category": row["category"], "component": row["component"]}
     except Exception as e:
         return {"error": str(e)}
 
@@ -870,20 +970,18 @@ def clear_sprint(project: str = "") -> dict:
 def review_sprint(project: str = "", since: str = "last_release") -> dict:
     """Session start/end dashboard — in_sprint, recent_activity, stale_in_progress, unconsumed_handoffs.
 
-    Returns structured data only. Interpretation (prioritization logic, "what to
-    do next", etc.) lives in the consuming skill — /pickup (session start) and
-    /handoff (session end) — so it can iterate without a schema change.
+    Structured data only; interpretation lives in the consuming skill (/pickup,
+    /handoff), so it iterates without a schema change.
 
     Args:
-        project: Slug. Empty = CWD auto-detect.
-        since: Accepted grammar —
-            - "last_release" (default) — anchor = max(released_at); falls back
-              to all-time when the project has no releases yet.
-            - "all" — no time cutoff, everything.
-            - "<N>h" where N is one-or-more digits — hours relative to now. Only
-              the hour suffix is supported (no "d"/"w"/"m"); e.g. "24h".
-            - ISO date / datetime — "2026-04-10" or "2026-04-10T14:00", optional
-              timezone (trailing "Z" accepted). Parsed via datetime.fromisoformat.
+        project: slug; empty = CWD auto-detect. Requires a resolvable project:
+            unlike list_* tools, an empty project with an unregistered CWD does
+            NOT span all projects — it returns {"error": ...}. See server
+            instructions.
+        since: "last_release" (default; anchor = max(released_at), falls back to
+            all-time when no releases) | "all" (no cutoff) | "<N>h" (hours from
+            now, hour suffix only) | ISO date/datetime ("2026-04-10" or
+            "2026-04-10T14:00", trailing "Z" ok).
 
     Returns: dashboard dict with keys project, since, since_anchor (human
         label), in_sprint, recent_activity, stale_in_progress,
@@ -929,7 +1027,8 @@ def create_handoff(
         scope: Optional tag like "sprint-v0.2" or "refactor-auth".
         context_summary: Optional snapshot of state at handoff time.
 
-    Returns: new handoff dict including `id`, `created_at`, `consumed_at=null`.
+    Returns: slim ack {id, project, scope, created_at} — `project` is the
+        resolved slug, `scope` may be null. NO prompt/context_summary echo.
         Error cases: {"error": "..."} when prompt is empty, created_by is empty,
         or project slug does not resolve.
     """
@@ -940,12 +1039,13 @@ def create_handoff(
     try:
         project_slug = _resolve_project(project, required=True)
         assert project_slug is not None
-        return _create(
+        h = _create(
             _get_engine(), project_slug,
             prompt=prompt, created_by=created_by,
             scope=scope or None,
             context_summary=context_summary or None,
         )
+        return {"id": h["id"], "project": project_slug, "scope": h["scope"], "created_at": h["created_at"]}
     except Exception as e:
         return {"error": str(e)}
 
@@ -958,28 +1058,50 @@ def list_handoffs(
 ):
     """List session handoffs for a project.
 
-    PROJECT RESOLUTION — IMPORTANT:
-      - `project="<slug>"` — filter to that project (recommended).
-      - `project=""` AND CWD is a registered project — filter to that project.
-      - `project=""` AND CWD is NOT a registered project — returns handoffs
-        ACROSS ALL PROJECTS. Intentional, but can surprise — pass `project`
-        explicitly when you want scoped output.
+    The `prompt` column is a PREVIEW — truncated to 200 chars with a trailing
+    '…' when longer. Fetch the full prompt (plus context_summary and the rest
+    of the row) with get_handoff(id).
 
     Args:
-        project: Slug. Empty = CWD auto-detect; falls back to all projects
-            when CWD is unregistered.
+        project: slug; empty = CWD auto-detect, unregistered CWD = cross-project
+            — see server instructions.
         unconsumed_only: If True (default) returns only handoffs without a
             consumed_at stamp — the "waiting for me" set. False returns all.
         format: 'structured' (default, {cols,rows}), 'markdown', 'dict'.
 
     Returns: {"cols": [...], "rows": [[...]]} by default, list[dict] for
-        format="dict", or markdown str for format="markdown".
+        format="dict", or markdown str for format="markdown". In every format
+        the prompt is the 200-char preview (see get_handoff for full text).
     """
     from dct.core.handoff import list_handoffs as _list
     try:
         project_slug = _resolve_project(project, required=False)
         rows = _list(_get_engine(), project_slug, unconsumed_only=unconsumed_only)
+        for r in rows:
+            r["prompt"] = _preview(r.get("prompt"))
         return _format_list(rows, HANDOFF_COLS, format)
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@mcp.tool()
+def get_handoff(handoff_id: int) -> dict:
+    """Fetch one handoff in full — the untruncated companion to list_handoffs.
+
+    Args:
+        handoff_id: id from list_handoffs / create_handoff.
+
+    Returns: the full semantic dict (prompt, context_summary, scope, created_by,
+        created_at, consumed_by, consumed_at, and the rest of the row) with the
+        prompt NOT truncated. {"error": "Handoff #N not found"} if the id is
+        unknown or soft-deleted.
+    """
+    from dct.core.handoff import get_handoff as _get
+    try:
+        result = _get(_get_engine(), handoff_id)
+        if not result:
+            return {"error": f"Handoff #{handoff_id} not found"}
+        return result
     except Exception as e:
         return {"error": str(e)}
 
@@ -993,13 +1115,16 @@ def consume_handoff(handoff_id: int, consumed_by: str = "") -> dict:
         consumed_by: optional — self-identify the consuming session (mirrors
             create_handoff's `created_by` format).
 
-    Returns: updated handoff dict with `consumed_at` timestamp set, or
-        {"error": "..."} if the handoff is missing / already consumed.
+    Returns: slim ack {id, consumed_at} — the consumed timestamp only. NO
+        prompt echo. {"error": "..."} if the handoff is missing / already
+        consumed.
     """
     from dct.core.handoff import consume_handoff as _consume
     try:
         result = _consume(_get_engine(), handoff_id, consumed_by=consumed_by or None)
-        return result or {"error": f"Handoff #{handoff_id} not found or already consumed"}
+        if not result:
+            return {"error": f"Handoff #{handoff_id} not found or already consumed"}
+        return {"id": result["id"], "consumed_at": result["consumed_at"]}
     except Exception as e:
         return {"error": str(e)}
 
@@ -1044,12 +1169,19 @@ def update_handoff(
         scope: New scope tag (omit/empty = unchanged).
         context_summary: New context snapshot (omit/empty = unchanged).
 
-    Returns: updated handoff dict, or {"error": "..."} if the handoff is
-        missing / consumed / deleted, or if no field was supplied.
+    Returns: slim ack {id, updated_fields} — `updated_fields` lists the applied
+        field names (subset of prompt / scope / context_summary). NO prompt
+        echo. {"error": "..."} if the handoff is missing / consumed / deleted,
+        or if no field was supplied.
     """
     if (err := _reject_toolcall_markup(prompt=prompt, context_summary=context_summary)):
         return err
     from dct.core.handoff import update_handoff as _update
+    applied = [
+        name for name, val in
+        (("prompt", prompt), ("scope", scope), ("context_summary", context_summary))
+        if val
+    ]
     try:
         result = _update(
             _get_engine(), handoff_id,
@@ -1057,7 +1189,9 @@ def update_handoff(
             scope=scope or None,
             context_summary=context_summary or None,
         )
-        return result or {"error": f"Handoff #{handoff_id} not found, consumed, or deleted"}
+        if not result:
+            return {"error": f"Handoff #{handoff_id} not found, consumed, or deleted"}
+        return {"id": result["id"], "updated_fields": applied}
     except Exception as e:
         return {"error": str(e)}
 
@@ -1088,19 +1222,21 @@ def create_plan(
         source_file: Optional relative path (empty = DB-only); stored verbatim.
         sprint_id: Optional sprint FK (0 = none).
 
-    Returns: created plan dict (status defaults to 'active'), or
-    {"error": "..."} on invalid kind, empty slug/title, duplicate slug in the
-    project, or an unresolvable project (bad slug / unregistered CWD).
+    Returns: slim ack {id, ulid, slug, kind, status, title} — scalar headers
+        (status defaults to 'active'). NOT the full plan row. {"error": "..."}
+        on invalid kind, empty slug/title, duplicate slug in the project, or an
+        unresolvable project (bad slug / unregistered CWD).
     """
     from dct.core.plans.crud import create_plan as _create
     try:
-        return _create(
+        p = _create(
             _get_engine(),
             _resolve_project(project),
             slug=slug, title=title, kind=kind,
             source_file=source_file or None,
             sprint_id=sprint_id or None,
         )
+        return {"id": p["id"], "ulid": p["ulid"], "slug": p["slug"], "kind": p["kind"], "status": p["status"], "title": p["title"]}
     except Exception as e:
         return {"error": str(e)}
 
@@ -1180,20 +1316,26 @@ def add_plan_section(
         sort_order: Ordering within the plan (default 0).
         sprint_id: Optional sprint FK to link this section (0 = none).
 
-    Returns: created section dict, or {"error": "..."} on ANY failure — both
-        validation errors (bad section_type / out-of-range depth) and DB
+    Returns: slim ack {id, ulid, heading, depth, section_type, status,
+        sort_order} — scalar headers only. {"error": "..."} on ANY failure —
+        both validation errors (bad section_type / out-of-range depth) and DB
         errors (e.g. a non-existent plan_id, sprint_id, or parent_section_id
         violating a foreign-key constraint) are caught and returned this way.
     """
     from dct.core.plans.crud import add_plan_section as _add
     try:
-        return _add(
+        s = _add(
             _get_engine(), plan_id=plan_id, heading=heading, depth=depth,
             section_type=section_type,
             parent_section_id=parent_section_id or None,
             slug=slug or None, sort_order=sort_order,
             sprint_id=sprint_id or None,
         )
+        return {
+            "id": s["id"], "ulid": s["ulid"], "heading": s["heading"],
+            "depth": s["depth"], "section_type": s["section_type"],
+            "status": s["status"], "sort_order": s["sort_order"],
+        }
     except Exception as e:
         return {"error": str(e)}
 
@@ -1233,18 +1375,30 @@ def list_plan_sections(
 
 @mcp.tool()
 def complete_plan_checkpoint(checkpoint_id: int) -> dict:
-    """Mark a plan checkpoint as done. Real-time; never batch completions."""
+    """Mark a plan checkpoint as done. Real-time; never batch completions.
+
+    Returns: slim ack {id, plan_section_id, status, sort_order} — NOT the
+        checkpoint text echo. {"error": "..."} on an unknown id.
+    """
     from dct.core.plans.crud import complete_plan_checkpoint as _done
     row = _done(_get_engine(), checkpoint_id)
-    return row or {"error": f"Plan checkpoint #{checkpoint_id} not found"}
+    if not row:
+        return {"error": f"Plan checkpoint #{checkpoint_id} not found"}
+    return {"id": row["id"], "plan_section_id": row["plan_section_id"], "status": row["status"], "sort_order": row["sort_order"]}
 
 
 @mcp.tool()
 def reject_plan_checkpoint(checkpoint_id: int) -> dict:
-    """Mark a plan checkpoint as rejected (scope change, N/A). Preserves ledger."""
+    """Mark a plan checkpoint as rejected (scope change, N/A). Preserves ledger.
+
+    Returns: slim ack {id, plan_section_id, status, sort_order} — NOT the
+        checkpoint text echo. {"error": "..."} on an unknown id.
+    """
     from dct.core.plans.crud import reject_plan_checkpoint as _reject
     row = _reject(_get_engine(), checkpoint_id)
-    return row or {"error": f"Plan checkpoint #{checkpoint_id} not found"}
+    if not row:
+        return {"error": f"Plan checkpoint #{checkpoint_id} not found"}
+    return {"id": row["id"], "plan_section_id": row["plan_section_id"], "status": row["status"], "sort_order": row["sort_order"]}
 
 
 @mcp.tool()
@@ -1266,15 +1420,17 @@ def promote_section_to_item(
         priority: P1 | P2 | P3 | future (default P2).
         title: Override item title. Empty → use the section heading.
 
-    Returns: the new item dict, or {"error": "..."} on failure.
+    Returns: slim ack {id, item_type, priority, status, title} (the new item) —
+        NOT the full item dict (no description echo). {"error": "..."} on failure.
     """
     from dct.core.plans.crud import promote_section_to_item as _promote
     try:
-        return _promote(
+        d = _promote(
             _get_engine(), section_id,
             item_type=item_type, priority=priority,
             title=title or None,
         )
+        return {"id": d["id"], "item_type": d["item_type"], "priority": d["priority"], "status": d["status"], "title": d["title"]}
     except Exception as e:
         return {"error": str(e)}
 
@@ -1298,15 +1454,17 @@ def promote_checkpoint_to_item(
         title: Override item title. Empty → use the checkpoint text
             (truncated to 500 chars).
 
-    Returns: the new item dict, or {"error": "..."} on failure.
+    Returns: slim ack {id, item_type, priority, status, title} (the new item) —
+        NOT the full item dict (no description echo). {"error": "..."} on failure.
     """
     from dct.core.plans.crud import promote_checkpoint_to_item as _promote
     try:
-        return _promote(
+        d = _promote(
             _get_engine(), checkpoint_id,
             item_type=item_type, priority=priority,
             title=title or None,
         )
+        return {"id": d["id"], "item_type": d["item_type"], "priority": d["priority"], "status": d["status"], "title": d["title"]}
     except Exception as e:
         return {"error": str(e)}
 
@@ -1336,14 +1494,16 @@ def promote_section_to_sprint(
         goal: Optional free-text sprint goal.
         kind: sprint | phase | milestone | block (default: sprint).
 
-    Returns: created sprint dict, or {"error": "..."} on validation failure.
+    Returns: slim ack {id, code, kind, status, name} — scalar headers (the
+        free-text `goal` is not echoed). {"error": "..."} on validation failure.
     """
     from dct.core.plans.crud import promote_section_to_sprint as _promote
     try:
-        return _promote(
+        s = _promote(
             _get_engine(), section_id,
             code=code, name=name or None, goal=goal or None, kind=kind,
         )
+        return {"id": s["id"], "code": s["code"], "kind": s["kind"], "status": s["status"], "name": s["name"]}
     except Exception as e:
         return {"error": str(e)}
 
@@ -1376,18 +1536,20 @@ def create_sprint(
             update_sprint.
         goal: Optional free-text objective.
 
-    Returns the new sprint dict (full row), or {"error": "..."} on failure
-    (empty name, invalid kind/status, status='deferred', duplicate code, a
-    second active sprint, or an unresolvable project — unknown slug, or empty
-    project when the CWD is not a registered project).
+    Returns: slim ack {id, code, kind, status, name} — scalar headers only (the
+        free-text `goal` is not echoed). {"error": "..."} on failure (empty
+        name, invalid kind/status, status='deferred', duplicate code, a second
+        active sprint, or an unresolvable project — unknown slug, or empty
+        project when the CWD is not a registered project).
     """
     from dct.core.sprints import create_sprint as _create
     try:
-        return _create(
+        s = _create(
             _get_engine(), _resolve_project(project),
             name=name, code=code or None, kind=kind,
             status=status, goal=goal or None,
         )
+        return {"id": s["id"], "code": s["code"], "kind": s["kind"], "status": s["status"], "name": s["name"]}
     except Exception as e:
         return {"error": str(e)}
 
@@ -1430,9 +1592,10 @@ def update_sprint(
     activated), and is HIDDEN from current-sprint views (get_current_sprint /
     review_sprint). It stays visible via list_sprints(status='deferred').
 
-    Returns the full updated sprint dict, or {"error": "..."} on an unknown id,
-    illegal transition, a second active sprint, a duplicate code, an invalid
-    kind/status, or no fields supplied.
+    Returns: slim ack {id, code, kind, status, name} — scalar headers only (the
+        free-text `goal` is not echoed). {"error": "..."} on an unknown id,
+        illegal transition, a second active sprint, a duplicate code, an invalid
+        kind/status, or no fields supplied.
     """
     from dct.core.sprints import update_sprint as _update
     kwargs: dict = {}
@@ -1452,7 +1615,7 @@ def update_sprint(
         return {"error": str(e)}
     if result is None:
         return {"error": f"Sprint #{sprint_id} not found"}
-    return result
+    return {"id": result["id"], "code": result["code"], "kind": result["kind"], "status": result["status"], "name": result["name"]}
 
 
 @mcp.tool()
@@ -1603,6 +1766,11 @@ def create_decision(
         ref_code: Short reference like "ADR-001" (optional, unique per project).
         status: proposed | accepted | superseded | rejected.
         plan_id / plan_section_id / sprint_id: optional anchors (0 = none).
+
+    Returns: slim ack {id, ulid, kind, ref_code, status, title} — scalar headers
+        only; the four prose fields (context/decision/consequences/alternatives)
+        are NOT echoed. {"error": "..."} on invalid kind/status, duplicate
+        ref_code, markup, or an unresolvable project.
     """
     if (err := _reject_toolcall_markup(
         title=title, context=context, decision=decision,
@@ -1611,7 +1779,7 @@ def create_decision(
         return err
     from dct.core.decisions import create_decision as _create
     try:
-        return _create(
+        d = _create(
             _get_engine(), _resolve_project(project),
             kind=kind, title=title,
             ref_code=ref_code or None,
@@ -1621,6 +1789,7 @@ def create_decision(
             plan_id=plan_id or None, plan_section_id=plan_section_id or None,
             sprint_id=sprint_id or None,
         )
+        return {"id": d["id"], "ulid": d["ulid"], "kind": d["kind"], "ref_code": d["ref_code"], "status": d["status"], "title": d["title"]}
     except Exception as e:
         return {"error": str(e)}
 
@@ -1689,10 +1858,11 @@ def update_decision(
     ref_code are NOT markup-scanned (status is instead validated against the enum
     above, ref_code is stored as given).
 
-    Returns the updated decision dict, or an {"error": ...} dict when: decision_id
-    is unknown, no (non-empty) fields were supplied, status is not a valid value,
-    a ref_code collides with another active decision in the project, or a prose
-    field contains tool-call markup.
+    Returns: slim ack {id, ulid, kind, ref_code, status, title} — scalar headers
+        only; the four prose fields are NOT echoed. {"error": ...} when:
+        decision_id is unknown, no (non-empty) fields were supplied, status is
+        not a valid value, a ref_code collides with another active decision in
+        the project, or a prose field contains tool-call markup.
     """
     if (err := _reject_toolcall_markup(
         title=title, context=context, decision=decision,
@@ -1707,7 +1877,9 @@ def update_decision(
     }.items() if v}
     try:
         row = _update(_get_engine(), decision_id=decision_id, **kwargs)
-        return row or {"error": f"Decision #{decision_id} not found"}
+        if not row:
+            return {"error": f"Decision #{decision_id} not found"}
+        return {"id": row["id"], "ulid": row["ulid"], "kind": row["kind"], "ref_code": row["ref_code"], "status": row["status"], "title": row["title"]}
     except Exception as e:
         return {"error": str(e)}
 
@@ -1719,12 +1891,17 @@ def supersede_decision(old_decision_id: int, new_decision_id: int) -> dict:
     Sets status='superseded' and superseded_by=#new on the OLD row only; the
     NEW row is left untouched — set its status (e.g. 'accepted') separately via
     update_decision. Errors if either id is unknown or the two ids are equal.
-    Returns the updated old-decision dict, or {"error": ...}.
+
+    Returns: slim ack {id, ulid, kind, ref_code, status, title} for the updated
+        OLD decision — scalar headers only, no prose echo. {"error": ...} on an
+        unknown id or equal ids.
     """
     from dct.core.decisions import supersede_decision as _supersede
     try:
         row = _supersede(_get_engine(), old_decision_id, new_decision_id)
-        return row or {"error": "Decision not found"}
+        if not row:
+            return {"error": "Decision not found"}
+        return {"id": row["id"], "ulid": row["ulid"], "kind": row["kind"], "ref_code": row["ref_code"], "status": row["status"], "title": row["title"]}
     except Exception as e:
         return {"error": str(e)}
 
@@ -1774,16 +1951,17 @@ def ingest_plan_file(
 # (plans, decisions, first-class sprints, web, release admin) stay deferred.
 # Add a name here ONLY if a routine skill needs it from token zero; keep the long
 # tail deferred to spend session context wisely. Takes effect on server restart.
+# The hot-set is deliberately the 10 mid-session daily drivers — the tools a
+# working session touches turn after turn (item lifecycle, checkpoints, changelog
+# add). Session-edge tools (handoffs, sprint set, review_sprint, list_projects,
+# count_unreleased_changelog) are used once at pickup/handoff and stay deferred:
+# their one ToolSearch round-trip is cheap next to keeping them resident all session.
 _ALWAYS_LOAD_TOOLS = frozenset({
-    # project + item lifecycle (track / track-list / track-update / track-resolve)
-    "list_projects", "list_items", "get_item",
-    "create_item", "update_item", "resolve_item", "add_note",
-    "add_checkpoint", "complete_checkpoint", "reject_checkpoint",
-    # changelog / commit
-    "add_changelog", "count_unreleased_changelog",
-    # sprint + handoff (pickup / handoff)
-    "review_sprint", "set_sprint",
-    "create_handoff", "list_handoffs", "consume_handoff", "delete_handoff",
+    # item + checkpoint lifecycle (track / track-list / track-update / track-resolve)
+    "create_item", "get_item", "list_items", "update_item", "resolve_item",
+    "add_note", "add_checkpoint", "complete_checkpoint", "reject_checkpoint",
+    # changelog add (clog / commit)
+    "add_changelog",
 })
 
 

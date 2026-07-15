@@ -89,9 +89,26 @@ port = 8787              # preferred port; auto_fallback scans upward if busy
 auto_fallback = true
 open_browser = false
 refresh_poll_ms = 2000   # SSE change-token poll interval
+
+[update]
+# Passive PyPI update check (#356). When false, disables BOTH the background
+# version probe and the CLI/MCP nudge. Offline-safe and non-blocking regardless.
+check = true
 ```
 
 **Environment override**: `DCT_DATABASE_URL` overrides `[database].url`. `DCT_CONFIG_PATH` overrides the config file location (defaults to `~/.claude/dct.toml`).
+
+### Update check (`dct/update.py`)
+
+`dct/update.py` implements a passive, offline-safe update check (#356). A cheap
+`check_for_update()` reads a 24h on-disk cache (`~/.claude/dct-update-check.json`);
+when stale it spawns a daemon thread that queries PyPI (2s timeout) and rewrites
+the cache — it never blocks and never raises. `get_cached_notice()` is a pure
+cache read (zero network) that returns a one-line "newer release available" notice
+when the cached `latest` is strictly newer than the installed version. CLI commands
+print the notice on stderr; the MCP server appends it to its instructions at start.
+`dct upgrade` detects the install method (editable / uv tool / pipx / pip), runs the
+matching upgrade, and refreshes the skill/hook symlinks. Opt out via `[update] check = false`.
 
 ### MCP server registration: `~/.claude.json`
 

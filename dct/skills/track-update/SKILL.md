@@ -1,12 +1,9 @@
 ---
 name: track-update
-description: |
-  Update an existing tracked item in dct.
-  Use when: "update issue", "edit item", "change priority", "zmień issue",
-  "track-update", "set status", "reassign priority",
-  "w toku", "zacznij", "rozpocznij", "start working on", "in progress",
-  "wip", "mark as wip", "assign priority", "flag as sprint", "add to sprint",
-  "remove from sprint", "wstrzymaj", "pause".
+description: >-
+  [dct] Update a tracked item — status, priority, fields, sprint membership.
+  Use when: "update item #N", "change priority", "start working on #N", "wip",
+  "add/remove from sprint" — in any language.
 ---
 
 # /track-update — Update Tracked Item

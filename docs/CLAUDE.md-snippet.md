@@ -18,17 +18,21 @@ hooks at `~/.claude/hooks/`.
 
 ### What's available
 
-**Skills** (invoke via `/name`):
+**Skills** (invoke via `/name`) — all model-facing descriptions carry a `[dct]`
+prefix and trigger in any language:
 - `/track` — create item (issue / todo / feature / idea / improvement)
 - `/track-list` — list/search, priority grouped, hotspot detection
-- `/track-update` — edit fields
+- `/track-update` — edit fields, status, priority, sprint membership
 - `/track-resolve` — close (resolved / wont_fix)
 - `/clog` — add changelog entry
 - `/commit` — conventional commit with `(vX.Y.Z)` suffix, changelog-aware
 - `/release` — stamp version, export Keep-a-Changelog MD, release commit
-- `/dct-import` — migrate markdown-based tracking into dct
-- `/handoff` — end-of-session: flag sprint + write prompt for next session
 - `/pickup` — start-of-session: read handoff, show sprint, propose first action
+- `/handoff` — end-of-session: flag sprint + write prompt for next session
+- `/plan-status` — cross-plan progress dashboard
+- `/dct-import` — migrate markdown-based tracking into dct (user-invoked only)
+- `/dct-init` — bootstrap dct + register current project (user-invoked only)
+- `/plan-resolve-uncertain` — batch classify uncertain plan sections (user-invoked only)
 
 ### Item type triggers (`/track` and `create_item`)
 
@@ -50,12 +54,12 @@ Rules of thumb:
 - `idea` = exploratory, not yet decided to build
 - `improvement` = existing thing works but could be better (refactor, UX polish, perf)
 
-**MCP tools** — 47 total; most important:
+**MCP tools** — 49 total; most important:
 - `list_projects`, `list_items`, `get_item`, `create_item`, `update_item`, `resolve_item`, `add_note`
 - `add_checkpoint`, `list_checkpoints`, `complete_checkpoint`, `reject_checkpoint`, `reopen_checkpoint`
 - `add_changelog`, `list_changelog`, `count_unreleased_changelog`, `release_changelog`, `export_changelog`
 - `set_sprint`, `clear_sprint`, `review_sprint`, `list_sprints`, `update_sprint`
-- `create_handoff`, `list_handoffs`, `consume_handoff`, `delete_handoff`
+- `create_handoff`, `list_handoffs`, `get_handoff`, `consume_handoff`, `delete_handoff`
 
 ### When to auto-invoke
 
@@ -101,13 +105,19 @@ complete_checkpoint(7)
 
 ### Response format cheatsheet
 
+**Write ops return a minimal ack**, not the full record — the created/updated `id`
+plus a few post-state scalars (e.g. `create_item` → `{id, project, item_type,
+priority, status, title}`; checkpoint ops → `{id, item_id, status, progress}`).
+**Remember the `id`** for follow-up calls. Need full context? Fetch it deliberately:
+`get_item(id)` (fields, notes, checkpoints, progress) or `get_handoff(id)`
+(untruncated prompt + context_summary) — both return a full semantic dict.
+
 `list_*` tools return compact `{cols, rows}`:
 - `cols` is the full-name column header array (once per response)
 - `rows` is an array of value arrays in the same order
 - short/fixed-width fields come first, long free text (title, description, entry, prompt) last
 - extract a field by `cols.indexOf("title")` → index into each row
-
-`get_item`, `get_handoff` return a full semantic dict (single record, full keys).
+- `list_handoffs` truncates `prompt` to a 200-char preview → `get_handoff(id)` for full text
 
 Opt-in formats on list-views:
 - `format="markdown"` → human-readable table (lossy — no description)

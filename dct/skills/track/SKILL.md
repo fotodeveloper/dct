@@ -1,13 +1,9 @@
 ---
 name: track
-description: |
-  Create a tracked item (issue, todo, feature, idea, improvement) in dct.
-  Use when: "track", "add issue", "add todo", "dodaj issue", "zanotuj",
-  "śledź", "track this", "new issue", "nowy issue", "zgłoś",
-  "dodaj jako problem", "problem", "bug", "błąd", "crash", "nie działa",
-  "dodaj feature", "ficzer", "dodaj ficzer", "dodaj todo",
-  "pomysł", "idea", "a może", "rozważ",
-  "poprawa", "ulepszenie", "poprawmy", "refactor", "cleanup".
+description: >-
+  [dct] Create a tracked item (issue / todo / feature / idea / improvement).
+  Use when: "track this", "add issue/todo/feature", "bug", "idea", "refactor"
+  — in any language. Type mapping lives in the create_item tool description.
 ---
 
 # /track — Create Tracked Item

@@ -1,9 +1,8 @@
 ---
 name: track-resolve
-description: |
-  Resolve or close a tracked item in dct.
-  Use when: "resolve issue", "close item", "mark as done", "zamknij issue",
-  "track-resolve", "wont fix", "done with #42".
+description: >-
+  [dct] Resolve or close a tracked item. Use when: "resolve issue",
+  "close item", "done with #42", "wont fix" — in any language.
 ---
 
 # /track-resolve — Resolve/Close Item

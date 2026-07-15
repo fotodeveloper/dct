@@ -1,10 +1,9 @@
 ---
 name: track-list
-description: |
-  List and search tracked items across projects. Supports priority grouping,
-  file hotspots, and cross-project aggregation.
-  Use when: "list issues", "show todos", "what's open", "pokaż issues",
-  "co mamy", "backlog", "track-list", "all items", "open issues".
+description: >-
+  [dct] List and search tracked items across projects, priority-grouped, with
+  file hotspots. Use when: "list issues", "what’s open", "backlog", "show todos"
+  — in any language.
 ---
 
 # /track-list — List Tracked Items

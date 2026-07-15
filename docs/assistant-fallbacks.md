@@ -6,6 +6,14 @@ versions. Do not couple logic to skill existence — the workflows below
 describe what each skill does so an assistant can perform the steps manually
 via MCP tools when the named skill is unavailable.
 
+**Write ops return a minimal ack**, not the full record — the created/updated
+`id` plus a few post-state scalars. **Remember the `id`** returned by
+`create_item` / `add_checkpoint` / `create_handoff` (etc.); you need it for
+every follow-up call. Fetch full context deliberately: `get_item(id)` (fields,
+notes, checkpoints, progress) or `get_handoff(id)` (untruncated prompt +
+context_summary). `list_handoffs` returns 200-char prompt previews — use
+`get_handoff(id)` for the full text.
+
 ## `/release` fallback
 
 1. Detect current project: match CWD against `mcp__dct__list_projects()` results, take longest path prefix.

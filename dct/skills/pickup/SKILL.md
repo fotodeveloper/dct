@@ -1,12 +1,9 @@
 ---
 name: pickup
-description: |
-  Start-of-session workflow — read last session's handoff, show current sprint,
-  and propose the first action.
-  Use when: "pickup", "gdzie byliśmy", "resume", "where were we", "start session",
-  "co robimy", "kontynuuj", "podejmij od",
-  "co dalej", "kontynuujmy", "wracam", "jestem z powrotem",
-  "dalej", "idziemy dalej", "next up", "what's next", "back to work".
+description: >-
+  [dct] Start-of-session workflow — read last handoff, show current sprint,
+  propose first action. Use when: "pickup", "resume", "where were we",
+  "what’s next", "back to work" — in any language.
 ---
 
 # /pickup — Session Resume
@@ -14,95 +11,93 @@ description: |
 Open a new session by loading the previous session's handoff prompt + current
 sprint state, then propose a concrete first action.
 
+## Deferred-tool load (do this first)
+
+`review_sprint`, `consume_handoff`, and `get_handoff` are deferred — load their
+schemas before first use with ONE ToolSearch call:
+
+```
+ToolSearch("select:mcp__dct__review_sprint,mcp__dct__consume_handoff,mcp__dct__get_handoff")
+```
+
 ## Workflow
 
-### Step 1: Detect project
+### Step 1: Fetch review (CWD auto-detect)
 
-`mcp__dct__list_projects` → match CWD (longest prefix).
-If not registered, ask via `AskUserQuestion`:
-  - question: "Which project are we working on?"
-  - options: list of slugs + "Cancel"
+Happy path is a SINGLE call — `review_sprint("")` auto-detects the project from
+CWD (empty project string), no `list_projects` needed:
 
-### Step 2: Fetch review
-
-Call `mcp__dct__review_sprint(project, since="last_release")`.
+```
+mcp__dct__review_sprint(project="", since="last_release")
+```
 
 Returns:
 - `in_sprint` — currently flagged items
 - `recent_activity` — items changed since anchor
 - `stale_in_progress` — forgotten in-progress items
-- `unconsumed_handoffs` — unread drafts from previous sessions
+- `unconsumed_handoffs` — unread drafts (with prompt previews) from previous sessions
 
-### Step 3: Handle unconsumed handoffs
+**Fallback only when project is unresolved** (CWD not a registered project →
+`review_sprint` errors): call `mcp__dct__list_projects()` and ask via
+`AskUserQuestion` ("Which project are we working on?" → slugs + "Cancel"), then
+re-call `review_sprint(<slug>, since="last_release")`.
 
-**If there are 0 handoffs** — skip to Step 4.
+### Step 2: Merged decision — handoff + first action (ONE AskUserQuestion)
 
-**If there is exactly 1 handoff**, present its prompt and ask via `AskUserQuestion`:
+Handle the handoff pick-up decision AND the first-action decision in a SINGLE
+`AskUserQuestion` call (two questions in one dialog). Embed the full handoff
+prompt text INSIDE the question field so the user reads it before deciding —
+never rely on plain text printed the same turn.
+
+**Question 1 — handoff** (skip this question entirely if 0 unconsumed handoffs):
+- If exactly 1 handoff:
   - question: "Handoff #N [scope: X] from <created_at> by <created_by>:\n\n<prompt>\n\nPick up this handoff?"
   - options:
     - "Yes — consume and follow it"
     - "Yes — follow it but keep unconsumed (for audit)"
     - "No — start fresh, discard this handoff"
-    - "Show other recent handoffs"
-
-**If there are multiple**, ask via `AskUserQuestion`:
+- If multiple handoffs:
   - question: "N handoffs waiting. Which to pick up?"
-  - options: one per handoff formatted `#N [scope] — <first 80 chars of prompt>` + "None — start fresh"
+  - options: one per handoff formatted `#N [scope] — <prompt preview>` + "None — start fresh"
+  - (fetch the full text of the chosen one with `get_handoff(id)` before acting)
 
-On picked handoff:
-- "Yes — consume" → `mcp__dct__consume_handoff(id, consumed_by=<session_id>)`
-- "keep unconsumed" → use prompt content, don't stamp consumed_at
-- "start fresh" → optionally ask to `delete_handoff(id)` (soft) or just leave
+**Question 2 — first action** (always present):
+- question: "First action for this session?"
+- options:
+  - "Open #<first-sprint-item> and start on its checkpoints"
+  - "Review all sprint items first"
+  - "Look at stale in_progress first (#X)"
+  - "Something else — tell me what"
 
-### Step 4: Show sprint
+**Empty-sprint variants** — replace Question 2's options when the sprint is empty:
+- Sprint empty BUT open items exist: "Pick sprint items now — run /handoff" / "Browse open items — /track-list" / "Just start working — I'll tell you what".
+- Sprint empty AND no open items: "Create the first item — run /track" / "Import existing tracking data — run /dct-import" / "Exit — not the right project".
 
-Present `in_sprint` as a compact table (use format from `review_sprint.in_sprint`).
-Show summary: sprint_size, sprint_completion, handoffs_pending.
+### Step 3: Act on the answers (ONE parallel message)
 
-If sprint is empty BUT there are open items in the project, ask via `AskUserQuestion`:
-  - question: "Sprint is empty (but N items open). What next?"
-  - options:
-    - "Pick sprint items now — run /handoff style proposal"
-    - "Browse open items — /track-list"
-    - "Just start working — I'll tell you what"
+Batch the follow-up calls in a single parallel message:
+- If the user chose to consume a handoff → `mcp__dct__consume_handoff(id, consumed_by=<session_id>)`
+- If the user chose "Open #X" → `mcp__dct__get_item(X)`
 
-If sprint is empty AND there are NO open items in the project, ask via `AskUserQuestion`:
-  - question: "Project is empty — nothing to pick up. What now?"
-  - options:
-    - "Create the first item — run /track"
-    - "Import existing tracking data — run /dct-import"
-    - "Exit — not the right project"
+("keep unconsumed" → use the prompt content but do NOT stamp consumed_at;
+"start fresh" → optionally `delete_handoff(id)`, soft, or leave it.)
 
-### Step 5: Propose first action
+Then show `in_sprint` as a compact table (format from `review_sprint.in_sprint`)
+plus summary: sprint_size, sprint_completion, handoffs_pending, and the opened
+item's checkpoints as the next-step plan.
 
-Combine:
-- Handoff prompt (if consumed) — primary intent
-- First in_sprint item by priority — concrete entry point
-- Any stale_in_progress — optional "unstick first" path
+### Step 4: Report
 
-Present via `AskUserQuestion`:
-  - question: "First action for this session?"
-  - options:
-    - "Open #<first-sprint-item> and start on its checkpoints"
-    - "Review all sprint items first"
-    - "Look at stale in_progress first (#X)"
-    - "Something else — tell me what"
-
-### Step 6: Report and open context
-
-Based on user choice, run the matching action:
-- "Open #X" → `mcp__dct__get_item(X)` + show checkpoints as next-step plan
-- "Review all" → full sprint listing
-- "Stale first" → `mcp__dct__get_item(<stale>)`
-- "Something else" → wait for user input
-
-Report:
 ```
 ✓ Picked up handoff #N
   Sprint: 3 items, 0/3 done
   Starting: #22 — "Optimize MCP response format"
   Plan: 4 pending checkpoints in this item
 ```
+
+If the project has plans with pending checkpoints (visible in
+`review_sprint`/`get_item` context), mention that **`/plan-status` shows overall
+plan progress** — a good next call when planned work is in flight.
 
 ## Rules
 

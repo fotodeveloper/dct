@@ -5,7 +5,7 @@
 [![CI](https://github.com/fotodeveloper/dct/actions/workflows/ci.yml/badge.svg)](https://github.com/fotodeveloper/dct/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-Persistent, queryable memory for AI coding assistants — your assistant reads facts from a database instead of guessing. One user-scoped database tracks issues, todos, changelog entries, plans, sprints, and decisions across all your projects. Built for [Claude Code](https://claude.com/claude-code) (skills, hooks, 48 MCP tools); the MCP server and CLI work with any MCP-capable assistant.
+Persistent, queryable memory for AI coding assistants — your assistant reads facts from a database instead of guessing. One user-scoped database tracks issues, todos, changelog entries, plans, sprints, and decisions across all your projects. Built for [Claude Code](https://claude.com/claude-code) (skills, hooks, 49 MCP tools); the MCP server and CLI work with any MCP-capable assistant.
 
 Part of the **dc tools** family ([dctools.dev](https://dctools.dev)) — *deterministic context* for AI-assisted development.
 
@@ -79,7 +79,7 @@ markdown, and makes the release commit.
 - **Decision records** — ADRs, sprint amendments, inline plan decisions with multi-anchor linkage
 - **LLM-assisted classification** — uncertain plan sections auto-resolved via `claude --print` (haiku by default)
 - **Passive autoscan hook** — PostToolUse hook re-scans plan-like files in background on every edit
-- **MCP server** — native Claude Code integration via FastMCP, 48 tools
+- **MCP server** — native Claude Code integration via FastMCP, 49 tools
 - **CLI** — fast `dct` command for hooks and scripts
 - **Skills** — Claude Code slash commands (`/track`, `/clog`, `/dct-import`, `/plan-status`, …)
 - **Soft deletes** — ledger pattern, nothing is ever lost
@@ -158,6 +158,16 @@ happens in the conversation you're already having.
 - **MCP tools don't show up in Claude Code** — the MCP server is a per-session subprocess, so newly registered tools (or a reinstall) appear only after you **restart the Claude Code session**. Start a fresh session and they'll be there.
 - **Plans/decisions tools fail with `No module named 'ulid'`** — your installed tool environment predates the `python-ulid` dependency. Upgrade it: `uv tool upgrade dctracker` (or reinstall via your chosen option above).
 
+### Updating
+
+dct runs a passive, offline-safe update check — a cached PyPI probe (refreshed at most once a day, never blocking) surfaces a one-line "newer release available" nudge on the CLI and in the MCP server instructions. Opt out with `[update] check = false` in `~/.claude/dct.toml`. When a newer version exists:
+
+```bash
+dct upgrade    # detects install method (uv tool / pipx / pip), upgrades, re-links skills + hooks
+```
+
+`dct upgrade` refreshes the skill/hook symlinks and prunes any that the new package dropped. Editable/dev checkouts print `git pull` guidance instead (no package to upgrade). Run it at a session boundary — skill descriptions and the MCP server pick up the new code on the next session, migrations on the next engine bootstrap.
+
 ## Usage
 
 ### CLI
@@ -201,22 +211,22 @@ dct checkpoint reject 4               # Scope-change, keep in ledger
 
 ## MCP Tools
 
-dct ships **48 MCP tools**, registered at user scope so they're callable from any Claude Code session as `mcp__dct__<name>`. Zero-arg calls auto-detect the project from the session's working directory; pass `project=<slug>` to override. The daily drivers:
+dct ships **49 MCP tools**, registered at user scope so they're callable from any Claude Code session as `mcp__dct__<name>`. Zero-arg calls auto-detect the project from the session's working directory; pass `project=<slug>` to override. Write ops return a minimal ack (id + a few post-state scalars); fetch full context with `get_item(id)` / `get_handoff(id)`. Ten mid-session daily drivers are always resident (`alwaysLoad`); the rest of the catalogue loads on demand via ToolSearch:
 
 | Tool | Purpose |
 |---|---|
 | `create_item` | Create a tracked item (issue / todo / feature / idea / improvement) |
+| `get_item` | Full item dict — fields, notes, checkpoints, progress |
 | `list_items` | List / search items in compact `{cols, rows}` form |
 | `update_item` | Update fields on an existing item |
 | `resolve_item` | Close an item (terminal status), with gate-checkpoint guard |
+| `add_note` | Append a note to an item (append-only ledger) |
 | `add_checkpoint` | Add an acceptance criterion to an item |
 | `complete_checkpoint` | Mark a checkpoint done (real-time, never batched) |
+| `reject_checkpoint` | Mark a checkpoint rejected (scope change) — ledger-preserving |
 | `add_changelog` | Add an unreleased changelog entry |
-| `release_changelog` | Stamp unreleased entries with a version + bump `current_version` |
-| `set_sprint` | Atomically replace the current sprint's membership |
-| `create_handoff` | Leave a handoff draft for the next session |
 
-Full categorized catalogue of all 48 tools: **[docs/mcp-tools.md](docs/mcp-tools.md)**.
+Session-edge tools stay deferred: `get_handoff` (full handoff dict — untruncated prompt + context_summary), `create_handoff`, `set_sprint`, `release_changelog`, and more. Full categorized catalogue of all 49 tools: **[docs/mcp-tools.md](docs/mcp-tools.md)**.
 
 ## Plans, Roadmaps & Decisions
 

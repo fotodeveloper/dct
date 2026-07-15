@@ -1,11 +1,17 @@
 """Sanity tests for hooks/dct-task-mirror.sh (v0.4.0 — item #34).
 
-Mirrors the shape of test_hook_plan_autoscan.py. We do NOT fire the hook
-end-to-end (that needs CC harness + real dct + jq); instead we verify
-file presence, syntax, and contract compliance.
+Mirrors the shape of test_hook_plan_autoscan.py. We do NOT fire the shell
+hook end-to-end (that needs CC harness + real dct + jq); instead we verify
+file presence, syntax, and contract compliance. The worker's gating logic
+(#354 — config gate + silent project autodetect moved off the shell
+fast-path) IS exercised directly against the in-memory engine.
 """
 
+import argparse
+import io
 import subprocess
+
+import pytest
 
 from dct.setup import HOOKS_DIR
 
@@ -55,11 +61,16 @@ def test_hook_filters_to_task_tools():
     assert "TodoWrite" in src
 
 
-def test_hook_respects_config_gate():
-    """[mirror].task_to_dct = off|ask must short-circuit."""
+def test_shell_defers_gate_and_detection_to_worker():
+    """#354: the shell is a lean dispatcher. The config gate and project
+    autodetect moved into `dct _task-mirror`, so NO synchronous Python or
+    config call runs before the worker is backgrounded — that is what keeps
+    the fast path in single-digit milliseconds."""
     src = HOOK_PATH.read_text()
-    assert "dct config get mirror.task_to_dct" in src
-    assert "off|ask" in src
+    assert "dct config get" not in src
+    assert "dct project detect" not in src
+    # The backgrounded worker is the only dct invocation on the hot path.
+    assert "dct _task-mirror" in src
 
 
 def test_hook_uses_fire_and_forget():
@@ -99,3 +110,102 @@ def test_hook_noop_on_non_task_tool():
         capture_output=True, text=True, timeout=5,
     )
     assert result.returncode == 0
+
+
+# ── Worker gating (#354): config gate + silent project autodetect ─────────────
+
+def _run_worker(engine, monkeypatch, payload, *, mode="auto", cwd=None, project=""):
+    """Drive `cmd_internal_task_mirror` against the in-memory engine.
+
+    Patches the worker's engine factory and config loader; feeds `payload`
+    (already-serialized JSON) on stdin. `cwd` overrides os.getcwd() so the
+    silent-autodetect branch is exercised deterministically.
+    """
+    from dct import cli
+    from dct.config import Config, MirrorConfig
+
+    monkeypatch.setattr(cli, "_get_engine", lambda: engine)
+    monkeypatch.setattr(
+        "dct.config.load_config",
+        lambda: Config(mirror=MirrorConfig(task_to_dct=mode)),
+    )
+    if cwd is not None:
+        monkeypatch.setattr("os.getcwd", lambda: cwd)
+    monkeypatch.setattr("sys.stdin", io.StringIO(payload))
+
+    args = argparse.Namespace(session_id="s1", project=project)
+    cli.cmd_internal_task_mirror(args)
+
+
+def _cc_items(engine):
+    from dct.core.items import list_items
+
+    return [
+        r for r in list_items(engine, project_slug="test", search="CC task list",
+                              status=None, limit=100)
+        if r.get("title", "").startswith("CC task list")
+    ]
+
+
+PAYLOAD = (
+    '{"tool_name":"TodoWrite","session_id":"s1",'
+    '"tool_input":{"todos":[{"content":"alpha"},{"content":"beta"}]}}'
+)
+
+
+def test_worker_mirrors_when_auto(engine, seed_project, monkeypatch):
+    """auto mode + resolvable project → item created with cc-task checkpoints."""
+    from dct.core.items import get_item
+
+    _run_worker(engine, monkeypatch, PAYLOAD, mode="auto", project="test")
+
+    items = _cc_items(engine)
+    assert len(items) == 1
+    full = get_item(engine, items[0]["id"])
+    cps = [c for c in full["checkpoints"] if c["kind"] == "cc-task"]
+    assert len(cps) == 2
+    assert all(c["text"].startswith("[cc] ") for c in cps)
+
+
+@pytest.mark.parametrize("mode", ["off", "ask", "bogus"])
+def test_worker_config_gate_blocks_non_auto(engine, seed_project, monkeypatch, mode):
+    """#354: only 'auto' mirrors — off/ask/unknown are silent no-ops that do
+    NOT touch the database."""
+    _run_worker(engine, monkeypatch, PAYLOAD, mode=mode, project="test")
+    assert _cc_items(engine) == []
+
+
+def test_worker_silent_when_no_project(engine, monkeypatch):
+    """auto mode but CWD is not a registered project → silent no-op, no crash,
+    no item created (autodetect moved into the worker)."""
+    _run_worker(
+        engine, monkeypatch, PAYLOAD,
+        mode="auto", project="", cwd="/nonexistent/unregistered/path",
+    )
+    from dct.core.items import list_items
+
+    assert list_items(engine, project_slug=None, search="CC task list",
+                      status=None, limit=100) == []
+
+
+def test_worker_reads_session_id_from_payload(engine, seed_project, monkeypatch):
+    """session_id travels in the payload now (shell no longer extracts it);
+    an empty --session-id arg falls back to payload .session_id."""
+    from dct import cli
+    from dct.config import Config, MirrorConfig
+
+    monkeypatch.setattr(cli, "_get_engine", lambda: engine)
+    monkeypatch.setattr(
+        "dct.config.load_config",
+        lambda: Config(mirror=MirrorConfig(task_to_dct="auto")),
+    )
+    payload = (
+        '{"tool_name":"TodoWrite","session_id":"from-payload",'
+        '"tool_input":{"todos":[{"content":"x"}]}}'
+    )
+    monkeypatch.setattr("sys.stdin", io.StringIO(payload))
+    cli.cmd_internal_task_mirror(
+        argparse.Namespace(session_id="", project="test")
+    )
+    titles = [r["title"] for r in _cc_items(engine)]
+    assert "CC task list — session from-payload" in titles

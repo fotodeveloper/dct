@@ -56,12 +56,23 @@ class WebConfig:
 
 
 @dataclass
+class UpdateConfig:
+    """[update] section — #356 passive PyPI update check.
+
+    check  when False, disables BOTH the background version probe and the CLI
+           nudge. Offline-safe and non-blocking regardless; this is the opt-out.
+    """
+    check: bool = True
+
+
+@dataclass
 class Config:
     database_url: str = ""
     dct_root: str = ""  # absolute path to the dct repo (for MCP server references)
     plans: PlansConfig = field(default_factory=PlansConfig)
     mirror: MirrorConfig = field(default_factory=MirrorConfig)
     web: WebConfig = field(default_factory=WebConfig)
+    update: UpdateConfig = field(default_factory=UpdateConfig)
 
     def __post_init__(self):
         if not self.database_url:
@@ -107,12 +118,18 @@ def load_config(config_path: Path | None = None) -> Config:
         refresh_poll_ms=int(web_section.get("refresh_poll_ms", 2000)),
     )
 
+    update_section = data.get("update", {})
+    update = UpdateConfig(check=bool(update_section.get("check", True)))
+
     # Env var overrides config file
     env_url = os.environ.get("DCT_DATABASE_URL")
     if env_url:
         database_url = env_url
 
-    return Config(database_url=database_url, dct_root=dct_root, plans=plans, mirror=mirror, web=web)
+    return Config(
+        database_url=database_url, dct_root=dct_root,
+        plans=plans, mirror=mirror, web=web, update=update,
+    )
 
 
 def save_config(config: Config, config_path: Path | None = None) -> Path:
@@ -145,6 +162,9 @@ def save_config(config: Config, config_path: Path | None = None) -> Path:
     lines.append(f'auto_fallback = {str(config.web.auto_fallback).lower()}\n')
     lines.append(f'open_browser = {str(config.web.open_browser).lower()}\n')
     lines.append(f'refresh_poll_ms = {config.web.refresh_poll_ms}\n')
+
+    lines.append('\n[update]\n')
+    lines.append(f'check = {str(config.update.check).lower()}\n')
 
     path.write_text("".join(lines))
     return path

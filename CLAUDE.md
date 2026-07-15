@@ -45,7 +45,7 @@ dct/core/ids.py          — ULID generation
 dct/core/plans/          — Plans subsystem: parser.py (pure MD parser),
                            classify.py (claude --print), crud.py, ingest.py
 dct/cli.py               — argparse CLI entry point
-dct/server.py            — FastMCP MCP server (48 tools)
+dct/server.py            — FastMCP MCP server (49 tools)
 dct/export.py            — Keep a Changelog MD export
 dct/setup.py             — Init workflow: MCP registration, skill/hook symlinks,
                            settings.json hook auto-wiring (`dct hooks wire`)

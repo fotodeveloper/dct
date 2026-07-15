@@ -4,6 +4,8 @@ Defines all tables, engine creation, and connection helpers.
 Uses Core (not ORM) for portability between PostgreSQL and SQLite.
 """
 
+from pathlib import Path
+
 import sqlalchemy as sa
 from sqlalchemy import event
 
@@ -321,6 +323,22 @@ def _set_sqlite_wal(dbapi_connection, _connection_record):
     except Exception:
         pass
     cursor.close()
+
+
+def ensure_sqlite_dir(database_url: str) -> None:
+    """Create the parent directory of a file-backed sqlite URL if missing.
+
+    First run on a pristine machine: the default sqlite path lives under a
+    directory that may not exist yet, and sqlite fails to open the database
+    file with a raw OperationalError instead of creating it (#360). No-op for
+    non-sqlite dialects and for memory URLs ('sqlite://', 'sqlite:///:memory:').
+    """
+    url = sa.engine.make_url(database_url)
+    if url.get_backend_name() != "sqlite":
+        return
+    if not url.database or url.database == ":memory:":
+        return
+    Path(url.database).parent.mkdir(parents=True, exist_ok=True)
 
 
 def get_engine(database_url: str) -> sa.Engine:

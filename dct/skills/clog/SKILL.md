@@ -1,14 +1,9 @@
 ---
 name: clog
-description: |
-  Add a changelog entry to dct database.
-  Use when: "clog", "changelog", "dodaj do changelogu", "add changelog entry",
-  "log this change", "record change", or when committing and changelog needs an entry.
-  Natural past-tense triggers (use after finishing a change):
-  "zmieniłem", "poprawiłem", "naprawiłem", "dodałem", "usunąłem", "zrobiłem",
-  "zrefaktorowałem", "zaktualizowałem",
-  "I added", "I fixed", "I changed", "I removed", "I refactored",
-  "just fixed", "just added", "logged a change", "note this change".
+description: >-
+  [dct] Add a changelog entry to the dct database. Use when: "clog",
+  "changelog", "log this change", or right after finishing any change
+  ("just fixed/added X") — in any language.
 ---
 
 # /clog — Add Changelog Entry

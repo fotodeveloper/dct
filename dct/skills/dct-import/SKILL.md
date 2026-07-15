@@ -1,7 +1,8 @@
 ---
 name: dct-import
+disable-model-invocation: true
 description: |
-  Import existing tracking data from markdown files into dct. Handles checkbox
+  [dct] Import existing tracking data from markdown files into dct. Handles checkbox
   TODOs, narrative sprints, custom issue formats (ORCH-N / BUG-N with field
   blocks), plan-as-parent documents (1k+ line planning docs), Keep-a-Changelog
   with or without [Unreleased], and conventional-commit style entries.

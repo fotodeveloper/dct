@@ -1,11 +1,10 @@
 ---
 name: plan-status
-description: |
-  Cross-plan progress dashboard for a project. Shows per-plan done/total
-  checkpoint counts, uncertain section count, and last-scanned timestamp.
-  Use when: "plan-status", "plan progress", "pokaż plany", "co zostało
-  w planach", "ile zrobione w planie X", "status planów", "how much of
-  the plan is done", "stan planów".
+description: >-
+  [dct] Cross-plan progress dashboard — per-plan done/total checkpoints,
+  uncertain sections, last scan. Use when: "plan status", "plan progress",
+  "how far along is the plan", "what’s left in the plans", or the user asks
+  about overall progress of planned work — in any language.
 ---
 
 # /plan-status — Cross-plan Progress Dashboard

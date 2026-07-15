@@ -1,14 +1,23 @@
 ---
 name: release
-description: |
-  Bump project version and release changelog entries.
-  Use when: "release", "/release", "bump version", "nowa wersja",
-  "release X.Y", "wypuść wersję", "zamknij wersję".
+description: >-
+  [dct] Bump project version and release changelog entries. Use when:
+  "release", "bump version", "ship it" — in any language.
 ---
 
 # /release — Version Bump & Changelog Release
 
 Zero-argument workflow. Auto-detects project from CWD.
+
+## Deferred-tool load (do this first)
+
+`list_projects`, `count_unreleased_changelog`, `list_changelog`,
+`release_changelog`, and `export_changelog` are deferred — load them all with
+ONE ToolSearch call before Step 1:
+
+```
+ToolSearch("select:mcp__dct__list_projects,mcp__dct__count_unreleased_changelog,mcp__dct__list_changelog,mcp__dct__release_changelog,mcp__dct__export_changelog")
+```
 
 ## Workflow
 
@@ -53,10 +62,13 @@ never leak secrets):
 5. Re-run `git status --porcelain`; it MUST now be empty (modulo any
    intentionally-skipped secret/junk files from step 2). Then continue to Step 1.
 
-### Step 1: Gather state
-Call `mcp__dct__list_projects()` and match CWD to a registered project.
-Call `mcp__dct__count_unreleased_changelog(project)`.
-Call `mcp__dct__list_changelog(project, unreleased_only=true)`.
+### Step 1: Gather state (ONE parallel message)
+
+After Step 0 leaves the tree clean, gather all state in a single parallel message:
+- `mcp__dct__list_projects()` — match CWD to a registered project → `slug`, `current_version`, `changelog_path`
+- `mcp__dct__count_unreleased_changelog(project)`
+- `mcp__dct__list_changelog(project, unreleased_only=true)`
+- `git status --porcelain` — confirm the tree is still clean going into the release
 
 Present the state:
 ```
@@ -73,35 +85,33 @@ Unreleased entries: 5
 
 If there are no unreleased entries, inform the user and stop.
 
-### Step 2: Offer changelog review before bumping
+### Step 2: Review entries + bump type (ONE AskUserQuestion, two questions)
 
-After showing the unreleased entries in Step 1, ask via `AskUserQuestion`:
+Ask both pre-stamp decisions in a SINGLE `AskUserQuestion` call. This is the
+pre-stamp safety net — once Step 4 stamps, reverting requires manual SQL.
+
+**Question 1 — entries review:**
 - question: "Ready to release, or review entries first?"
 - options:
-  - `"Go ahead — entries look correct"` → proceed to Step 2b
-  - `"Amend one entry"` → free-text `AskUserQuestion` asking which (id) and the new text, call `mcp__dct__add_changelog` for the replacement and mark the old one via `/clog` amend flow; then re-show the list
-  - `"Drop one entry"` → free-text `AskUserQuestion` for id, soft-delete via direct DB update (or flag for post-release removal); re-show the list
+  - `"Go ahead — entries look correct"`
+  - `"Amend one entry"` → follow-up free-text `AskUserQuestion` for id + new text; call `mcp__dct__add_changelog` for the replacement, mark the old one via `/clog` amend flow; re-show the list
+  - `"Drop one entry"` → follow-up free-text `AskUserQuestion` for id; soft-delete (or flag for post-release removal); re-show the list
   - `"Cancel release"` → stop
 
-This is the pre-stamp safety net — once Step 4 stamps, reverting requires
-manual SQL. Offering an explicit review step prevents regret.
-
-### Step 2b: Ask bump type
-
-The bump type MUST be chosen through `AskUserQuestion` — do NOT substitute a
-plain-text prompt, and do NOT infer it from the user's earlier words, even if
-they seem decided. The bump is effectively irreversible once Step 4 stamps
-(reverting needs manual SQL), so the structured options must show the semver
-implication AND the concrete resulting version number before committing to it.
-This overrides any general "a plain-text answer is fine" preference.
-
-Compute the concrete next version from `current_version` (vX.Y.Z) for each label:
+**Question 2 — bump type.** The bump type MUST be an `AskUserQuestion` option —
+do NOT substitute a plain-text prompt, and do NOT infer it from the user's
+earlier words. The bump is effectively irreversible once Step 4 stamps, so the
+options MUST show the semver implication AND the concrete resulting version
+number. Compute the next version from `current_version` (vX.Y.Z):
 - question: `"What type of release? (current: v<current_version>)"`
 - options:
   - `"patch — v<X.Y.(Z+1)> (bug fixes only)"`
   - `"minor — v<X.(Y+1).0> (new features, backward compatible)"`
   - `"major — v<(X+1).0.0> (breaking changes)"`
   - `"explicit version — I'll type one"` → follow-up free-text AskUserQuestion
+
+If either "Amend"/"Drop"/"Cancel" was chosen, resolve that first (re-showing the
+list) before honoring the bump-type answer.
 
 ### Step 3: Confirm
 ```
@@ -147,14 +157,14 @@ incremental one, so this is safe. Then continue to Step 6.
 
 **Case B — F already exists (the normal path):**
 
-1. Render ONLY the new section:
-   `section = mcp__dct__export_changelog(project, version=V)`.
+1. In ONE parallel message, render the new section AND read F:
+   `section = mcp__dct__export_changelog(project, version=V)` and `Read(F)`.
    - If `isinstance(section, dict)` → it is an error: do NOT touch F, report it,
      stop (the DB was already stamped in Step 4, so either fix the export error
      and re-run Step 5, or manually revert the stamped entries).
    - If `section == ""` → V has no entries (unexpected after Step 4): STOP and
      report rather than writing an empty section.
-2. Read F. Count its existing version-section markers — **lines that start with** `## [` (`grep -c '^## \['`) — call it `N`. Anchor to line start; an entry body may contain `## [` mid-text and MUST NOT be counted.
+2. From the F contents, count its existing version-section markers — **lines that start with** `## [` (`grep -c '^## \['`) — call it `N`. Anchor to line start; an entry body may contain `## [` mid-text and MUST NOT be counted.
 3. **Idempotency guard:** if a **line starting with** `## [V]` already appears in F (anchored — `grep -q '^## \[V\]'`), the section is
    already archived (e.g. a re-run after a partial release). Do NOT write —
    report "changelog.md already contains [V]" and continue to Step 6.
@@ -205,43 +215,42 @@ If the sync script doesn't exist, skip this step — DB is the source of
 truth. Inform the user so they can add one if they have build files that
 need sync.
 
-### Step 7: Commit the release
+### Step 7: Commit + tag the release (ONE command)
 
-Stage ONLY the artifacts touched by Steps 5 and 6:
-- `changelog.md`
-- Any files modified by `scripts/dct-version-sync.sh` (check `git status --porcelain` after Step 6)
+Stage ONLY the artifacts touched by Steps 5 and 6 (`changelog.md` and any files
+modified by `scripts/dct-version-sync.sh` — check `git status --porcelain` after
+Step 6), then commit and tag in a SINGLE command with explicit paths:
 
-Then commit with the **literal** release message format:
 ```bash
-git commit -m "release: v<version>"
+git add changelog.md <version-synced-files> && git commit -m "release: v<version>" && git tag v<version>
 ```
 
-No type, no scope, no version suffix — just `release: v1.1`. The dct global hook
-recognizes this prefix and bypasses the changelog-presence check (which would otherwise
-fail because all entries were just stamped).
+- The commit message is the **literal** `release: v<version>` — no type, no
+  scope, no version suffix. The dct global hook recognizes this prefix and
+  bypasses the changelog-presence check (all entries were just stamped).
+- The tag is **mandatory** — the `v<version>` prefix is the canonical
+  "this commit = this release" marker for `git log`, `git describe`, GitHub, and
+  matches npm/PyPI/Cargo release-UI expectations.
 
-### Step 8: Tag the release (mandatory)
-
-Tag HEAD with the `v<version>` prefix:
-```bash
-git tag v<version>
-```
-
-Rationale: the tag is the canonical marker of "this commit = this release"
-for git log, GitHub, and future `git describe` output. Conventional `v`
-prefix matches npm, PyPI, Cargo, and GitHub release UI expectations.
-
-**Do NOT `git push --tags`** automatically — pushing to remote is a
-separate, user-confirmed action. Inform the user the tag is local; if
-they want it on the remote, they run `git push origin v<version>` or
-`git push --tags` themselves.
-
-If a tag `v<version>` already exists (rare — usually indicates a failed
-earlier release), ask the user via `AskUserQuestion`:
+If a tag `v<version>` already exists (rare — usually a failed earlier release),
+`git tag` fails; ask via `AskUserQuestion`:
   - "Tag v<version> exists. Move it to the new commit, or fail?"
-  - `"Move tag to new HEAD (--force)"`
+  - `"Move tag to new HEAD (--force)"` → `git tag -f v<version>`
   - `"Leave tag alone, don't tag this commit"`
   - `"Abort — the existing tag is correct, something is wrong with this release"`
+
+### Step 8b: Push the tag? (AskUserQuestion)
+
+Pushing is a separate, user-confirmed action — never push automatically. Ask via
+`AskUserQuestion`:
+- question: "Push tag v<version> now?"
+- options:
+  - `"Push now"` → run `git push origin v<version>`. **If `.github/workflows/publish.yml`
+    exists in the repo, the option description MUST state that pushing publishes
+    the package to PyPI after the test job passes** (the tag push triggers the
+    release workflow). Check for the file before rendering the options.
+  - `"Keep local"` → do not push; the Step 9 report reminds the user how to push
+    later (`git push origin v<version>`).
 
 ### Step 9: Report
 ```
@@ -250,8 +259,11 @@ earlier release), ask the user via `AskUserQuestion`:
   changelog.md: [1.1] section prepended (older history preserved)
   Version-synced files: pyproject.toml, myproj/__init__.py
   Commit: release: v1.1 (abc1234)
-  Tag: v1.1 (local only — run `git push origin v1.1` to push)
+  Tag: v1.1 (pushed to origin) | v1.1 (local only — run `git push origin v1.1` to push)
 ```
+
+The Tag line reflects the Step 8b choice: "pushed to origin" if the user chose
+"Push now", otherwise "local only" with the push-later reminder.
 
 ## Rules
 - NEVER release without user confirmation.
@@ -277,5 +289,6 @@ earlier release), ask the user via `AskUserQuestion`:
   A release without a tag is not a release — it's a commit that happens to bump
   `pyproject.toml`. Tags are the git-native marker for `git describe`,
   `git log --decorate`, GitHub's release UI, and `pip install <pkg>==<version>`.
-- Pushing the tag to remote is NOT automatic — inform the user the tag is local
-  and suggest `git push origin v<version>` (or `git push --tags`) as a separate step.
+- Pushing the tag to remote is NOT automatic — it is a user-confirmed
+  `AskUserQuestion` (Step 8b). When `.github/workflows/publish.yml` exists,
+  "Push now" publishes to PyPI after the test job passes; say so in the option.

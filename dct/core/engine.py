@@ -11,16 +11,19 @@ the schema (no create_tables, only SELECTs).
 import sqlalchemy as sa
 
 from dct.config import load_config
-from dct.db import get_engine, create_tables
+from dct.db import ensure_sqlite_dir, get_engine, create_tables
 
 
 def bootstrap_engine(create: bool = True) -> sa.Engine:
     """Build a SQLAlchemy Engine from dct config.
 
     Args:
-        create: when True (default) run idempotent DDL via create_tables so the
-            schema exists. When False, skip ALL DDL — caller guarantees the DB
-            already exists (read-only consumers such as the web viewer).
+        create: when True (default) provision the parent directory for
+            file-backed sqlite URLs (first run on a pristine machine, #360)
+            and run idempotent DDL via create_tables so the schema exists.
+            When False, skip ALL provisioning — no DDL, no directory creation;
+            caller guarantees the DB already exists (read-only consumers such
+            as the web viewer).
 
     Returns:
         A configured sqlalchemy.Engine.
@@ -28,5 +31,6 @@ def bootstrap_engine(create: bool = True) -> sa.Engine:
     cfg = load_config()
     engine = get_engine(cfg.database_url)
     if create:
+        ensure_sqlite_dir(cfg.database_url)
         create_tables(engine)  # idempotent
     return engine

@@ -1,7 +1,8 @@
 ---
 name: plan-resolve-uncertain
+disable-model-invocation: true
 description: |
-  Batch-resolve plan sections flagged `section_type='uncertain'` during
+  [dct] Batch-resolve plan sections flagged `section_type='uncertain'` during
   import. Offers LLM classification (via `claude --print`) per section or
   manual override. Use when: "plan-resolve-uncertain", "resolve uncertain",
   "sklasyfikuj niejasne", "check uncertain sections", "fix section types",

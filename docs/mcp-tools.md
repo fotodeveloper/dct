@@ -1,6 +1,6 @@
 # dct — MCP Tools Reference
 
-Complete catalogue of the **48 MCP tools** the dct server exposes to Claude Code, grouped by domain. ← back to the [README](../README.md).
+Complete catalogue of the **49 MCP tools** the dct server exposes to Claude Code, grouped by domain. ← back to the [README](../README.md).
 
 The dct MCP server is registered at **user scope** (`~/.claude.json`), so every tool below is callable from any Claude Code session as `mcp__dct__<name>`. Most list/create tools accept an empty `project=""` and auto-detect the project from the session's working directory (longest-prefix match); pass `project=<slug>` to override.
 
@@ -10,7 +10,9 @@ New tools become callable only after the Claude Code session restarts (the MCP s
 
 - `list_*` → compact `{cols, rows}` — `cols` names the fields once, `rows` are value arrays in the same order. Opt into `format="markdown"` (lossy human table) or `format="dict"` (list of full-key dicts).
 - `get_*` → a full semantic dict (single record, all keys, nested notes/checkpoints).
-- Mutations → the updated record dict, or `{"error": "..."}` on failure.
+- **Write ops → a minimal ack**, not the full record echo: the created/updated `id` plus a few post-state scalars. Fetch full context deliberately — `get_item(id)` (notes, checkpoints, progress) or `get_handoff(id)` (untruncated prompt + context_summary). Per-tool ack shapes are listed below; failures return `{"error": "..."}`.
+
+**Deferral / `alwaysLoad`**: Claude Code defers all MCP tools by default. dct exempts exactly **10 mid-session daily drivers** — `create_item`, `get_item`, `list_items`, `update_item`, `resolve_item`, `add_note`, `add_checkpoint`, `complete_checkpoint`, `reject_checkpoint`, `add_changelog` — via the `anthropic/alwaysLoad` `_meta` hint so they load at session start. Every other tool (handoffs, sprints, changelog release, plans, decisions) loads on demand through a one-time ToolSearch `select:<name>` round-trip. Takes effect on server restart.
 
 ---
 
@@ -76,15 +78,18 @@ Project registration, rename, version, and changelog-location changes are **CLI-
 | `remove_item_from_sprint` | Soft-remove the item↔sprint link by explicit id. |
 | `list_items_in_sprint` | List items linked to a sprint, newest assignment first. |
 
-## Handoffs (5)
+## Handoffs (6)
 
 | Tool | Purpose |
 |---|---|
 | `create_handoff` | Leave a handoff draft for the next session. |
-| `list_handoffs` | List session handoffs for a project. |
+| `list_handoffs` | List session handoffs for a project; the `prompt` column is a 200-char preview. |
+| `get_handoff` | Full handoff dict — untruncated `prompt` + `context_summary` for a single id. |
 | `consume_handoff` | Mark a handoff as consumed (preserves the row in the ledger). |
 | `delete_handoff` | Soft-delete a handoff (hide from lists, preserve for audit). |
 | `update_handoff` | Amend an unconsumed handoff in place — preserves id + created_at. |
+
+`list_handoffs` truncates the `prompt` to a 200-char preview (with a trailing `…` when longer) across all formats; call `get_handoff(id)` for the full text.
 
 ## Plans (11)
 
@@ -115,4 +120,31 @@ See [docs/plans.md](plans.md) for the plan lifecycle, ULID anchors, and ingest p
 
 ---
 
-**Total: 48 tools.** This list is generated from `dct/server.py`; if it drifts, `dct server` prints the live set.
+## Write-op ack shapes
+
+Write ops return a minimal ack, not the full record. `get_item` / `get_handoff` stay full. Error paths are unchanged (`{"error": "..."}`). `progress` is the item's `{done, pending, active}` checkpoint rollup (rejected excluded).
+
+| Tool | Ack shape |
+|---|---|
+| `create_item` | `{id, project, item_type, priority, status, title}` |
+| `update_item` | post-state `{id, item_type, status, priority, title, component, in_current_sprint, resolved_at, progress}` (a `__clear__`ed field shows `null`) |
+| `resolve_item` | `{id, status, resolved_at, progress}` |
+| `add_note` | `{id, item_id, item_title}` |
+| `add_checkpoint` | `{id, item_id, item_title, kind, status, sort_order}` |
+| `complete_checkpoint` / `reject_checkpoint` / `reopen_checkpoint` | `{id, item_id, status, progress}` |
+| `add_changelog` | `{id, project, category, component}` |
+| `create_handoff` | `{id, project, scope, created_at}` |
+| `update_handoff` | `{id, updated_fields}` (list of applied field names) |
+| `consume_handoff` | `{id, consumed_at}` |
+| `create_sprint` / `update_sprint` / `promote_section_to_sprint` | `{id, code, kind, status, name}` |
+| `create_decision` / `update_decision` / `supersede_decision` | `{id, ulid, kind, ref_code, status, title}` |
+| `create_plan` | `{id, ulid, slug, kind, status, title}` |
+| `add_plan_section` | `{id, ulid, heading, depth, section_type, status, sort_order}` |
+| `complete_plan_checkpoint` / `reject_plan_checkpoint` | `{id, plan_section_id, status, sort_order}` |
+| `promote_section_to_item` / `promote_checkpoint_to_item` | `{id, item_type, priority, status, title}` |
+
+`assign_item_to_sprint` / `remove_item_from_sprint` and the current-sprint add/remove ops return their link rows unchanged (all ids/timestamps, no free-text to strip).
+
+---
+
+**Total: 49 tools.** This list is generated from `dct/server.py`; if it drifts, `dct server` prints the live set.
