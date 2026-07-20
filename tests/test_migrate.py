@@ -153,3 +153,85 @@ def test_cli_dry_run_changes_nothing(fake_home, capsys):
     assert "would move" in out
     assert (fake_home / ".claude" / "dct.toml").exists()  # untouched
     assert not (paths.config_dir() / "dct.toml").exists()
+
+
+# ── Codex review findings (commit b6efa5c) — regression scenarios ────────────
+
+
+def test_rewrite_anchored_to_url_assignment(fake_home):
+    """P1-1: a quoted copy of the URL earlier in the file (e.g. a comment)
+    must NOT swallow the replacement — only the url = assignment rewrites."""
+    legacy = fake_home / ".claude"
+    legacy.mkdir()
+    db = legacy / "dct.db"
+    db.write_text("sqlite-bytes")
+    (legacy / "dct.toml").write_text(
+        f'# backup of old url = "sqlite:///{db}"\n[database]\nurl = "sqlite:///{db}"\n'
+    )
+    migrate.execute_migration(migrate.plan_migration())
+    content = (paths.config_dir() / "dct.toml").read_text()
+    assert f'# backup of old url = "sqlite:///{db}"' in content  # comment intact
+    new_url = paths.sqlite_url(paths.data_dir() / "dct.db")
+    assert f'url = "{new_url}"' in content
+    assert load_config().database_url == new_url
+
+
+def test_db_copy_failure_cancels_unit_keeps_state_consistent(fake_home, monkeypatch):
+    """P1-2: a failure while copying the db must cancel the unit — the config
+    may still migrate but with the URL unrewritten, pointing at the intact
+    legacy db. No state may reference a file that does not exist."""
+    _legacy_install(fake_home, with_db=True)
+    monkeypatch.setattr(
+        migrate.shutil, "copy2",
+        lambda *a, **k: (_ for _ in ()).throw(OSError("disk full")),
+    )
+    migrate.execute_migration(migrate.plan_migration())
+    legacy_db = fake_home / ".claude" / "dct.db"
+    assert legacy_db.exists()                       # db untouched
+    assert not (paths.data_dir() / "dct.db").exists()
+    cfg = load_config()
+    assert cfg.database_url == paths.sqlite_url(legacy_db)  # url still legacy
+
+
+def test_sidecar_conflict_cancels_whole_db_unit(fake_home):
+    """P1-3: a conflicting destination sidecar must cancel the WHOLE db unit
+    (WAL may hold committed transactions) — nothing moves, target untouched."""
+    legacy = _legacy_install(fake_home, with_db=True)
+    (legacy / "dct.db-wal").write_text("wal-with-committed-transactions")
+    conflicting = paths.data_dir() / "dct.db-wal"
+    conflicting.parent.mkdir(parents=True)
+    conflicting.write_text("stale-target")
+    migrate.execute_migration(migrate.plan_migration())
+    assert (legacy / "dct.db").exists()
+    assert (legacy / "dct.db-wal").read_text() == "wal-with-committed-transactions"
+    assert not (paths.data_dir() / "dct.db").exists()
+    assert conflicting.read_text() == "stale-target"
+    assert load_config().database_url == paths.sqlite_url(legacy / "dct.db")
+
+
+def test_no_clobber_survives_target_appearing_after_planning(fake_home):
+    """P1-4: a target created between plan and execute must never be
+    truncated or replaced (atomic hard-link commit, not check-then-write)."""
+    _legacy_install(fake_home, url="postgresql://h/db")
+    steps = migrate.plan_migration()
+    victim = paths.config_dir() / "dct.toml"
+    victim.parent.mkdir(parents=True)
+    victim.write_text("someone else's file")
+    migrate.execute_migration(steps)
+    assert victim.read_text() == "someone else's file"
+    assert (fake_home / ".claude" / "dct.toml").exists()  # source preserved
+
+
+def test_rerun_after_partial_stage_converges(fake_home):
+    """P1-2 rerun-recovery: a byte-identical leftover copy from a crashed run
+    must be treated as already-staged — the rerun completes the migration."""
+    import shutil as _shutil
+
+    legacy = _legacy_install(fake_home, with_db=True)
+    leftover = paths.data_dir() / "dct.db"
+    leftover.parent.mkdir(parents=True)
+    _shutil.copy2(legacy / "dct.db", leftover)
+    migrate.execute_migration(migrate.plan_migration())
+    assert load_config().database_url == paths.sqlite_url(leftover)
+    assert not (legacy / "dct.db").exists()      # converged: legacy cleaned
+    assert not (legacy / "dct.toml").exists()

@@ -143,3 +143,19 @@ def test_clear_pidfile_default_clears_legacy_too(tmp_path, monkeypatch):
     cli._clear_pidfile()
     assert cli._read_pidfile() is None
     assert not legacy.exists()
+
+
+def test_read_pidfile_falls_back_when_new_file_malformed(tmp_path, monkeypatch):
+    """P2-2: a malformed new-location pidfile must not mask a live legacy
+    daemon — fall back to the legacy pidfile on unparseable content too."""
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("XDG_STATE_HOME", raising=False)
+    new = home / ".local" / "state" / "dctools" / "dct-web.pid"
+    new.parent.mkdir(parents=True)
+    new.write_text("garbage-not-a-pid\n")
+    legacy = home / ".claude" / "dct-web.pid"
+    legacy.parent.mkdir(parents=True)
+    legacy.write_text("4242\nhttp://localhost:8787\n")
+    assert cli._read_pidfile() == (4242, "http://localhost:8787")

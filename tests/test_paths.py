@@ -175,3 +175,15 @@ def _touch(path: Path) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("")
     return path
+
+
+def test_is_legacy_resolves_symlinked_home(tmp_path, monkeypatch):
+    """P2-1: canonical path vs symlinked HOME (macOS /var → /private/var
+    classic) must still be recognized as legacy."""
+    real = tmp_path / "realhome"
+    real.mkdir()
+    link = tmp_path / "homelink"
+    link.symlink_to(real)
+    monkeypatch.setenv("HOME", str(link))
+    (real / ".claude").mkdir()
+    assert paths.is_legacy(real / ".claude" / "dct.db")

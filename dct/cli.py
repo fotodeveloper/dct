@@ -1199,15 +1199,7 @@ def _detach_stdio(logfile: Path | None = None) -> None:
             os.close(fd)
 
 
-def _read_pidfile(path: Path | None = None) -> "tuple[int, str] | None":
-    if path is None:
-        path = _web_pidfile()
-        if not path.exists():
-            # A daemon started by pre-1.2 dct wrote its pidfile under ~/.claude;
-            # stop/status after the upgrade must still find that process.
-            legacy = paths.legacy_dir() / "dct-web.pid"
-            if legacy.exists():
-                path = legacy
+def _parse_pidfile(path: Path) -> "tuple[int, str] | None":
     if not path.exists():
         return None
     lines = path.read_text().splitlines()
@@ -1219,6 +1211,18 @@ def _read_pidfile(path: Path | None = None) -> "tuple[int, str] | None":
         return None
     url = lines[1].strip() if len(lines) > 1 else ""
     return pid, url
+
+
+def _read_pidfile(path: Path | None = None) -> "tuple[int, str] | None":
+    if path is not None:
+        return _parse_pidfile(path)
+    # A daemon started by pre-1.2 dct wrote its pidfile under ~/.claude;
+    # stop/status after the upgrade must still find that process — also when
+    # the new-location file exists but is unparseable (a malformed file must
+    # not mask a live legacy daemon).
+    return _parse_pidfile(_web_pidfile()) or _parse_pidfile(
+        paths.legacy_dir() / "dct-web.pid"
+    )
 
 
 def _clear_pidfile(path: Path | None = None) -> None:

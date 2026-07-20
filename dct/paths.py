@@ -66,7 +66,11 @@ def legacy_dir() -> Path:
 
 
 def is_legacy(path: PurePath | str) -> bool:
-    return Path(path).parent == legacy_dir()
+    """True when path lives directly under ~/.claude. Compares realpaths so a
+    symlinked HOME (macOS /var → /private/var) and a canonical path in a
+    config URL still recognize each other."""
+    parent = Path(os.path.realpath(Path(path).parent))
+    return parent == Path(os.path.realpath(legacy_dir()))
 
 
 def default_config_path() -> Path:
