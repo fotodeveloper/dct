@@ -14,7 +14,7 @@ the directory — never a hardcoded list that can drift.
 import tomllib
 from pathlib import Path
 
-from dct.setup import HOOKS_DIR, SKILLS_DIR, discover_skills
+from dct.integrations.claude import HOOKS_DIR, SKILLS_DIR, discover_skills
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 PKG_ROOT = REPO_ROOT / "dct"

@@ -7,7 +7,7 @@ bash syntax check, and respects its exit-0-on-no-op contract.
 
 import subprocess
 
-from dct.setup import HOOKS_DIR
+from dct.integrations.claude import HOOKS_DIR
 
 import pytest
 

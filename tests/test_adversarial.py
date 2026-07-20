@@ -8,7 +8,7 @@ from dct.core.items import (
     add_note, delete_item, _serialize_tags, _parse_tags,
 )
 from dct.core.changelog import add_entry, count_unreleased, list_entries, delete_entry
-from dct import server as dct_server
+from dct.mcp import server as dct_server
 
 
 # ── Empty / blank inputs ─────────────────────────────────────────────────────

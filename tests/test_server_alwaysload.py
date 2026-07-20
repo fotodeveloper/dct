@@ -6,7 +6,7 @@ Session-edge and specialist tools stay deferred (frugal split).
 
 import asyncio
 
-from dct.server import mcp, _ALWAYS_LOAD_TOOLS
+from dct.mcp.server import mcp, _ALWAYS_LOAD_TOOLS
 
 # The exact mid-session hot-set (#349): item + checkpoint lifecycle plus the
 # changelog add. Session-edge tools (pickup/handoff/release) are deferred.

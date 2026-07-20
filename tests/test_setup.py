@@ -1,6 +1,6 @@
 """Tests for the dct init installer (setup.py)."""
 
-import dct.setup as setup
+import dct.integrations.claude as setup
 
 _ALL_HOOKS = [
     "dct-check-changelog.sh",

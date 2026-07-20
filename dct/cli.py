@@ -163,7 +163,7 @@ def cmd_init(args):
             break
 
     # Install hook, skills, and register MCP server (user scope)
-    from dct.setup import install_hook, install_skills, register_mcp
+    from dct.integrations.claude import install_hook, install_skills, register_mcp
 
     ok, msg = register_mcp(config)
     if ok:
@@ -186,7 +186,7 @@ def cmd_init(args):
         else:
             wire = False
     if wire:
-        from dct.setup import wire_hooks_into_settings
+        from dct.integrations.claude import wire_hooks_into_settings
         try:
             result = wire_hooks_into_settings()
         except ValueError as e:
@@ -209,7 +209,7 @@ def cmd_init(args):
 # ── Hooks commands ────────────────────────────────────────────────────────────
 
 def cmd_hooks_wire(args):
-    from dct.setup import wire_hooks_into_settings
+    from dct.integrations.claude import wire_hooks_into_settings
 
     try:
         result = wire_hooks_into_settings(settings_path=args.settings)
@@ -1060,7 +1060,7 @@ def cmd_sprint_update(args):
 
 def cmd_server(args):
     try:
-        from dct.server import mcp
+        from dct.mcp.server import mcp
     except ImportError as e:
         print(
             f"MCP server requires extras. Install with: pip install 'dct[mcp]'\n  (or reinstall: uv tool install --editable . --with 'mcp[cli]')\nOriginal error: {e}",
@@ -1101,7 +1101,7 @@ def cmd_upgrade(args):
 
     # Refresh Claude Code integration: re-link current skills/hooks (idempotent),
     # then remove links to skills/hooks that the new package no longer ships.
-    from dct.setup import install_hook, install_skills, prune_dangling_symlinks
+    from dct.integrations.claude import install_hook, install_skills, prune_dangling_symlinks
 
     linked_ok = True
     removed: list[str] = []

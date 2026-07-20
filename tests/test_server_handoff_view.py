@@ -11,7 +11,7 @@ with server._get_engine monkeypatched onto the in-memory fixture engine.
 
 import pytest
 
-from dct import server as S
+from dct.mcp import server as S
 from dct.core.projects import create_project
 
 

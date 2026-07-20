@@ -30,7 +30,11 @@ uv run --no-project --with 'mcp[cli]' --with sqlalchemy --with 'psycopg[binary]'
 ## Architecture
 
 ```
-dct/config.py            — Config loading (~/.claude/dct.toml + env var)
+dct/config.py            — Config loading (platform config dir + legacy
+                           ~/.claude fallback + env vars; ADR #52)
+dct/paths.py             — Platform-neutral config/data/cache/state dirs
+                           (XDG on POSIX, platformdirs on Windows)
+dct/migrate.py           — dct migrate-home (legacy → platform-neutral home)
 dct/db.py                — SQLAlchemy Core tables + engine factory + migrations
 dct/core/projects.py     — Projects CRUD (+ realpath-canonical CWD detection)
 dct/core/items.py        — Items / notes / checkpoints CRUD
@@ -44,11 +48,18 @@ dct/core/checkpoints.py  — Item checkpoint helpers
 dct/core/ids.py          — ULID generation
 dct/core/plans/          — Plans subsystem: parser.py (pure MD parser),
                            classify.py (claude --print), crud.py, ingest.py
+dct/services/            — Service layer (G1 workflow ops land here)
+dct/workflows/           — Workflow orchestration layer (G1)
+dct/mcp/server.py        — FastMCP MCP server (49 tools); dct/server.py is
+                           a compat shim
 dct/cli.py               — argparse CLI entry point
-dct/server.py            — FastMCP MCP server (49 tools)
 dct/export.py            — Keep a Changelog MD export
-dct/setup.py             — Init workflow: MCP registration, skill/hook symlinks,
-                           settings.json hook auto-wiring (`dct hooks wire`)
+dct/integrations/claude.py — Claude Code adapter: MCP registration, skill/hook
+                           symlinks, settings.json wiring (`dct hooks wire`);
+                           dct/setup.py is a compat shim
+dct/assets/              — Indirection for packaged asset dirs (physical
+                           skills/ + hooks/ stay put until 2.0.0 — host
+                           symlinks point into them)
 dct/web/                 — Read-only Flask dashboard (dct web)
 dct/skills/              — Packaged Claude Code skills (symlinked by dct init)
 dct/hooks/               — Packaged Claude Code hooks (symlinked by dct init)

@@ -13,7 +13,7 @@ import json
 
 import pytest
 
-from dct.setup import HOOK_WIRING, wire_hooks_into_settings
+from dct.integrations.claude import HOOK_WIRING, wire_hooks_into_settings
 
 ALL_HOOK_NAMES = [spec["script"] for spec in HOOK_WIRING]
 

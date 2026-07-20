@@ -14,7 +14,7 @@ import time
 import pytest
 
 import dct.cli as cli
-import dct.setup as setup
+import dct.integrations.claude as setup
 import dct.update as update
 from dct.config import Config, UpdateConfig, save_config, load_config
 

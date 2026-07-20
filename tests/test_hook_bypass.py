@@ -11,7 +11,7 @@ import subprocess
 
 import pytest
 
-from dct.setup import HOOKS_DIR
+from dct.integrations.claude import HOOKS_DIR
 
 HOOK_PATH = HOOKS_DIR / "check-changelog.sh"
 
