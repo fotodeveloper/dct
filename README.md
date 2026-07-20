@@ -123,13 +123,13 @@ dct init
 
 The interactive wizard walks through the one-time global bootstrap:
 
-1. **Database backend** — `sqlite` (default, zero setup at `~/.claude/dct.db`) or `postgresql` (you supply the URL). It test-connects before saving.
+1. **Database backend** — `sqlite` (default, zero setup at the platform data dir, e.g. `~/.local/share/dctools/dct.db`) or `postgresql` (you supply the URL). It test-connects before saving.
 2. **Register projects** — for each project it asks slug / path / name, then **auto-detects the version** from `VERSION`, `pyproject.toml`, `package.json`, `Cargo.toml`, or `src-tauri/tauri.conf.json`. If none matches, you get an interactive prompt (`0.0.1` / `0.1.0` / `1.0.0` shortcuts); in non-tty contexts it stores `current_version=NULL` and reminds you to set it later. Register more any time with `dct project add`.
 3. **MCP server** — registered at **user scope** in `~/.claude.json` (via `claude mcp add --scope user`, with a direct-edit fallback), so `/track`, `/clog`, `/release`, and the MCP tools are available in **every** Claude Code session, from any directory.
 4. **Skills + hooks** — symlinks the skills into `~/.claude/skills/` and the four hooks into `~/.claude/hooks/`. Both ship inside the package; with an editable/dev install the symlinks point at the repo, so a fix goes live without reinstall.
 5. **Hook wiring** — with your consent, merges the hooks into `~/.claude/settings.json`. The merge is idempotent, backs up the file before the first write, and never touches hooks you already have. Re-run any time with `dct hooks wire`.
 
-`dct init` writes `~/.claude/dct.toml`, `~/.claude.json` (MCP entry), the skill/hook symlinks, and (opt-in) the settings.json wiring — see [docs/architecture.md](docs/architecture.md) for the full config reference and scope model.
+`dct init` writes the config to the platform config dir (`~/.config/dctools/dct.toml`; existing `~/.claude/dct.toml` installs keep working — `dct migrate-home` moves them), `~/.claude.json` (MCP entry), the skill/hook symlinks, and (opt-in) the settings.json wiring — see [docs/architecture.md](docs/architecture.md) for the full config reference and scope model.
 
 ### Your first session
 
@@ -160,7 +160,7 @@ happens in the conversation you're already having.
 
 ### Updating
 
-dct runs a passive, offline-safe update check — a cached PyPI probe (refreshed at most once a day, never blocking) surfaces a one-line "newer release available" nudge on the CLI and in the MCP server instructions. Opt out with `[update] check = false` in `~/.claude/dct.toml`. When a newer version exists:
+dct runs a passive, offline-safe update check — a cached PyPI probe (refreshed at most once a day, never blocking) surfaces a one-line "newer release available" nudge on the CLI and in the MCP server instructions. Opt out with `[update] check = false` in the dct config file (`dct config path` shows where it lives). When a newer version exists:
 
 ```bash
 dct upgrade    # detects install method (uv tool / pipx / pip), upgrades, re-links skills + hooks
@@ -218,7 +218,8 @@ dct sprint activate 3                 # Shortcuts: activate / complete / defer
 dct handoff update 12 --prompt "Wire the toggle into settings next"
 
 # Config
-dct config get mirror.task_to_dct     # Read a dotted key from ~/.claude/dct.toml
+dct config get integrations.claude.task_mirror   # Read a dotted config key
+dct config path                       # Show resolved config/data locations
 ```
 
 ## MCP Tools
@@ -258,7 +259,7 @@ dct web status              # show pid + URL
 dct web stop                # SIGTERM the daemon
 ```
 
-If the preferred port (default `8787`) is busy, the daemon auto-selects the next free port (disable with `--no-fallback`). Configure defaults under `[web]` in `~/.claude/dct.toml`.
+If the preferred port (default `8787`) is busy, the daemon auto-selects the next free port (disable with `--no-fallback`). Configure defaults under `[web]` in the dct config file.
 
 ![dct web viewer — read-only dashboard over all registered projects](docs/assets/web-viewer.png)
 
@@ -303,11 +304,11 @@ Manual wiring reference (full JSON) and the five rules every dct hook follows: [
 
 ## Configuration
 
-dct reads `~/.claude/dct.toml`. The minimal config is just the database URL:
+dct reads its config from the platform config dir — `~/.config/dctools/dct.toml` on Linux and macOS, `%LOCALAPPDATA%\dctools\dct.toml` on Windows — with a permanent fallback to a legacy `~/.claude/dct.toml` (run `dct migrate-home` to move an old install). The minimal config is just the database URL:
 
 ```toml
 [database]
-url = "sqlite:////Users/you/.claude/dct.db"
+url = "sqlite:////home/you/.local/share/dctools/dct.db"
 # or: url = "postgresql+psycopg://localhost:5432/dct"
 ```
 
@@ -316,7 +317,7 @@ The `DCT_DATABASE_URL` environment variable overrides `[database].url`. For the 
 ## Testing
 
 ```bash
-.venv/bin/pytest -q                    # All tests (823)
+.venv/bin/pytest -q                    # All tests (936)
 .venv/bin/pytest tests/test_plan_parser.py -v          # Parser only
 .venv/bin/pytest tests/test_plan_ingest.py -v          # Ingest + sticky-resolved semantics
 

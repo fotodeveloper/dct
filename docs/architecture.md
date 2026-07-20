@@ -8,7 +8,7 @@ dct is a **cross-project tool** — every surface is user-scoped, not per-projec
 
 | Artefact | Location | Mechanism |
 |---|---|---|
-| Database config | `~/.claude/dct.toml` | TOML read by `load_config()` |
+| Database config | platform config dir (`~/.config/dctools/dct.toml`; legacy `~/.claude/dct.toml` fallback) | TOML read by `load_config()`; `dct config path` shows the resolved location |
 | Database | SQLite file or PostgreSQL | `[database].url` or `DCT_DATABASE_URL` |
 | MCP server | `~/.claude.json` | `claude mcp add --scope user` |
 | Skills | `~/.claude/skills/<name>` | Symlinks → `<dct_root>/skills/<name>` |
@@ -52,7 +52,7 @@ Schema updates run on the first engine bootstrap of a new-code session — verif
 
 ## Configuration
 
-### `~/.claude/dct.toml`
+### The dct config file (`dct.toml`)
 
 The full reference (all sections; `dct init` writes a subset with sensible defaults):
 
@@ -106,7 +106,7 @@ from old files but never written.
 ### Update check (`dct/update.py`)
 
 `dct/update.py` implements a passive, offline-safe update check (#356). A cheap
-`check_for_update()` reads a 24h on-disk cache (`~/.claude/dct-update-check.json`);
+`check_for_update()` reads a 24h on-disk cache (`dct-update-check.json` in the platform cache dir, e.g. `~/.cache/dctools/`);
 when stale it spawns a daemon thread that queries PyPI (2s timeout) and rewrites
 the cache — it never blocks and never raises. `get_cached_notice()` is a pure
 cache read (zero network) that returns a one-line "newer release available" notice
