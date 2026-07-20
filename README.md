@@ -317,7 +317,7 @@ The `DCT_DATABASE_URL` environment variable overrides `[database].url`. For the 
 ## Testing
 
 ```bash
-.venv/bin/pytest -q                    # All tests (938)
+.venv/bin/pytest -q                    # All tests (948)
 .venv/bin/pytest tests/test_plan_parser.py -v          # Parser only
 .venv/bin/pytest tests/test_plan_ingest.py -v          # Ingest + sticky-resolved semantics
 
