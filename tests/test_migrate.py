@@ -99,14 +99,18 @@ def test_execute_moves_config_db_and_rewrites_url(fake_home):
     assert any("dct.db" in m for m in messages)
 
 
-def test_execute_moves_db_sidecars(fake_home):
+def test_execute_consolidates_db_sidecars(fake_home):
+    """Sidecars are consolidated into the snapshot, never copied: the target
+    is a standalone db, and the legacy WAL/SHM files are removed with it."""
     legacy = _legacy_install(fake_home, with_db=True)
     (legacy / "dct.db-wal").write_text("wal")
     (legacy / "dct.db-shm").write_text("shm")
     migrate.execute_migration(migrate.plan_migration())
-    assert (paths.data_dir() / "dct.db-wal").read_text() == "wal"
-    assert (paths.data_dir() / "dct.db-shm").read_text() == "shm"
+    assert (paths.data_dir() / "dct.db").exists()
+    assert not (paths.data_dir() / "dct.db-wal").exists()
+    assert not (paths.data_dir() / "dct.db-shm").exists()
     assert not (legacy / "dct.db-wal").exists()
+    assert not (legacy / "dct.db-shm").exists()
 
 
 def test_execute_writes_breadcrumb(fake_home):
@@ -235,3 +239,171 @@ def test_rerun_after_partial_stage_converges(fake_home):
     assert load_config().database_url == paths.sqlite_url(leftover)
     assert not (legacy / "dct.db").exists()      # converged: legacy cleaned
     assert not (legacy / "dct.toml").exists()
+
+
+# ── Codex re-review findings (commit d4f3c4c) — round-2 regression scenarios ─
+
+
+def test_rewrite_limited_to_database_section(fake_home):
+    """R2-P1: an identical url value in ANOTHER section (e.g. [backup]) must
+    not swallow the rewrite — only [database].url changes."""
+    legacy = fake_home / ".claude"
+    legacy.mkdir()
+    db = legacy / "dct.db"
+    db.write_text("sqlite-bytes")
+    old = f"sqlite:///{db}"
+    (legacy / "dct.toml").write_text(
+        f'[backup]\nurl = "{old}"\n\n[database]\nurl = "{old}"\n'
+    )
+    migrate.execute_migration(migrate.plan_migration())
+    content = (paths.config_dir() / "dct.toml").read_text()
+    new_url = paths.sqlite_url(paths.data_dir() / "dct.db")
+    assert f'[backup]\nurl = "{old}"' in content          # other section intact
+    assert f'[database]\nurl = "{new_url}"' in content
+    assert load_config().database_url == new_url
+
+
+def test_rewrite_handles_single_quoted_literal_url(fake_home):
+    """R2-P2: a TOML literal string url = '…' parses fine, so the rewrite
+    must handle it instead of stranding the database."""
+    legacy = fake_home / ".claude"
+    legacy.mkdir()
+    db = legacy / "dct.db"
+    db.write_text("sqlite-bytes")
+    (legacy / "dct.toml").write_text(f"[database]\nurl = 'sqlite:///{db}'\n")
+    migrate.execute_migration(migrate.plan_migration())
+    assert load_config().database_url == paths.sqlite_url(paths.data_dir() / "dct.db")
+    assert not db.exists()
+
+
+def test_commit_success_survives_tmp_cleanup_failure(tmp_path, monkeypatch):
+    """R2-P1: a failing unlink of the .migrating temp AFTER a successful
+    os.link must still report success — else rollback deletes a database the
+    already-published config points at."""
+    from pathlib import Path as _P
+
+    dst = tmp_path / "out.txt"
+    tmp = tmp_path / "out.txt.migrating"
+    tmp.write_text("content")
+    real_unlink = _P.unlink
+
+    def flaky_unlink(self, *a, **k):
+        if self.name.endswith(".migrating"):
+            raise OSError("file locked by antivirus")
+        return real_unlink(self, *a, **k)
+
+    monkeypatch.setattr(_P, "unlink", flaky_unlink)
+    assert migrate._commit(tmp, dst) is True
+    assert dst.read_text() == "content"
+
+
+def test_parallel_migrations_are_serialized(fake_home):
+    """R2-P1: a second migrate-home while one holds the lock must abort
+    without touching anything."""
+    import fcntl
+
+    _legacy_install(fake_home, with_db=True)
+    lock_path = paths.data_dir() / ".migrate-home.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    holder = open(lock_path, "w")
+    fcntl.flock(holder, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    try:
+        messages = migrate.execute_migration(migrate.plan_migration())
+        assert any("another" in m for m in messages)
+        assert (fake_home / ".claude" / "dct.toml").exists()   # untouched
+        assert not (paths.config_dir() / "dct.toml").exists()
+    finally:
+        holder.close()
+
+
+def test_env_pinned_config_is_never_migrated(fake_home, monkeypatch):
+    """R2-P1: with DCT_CONFIG_PATH pointing at the legacy file, moving it
+    would break resolution (env wins unconditionally) — the planner must not
+    plan config/database steps at all."""
+    legacy = _legacy_install(fake_home, with_db=True)
+    monkeypatch.setenv("DCT_CONFIG_PATH", str(legacy / "dct.toml"))
+    kinds = {s.kind for s in migrate.plan_migration()}
+    assert "config" not in kinds and "database" not in kinds
+
+
+def test_plan_resumes_cache_and_state_leftovers(fake_home):
+    """R2-P2: a byte-identical cache/state target left by a crashed run must
+    still be planned so the legacy source finally gets removed."""
+    import shutil as _shutil
+
+    legacy = _legacy_install(fake_home, url="postgresql://h/db", with_cache=True)
+    leftover = paths.cache_dir() / "dct-update-check.json"
+    leftover.parent.mkdir(parents=True)
+    _shutil.copy2(legacy / "dct-update-check.json", leftover)
+    migrate.execute_migration(migrate.plan_migration())
+    assert not (legacy / "dct-update-check.json").exists()   # converged
+
+
+def test_sqlite_snapshot_reads_through_wal(fake_home):
+    """R2-P1: rows living only in an un-checkpointed WAL must reach the
+    migrated database (consistent snapshot, not a raw file copy)."""
+    import sqlite3
+
+    legacy = fake_home / ".claude"
+    legacy.mkdir()
+    db = legacy / "dct.db"
+    con = sqlite3.connect(db)
+    con.execute("PRAGMA journal_mode=WAL")
+    con.execute("CREATE TABLE t (v TEXT)")
+    con.execute("INSERT INTO t VALUES ('wal-only-row')")
+    con.commit()          # committed, but sits in the WAL — no checkpoint yet
+    assert (legacy / "dct.db-wal").exists()
+    (legacy / "dct.toml").write_text(f'[database]\nurl = "sqlite:///{db}"\n')
+
+    migrate.execute_migration(migrate.plan_migration())
+
+    target = paths.data_dir() / "dct.db"
+    # Sidecar check BEFORE opening the target — a read connection to a
+    # WAL-mode db creates fresh -wal/-shm files itself.
+    assert not (paths.data_dir() / "dct.db-wal").exists()  # consolidated
+    reader = sqlite3.connect(target)
+    assert reader.execute("SELECT v FROM t").fetchall() == [("wal-only-row",)]
+    reader.close()
+    con.close()
+
+
+def test_fixup_converges_stranded_db(fake_home):
+    """Convergence: new config exists but its url still points at a legacy
+    sqlite db (any earlier cancel path) — a re-run must finish the job."""
+    legacy = fake_home / ".claude"
+    legacy.mkdir()
+    db = legacy / "dct.db"
+    db.write_text("sqlite-bytes")
+    new_cfg = paths.config_dir() / "dct.toml"
+    new_cfg.parent.mkdir(parents=True)
+    new_cfg.write_text(f'[database]\nurl = "sqlite:///{db}"\n')
+
+    kinds = [s.kind for s in migrate.plan_migration()]
+    assert "database" in kinds and "config_fixup" in kinds
+    migrate.execute_migration(migrate.plan_migration())
+
+    new_db = paths.data_dir() / "dct.db"
+    assert new_db.read_text() == "sqlite-bytes"
+    assert not db.exists()
+    assert load_config().database_url == paths.sqlite_url(new_db)
+
+
+def test_fixup_replaces_stale_orphan_target(fake_home):
+    """Convergence: a NON-identical dst leftover is safe to replace in fixup
+    mode — the new config's url proves it never became the live database."""
+    legacy = fake_home / ".claude"
+    legacy.mkdir()
+    db = legacy / "dct.db"
+    db.write_text("current-bytes")
+    stale = paths.data_dir() / "dct.db"
+    stale.parent.mkdir(parents=True)
+    stale.write_text("stale-orphan-from-crashed-run")
+    new_cfg = paths.config_dir() / "dct.toml"
+    new_cfg.parent.mkdir(parents=True)
+    new_cfg.write_text(f'[database]\nurl = "sqlite:///{db}"\n')
+
+    migrate.execute_migration(migrate.plan_migration())
+
+    assert (paths.data_dir() / "dct.db").read_text() == "current-bytes"
+    assert not db.exists()
+    assert load_config().database_url == paths.sqlite_url(paths.data_dir() / "dct.db")

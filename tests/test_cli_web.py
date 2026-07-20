@@ -159,3 +159,19 @@ def test_read_pidfile_falls_back_when_new_file_malformed(tmp_path, monkeypatch):
     legacy.parent.mkdir(parents=True)
     legacy.write_text("4242\nhttp://localhost:8787\n")
     assert cli._read_pidfile() == (4242, "http://localhost:8787")
+
+
+def test_read_pidfile_survives_undecodable_bytes(tmp_path, monkeypatch):
+    """R2-P2: undecodable bytes in the new pidfile must fall back to legacy
+    instead of raising out of web status/stop."""
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("XDG_STATE_HOME", raising=False)
+    new = home / ".local" / "state" / "dctools" / "dct-web.pid"
+    new.parent.mkdir(parents=True)
+    new.write_bytes(b"\xff\xfe\x00garbage")
+    legacy = home / ".claude" / "dct-web.pid"
+    legacy.parent.mkdir(parents=True)
+    legacy.write_text("4242\nhttp://localhost:8787\n")
+    assert cli._read_pidfile() == (4242, "http://localhost:8787")

@@ -1200,9 +1200,12 @@ def _detach_stdio(logfile: Path | None = None) -> None:
 
 
 def _parse_pidfile(path: Path) -> "tuple[int, str] | None":
-    if not path.exists():
+    try:
+        lines = path.read_text().splitlines()
+    except (OSError, UnicodeDecodeError, ValueError):
+        # Missing, unreadable, or undecodable — all mean "no usable pidfile";
+        # raising here would crash web status/stop and mask a legacy daemon.
         return None
-    lines = path.read_text().splitlines()
     if not lines:
         return None
     try:
