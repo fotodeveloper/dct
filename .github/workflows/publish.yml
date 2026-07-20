@@ -11,13 +11,19 @@ on:
     tags: ["v*"]
 
 jobs:
+  # Keep this matrix identical to ci.yml's. A narrower gate here published
+  # 1.2.0 while CI was red on 3.11 — the release gate must never be weaker
+  # than the branch gate.
   test:
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: ${{ matrix.python-version }}
       - run: python -m pip install -e '.[all]'
       - run: pytest -q
 

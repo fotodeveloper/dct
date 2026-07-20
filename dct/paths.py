@@ -100,4 +100,9 @@ def default_db_path() -> Path:
 
 
 def sqlite_url(path: PurePath | str) -> str:
-    return f"sqlite:///{PurePath(path).as_posix()}"
+    # Honor the caller's flavour instead of re-wrapping: PurePath() re-flavours
+    # a PureWindowsPath to PurePosixPath on POSIX hosts, where the drive then
+    # survives as a literal "C:\\" segment on 3.11 (3.13+ normalizes it away) —
+    # that made the forward-slash guarantee depend on the Python version.
+    pure = path if isinstance(path, PurePath) else PurePath(path)
+    return f"sqlite:///{pure.as_posix()}"
