@@ -94,6 +94,20 @@ def get_project(engine: sa.Engine, slug: str) -> dict | None:
         return row_to_dict(row) if row else None
 
 
+def _path_is_within(target: str, stored: str, *, normcase=os.path.normcase,
+                    sep=os.sep) -> bool:
+    """Case- and separator-aware path containment (W4, ADR #52).
+
+    The previous hardcoded '/' + case-sensitive compare silently disabled
+    CWD auto-detection on Windows — every project subdir failed to resolve,
+    no-oping the hooks and every project='' MCP call. os.path.normcase is a
+    no-op on POSIX and lowercases + flips '/'→'\\\\' on Windows, fixing both
+    mismatches in one call. normcase/sep are injectable so the Windows
+    semantics are testable from POSIX (ntpath.normcase + '\\\\')."""
+    t, s = normcase(target), normcase(stored)
+    return t == s or t.startswith(s.rstrip(sep) + sep)
+
+
 def get_project_by_path(engine: sa.Engine, path: str) -> dict | None:
     """Find the project whose registered path is a prefix of `path`.
 
@@ -116,7 +130,7 @@ def get_project_by_path(engine: sa.Engine, path: str) -> dict | None:
         matches = []
         for r in rows:
             stored = os.path.realpath(r._mapping["path"])
-            if target == stored or target.startswith(stored.rstrip("/") + "/"):
+            if _path_is_within(target, stored):
                 matches.append((r, len(stored)))
         if not matches:
             return None

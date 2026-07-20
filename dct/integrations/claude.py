@@ -12,6 +12,24 @@ from pathlib import Path
 from dct import assets
 from dct.config import Config
 
+
+def _link_or_copy(src: Path, dst: Path) -> None:
+    """Symlink dst → src; on OSError fall back to a real copy (W5: Windows
+    without Developer Mode / SeCreateSymbolicLinkPrivilege raises
+    WinError 1314). Copies drift until the next `dct init` / `dct upgrade`
+    re-run — say so instead of failing the whole init."""
+    try:
+        dst.symlink_to(src)
+    except OSError:
+        if src.is_dir():
+            shutil.copytree(src, dst)
+        else:
+            shutil.copy2(src, dst)
+        print(
+            f"  note: symlinks unavailable — copied {src.name} instead "
+            "(copies drift; re-run `dct init` after upgrades)"
+        )
+
 SKILLS_DIR = assets.skills_dir()
 HOOKS_DIR = assets.hooks_dir()
 CLAUDE_SKILLS_DIR = Path.home() / ".claude" / "skills"
@@ -64,26 +82,35 @@ def register_mcp(config: Config) -> tuple[bool, str]:
     """
     server_cmd = ["dct", "server"]
 
-    if shutil.which("claude"):
-        cmd = ["claude", "mcp", "add", "dct", "--scope", "user", "--"] + server_cmd
-        result = subprocess.run(cmd, capture_output=True, text=True)
-        if result.returncode == 0:
-            return True, "registered via `claude mcp add --scope user`"
-        if "already exists" in (result.stderr + result.stdout).lower():
-            return True, "already registered"
+    claude_exe = shutil.which("claude")
+    if claude_exe:
+        cmd = [claude_exe, "mcp", "add", "dct", "--scope", "user", "--"] + server_cmd
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True)
+        except OSError:
+            # W6: on Windows `which` finds the claude.cmd shim via PATHEXT,
+            # but CreateProcess cannot exec a .cmd from an argv list — fall
+            # through to the direct edit instead of crashing dct init.
+            result = None
+        if result is not None:
+            if result.returncode == 0:
+                return True, "registered via `claude mcp add --scope user`"
+            if "already exists" in (result.stderr + result.stdout).lower():
+                return True, "already registered"
         # fall through to direct edit
 
-    # Fallback: direct ~/.claude.json edit
+    # Fallback: direct ~/.claude.json edit (UTF-8 both ways — W7: this file
+    # is the user's whole Claude Code config; a locale re-encode corrupts it)
     data = {}
     if CLAUDE_JSON.exists():
-        with open(CLAUDE_JSON) as f:
+        with open(CLAUDE_JSON, encoding="utf-8") as f:
             data = json.load(f)
     data.setdefault("mcpServers", {})["dct"] = {
         "type": "stdio",
         "command": server_cmd[0],
         "args": server_cmd[1:],
     }
-    with open(CLAUDE_JSON, "w") as f:
+    with open(CLAUDE_JSON, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
         f.write("\n")
     return True, "registered via direct ~/.claude.json edit"
@@ -131,7 +158,7 @@ def install_hook(config: Config | None = None) -> bool:
         # Replace any existing symlink OR a pre-#224 regular-file copy in place.
         if dst.is_symlink() or dst.exists():
             dst.unlink()
-        dst.symlink_to(src)
+        _link_or_copy(src, dst)
         installed += 1
 
     return installed > 0
@@ -162,7 +189,7 @@ def wire_hooks_into_settings(settings_path: Path | None = None) -> dict:
         settings_path = CLAUDE_SETTINGS
     settings_path = Path(settings_path)
 
-    raw = settings_path.read_text() if settings_path.exists() else None
+    raw = settings_path.read_text(encoding="utf-8") if settings_path.exists() else None
     if raw is None or not raw.strip():
         settings = {}
     else:
@@ -225,11 +252,11 @@ def wire_hooks_into_settings(settings_path: Path | None = None) -> dict:
             backup_path = settings_path.with_name(
                 f"{settings_path.name}.bak-dct-{stamp}"
             )
-            backup_path.write_text(raw)
+            backup_path.write_text(raw, encoding="utf-8")
             backup = str(backup_path)
         settings_path.parent.mkdir(parents=True, exist_ok=True)
         tmp_path = settings_path.with_name(settings_path.name + ".dct-tmp")
-        tmp_path.write_text(json.dumps(settings, indent=2, ensure_ascii=False) + "\n")
+        tmp_path.write_text(json.dumps(settings, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
         os.replace(tmp_path, settings_path)
 
     return {
@@ -299,7 +326,7 @@ def install_skills(config: Config | None = None) -> bool:
         elif dst.exists():
             continue  # don't overwrite non-symlink dirs
 
-        dst.symlink_to(src)
+        _link_or_copy(src, dst)
         installed += 1
 
     return installed > 0

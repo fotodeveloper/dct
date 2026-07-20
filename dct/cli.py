@@ -5,6 +5,7 @@ import atexit
 import os
 import signal
 import socket
+import subprocess
 import sys
 from pathlib import Path
 
@@ -12,6 +13,11 @@ from dct import __version__, migrate, paths
 from dct.config import load_config, save_config, Config
 from dct.db import get_engine, create_tables
 from dct.core.engine import bootstrap_engine
+
+# Windows-policy seam (tests flip it): dispatches the daemonization,
+# liveness-probe and signal paths that differ on win32 (W8-W10, ADR #52).
+_IS_WINDOWS = os.name == "nt"
+
 
 # ── web daemon runtime files (platform state dir, ADR #52) ───────────────────
 def _web_pidfile() -> Path:
@@ -1278,8 +1284,25 @@ def _clear_pidfile(path: Path | None = None) -> None:
             pass
 
 
+def _pid_alive_windows(pid: int) -> bool:
+    """Liveness via OpenProcess — os.kill(pid, 0) on Windows maps every
+    non-CTRL signal to TerminateProcess, so the POSIX probe would KILL the
+    daemon it is checking (W9)."""
+    import ctypes
+
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+    handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+    if not handle:
+        return False
+    kernel32.CloseHandle(handle)
+    return True
+
+
 def _pid_alive(pid: int) -> bool:
-    """True if a process with `pid` exists (signal 0 is a no-op probe)."""
+    """True if a process with `pid` exists (POSIX: signal 0 no-op probe)."""
+    if _IS_WINDOWS:
+        return _pid_alive_windows(pid)
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
@@ -1320,6 +1343,18 @@ def cmd_web_start(args):
 
     url = f"http://localhost:{port}"
 
+    if _IS_WINDOWS:
+        # W8: fork/setsid don't exist on Windows — detach a fresh interpreter
+        # running the internal `_web-serve` foreground entry instead.
+        pid = _spawn_windows_daemon(host, port)
+        _write_pidfile(pid, url)
+        print(f"✓ dct web started (pid {pid}) → {url}")
+        if open_browser:
+            import webbrowser
+
+            webbrowser.open(url)
+        return
+
     # Daemonize: parent records the child pid + URL and returns; child detaches
     # from the controlling terminal and serves. No tty needed — safe under CC/CI.
     pid = os.fork()
@@ -1343,6 +1378,34 @@ def cmd_web_start(args):
         os._exit(0)
 
 
+def _spawn_windows_daemon(host: str, port: int) -> int:
+    """Detached serve process for Windows (W8): DETACHED_PROCESS +
+    CREATE_NEW_PROCESS_GROUP replace the fork/setsid daemonization; stdio
+    goes to the web logfile like _detach_stdio does on POSIX."""
+    DETACHED_PROCESS = 0x00000008
+    CREATE_NEW_PROCESS_GROUP = 0x00000200
+    logfile = _web_logfile()
+    logfile.parent.mkdir(parents=True, exist_ok=True)
+    with open(logfile, "ab") as log:
+        proc = subprocess.Popen(
+            [sys.executable, "-m", "dct.cli", "_web-serve",
+             "--host", host, "--port", str(port)],
+            creationflags=DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP,
+            stdin=subprocess.DEVNULL, stdout=log, stderr=log,
+        )
+    return proc.pid
+
+
+def cmd_internal_web_serve(args):
+    """Foreground serve entry for the Windows daemon spawn (hidden)."""
+    from dct.core.engine import bootstrap_engine
+    from dct.web.app import create_app
+
+    engine = bootstrap_engine(create=False)  # READ-ONLY: never create_tables()
+    app = create_app(engine, read_only=True)
+    app.run(host=args.host, port=args.port, threaded=True, use_reloader=False)
+
+
 def cmd_web_stop(args):
     info = _read_pidfile()
     if not info:
@@ -1357,6 +1420,10 @@ def cmd_web_stop(args):
     except PermissionError:
         print(f"✗ No permission to signal pid {pid}", file=sys.stderr)
         sys.exit(1)
+    except OSError:
+        # W10: Windows raises plain OSError (e.g. WinError 87) for a missing
+        # pid — same stale-pidfile treatment as ProcessLookupError on POSIX.
+        print(f"  (pid {pid} not alive — clearing stale pidfile)")
     _clear_pidfile()
 
 
@@ -1405,6 +1472,10 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("server", help="Start the MCP server (stdio transport)")
 
     # upgrade (self-update + symlink refresh — #356)
+    p_web_serve = sub.add_parser("_web-serve")  # hidden: Windows daemon entry (W8)
+    p_web_serve.add_argument("--host", default="127.0.0.1")
+    p_web_serve.add_argument("--port", type=int, required=True)
+
     sub.add_parser(
         "upgrade",
         help="Upgrade dct (auto-detects uv tool / pipx / pip; guides editable installs) "
@@ -1713,6 +1784,7 @@ COMMAND_MAP = {
     "note": cmd_note,
     "delete": cmd_delete,
     "_task-mirror": cmd_internal_task_mirror,
+    "_web-serve": cmd_internal_web_serve,
 }
 
 HOOKS_COMMAND_MAP = {
