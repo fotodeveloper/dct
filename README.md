@@ -79,7 +79,7 @@ markdown, and makes the release commit.
 - **Decision records** — ADRs, sprint amendments, inline plan decisions with multi-anchor linkage
 - **LLM-assisted classification** — uncertain plan sections auto-resolved via `claude --print` (haiku by default)
 - **Passive autoscan hook** — PostToolUse hook re-scans plan-like files in background on every edit
-- **MCP server** — native Claude Code integration via FastMCP, 49 tools
+- **MCP server** — native Claude Code integration via FastMCP
 - **CLI** — fast `dct` command for hooks and scripts
 - **Skills** — Claude Code slash commands (`/track`, `/clog`, `/dct-import`, `/plan-status`, …)
 - **Soft deletes** — ledger pattern, nothing is ever lost
@@ -239,7 +239,7 @@ dct ships **49 MCP tools**, registered at user scope so they're callable from an
 | `reject_checkpoint` | Mark a checkpoint rejected (scope change) — ledger-preserving |
 | `add_changelog` | Add an unreleased changelog entry |
 
-Session-edge tools stay deferred: `get_handoff` (full handoff dict — untruncated prompt + context_summary), `create_handoff`, `set_sprint`, `release_changelog`, and more. Full categorized catalogue of all 49 tools: **[docs/mcp-tools.md](docs/mcp-tools.md)**.
+Session-edge tools stay deferred: `get_handoff` (full handoff dict — untruncated prompt + context_summary), `create_handoff`, `set_sprint`, `release_changelog`, and more. Full categorized catalogue: **[docs/mcp-tools.md](docs/mcp-tools.md)**.
 
 ## Plans, Roadmaps & Decisions
 
@@ -317,7 +317,7 @@ The `DCT_DATABASE_URL` environment variable overrides `[database].url`. For the 
 ## Testing
 
 ```bash
-.venv/bin/pytest -q                    # All tests (948)
+.venv/bin/pytest -q                    # All tests
 .venv/bin/pytest tests/test_plan_parser.py -v          # Parser only
 .venv/bin/pytest tests/test_plan_ingest.py -v          # Ingest + sticky-resolved semantics
 

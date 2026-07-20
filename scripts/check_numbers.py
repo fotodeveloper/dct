@@ -50,11 +50,12 @@ SITE_COUNTS = [
     (r"(\d+) hooks", "hooks", False),
 ]
 
-README_PATTERNS = [
-    (r"(\d+) MCP tools", "tools", False),
-    (r"(\d+) tools", "tools", False),
-    (r"All tests \((\d+)\)", "tests", False),
-]
+# README deliberately renders no volatile number. The test count used to sit in
+# a pytest comment, where it told the reader nothing and drifted on every commit
+# that added a test — which would have made this gate cry wolf in CI. What is
+# left changes only when a tool is added or removed, which is exactly the drift
+# worth failing a build over.
+README_PATTERNS = [(r"(\d+) MCP tools", "tools", False)]
 
 # Per-file contracts: exactly the numbers that page is expected to render.
 SITE_PATTERNS = {
@@ -133,6 +134,54 @@ def derive(repo: Path) -> dict[str, str]:
     }
 
 
+def render(value: str, approximate: bool) -> str:
+    """How a derived number should be written into a page.
+
+    Approximate targets lose their last digits rather than their tilde: the
+    "~" belongs to the surrounding prose (and to the pattern), so only the
+    digits are ever rewritten.
+    """
+    return str(int(value) // 10 * 10) if approximate else value
+
+
+def fix_file(path: Path, patterns, derived: dict[str, str]) -> list[str]:
+    """Rewrite drifted numbers in place. Returns one line per rewrite.
+
+    Only the capture group's span is replaced, so every other byte — including
+    the rest of the matched line — survives untouched. A pattern that matches
+    nothing raises before anything is written: a fix that silently covers only
+    part of a page is worse than none.
+    """
+    text = path.read_text(encoding="utf-8")
+
+    missing = [quantity for pattern, quantity, _ in patterns if not re.search(pattern, text)]
+    if missing:
+        raise ValueError(
+            f"{path}: nothing matches the {', '.join(missing)} pattern(s) — "
+            "refusing to write a partial fix"
+        )
+
+    rewrites: list[str] = []
+    for pattern, quantity, approximate in patterns:
+        want = render(derived[quantity], approximate)
+        scanned = text
+
+        def swap(match, quantity=quantity, want=want, scanned=scanned):
+            found = match.group(1)
+            if found == want:
+                return match.group(0)
+            line = scanned.count("\n", 0, match.start()) + 1
+            rewrites.append(f"{path}:{line}: {quantity} {found} → {want}")
+            start, end = (offset - match.start() for offset in match.span(1))
+            return match.group(0)[:start] + want + match.group(0)[end:]
+
+        text = re.sub(pattern, swap, text)
+
+    if rewrites:
+        path.write_text(text, encoding="utf-8")
+    return rewrites
+
+
 def check_file(path: Path, patterns, derived: dict[str, str]) -> tuple[int, list[str]]:
     """Returns (claims checked, problems) for one rendered file."""
     if not path.exists():
@@ -162,6 +211,11 @@ def main() -> int:
         type=Path,
         help="dc-tools checkout; without it only README.md is checked",
     )
+    parser.add_argument(
+        "--fix",
+        action="store_true",
+        help="rewrite drifted numbers in place, then report what remains",
+    )
     args = parser.parse_args()
 
     derived = derive(REPO)
@@ -170,6 +224,13 @@ def main() -> int:
     targets = [(REPO / "README.md", README_PATTERNS)]
     if args.site:
         targets += [(args.site / rel, pats) for rel, pats in SITE_PATTERNS.items()]
+
+    if args.fix:
+        try:
+            rewrites = [line for path, pats in targets if path.exists() for line in fix_file(path, pats, derived)]
+        except ValueError as refusal:
+            return sys.exit(str(refusal))
+        print("\n".join(rewrites) if rewrites else "nothing to rewrite")
 
     problems, checked = [], 0
     for path, patterns in targets:

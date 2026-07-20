@@ -92,14 +92,22 @@ def test_approximate_test_count_beyond_tolerance_fails(checker, full_page):
     assert "rendered as 820" in problems[0] and "source says 946" in problems[0]
 
 
-def test_exact_readme_count_tolerates_nothing(checker, tmp_path):
+def test_exact_readme_number_tolerates_nothing(checker, tmp_path):
+    """No tilde, no tolerance: an in-repo number is edited with the code."""
     readme = tmp_path / "README.md"
-    readme.write_text("49 MCP tools\n49 tools\nAll tests (945)\n", encoding="utf-8")
+    readme.write_text("Built for Claude Code (skills, hooks, 48 MCP tools).\n", encoding="utf-8")
 
     _, problems = checker.check_file(readme, checker.README_PATTERNS, DERIVED)
 
     assert len(problems) == 1
-    assert "rendered as 945" in problems[0] and "source says 946" in problems[0]
+    assert "rendered as 48" in problems[0] and "source says 49" in problems[0]
+
+
+def test_readme_carries_no_volatile_number(checker):
+    """The test count drifts on every commit; keeping it would make CI cry wolf."""
+    quantities = {quantity for _, quantity, _ in checker.README_PATTERNS}
+
+    assert "tests" not in quantities
 
 
 def test_version_drift_is_reported(checker, tmp_path):
@@ -141,3 +149,71 @@ def test_missing_file_is_reported(checker, tmp_path):
 
     assert checked == 0
     assert "missing" in problems[0]
+
+
+# --- --fix rewrites the numbers in place ---
+
+def test_fix_corrects_a_drifted_number(checker, tmp_path):
+    page = tmp_path / "llms.txt"
+    page.write_text("48 MCP tools, 13 skills, 4 hooks\n", encoding="utf-8")
+
+    rewrites = checker.fix_file(page, checker.SITE_COUNTS, DERIVED)
+
+    assert page.read_text(encoding="utf-8") == "49 MCP tools, 13 skills, 4 hooks\n"
+    assert len(rewrites) == 1
+    assert "48" in rewrites[0] and "49" in rewrites[0]
+
+
+def test_fix_touches_nothing_but_the_captured_span(checker, tmp_path):
+    page = tmp_path / "llms.txt"
+    before = "48 MCP tools, 13 skills, 4 hooks\nunrelated 48 elsewhere · 1948 · dcg: 17 tools\n"
+    page.write_text(before, encoding="utf-8")
+
+    checker.fix_file(page, checker.SITE_COUNTS, DERIVED)
+
+    after = page.read_text(encoding="utf-8")
+    assert after == before.replace("48 MCP tools", "49 MCP tools", 1)
+
+
+def test_fix_is_idempotent(checker, tmp_path):
+    page = tmp_path / "llms.txt"
+    page.write_text("48 MCP tools, 13 skills, 4 hooks\n", encoding="utf-8")
+
+    checker.fix_file(page, checker.SITE_COUNTS, DERIVED)
+    settled = page.read_text(encoding="utf-8")
+    second = checker.fix_file(page, checker.SITE_COUNTS, DERIVED)
+
+    assert second == []
+    assert page.read_text(encoding="utf-8") == settled
+
+
+def test_fix_refuses_when_a_pattern_matches_nothing(checker, tmp_path):
+    page = tmp_path / "llms.txt"
+    page.write_text("48 MCP tools, 13 skills\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="hooks"):
+        checker.fix_file(page, checker.SITE_COUNTS, DERIVED)
+
+    assert page.read_text(encoding="utf-8") == "48 MCP tools, 13 skills\n", "must not write a partial fix"
+
+
+def test_fix_writes_approximate_targets_with_a_tilde_rounded_down(checker, tmp_path):
+    page = tmp_path / "llms-full.txt"
+    page.write_text("(v1.2.1, available)\n49 MCP tools · 13 skills · 4 hooks · ~820 tests\n", encoding="utf-8")
+
+    checker.fix_file(page, checker.SITE_PATTERNS["public/llms-full.txt"], DERIVED)
+
+    assert "~940 tests" in page.read_text(encoding="utf-8"), "946 rounds down to 940, keeps the tilde"
+
+
+def test_fix_canonicalizes_an_approximation_the_check_tolerates(checker, tmp_path):
+    """check() is lenient so CI stays quiet; fix() normalizes to one rendering."""
+    page = tmp_path / "llms-full.txt"
+    page.write_text("(v1.2.1, available)\n49 MCP tools · 13 skills · 4 hooks · ~900 tests\n", encoding="utf-8")
+    patterns = checker.SITE_PATTERNS["public/llms-full.txt"]
+
+    _, problems = checker.check_file(page, patterns, DERIVED)
+    checker.fix_file(page, patterns, DERIVED)
+
+    assert problems == [], "~900 is within tolerance of 946"
+    assert "~940 tests" in page.read_text(encoding="utf-8")
