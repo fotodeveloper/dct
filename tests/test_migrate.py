@@ -589,3 +589,91 @@ def test_config_only_migration_survives_unwritable_data_dir(fake_home):
     (blocker / "dctools").write_text("a file where the data DIR should be")
     migrate.execute_migration(migrate.plan_migration())
     assert (paths.config_dir() / "dct.toml").exists()   # config still migrated
+
+
+# ── Codex round-4 findings (commit f7da3aa) ──────────────────────────────────
+
+
+def test_active_target_blocks_refresh_replace(fake_home):
+    """R4-P1: a target held open by ANY connection must never be os.replace'd
+    — the dst quiesce refuses (busy) and the unit cancels, sources intact."""
+    import shutil as _sh
+    import sqlite3
+
+    workdir = fake_home / "build"
+    workdir.mkdir()
+    legacy = fake_home / ".claude"
+    legacy.mkdir()
+    checkpointed_main = _build_wal_db(workdir, legacy, checkpoint_first=True)
+    dst = paths.data_dir() / "dct.db"
+    dst.parent.mkdir(parents=True)
+    _sh.copy2(checkpointed_main, dst)        # identical-to-main leftover…
+    holder = sqlite3.connect(dst)            # …that something now holds open
+    holder.execute("SELECT count(*) FROM sqlite_master").fetchone()
+    db = legacy / "dct.db"
+    (legacy / "dct.toml").write_text(f'[database]\nurl = "sqlite:///{db}"\n')
+    try:
+        messages = migrate.execute_migration(migrate.plan_migration())
+        assert any("in use" in m or "cancelled" in m for m in messages)
+        assert db.exists()                                   # legacy intact
+        assert (legacy / "dct.db-wal").exists()
+        assert dst.read_bytes() == checkpointed_main.read_bytes()  # not replaced
+    finally:
+        holder.close()
+
+
+def test_active_rollback_journal_orphan_blocks_replace(fake_home):
+    """R4-P1: fixup's replace license (config-url-proven-dead) is NOT enough
+    when something holds the target open — a rollback-journal target leaves
+    no sidecar tell-tale, so only quiescing dst itself can protect the rows
+    another process committed there between planning and replace."""
+    import sqlite3
+
+    legacy = fake_home / ".claude"
+    legacy.mkdir()
+    db = legacy / "dct.db"
+    db.write_text("legacy-bytes")            # stranded legacy (non-sqlite is fine)
+    dst = paths.data_dir() / "dct.db"
+    dst.parent.mkdir(parents=True)
+    active = sqlite3.connect(dst)            # rollback-journal by default
+    active.execute("CREATE TABLE t (v TEXT)")
+    active.execute("INSERT INTO t VALUES ('precious')")
+    active.commit()
+    new_cfg = paths.config_dir() / "dct.toml"
+    new_cfg.parent.mkdir(parents=True)
+    new_cfg.write_text(f'[database]\nurl = "sqlite:///{db}"\n')
+    try:
+        messages = migrate.execute_migration(migrate.plan_migration())
+        assert any("in use" in m or "cancelled" in m for m in messages)
+        assert db.exists()                                   # legacy intact
+        reader = sqlite3.connect(dst)
+        assert reader.execute("SELECT v FROM t").fetchall() == [("precious",)]
+        reader.close()
+    finally:
+        active.close()
+
+
+def test_windows_mode_releases_locks_before_unlink(fake_home, monkeypatch):
+    """R4-P2 seam: with _IS_WINDOWS the held sqlite locks are closed BEFORE
+    the phase-2 unlink — sqlite handles lack FILE_SHARE_DELETE on Windows,
+    so deleting under an open handle is a sharing violation and the legacy
+    db would be orphaned forever (config already flipped, nothing re-plans)."""
+    legacy = fake_home / ".claude"
+    legacy.mkdir()
+    db = legacy / "dct.db"
+    _real_db(db, ["row-1"]).close()
+    (legacy / "dct.toml").write_text(f'[database]\nurl = "sqlite:///{db}"\n')
+
+    seen = {}
+    real_release = migrate._release_locks
+
+    def spy(held):
+        seen["legacy_still_present_at_release"] = db.exists()
+        real_release(held)
+
+    monkeypatch.setattr(migrate, "_IS_WINDOWS", True)
+    monkeypatch.setattr(migrate, "_release_locks", spy)
+    migrate.execute_migration(migrate.plan_migration())
+
+    assert seen["legacy_still_present_at_release"] is True  # released BEFORE unlink
+    assert not db.exists()                                  # …and still cleaned up

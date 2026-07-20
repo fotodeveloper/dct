@@ -58,6 +58,23 @@ _SQLITE_PREFIX = "sqlite:///"
 _SQLITE_MAGIC = b"SQLite format 3\x00"
 _DB_SIDECAR_SUFFIXES = ("-wal", "-shm")
 
+# Phase-2 lock-release policy seam (tests flip it): on Windows the sqlite
+# handles must close BEFORE the legacy files are unlinked — sqlite does not
+# open with FILE_SHARE_DELETE, so unlinking under a held handle is a sharing
+# violation and the legacy db would be orphaned forever (the flipped config
+# means no later plan ever cleans it up). NOT used for the lock mechanics in
+# _migration_lock, which must always match the real platform.
+_IS_WINDOWS = os.name == "nt"
+
+
+def _release_locks(held: list) -> None:
+    for con in held:
+        try:
+            con.close()
+        except sqlite3.Error:
+            pass
+    held.clear()
+
 
 @dataclass(frozen=True)
 class MigrationStep:
@@ -214,18 +231,42 @@ def _run_backup(src_con: sqlite3.Connection, dst_con: sqlite3.Connection) -> Non
     src_con.backup(dst_con)
 
 
+def _quiesce_sqlite(path: Path) -> sqlite3.Connection | None:
+    """Exclusive-locking handle on a sqlite file, or None when busy/broken.
+
+    locking_mode=EXCLUSIVE + BEGIN IMMEDIATE/COMMIT retains the file lock
+    with NO open transaction (an open BEGIN EXCLUSIVE would deadlock the
+    backup API against itself). Writers get BUSY until the handle closes."""
+    con: sqlite3.Connection | None = None
+    try:
+        con = sqlite3.connect(path, timeout=0.5)
+        con.execute("PRAGMA locking_mode=EXCLUSIVE")
+        con.execute("BEGIN IMMEDIATE")
+        con.execute("COMMIT")
+        return con
+    except sqlite3.Error:
+        if con is not None:
+            con.close()
+        return None
+
+
 def _stage_raw_db(src: Path, dst: Path, allow_replace: bool) -> str | None:
     """Raw-copy staging for a non-sqlite 'database' file (empty/garbage)."""
     try:
         if dst.exists():
             if _identical(src, dst):
                 return "resumed"
-            if not allow_replace:
+            # A genuine sqlite database at the target is NEVER clobbered by
+            # a non-database source, fixup license or not (R4-P1).
+            if not allow_replace or _is_sqlite(dst):
                 return None
         dst.parent.mkdir(parents=True, exist_ok=True)
         tmp = dst.with_name(dst.name + ".migrating")
         shutil.copy2(src, tmp)
         if dst.exists():
+            if _is_sqlite(dst):
+                tmp.unlink(missing_ok=True)
+                return None
             os.replace(tmp, dst)
             return "replaced"
         if _commit(tmp, dst):
@@ -252,19 +293,8 @@ def _stage_db(
     if not _is_sqlite(src):
         return _stage_raw_db(src, dst, allow_replace), None
 
-    lock_con: sqlite3.Connection | None = None
-    try:
-        lock_con = sqlite3.connect(src, timeout=0.5)
-        # Writer quiesce WITHOUT an open transaction: exclusive locking mode
-        # retains the file lock after COMMIT, and the backup API can then
-        # read from this same connection (an open BEGIN EXCLUSIVE would make
-        # backup spin forever on SQLITE_BUSY against itself).
-        lock_con.execute("PRAGMA locking_mode=EXCLUSIVE")
-        lock_con.execute("BEGIN IMMEDIATE")
-        lock_con.execute("COMMIT")
-    except sqlite3.Error:
-        if lock_con is not None:
-            lock_con.close()
+    lock_con = _quiesce_sqlite(src)
+    if lock_con is None:
         return "busy", None
 
     try:
@@ -296,7 +326,24 @@ def _stage_db(
             lock_con.close()
             return None, None
         if dst.exists():
-            os.replace(tmp, dst)
+            # A target can be activated and written between the planning
+            # comparison and this point (R4-P1): quiesce it and re-verify
+            # the replace license — byte-identity with the source main —
+            # under that lock. Anything divergent or busy is refused.
+            dst_lock = _quiesce_sqlite(dst) if _is_sqlite(dst) else None
+            if _is_sqlite(dst) and dst_lock is None:
+                tmp.unlink(missing_ok=True)
+                lock_con.close()
+                return "busy", None
+            try:
+                if dst_lock is not None and not _identical(src, dst):
+                    tmp.unlink(missing_ok=True)
+                    lock_con.close()
+                    return None, None
+                os.replace(tmp, dst)
+            finally:
+                if dst_lock is not None:
+                    dst_lock.close()
             return "replaced", lock_con
         if _commit(tmp, dst):
             return "created", lock_con
@@ -522,9 +569,13 @@ def _run_phases(
             return messages
 
     # Phase 2 — the new home is complete; remove legacy sources. Failures
-    # here leave harmless duplicates, reported, never raised. The db lock
-    # (if any) is still held here, so no writer can commit into the legacy
-    # database between the snapshot and its removal.
+    # here leave harmless duplicates, reported, never raised. On POSIX the
+    # db lock (if any) is still held here, so no writer can commit into the
+    # legacy database between the snapshot and its removal; on Windows the
+    # handles must close first (no FILE_SHARE_DELETE) — the config has
+    # already flipped, so the writer window is closed either way.
+    if _IS_WINDOWS:
+        _release_locks(held_locks)
     for src in to_unlink:
         try:
             src.unlink()
