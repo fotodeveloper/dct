@@ -1059,6 +1059,9 @@ def cmd_sprint_update(args):
 # ── MCP server (stdio) ───────────────────────────────────────────────────────
 
 def cmd_server(args):
+    from dct.core.provenance import from_environment, set_provenance
+
+    set_provenance(from_environment("mcp"))
     try:
         from dct.mcp.server import mcp
     except ImportError as e:
@@ -1814,6 +1817,12 @@ def _maybe_nudge(args) -> None:
 
 
 def main():
+    # Creation-provenance context for every write this process makes
+    # (CP #1236). `dct server` re-stamps with source="mcp" in cmd_server.
+    from dct.core.provenance import from_environment, set_provenance
+
+    set_provenance(from_environment("cli"))
+
     parser = build_parser()
     args = parser.parse_args()
 

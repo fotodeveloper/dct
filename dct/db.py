@@ -9,7 +9,41 @@ from pathlib import Path
 import sqlalchemy as sa
 from sqlalchemy import event
 
+from dct.core.provenance import get_provenance
+
 metadata = sa.MetaData()
+
+# Names of the creation-provenance columns added to every mutating ledger
+# table (CP #1236). Single source of truth for the table defs, the
+# _apply_schema_updates migration, and tests.
+PROVENANCE_COLUMNS = ("actor_type", "actor_client", "session_id", "source")
+PROVENANCE_TABLES = (
+    "items",
+    "item_notes",
+    "item_checkpoints",
+    "changelog_entries",
+    "session_handoffs",
+    "sprints",
+    "decisions",
+    "plans",
+)
+
+
+def _provenance_columns() -> list:
+    """Fresh Column objects per table (Columns cannot be shared). The python
+    defaults read the entry-point ContextVar, so every Core INSERT records
+    who created the row with zero call-site changes. Nullable by design —
+    honest absence beats guessed attribution."""
+    return [
+        sa.Column("actor_type", sa.String(16),
+                  default=lambda: get_provenance().actor_type),
+        sa.Column("actor_client", sa.String(64),
+                  default=lambda: get_provenance().actor_client),
+        sa.Column("session_id", sa.String(128),
+                  default=lambda: get_provenance().session_id),
+        sa.Column("source", sa.String(16),
+                  default=lambda: get_provenance().source),
+    ]
 
 projects = sa.Table(
     "projects",
@@ -57,6 +91,7 @@ items = sa.Table(
     sa.Column("updated_at", sa.DateTime, nullable=False, server_default=sa.text("CURRENT_TIMESTAMP")),
     sa.Column("resolved_at", sa.DateTime),
     sa.Column("deleted_at", sa.DateTime),
+    *_provenance_columns(),
 )
 
 item_notes = sa.Table(
@@ -67,6 +102,7 @@ item_notes = sa.Table(
     sa.Column("note", sa.Text, nullable=False),
     sa.Column("created_at", sa.DateTime, nullable=False, server_default=sa.text("CURRENT_TIMESTAMP")),
     sa.Column("deleted_at", sa.DateTime),
+    *_provenance_columns(),
 )
 
 item_checkpoints = sa.Table(
@@ -86,6 +122,7 @@ item_checkpoints = sa.Table(
     sa.Column("created_at", sa.DateTime, nullable=False, server_default=sa.text("CURRENT_TIMESTAMP")),
     sa.Column("updated_at", sa.DateTime, nullable=False, server_default=sa.text("CURRENT_TIMESTAMP")),
     sa.Column("deleted_at", sa.DateTime),
+    *_provenance_columns(),
 )
 
 changelog_entries = sa.Table(
@@ -104,6 +141,7 @@ changelog_entries = sa.Table(
     sa.Column("updated_at", sa.DateTime, nullable=False, server_default=sa.text("CURRENT_TIMESTAMP")),
     sa.Column("released_at", sa.DateTime),
     sa.Column("deleted_at", sa.DateTime),
+    *_provenance_columns(),
 )
 
 session_handoffs = sa.Table(
@@ -119,6 +157,7 @@ session_handoffs = sa.Table(
     sa.Column("consumed_at", sa.DateTime),
     sa.Column("consumed_by", sa.String(200)),
     sa.Column("deleted_at", sa.DateTime),
+    *_provenance_columns(),
 )
 
 # ── v0.2.0 schema: plans / sprints / decisions ────────────────────────────────
@@ -138,6 +177,7 @@ sprints = sa.Table(
     sa.Column("created_at", sa.DateTime, nullable=False, server_default=sa.text("CURRENT_TIMESTAMP")),
     sa.Column("updated_at", sa.DateTime, nullable=False, server_default=sa.text("CURRENT_TIMESTAMP")),
     sa.Column("deleted_at", sa.DateTime),
+    *_provenance_columns(),
 )
 
 plans = sa.Table(
@@ -158,6 +198,7 @@ plans = sa.Table(
     sa.Column("updated_at", sa.DateTime, nullable=False, server_default=sa.text("CURRENT_TIMESTAMP")),
     sa.Column("archived_at", sa.DateTime),
     sa.Column("deleted_at", sa.DateTime),
+    *_provenance_columns(),
 )
 
 plan_sections = sa.Table(
@@ -231,6 +272,7 @@ decisions = sa.Table(
     sa.Column("created_at", sa.DateTime, nullable=False, server_default=sa.text("CURRENT_TIMESTAMP")),
     sa.Column("updated_at", sa.DateTime, nullable=False, server_default=sa.text("CURRENT_TIMESTAMP")),
     sa.Column("deleted_at", sa.DateTime),
+    *_provenance_columns(),
 )
 
 
@@ -435,6 +477,26 @@ def _apply_schema_updates(engine: sa.Engine) -> None:
                     "CREATE INDEX IF NOT EXISTS ix_checkpoints_pending_gate "
                     "ON item_checkpoints(item_id) "
                     "WHERE kind != 'task' AND status = 'pending' AND deleted_at IS NULL"
+                ))
+
+    # CP #1236 (ADR #52): creation-provenance columns on every mutating
+    # ledger. Purely additive and nullable — no backfill, no literal dance,
+    # portable ALTERs; each (table, column) pair heals independently, per
+    # this runner's docstring.
+    _PROV_SIZES = {"actor_type": 16, "actor_client": 64,
+                   "session_id": 128, "source": 16}
+    for prov_table in PROVENANCE_TABLES:
+        if prov_table not in inspector.get_table_names():
+            continue
+        existing = {c["name"] for c in inspector.get_columns(prov_table)}
+        missing = [c for c in PROVENANCE_COLUMNS if c not in existing]
+        if not missing:
+            continue
+        with engine.begin() as conn:
+            for col in missing:
+                conn.execute(sa.text(
+                    f"ALTER TABLE {prov_table} ADD COLUMN {col} "
+                    f"VARCHAR({_PROV_SIZES[col]})"
                 ))
 
     # v0.2.0 + #216: migrate the legacy `in_current_sprint` boolean into the
