@@ -1,6 +1,13 @@
 # Changelog
 
 
+## [1.2.1] - 2026-07-20
+
+### Fixed
+
+- fix(paths): sqlite_url honors the caller's path flavour instead of re-wrapping in PurePath() — on POSIX hosts that re-flavoured a PureWindowsPath to PurePosixPath, where the drive survived as a literal "C:\" segment on Python 3.11 (3.13+ normalizes it away), so the W3 forward-slash guarantee silently depended on the interpreter version; caught by CI on 3.11 only (green on the 3.14 dev box), and real Windows was never affected because PurePath() constructs PureWindowsPath there (core)
+- ci(publish): the release gate now runs the same 3.11/3.12/3.13 matrix as ci.yml — it previously tested a single version (3.12), so the v1.2.0 tag published to PyPI while CI was red on 3.11; a release gate weaker than the branch gate cannot catch what the branch gate catches (ci)
+
 ## [1.2.0] - 2026-07-20
 
 ### Added
