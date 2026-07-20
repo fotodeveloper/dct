@@ -153,14 +153,76 @@ def test_classify_passes_model_and_timeout_to_subprocess(monkeypatch):
 
 # ── Config wiring (light smoke — PlansConfig defaults reach classify) ────────
 
-def test_plans_config_defaults_align_with_classify_defaults():
-    """PlansConfig.classify_model must match classify.DEFAULT_MODEL.
+def test_classification_config_defaults_align_with_classify_defaults():
+    """ClassificationConfig defaults must match classify.DEFAULT_* (keys
+    moved from [plans] in the ADR #52 rename window).
 
     Guards against drift — if one is bumped, the other must follow. This
     is defense against the trap where the config says 'haiku-4-5' but
     classify falls back to a different model when called with defaults.
     """
-    from dct.config import PlansConfig
-    cfg = PlansConfig()
-    assert cfg.classify_model == classify.DEFAULT_MODEL
-    assert cfg.classify_timeout_seconds == classify.DEFAULT_TIMEOUT_SECONDS
+    from dct.config import ClassificationConfig
+    cfg = ClassificationConfig()
+    assert cfg.model == classify.DEFAULT_MODEL
+    assert cfg.timeout_seconds == classify.DEFAULT_TIMEOUT_SECONDS
+
+
+# ── CP #1257: config actually reaches the classifier (round-1 audit bug) ─────
+
+
+def test_ingest_threads_classification_config(tmp_path, monkeypatch, engine):
+    """plans.classify_* were parsed and documented but NEVER passed to
+    classify_uncertain (ingest.py:283) — a user override was silently
+    ignored. This asserts the config value flows into the call."""
+    import dct.core.plans.ingest as ingest_mod
+    from dct.config import Config, save_config
+    from dct.core.projects import create_project
+
+    captured = {}
+
+    def fake_classify(heading, parent_heading=None, preview="",
+                      model=None, timeout_seconds=None, **kw):
+        captured["model"] = model
+        captured["timeout_seconds"] = timeout_seconds
+        return "prose"
+
+    monkeypatch.setattr(ingest_mod.classify_mod, "classify_uncertain", fake_classify)
+
+    cfg = Config(database_url="sqlite:///x.db")
+    cfg.classification.model = "threaded-model"
+    cfg.classification.timeout_seconds = 5
+    cfg_path = tmp_path / "dct.toml"
+    save_config(cfg, cfg_path)
+    monkeypatch.setenv("DCT_CONFIG_PATH", str(cfg_path))
+
+    create_project(engine, slug="cls", name="Cls", path=str(tmp_path))
+    plan_md = tmp_path / "plan.md"
+    plan_md.write_text("# Plan\n\n## zagadkowa sekcja bez sygnału\n\ntekst\n")
+    ingest_mod.ingest_file(engine, str(plan_md), "cls", auto_resolve_uncertain=True)
+
+    assert captured.get("model") == "threaded-model"
+    assert captured.get("timeout_seconds") == 5
+
+
+def test_provider_disabled_skips_classifier(tmp_path, monkeypatch, engine):
+    import dct.core.plans.ingest as ingest_mod
+    from dct.config import Config, save_config
+    from dct.core.projects import create_project
+
+    called = []
+    monkeypatch.setattr(
+        ingest_mod.classify_mod, "classify_uncertain",
+        lambda *a, **k: called.append(1) or "prose",
+    )
+    cfg = Config(database_url="sqlite:///x.db")
+    cfg.classification.provider = "disabled"
+    cfg_path = tmp_path / "dct.toml"
+    save_config(cfg, cfg_path)
+    monkeypatch.setenv("DCT_CONFIG_PATH", str(cfg_path))
+
+    create_project(engine, slug="cls2", name="Cls2", path=str(tmp_path))
+    plan_md = tmp_path / "plan.md"
+    plan_md.write_text("# Plan\n\n## zagadkowa sekcja bez sygnału\n\ntekst\n")
+    ingest_mod.ingest_file(engine, str(plan_md), "cls2", auto_resolve_uncertain=True)
+
+    assert called == []

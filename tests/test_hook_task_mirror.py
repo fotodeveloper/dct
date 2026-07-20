@@ -122,12 +122,13 @@ def _run_worker(engine, monkeypatch, payload, *, mode="auto", cwd=None, project=
     silent-autodetect branch is exercised deterministically.
     """
     from dct import cli
-    from dct.config import Config, MirrorConfig
+    from dct.config import ClaudeIntegrationConfig, Config, IntegrationsConfig
 
     monkeypatch.setattr(cli, "_get_engine", lambda: engine)
     monkeypatch.setattr(
         "dct.config.load_config",
-        lambda: Config(mirror=MirrorConfig(task_to_dct=mode)),
+        lambda: Config(integrations=IntegrationsConfig(
+            claude=ClaudeIntegrationConfig(task_mirror=mode))),
     )
     if cwd is not None:
         monkeypatch.setattr("os.getcwd", lambda: cwd)
@@ -192,12 +193,13 @@ def test_worker_reads_session_id_from_payload(engine, seed_project, monkeypatch)
     """session_id travels in the payload now (shell no longer extracts it);
     an empty --session-id arg falls back to payload .session_id."""
     from dct import cli
-    from dct.config import Config, MirrorConfig
+    from dct.config import ClaudeIntegrationConfig, Config, IntegrationsConfig
 
     monkeypatch.setattr(cli, "_get_engine", lambda: engine)
     monkeypatch.setattr(
         "dct.config.load_config",
-        lambda: Config(mirror=MirrorConfig(task_to_dct="auto")),
+        lambda: Config(integrations=IntegrationsConfig(
+            claude=ClaudeIntegrationConfig(task_mirror="auto"))),
     )
     payload = (
         '{"tool_name":"TodoWrite","session_id":"from-payload",'

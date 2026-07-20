@@ -780,7 +780,7 @@ def cmd_internal_task_mirror(args):
 
     # Config gate (moved off the shell fast-path). auto → mirror; ask/off/
     # anything else → silent no-op.
-    mode = getattr(load_config().mirror, "task_to_dct", "auto") or "auto"
+    mode = load_config().integrations.claude.task_mirror or "auto"
     if mode != "auto":
         return
 
@@ -849,10 +849,38 @@ def cmd_internal_task_mirror(args):
     print(f"mirror ok: item #{item_id}, {len(todos)} checkpoint(s) added")
 
 
+def cmd_config_path(args):
+    """Print the resolved config/data/cache/state locations and their
+    sources (env / platform default / legacy) — the discoverability
+    companion of the dctools family dir (ADR #52, CP #1258)."""
+    cfg_path = paths.default_config_path()
+    if os.environ.get("DCT_CONFIG_PATH"):
+        cfg_src = "DCT_CONFIG_PATH env"
+    elif paths.is_legacy(cfg_path):
+        cfg_src = "legacy ~/.claude — run `dct migrate-home`"
+    else:
+        cfg_src = "platform default"
+    db_path = paths.default_db_path()
+    if os.environ.get("DCT_DATA_DIR"):
+        db_src = "DCT_DATA_DIR env"
+    elif paths.is_legacy(db_path):
+        db_src = "legacy ~/.claude — run `dct migrate-home`"
+    else:
+        db_src = "platform default"
+    print(f"config: {cfg_path}  [{cfg_src}]")
+    print(f"data:   {db_path}  [{db_src}]")
+    print(f"cache:  {paths.cache_dir()}")
+    print(f"state:  {paths.state_dir()}")
+    if os.environ.get("DCT_DATABASE_URL"):
+        print("database url: set via DCT_DATABASE_URL env (overrides everything)")
+
+
 def cmd_config_get(args):
     """Read a dotted config key — e.g. `dct config get mirror.task_to_dct`.
 
-    Supports: database.url, dct_root, plans.<field>, mirror.<field>.
+    Supports: database.url, dct_root, plans.<field>, classification.<field>,
+    integrations.claude.<field>, mirror.<field> (compat view), web.<field>,
+    update.<field>.
     Prints the value (or empty string for unset). Exit 1 on unknown key.
     """
     from dct.config import load_config
@@ -868,14 +896,21 @@ def cmd_config_get(args):
         print(cfg.dct_root)
         return
 
-    # Nested dataclass access
-    section, _, field_name = key.partition(".")
-    if not field_name:
+    # Nested dataclass access — arbitrary depth, so three-part paths like
+    # integrations.claude.task_mirror resolve too (ADR #52 sections).
+    parts = key.split(".")
+    if len(parts) < 2:
         print(f"✗ Unknown config key: '{key}'", file=sys.stderr)
         sys.exit(1)
 
-    obj = getattr(cfg, section, None)
-    if obj is None or not hasattr(obj, field_name):
+    obj = cfg
+    for part in parts[:-1]:
+        obj = getattr(obj, part, None)
+        if obj is None:
+            print(f"✗ Unknown config key: '{key}'", file=sys.stderr)
+            sys.exit(1)
+    field_name = parts[-1]
+    if not hasattr(obj, field_name):
         print(f"✗ Unknown config key: '{key}'", file=sys.stderr)
         sys.exit(1)
 
@@ -1543,6 +1578,10 @@ def build_parser() -> argparse.ArgumentParser:
     # config
     p_config = sub.add_parser("config", help="Inspect dct configuration")
     p_config_sub = p_config.add_subparsers(dest="config_command")
+    p_config_sub.add_parser(
+        "path",
+        help="Show resolved config/data/cache/state locations and their sources",
+    )
     p_config_get = p_config_sub.add_parser("get", help="Read a dotted config key")
     p_config_get.add_argument("key", help="e.g. mirror.task_to_dct, plans.auto_resolve_uncertain")
 
@@ -1706,6 +1745,7 @@ CLOG_COMMAND_MAP = {
 
 CONFIG_COMMAND_MAP = {
     "get": cmd_config_get,
+    "path": cmd_config_path,
 }
 
 WEB_COMMAND_MAP = {

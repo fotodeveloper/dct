@@ -52,24 +52,54 @@ def _toml_str(value: object) -> str:
 
 @dataclass
 class PlansConfig:
-    """[plans] section — v0.2.0 parser/classifier/hook behaviour."""
+    """[plans] section — parser/hook behaviour.
+
+    ADR #52 (1.2.0 rename window): classify_model / classify_timeout_seconds
+    moved to [classification]; surface_on_session_start and
+    discovery_include/exclude were deleted outright — they had ZERO code
+    consumers (round-1 audit), so nothing is aliased forward."""
     auto_resolve_uncertain: bool = True
-    classify_model: str = "claude-haiku-4-5-20251001"
-    classify_timeout_seconds: int = 30
-    surface_on_session_start: bool = False
-    discovery_include: list[str] = field(default_factory=list)
-    discovery_exclude: list[str] = field(default_factory=list)
+
+
+@dataclass
+class ClassificationConfig:
+    """[classification] section — pluggable uncertain-section classifier
+    (ADR #52, plan #12 §11; keys formerly [plans].classify_*).
+
+    provider: 'command' (default — shell out to `command`) or 'disabled'
+              (leave uncertain sections as-is). Other providers (rules/
+              openai/ollama/…) are G2 scope; an unknown value behaves as
+              'disabled' rather than silently shelling out.
+    command:  argv base for provider='command'.
+    """
+    provider: str = "command"
+    command: list[str] = field(default_factory=lambda: ["claude", "--print"])
+    model: str = "claude-haiku-4-5-20251001"
+    timeout_seconds: int = 30
+
+
+@dataclass
+class ClaudeIntegrationConfig:
+    """[integrations.claude] — the Claude Code adapter's knobs.
+
+    task_mirror (formerly [mirror].task_to_dct, permanently aliased):
+        'auto' mirrors every TaskCreate/TodoWrite into a session-scoped item
+        as kind='cc-task' checkpoints; 'ask' skips; 'off' disables the hook.
+    """
+    task_mirror: str = "auto"
+
+
+@dataclass
+class IntegrationsConfig:
+    claude: ClaudeIntegrationConfig = field(default_factory=ClaudeIntegrationConfig)
 
 
 @dataclass
 class MirrorConfig:
-    """[mirror] section — v0.4.0 TaskCreate ↔ dct integration.
-
-    task_to_dct: 'auto' mirrors every TaskCreate/TodoWrite into a session-scoped
-                 item as kind='cc-task' checkpoints (non-blocking).
-                 'ask'  skips mirror — Claude keeps TaskCreate and dct separate.
-                 'off'  disables the hook entirely.
-    """
+    """Compat view over integrations.claude.task_mirror — kept so the dotted
+    path `dct config get mirror.task_to_dct` (referenced by shipped hook
+    docs) keeps resolving. Populated from the SAME resolved value; never
+    written back to disk."""
     task_to_dct: str = "auto"
 
 
@@ -106,8 +136,12 @@ class UpdateConfig:
 @dataclass
 class Config:
     database_url: str = ""
-    dct_root: str = ""  # absolute path to the dct repo (for MCP server references)
+    # Retired key (ADR #52): still PARSED so old files load, auto-detected
+    # otherwise, but never written back — nothing consumes it functionally.
+    dct_root: str = ""
     plans: PlansConfig = field(default_factory=PlansConfig)
+    classification: ClassificationConfig = field(default_factory=ClassificationConfig)
+    integrations: IntegrationsConfig = field(default_factory=IntegrationsConfig)
     mirror: MirrorConfig = field(default_factory=MirrorConfig)
     web: WebConfig = field(default_factory=WebConfig)
     update: UpdateConfig = field(default_factory=UpdateConfig)
@@ -138,17 +172,40 @@ def load_config(config_path: Path | None = None) -> Config:
     plans_section = data.get("plans", {})
     plans = PlansConfig(
         auto_resolve_uncertain=bool(plans_section.get("auto_resolve_uncertain", True)),
-        classify_model=str(plans_section.get("classify_model", "claude-haiku-4-5-20251001")),
-        classify_timeout_seconds=int(plans_section.get("classify_timeout_seconds", 30)),
-        surface_on_session_start=bool(plans_section.get("surface_on_session_start", False)),
-        discovery_include=list(plans_section.get("discovery_include", [])),
-        discovery_exclude=list(plans_section.get("discovery_exclude", [])),
     )
 
-    mirror_section = data.get("mirror", {})
-    mirror_mode = str(mirror_section.get("task_to_dct", "auto"))
+    # [classification] with permanent aliases for the pre-1.2 [plans] keys
+    # (ADR #52 rename window; new keys win when both are present).
+    cls_section = data.get("classification", {})
+    cls_defaults = ClassificationConfig()
+    classification = ClassificationConfig(
+        provider=str(cls_section.get("provider", cls_defaults.provider)),
+        command=[str(c) for c in cls_section.get("command", cls_defaults.command)],
+        model=str(
+            cls_section.get("model")
+            or plans_section.get("classify_model")
+            or cls_defaults.model
+        ),
+        timeout_seconds=int(
+            cls_section.get("timeout_seconds")
+            or plans_section.get("classify_timeout_seconds")
+            or cls_defaults.timeout_seconds
+        ),
+    )
+
+    # [integrations.claude].task_mirror with the permanent [mirror].task_to_dct
+    # alias; the MirrorConfig compat view mirrors the SAME resolved value.
+    claude_section = data.get("integrations", {}).get("claude", {})
+    mirror_mode = str(
+        claude_section.get("task_mirror")
+        or data.get("mirror", {}).get("task_to_dct")
+        or "auto"
+    )
     if mirror_mode not in ("auto", "ask", "off"):
         mirror_mode = "auto"
+    integrations = IntegrationsConfig(
+        claude=ClaudeIntegrationConfig(task_mirror=mirror_mode)
+    )
     mirror = MirrorConfig(task_to_dct=mirror_mode)
 
     web_section = data.get("web", {})
@@ -170,7 +227,8 @@ def load_config(config_path: Path | None = None) -> Config:
 
     return Config(
         database_url=database_url, dct_root=dct_root,
-        plans=plans, mirror=mirror, web=web, update=update,
+        plans=plans, classification=classification,
+        integrations=integrations, mirror=mirror, web=web, update=update,
     )
 
 
@@ -178,25 +236,24 @@ def save_config(config: Config, config_path: Path | None = None) -> Path:
     path = config_path or paths.default_config_path()
     path.parent.mkdir(parents=True, exist_ok=True)
 
+    # Canonical writer: ONLY the post-ADR-#52 shape. Legacy keys ([mirror],
+    # plans.classify_*, top-level dct_root) are read-side aliases, never
+    # written back.
     lines = []
-    if config.dct_root:
-        lines.append(f'dct_root = {_toml_str(config.dct_root)}\n\n')
     lines.append('[database]\n')
     lines.append(f'url = {_toml_str(config.database_url)}\n\n')
     lines.append('[plans]\n')
     lines.append(f'auto_resolve_uncertain = {str(config.plans.auto_resolve_uncertain).lower()}\n')
-    lines.append(f'classify_model = {_toml_str(config.plans.classify_model)}\n')
-    lines.append(f'classify_timeout_seconds = {config.plans.classify_timeout_seconds}\n')
-    lines.append(f'surface_on_session_start = {str(config.plans.surface_on_session_start).lower()}\n')
-    if config.plans.discovery_include:
-        inc = ", ".join(_toml_str(p) for p in config.plans.discovery_include)
-        lines.append(f'discovery_include = [{inc}]\n')
-    if config.plans.discovery_exclude:
-        exc = ", ".join(_toml_str(p) for p in config.plans.discovery_exclude)
-        lines.append(f'discovery_exclude = [{exc}]\n')
 
-    lines.append('\n[mirror]\n')
-    lines.append(f'task_to_dct = {_toml_str(config.mirror.task_to_dct)}\n')
+    lines.append('\n[classification]\n')
+    lines.append(f'provider = {_toml_str(config.classification.provider)}\n')
+    cmd = ", ".join(_toml_str(c) for c in config.classification.command)
+    lines.append(f'command = [{cmd}]\n')
+    lines.append(f'model = {_toml_str(config.classification.model)}\n')
+    lines.append(f'timeout_seconds = {config.classification.timeout_seconds}\n')
+
+    lines.append('\n[integrations.claude]\n')
+    lines.append(f'task_mirror = {_toml_str(config.integrations.claude.task_mirror)}\n')
 
     lines.append('\n[web]\n')
     lines.append(f'host = {_toml_str(config.web.host)}\n')

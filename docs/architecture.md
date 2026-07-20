@@ -57,31 +57,30 @@ Schema updates run on the first engine bootstrap of a new-code session — verif
 The full reference (all sections; `dct init` writes a subset with sensible defaults):
 
 ```toml
-dct_root = "/path/to/dct/repo"   # absolute path to the dct checkout (skill/hook symlink target)
-
 [database]
 url = "postgresql+psycopg://localhost:5432/dct"
-# or: url = "sqlite:////Users/you/.claude/dct.db"
+# or: url = "sqlite:////home/you/.local/share/dctools/dct.db"
 
 [plans]
-# LLM classification — always-on by default
+# LLM classification of uncertain plan sections — always-on by default
 auto_resolve_uncertain = true
-classify_model = "claude-haiku-4-5-20251001"
-classify_timeout_seconds = 30
 
-# Session start — surface uncertain sections (opt-in, default off)
-surface_on_session_start = false
+[classification]
+# Pluggable classifier (ADR #52; formerly [plans].classify_* — old keys
+# still read as permanent aliases). provider: "command" | "disabled"
+# (other providers are future scope; unknown values behave as "disabled").
+provider = "command"
+command = ["claude", "--print"]
+model = "claude-haiku-4-5-20251001"
+timeout_seconds = 30
 
-# Discovery overrides (optional)
-discovery_include = []   # extra patterns, e.g. ["**/PLANS/*.md"]
-discovery_exclude = []   # additional skips, e.g. ["docs/legacy/**"]
-
-[mirror]
-# TaskCreate/TodoWrite ↔ dct integration:
+[integrations.claude]
+# TaskCreate/TodoWrite ↔ dct integration (formerly [mirror].task_to_dct,
+# still read as a permanent alias):
 #   auto — mirror every task into a session-scoped item as cc-task checkpoints
 #   ask  — keep Claude Code tasks and dct separate
 #   off  — disable the task-mirror hook entirely
-task_to_dct = "auto"
+task_mirror = "auto"
 
 [web]
 host = "127.0.0.1"       # localhost-only by design
@@ -96,7 +95,13 @@ refresh_poll_ms = 2000   # SSE change-token poll interval
 check = true
 ```
 
-**Environment override**: `DCT_DATABASE_URL` overrides `[database].url`. `DCT_CONFIG_PATH` overrides the config file location (defaults to `~/.claude/dct.toml`).
+**Environment overrides**: `DCT_DATABASE_URL` overrides `[database].url`;
+`DCT_CONFIG_PATH` pins the config file location; `DCT_DATA_DIR` pins the data
+dir. Default resolution (ADR #52): platform config dir (e.g.
+`~/.config/dctools/dct.toml`) with a permanent legacy `~/.claude/dct.toml`
+fallback — `dct config path` prints the resolved locations, `dct migrate-home`
+moves a legacy install. The retired top-level `dct_root` key is still parsed
+from old files but never written.
 
 ### Update check (`dct/update.py`)
 

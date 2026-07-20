@@ -53,7 +53,7 @@ Every indexed element gets a stable Crockford base32 ULID in an HTML comment. Ma
 | `FUTURE.md`, `*/FUTURE.md` | `backlog` (kind-hint=future) |
 | `docs/retros/*.md`, `retros/*.md` | `retro` |
 
-**Hardcoded exclusions**: `node_modules/`, `.venv/`, `venv/`, `.git/`, `target/`, `dist/`, `build/`, `.next/`, `coverage/`, `*.min.md`. Overrides via `~/.claude/dct.toml [plans].discovery_include/exclude`.
+**Hardcoded exclusions**: `node_modules/`, `.venv/`, `venv/`, `.git/`, `target/`, `dist/`, `build/`, `.next/`, `coverage/`, `*.min.md` (fixed list — the once-documented `[plans].discovery_include/exclude` overrides never had a code consumer and were removed in the ADR #52 key audit).
 
 ## Ingest pipeline
 

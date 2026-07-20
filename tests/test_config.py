@@ -11,11 +11,12 @@ from dct.config import Config, save_config, load_config
 
 def test_save_load_roundtrip(tmp_path):
     config_path = tmp_path / "dct.toml"
-    original = Config(database_url="postgresql://localhost:5432/dct", dct_root="/tmp/dct-test")
+    original = Config(database_url="postgresql://localhost:5432/dct")
     save_config(original, config_path)
     loaded = load_config(config_path)
     assert loaded.database_url == original.database_url
-    assert loaded.dct_root == original.dct_root
+    # dct_root is retired (ADR #52): never persisted, auto-detected on load.
+    assert loaded.dct_root != ""
 
 
 def test_save_load_sqlite_default(tmp_path):
@@ -52,12 +53,20 @@ def test_env_var_overrides_config(tmp_path, monkeypatch):
 
 
 def test_toml_structure(tmp_path):
-    """Verify the TOML file has correct section structure."""
+    """Verify the TOML file has the canonical post-ADR-#52 section order —
+    and that the retired dct_root never reappears."""
     config_path = tmp_path / "dct.toml"
     save_config(Config(database_url="sqlite:///x.db", dct_root="/my/path"), config_path)
     content = config_path.read_text()
-    # dct_root should be before [database] section (top-level key)
-    assert content.index("dct_root") < content.index("[database]")
+    assert "dct_root" not in content
+    assert (
+        content.index("[database]")
+        < content.index("[plans]")
+        < content.index("[classification]")
+        < content.index("[integrations.claude]")
+        < content.index("[web]")
+        < content.index("[update]")
+    )
 
 
 # ── Path-resolution chain (ADR #52: platformdirs move, legacy fallback) ──────
@@ -191,3 +200,101 @@ def test_save_config_writes_utf8(tmp_path):
     save_config(Config(database_url=url), config_path)
     assert "michał" in config_path.read_bytes().decode("utf-8")
     assert load_config(config_path).database_url == url
+
+
+# ── ADR #52 key renames — one-shot 1.2.0 window (CP #1259) ────────────────────
+
+
+def test_new_sections_roundtrip(tmp_path):
+    config_path = tmp_path / "dct.toml"
+    cfg = Config(database_url="sqlite:///x.db")
+    cfg.integrations.claude.task_mirror = "ask"
+    cfg.classification.model = "custom-model"
+    save_config(cfg, config_path)
+    text = config_path.read_text()
+    assert "[integrations.claude]" in text
+    assert "[classification]" in text
+    assert "task_to_dct" not in text          # legacy keys never written…
+    assert "classify_model" not in text
+    assert "dct_root" not in text             # …and dct_root is retired
+    loaded = load_config(config_path)
+    assert loaded.integrations.claude.task_mirror == "ask"
+    assert loaded.classification.model == "custom-model"
+
+
+def test_legacy_keys_alias_into_new_shape(tmp_path):
+    """A pre-1.2 file keeps working: [mirror].task_to_dct and the
+    plans.classify_* keys read as permanent aliases."""
+    config_path = tmp_path / "dct.toml"
+    config_path.write_text(
+        '[database]\nurl = "sqlite:///x.db"\n'
+        '[mirror]\ntask_to_dct = "off"\n'
+        '[plans]\nclassify_model = "legacy-model"\nclassify_timeout_seconds = 7\n'
+    )
+    cfg = load_config(config_path)
+    assert cfg.integrations.claude.task_mirror == "off"
+    assert cfg.mirror.task_to_dct == "off"    # compat view: `dct config get`
+    assert cfg.classification.model == "legacy-model"
+    assert cfg.classification.timeout_seconds == 7
+
+
+def test_new_keys_beat_legacy_aliases(tmp_path):
+    config_path = tmp_path / "dct.toml"
+    config_path.write_text(
+        '[database]\nurl = "sqlite:///x.db"\n'
+        '[mirror]\ntask_to_dct = "off"\n'
+        '[integrations.claude]\ntask_mirror = "ask"\n'
+        '[plans]\nclassify_model = "old"\n'
+        '[classification]\nmodel = "new"\n'
+    )
+    cfg = load_config(config_path)
+    assert cfg.integrations.claude.task_mirror == "ask"
+    assert cfg.classification.model == "new"
+
+
+def test_dct_root_read_but_never_written(tmp_path):
+    config_path = tmp_path / "dct.toml"
+    config_path.write_text('dct_root = "/legacy/checkout"\n[database]\nurl = "sqlite:///x.db"\n')
+    cfg = load_config(config_path)
+    assert cfg.dct_root == "/legacy/checkout"  # old files still load
+    out = tmp_path / "out.toml"
+    save_config(cfg, out)
+    assert "dct_root" not in out.read_text()   # retired from the write path
+
+
+def test_dead_plans_keys_are_gone(tmp_path):
+    """surface_on_session_start and discovery_include/exclude had ZERO
+    consumers (round-1 audit) — deleted, not aliased forward."""
+    config_path = tmp_path / "dct.toml"
+    save_config(Config(database_url="sqlite:///x.db"), config_path)
+    text = config_path.read_text()
+    for dead in ("surface_on_session_start", "discovery_include", "discovery_exclude"):
+        assert dead not in text
+    cfg = load_config(config_path)
+    assert not hasattr(cfg.plans, "surface_on_session_start")
+    assert not hasattr(cfg.plans, "discovery_include")
+
+
+def test_classification_defaults():
+    cfg = Config(database_url="sqlite:///x.db")
+    assert cfg.classification.provider == "command"
+    assert cfg.classification.command == ["claude", "--print"]
+    assert cfg.integrations.claude.task_mirror == "auto"
+
+
+# ── dct config path (CP #1258) ────────────────────────────────────────────────
+
+
+def test_cmd_config_path_prints_resolved_locations(fake_home, capsys):
+    import argparse
+
+    from dct import cli
+
+    _write_config(fake_home / ".claude" / "dct.toml", "sqlite:///x.db")
+    cli.cmd_config_path(argparse.Namespace())
+    out = capsys.readouterr().out
+    assert str(fake_home / ".claude" / "dct.toml") in out   # resolved config
+    assert "legacy" in out                                   # …with its source
+    assert str(paths.data_dir()) in out or str(fake_home / ".claude" / "dct.db") in out
+    assert str(paths.cache_dir()) in out
+    assert str(paths.state_dir()) in out

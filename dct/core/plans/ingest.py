@@ -228,8 +228,15 @@ def ingest_file(
     if not path.is_file():
         raise FileNotFoundError(f"Plan file not found: {path}")
 
+    cfg = load_config()
     if auto_resolve_uncertain is None:
-        auto_resolve_uncertain = load_config().plans.auto_resolve_uncertain
+        auto_resolve_uncertain = cfg.plans.auto_resolve_uncertain
+    # [classification] dispatch (ADR #52 shape; full provider matrix is G2):
+    # 'command' shells out below with the configured model/timeout THREADED
+    # (round-1 audit: these were parsed but never passed — user overrides
+    # were silently ignored); anything else behaves as 'disabled'.
+    if cfg.classification.provider != "command":
+        auto_resolve_uncertain = False
 
     content = path.read_text(encoding="utf-8")
     result = parse_plan(content)
@@ -284,6 +291,8 @@ def ingest_file(
                 s.heading,
                 parent_heading=_find_parent_heading(s, result.sections),
                 preview="",
+                model=cfg.classification.model,
+                timeout_seconds=cfg.classification.timeout_seconds,
             )
             if resolved:
                 section_type = resolved
