@@ -67,4 +67,29 @@ The release flow (stamp changelog → append section to changelog.md → version
 sync → `release: vX.Y.Z` commit → tag) is documented step by step in
 [docs/assistant-fallbacks.md](assistant-fallbacks.md#release-fallback); the
 `/release` skill automates it. Pushing a `v*` tag triggers
-`.github/workflows/publish.yml` (PyPI trusted publishing).
+`.github/workflows/publish.yml` (PyPI trusted publishing), whose test matrix
+must stay identical to `ci.yml`'s — a release gate weaker than the branch
+gate published 1.2.0 while CI was red on 3.11.
+
+### Advertised numbers
+
+Every number dct quotes about itself is derived, never retyped. Between the
+version sync and the release commit, run:
+
+```bash
+python scripts/check_numbers.py --fix --site /path/to/dc-tools
+```
+
+dct-side edits belong in the release commit; site-side edits are committed
+and pushed in the site repo, which deploys them. CI runs the same script
+without `--fix` (README only — the site lives in a separate repo), so drift
+fails the branch gate.
+
+Two tiers, by how fast each surface moves: **in-repo numbers are exact**,
+because they are edited in the same commit that changes them; **published
+numbers that churn are approximate** — they carry a `~`, are rounded down to
+the nearest ten, and are accepted within 5%. A page deployed once per release
+cannot hold an exact test count honestly: the count moved 938 → 948 within an
+hour of one being pinned to it. `--fix` rewrites only the matched number, and
+refuses to write anything when a pattern stops matching, so a redesigned page
+fails loudly instead of passing on a technicality.
