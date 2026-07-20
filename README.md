@@ -207,6 +207,18 @@ dct checkpoint add 42 "Write parser"
 dct checkpoint list 42
 dct checkpoint done 3                 # Mark CP #3 as done
 dct checkpoint reject 4               # Scope-change, keep in ledger
+
+# Sprints (first-class, named units of work; /handoff manages the current-sprint set)
+dct sprint list --status active
+dct sprint create "Payments hardening" --code pay-1 --goal "Close the P1 backlog"
+dct sprint show 3                     # Details + linked items
+dct sprint activate 3                 # Shortcuts: activate / complete / defer
+
+# Handoffs (amend an unconsumed handoff in place; creation is /handoff or MCP)
+dct handoff update 12 --prompt "Wire the toggle into settings next"
+
+# Config
+dct config get mirror.task_to_dct     # Read a dotted key from ~/.claude/dct.toml
 ```
 
 ## MCP Tools
@@ -304,7 +316,7 @@ The `DCT_DATABASE_URL` environment variable overrides `[database].url`. For the 
 ## Testing
 
 ```bash
-.venv/bin/pytest -q                    # All tests (670)
+.venv/bin/pytest -q                    # All tests (823)
 .venv/bin/pytest tests/test_plan_parser.py -v          # Parser only
 .venv/bin/pytest tests/test_plan_ingest.py -v          # Ingest + sticky-resolved semantics
 

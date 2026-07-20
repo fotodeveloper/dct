@@ -16,3 +16,5 @@ build/
 .superpowers/
 # internal design history — excluded from the public repo (decision 2026-07-06)
 docs/superpowers/
+# external model reviews / private working notes — not part of the public repo
+docs/other/
