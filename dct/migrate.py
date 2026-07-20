@@ -5,36 +5,37 @@ Planner/executor split: ``plan_migration()`` inspects the filesystem and
 returns the steps; ``execute_migration()`` performs them. The CLI implements
 ``--dry-run`` by printing the plan without executing it.
 
-Execution is **copy-then-swap**, hardened across two Codex review rounds
-(b6efa5c, d4f3c4c):
+Execution is **copy-then-swap**, hardened across three Codex review rounds
+(b6efa5c, d4f3c4c, 0b67d18):
 
-- Executions are serialized by an exclusive file lock — a second concurrent
-  ``migrate-home`` aborts instead of racing the first one's rollback.
-- The sqlite database is snapshotted with the SQLite backup API (reads
-  through an un-checkpointed WAL, so committed rows are never lost), falling
-  back to a raw copy when the file is not a real database. Sidecars are
-  consolidated into the snapshot, never copied; a pre-existing target
-  sidecar is a hard conflict that cancels the whole database unit.
-- The config file is published LAST, because its presence is what flips
-  path resolution to the new home; legacy sources are unlinked only after
-  every copy has landed. A crash at any point leaves a consistent install.
-- Copies commit atomically via hard-link (``os.link`` raises EEXIST instead
-  of clobbering); tmp-cleanup failures after a successful link are cleanup
-  noise, never a publish failure. Byte-identical leftovers of a crashed run
-  are treated as already staged, so re-runs converge — for cache/state the
-  planner re-plans them too.
-- The ``[database].url`` rewrite is anchored to the url assignment INSIDE
-  the ``[database]`` section and accepts both basic ("…") and literal ('…')
-  TOML strings. If it cannot be applied, the database move is cancelled and
-  the config migrates unchanged, still pointing at the intact legacy db.
-- A **fixup** plan branch converges stranded states: when the new config
-  exists but its url still points at a legacy sqlite db (any earlier cancel
-  path), the db move + in-place config rewrite are planned; a non-identical
-  target leftover is safe to replace there, because the config url proves it
-  never became the live database.
-- When ``DCT_CONFIG_PATH`` is set, the config (and db) are never migrated —
-  env resolution wins unconditionally, so moving the pinned file would break
-  the supported configuration mechanism.
+- Executions are serialized by an exclusive non-blocking file lock in the
+  CONFIG dir (every migration touches it; a config-only run must not require
+  a writable data dir). Lock-setup failures abort gracefully, never crash.
+- The database unit is integrity-first: a file is treated as sqlite only on
+  a positive header match; genuine databases are snapshotted with the SQLite
+  backup API FROM a connection holding ``BEGIN EXCLUSIVE`` on the source —
+  held through the cutover, so a live writer gets an explicit BUSY (and the
+  migration aborts with "in use") instead of silently losing its commit. A
+  backup failure on a genuine database aborts the unit — never a raw copy
+  that would drop WAL'd rows. Snapshots preserve the source file mode. A
+  byte-identical target leftover with a non-empty source WAL is
+  re-snapshotted, not blessed. Sidecars are consolidated, never copied; a
+  pre-existing target sidecar is a hard conflict.
+- The config file is published LAST; legacy sources are unlinked only after
+  every copy landed. Copies commit atomically via hard-link (EEXIST instead
+  of clobbering); tmp-cleanup failures after a successful link are noise,
+  never a publish failure.
+- The ``[database].url`` rewrite is anchored INSIDE the ``[database]``
+  section (trailing header comments allowed) and accepts both basic and
+  literal TOML strings; an inapplicable rewrite cancels the database move.
+- A **fixup** plan branch converges stranded states (new config exists, url
+  still legacy). A replaced orphan target that later fails its config update
+  is KEPT — its predecessor is unrecoverable, and the staged snapshot lets
+  the next run converge; the message says so honestly.
+- ``DCT_CONFIG_PATH`` pins the config (nothing config/db is migrated);
+  ``DCT_DATABASE_URL`` pins the database (no database step is ever planned —
+  runtime precedence makes the env target authoritative, so the config url
+  alone can never prove a target file dead).
 
 Guarantees: idempotent re-runs, never overwrites a live target, breadcrumb
 at ``~/.claude/dct.toml.migrated``.
@@ -54,6 +55,7 @@ from pathlib import Path
 from dct import paths
 
 _SQLITE_PREFIX = "sqlite:///"
+_SQLITE_MAGIC = b"SQLite format 3\x00"
 _DB_SIDECAR_SUFFIXES = ("-wal", "-shm")
 
 
@@ -97,20 +99,24 @@ def _identical(a: Path, b: Path) -> bool:
 def plan_migration() -> list[MigrationStep]:
     legacy = paths.legacy_dir()
     steps: list[MigrationStep] = []
+    # Env pins: DCT_CONFIG_PATH makes the config unmovable (env resolution
+    # wins unconditionally); DCT_DATABASE_URL makes the database unmovable —
+    # the env target is what runtime actually uses, so no config url can
+    # prove any file dead while it is set.
+    env_config = bool(os.environ.get("DCT_CONFIG_PATH"))
+    env_db = bool(os.environ.get("DCT_DATABASE_URL"))
 
     legacy_cfg = legacy / "dct.toml"
     new_cfg = paths.config_dir() / "dct.toml"
-    if os.environ.get("DCT_CONFIG_PATH"):
-        # Env resolution wins unconditionally — migrating the config from
-        # under a pinned path would break the supported mechanism, and the
-        # db url would then resolve against a missing file. Hands off both.
+    if env_config:
         pass
     elif legacy_cfg.exists() and not new_cfg.exists():
         steps.append(MigrationStep("config", legacy_cfg, new_cfg))
-        db = _legacy_db_path(legacy_cfg)
-        if db is not None and db.exists():
-            steps.append(MigrationStep("database", db, paths.data_dir() / db.name))
-    elif new_cfg.exists():
+        if not env_db:
+            db = _legacy_db_path(legacy_cfg)
+            if db is not None and db.exists():
+                steps.append(MigrationStep("database", db, paths.data_dir() / db.name))
+    elif new_cfg.exists() and not env_db:
         # Fixup branch: an earlier run published the config but a cancel
         # path left the database stranded under ~/.claude — finish the job.
         db = _legacy_db_path(new_cfg)
@@ -180,8 +186,7 @@ def _stage_text(content: str, dst: Path) -> bool:
 
 
 def _replace_text(content: str, dst: Path) -> bool:
-    """In-place atomic update of a file WE own (fixup of the new config) —
-    os.replace, not the no-clobber link commit."""
+    """In-place atomic update of a file WE own (fixup of the new config)."""
     try:
         tmp = dst.with_name(dst.name + ".migrating")
         tmp.write_text(content, encoding="utf-8")
@@ -191,49 +196,38 @@ def _replace_text(content: str, dst: Path) -> bool:
         return False
 
 
-def _snapshot_db(src: Path, tmp: Path) -> bool:
-    """Write a consistent snapshot of src at tmp. Real sqlite files go
-    through the backup API (reads through an un-checkpointed WAL); anything
-    else falls back to a raw copy."""
-    try:
-        src_con = sqlite3.connect(f"file:{src.as_posix()}?mode=ro", uri=True, timeout=5)
-        try:
-            dst_con = sqlite3.connect(tmp)
-            try:
-                src_con.backup(dst_con)
-            finally:
-                dst_con.close()
-        finally:
-            src_con.close()
-        return True
-    except sqlite3.Error:
-        tmp.unlink(missing_ok=True)
-        try:
-            shutil.copy2(src, tmp)
-            return True
-        except OSError:
-            return False
+# ── database unit ────────────────────────────────────────────────────────────
 
 
-def _stage_db(src: Path, dst: Path, allow_replace: bool) -> str | None:
-    """Stage a database snapshot at dst. A pre-existing target sidecar is a
-    hard conflict (a stale WAL next to a fresh db would be replayed into it).
-    allow_replace lets fixup mode overwrite a non-identical dst — safe there,
-    because the config url proves that file never went live."""
-    for suffix in _DB_SIDECAR_SUFFIXES:
-        if dst.with_name(dst.name + suffix).exists():
-            return None
+def _is_sqlite(path: Path) -> bool:
+    """Positive identification only — anything without the magic header is
+    NOT a database and may be raw-copied; anything with it must go through
+    the backup API or not migrate at all."""
     try:
-        if dst.exists() and not allow_replace:
-            return "resumed" if _identical(src, dst) else None
+        with open(path, "rb") as f:
+            return f.read(len(_SQLITE_MAGIC)) == _SQLITE_MAGIC
+    except OSError:
+        return False
+
+
+def _run_backup(src_con: sqlite3.Connection, dst_con: sqlite3.Connection) -> None:
+    src_con.backup(dst_con)
+
+
+def _stage_raw_db(src: Path, dst: Path, allow_replace: bool) -> str | None:
+    """Raw-copy staging for a non-sqlite 'database' file (empty/garbage)."""
+    try:
+        if dst.exists():
+            if _identical(src, dst):
+                return "resumed"
+            if not allow_replace:
+                return None
         dst.parent.mkdir(parents=True, exist_ok=True)
         tmp = dst.with_name(dst.name + ".migrating")
-        if not _snapshot_db(src, tmp):
-            tmp.unlink(missing_ok=True)
-            return None
-        if dst.exists():  # allow_replace: overwrite the dead orphan atomically
+        shutil.copy2(src, tmp)
+        if dst.exists():
             os.replace(tmp, dst)
-            return "created"
+            return "replaced"
         if _commit(tmp, dst):
             return "created"
         return "resumed" if _identical(src, dst) else None
@@ -241,12 +235,88 @@ def _stage_db(src: Path, dst: Path, allow_replace: bool) -> str | None:
         return None
 
 
+def _stage_db(
+    src: Path, dst: Path, allow_replace: bool
+) -> tuple[str | None, sqlite3.Connection | None]:
+    """Stage a database snapshot at dst. Returns (status, lock_connection).
+
+    status: "created" | "replaced" | "resumed" | "busy" | None (conflict/
+    failure). For a genuine sqlite file the returned connection holds
+    ``BEGIN EXCLUSIVE`` on the source — the caller must keep it until after
+    the legacy files are unlinked (writers stay quiesced through cutover)
+    and close it afterwards.
+    """
+    for suffix in _DB_SIDECAR_SUFFIXES:
+        if dst.with_name(dst.name + suffix).exists():
+            return None, None
+    if not _is_sqlite(src):
+        return _stage_raw_db(src, dst, allow_replace), None
+
+    lock_con: sqlite3.Connection | None = None
+    try:
+        lock_con = sqlite3.connect(src, timeout=0.5)
+        # Writer quiesce WITHOUT an open transaction: exclusive locking mode
+        # retains the file lock after COMMIT, and the backup API can then
+        # read from this same connection (an open BEGIN EXCLUSIVE would make
+        # backup spin forever on SQLITE_BUSY against itself).
+        lock_con.execute("PRAGMA locking_mode=EXCLUSIVE")
+        lock_con.execute("BEGIN IMMEDIATE")
+        lock_con.execute("COMMIT")
+    except sqlite3.Error:
+        if lock_con is not None:
+            lock_con.close()
+        return "busy", None
+
+    try:
+        wal = src.with_name(src.name + "-wal")
+        wal_dirty = wal.exists() and wal.stat().st_size > 0
+        dst_exists = dst.exists()
+        refresh_leftover = dst_exists and _identical(src, dst)
+        if dst_exists and not allow_replace and not refresh_leftover:
+            lock_con.close()
+            return None, None
+        if refresh_leftover and not wal_dirty and not allow_replace:
+            return "resumed", lock_con  # nothing newer than the leftover
+        # Snapshot needed: fresh target, leftover with a dirty WAL, or an
+        # orphan replacement licensed by fixup.
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        tmp = dst.with_name(dst.name + ".migrating")
+        tmp.unlink(missing_ok=True)
+        try:
+            dst_con = sqlite3.connect(tmp)
+            try:
+                _run_backup(lock_con, dst_con)
+            finally:
+                dst_con.close()
+            shutil.copymode(src, tmp)
+        except (sqlite3.Error, OSError):
+            # Genuine database, failed backup: abort the unit — a raw copy
+            # here would silently drop WAL'd rows.
+            tmp.unlink(missing_ok=True)
+            lock_con.close()
+            return None, None
+        if dst.exists():
+            os.replace(tmp, dst)
+            return "replaced", lock_con
+        if _commit(tmp, dst):
+            return "created", lock_con
+        status = "resumed" if _identical(src, dst) else None
+        if status is None:
+            lock_con.close()
+            return None, None
+        return status, lock_con
+    except OSError:
+        lock_con.close()
+        return None, None
+
+
 def _rewrite_db_url(content: str, old_url: str, new_url: str) -> str | None:
     """Rewrite the url assignment INSIDE the [database] section — a quoted
     copy of the URL in a comment or another section must never be the one
-    replaced. Accepts basic ("…") and literal ('…') TOML strings; always
-    writes back a basic string. Returns None when nothing matches."""
-    header = re.search(r"(?m)^\s*\[database\]\s*$", content)
+    replaced. The header may carry a trailing comment; both basic ("…") and
+    literal ('…') strings are accepted; a basic string is always written
+    back. Returns None when nothing matches."""
+    header = re.search(r"(?m)^\s*\[database\]\s*(?:#.*)?$", content)
     if header is None:
         return None
     start = header.end()
@@ -266,11 +336,21 @@ def _rewrite_db_url(content: str, old_url: str, new_url: str) -> str | None:
 
 @contextmanager
 def _migration_lock():
-    """Exclusive, non-blocking lock serializing migrate-home executions."""
-    lock_dir = paths.data_dir()
-    lock_dir.mkdir(parents=True, exist_ok=True)
-    handle = open(lock_dir / ".migrate-home.lock", "w")
+    """Exclusive, non-blocking lock serializing migrate-home executions.
+
+    Lives in the CONFIG dir — every migration touches the config, while a
+    config-only (PostgreSQL) run must not require a writable data dir.
+    Yields "ok", "busy", or "error: …" — setup failures degrade to a
+    message, never an uncaught exception."""
+    handle = None
     try:
+        try:
+            lock_dir = paths.config_dir()
+            lock_dir.mkdir(parents=True, exist_ok=True)
+            handle = open(lock_dir / ".migrate-home.lock", "w")
+        except OSError as exc:
+            yield f"error: {exc}"
+            return
         try:
             if os.name == "nt":
                 import msvcrt
@@ -281,27 +361,50 @@ def _migration_lock():
 
                 fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError:
-            yield False
+            yield "busy"
             return
-        yield True
+        yield "ok"
     finally:
-        handle.close()
+        if handle is not None:
+            handle.close()
 
 
 # ── execution ────────────────────────────────────────────────────────────────
 
 
 def execute_migration(steps: list[MigrationStep]) -> list[str]:
-    with _migration_lock() as acquired:
-        if not acquired:
+    with _migration_lock() as lock_status:
+        if lock_status == "busy":
             return [
                 "another dct migrate-home appears to be running — aborted, "
                 "nothing changed"
+            ]
+        if lock_status != "ok":
+            return [
+                f"cannot acquire the migration lock ({lock_status}) — "
+                "aborted, nothing changed"
             ]
         return _execute_locked(steps)
 
 
 def _execute_locked(steps: list[MigrationStep]) -> list[str]:
+    # The db lock connection (BEGIN EXCLUSIVE on the source) must survive
+    # until AFTER phase 2 unlinked the legacy files — writers stay quiesced
+    # through the whole cutover window.
+    held_locks: list[sqlite3.Connection] = []
+    try:
+        return _run_phases(steps, held_locks)
+    finally:
+        for con in held_locks:
+            try:
+                con.close()
+            except sqlite3.Error:
+                pass
+
+
+def _run_phases(
+    steps: list[MigrationStep], held_locks: list[sqlite3.Connection]
+) -> list[str]:
     messages: list[str] = []
     config_step = next((s for s in steps if s.kind == "config"), None)
     fixup_step = next((s for s in steps if s.kind == "config_fixup"), None)
@@ -335,22 +438,35 @@ def _execute_locked(steps: list[MigrationStep]) -> list[str]:
         else:
             config_content = rewritten
 
-    # Phase 1a — stage the database snapshot (consistent via the sqlite
-    # backup API; sidecars consolidated, never copied).
+    def _cancel_db_unit() -> None:
+        nonlocal db_step, config_content
+        db_step = None
+        config_content = (
+            rewrite_source.src.read_text(encoding="utf-8")
+            if rewrite_source is not None
+            else None
+        )
+
+    # Phase 1a — stage the database snapshot (consistent + writer-quiesced).
     db_staged = False
     if db_step is not None:
-        result = _stage_db(db_step.src, db_step.dst, allow_replace=fixup_step is not None)
-        if result is None:
+        result, lock_con = _stage_db(
+            db_step.src, db_step.dst, allow_replace=fixup_step is not None
+        )
+        if lock_con is not None:
+            held_locks.append(lock_con)
+        if result == "busy":
+            messages.append(
+                f"database {db_step.src} is in use — close dct sessions and "
+                "daemons, then re-run; database left in place"
+            )
+            _cancel_db_unit()
+        elif result is None:
             messages.append(
                 f"conflict/failure staging {db_step.dst} — database move "
                 "cancelled, nothing moved"
             )
-            db_step = None
-            config_content = (
-                rewrite_source.src.read_text(encoding="utf-8")
-                if rewrite_source is not None
-                else None
-            )
+            _cancel_db_unit()
         else:
             db_staged = True
             if result == "created":
@@ -395,16 +511,20 @@ def _execute_locked(steps: list[MigrationStep]) -> list[str]:
         if _replace_text(config_content, fixup_step.dst):
             messages.append(f"updated {fixup_step.dst} — database url now neutral")
         else:
-            for p in created:
-                p.unlink(missing_ok=True)
+            # Do NOT roll back the staged snapshot: a replaced orphan's
+            # predecessor is unrecoverable, and keeping the snapshot lets
+            # the next run converge. Legacy stays authoritative meanwhile.
             messages.append(
-                f"error: could not update {fixup_step.dst} — nothing changed; "
-                "re-run dct migrate-home"
+                f"error: could not update {fixup_step.dst}; the database "
+                f"snapshot is staged at {db_step.dst if db_step else '?'} — "
+                "legacy left in place, re-run dct migrate-home to converge"
             )
             return messages
 
     # Phase 2 — the new home is complete; remove legacy sources. Failures
-    # here leave harmless duplicates, reported, never raised.
+    # here leave harmless duplicates, reported, never raised. The db lock
+    # (if any) is still held here, so no writer can commit into the legacy
+    # database between the snapshot and its removal.
     for src in to_unlink:
         try:
             src.unlink()

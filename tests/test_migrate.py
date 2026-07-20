@@ -303,7 +303,7 @@ def test_parallel_migrations_are_serialized(fake_home):
     import fcntl
 
     _legacy_install(fake_home, with_db=True)
-    lock_path = paths.data_dir() / ".migrate-home.lock"
+    lock_path = paths.config_dir() / ".migrate-home.lock"
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     holder = open(lock_path, "w")
     fcntl.flock(holder, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -341,30 +341,23 @@ def test_plan_resumes_cache_and_state_leftovers(fake_home):
 
 def test_sqlite_snapshot_reads_through_wal(fake_home):
     """R2-P1: rows living only in an un-checkpointed WAL must reach the
-    migrated database (consistent snapshot, not a raw file copy)."""
-    import sqlite3
-
+    migrated database (consistent snapshot, not a raw file copy). The legacy
+    db has NO open connections — the writer-quiesce lock refuses otherwise
+    (see test_live_writer_blocks_db_migration)."""
+    workdir = fake_home / "build"
+    workdir.mkdir()
     legacy = fake_home / ".claude"
     legacy.mkdir()
+    _build_wal_db(workdir, legacy)
     db = legacy / "dct.db"
-    con = sqlite3.connect(db)
-    con.execute("PRAGMA journal_mode=WAL")
-    con.execute("CREATE TABLE t (v TEXT)")
-    con.execute("INSERT INTO t VALUES ('wal-only-row')")
-    con.commit()          # committed, but sits in the WAL — no checkpoint yet
-    assert (legacy / "dct.db-wal").exists()
     (legacy / "dct.toml").write_text(f'[database]\nurl = "sqlite:///{db}"\n')
 
     migrate.execute_migration(migrate.plan_migration())
 
-    target = paths.data_dir() / "dct.db"
     # Sidecar check BEFORE opening the target — a read connection to a
     # WAL-mode db creates fresh -wal/-shm files itself.
     assert not (paths.data_dir() / "dct.db-wal").exists()  # consolidated
-    reader = sqlite3.connect(target)
-    assert reader.execute("SELECT v FROM t").fetchall() == [("wal-only-row",)]
-    reader.close()
-    con.close()
+    assert _rows(paths.data_dir() / "dct.db") == {"row-1", "row-2-wal-only"}
 
 
 def test_fixup_converges_stranded_db(fake_home):
@@ -407,3 +400,192 @@ def test_fixup_replaces_stale_orphan_target(fake_home):
     assert (paths.data_dir() / "dct.db").read_text() == "current-bytes"
     assert not db.exists()
     assert load_config().database_url == paths.sqlite_url(paths.data_dir() / "dct.db")
+
+
+# ── Codex round-3 findings (commit 0b67d18) — db-unit integrity scenarios ────
+
+
+def _real_db(path, rows):
+    import sqlite3
+
+    con = sqlite3.connect(path)
+    con.execute("PRAGMA journal_mode=WAL")
+    con.execute("CREATE TABLE t (v TEXT)")
+    con.executemany("INSERT INTO t VALUES (?)", [(r,) for r in rows])
+    con.commit()
+    return con
+
+
+def _rows(path):
+    import sqlite3
+
+    con = sqlite3.connect(path)
+    got = {r[0] for r in con.execute("SELECT v FROM t")}
+    con.close()
+    return got
+
+
+def _build_wal_db(workdir, legacy, checkpoint_first=False):
+    """Create a legacy db with committed rows sitting ONLY in its WAL and no
+    open connections — the realistic crashed-process state. Built at a
+    scratch path with a live connection, copied (db + wal) to legacy, then
+    the builder connection is closed (closing directly at legacy would
+    checkpoint and delete the WAL)."""
+    import shutil as _sh
+
+    src = workdir / "dct.db"
+    con = _real_db(src, ["row-1"])
+    if checkpoint_first:
+        con.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        checkpointed_main = workdir / "main-snapshot"
+        _sh.copy2(src, checkpointed_main)
+    con.execute("INSERT INTO t VALUES ('row-2-wal-only')")
+    con.commit()                             # lands in the WAL, main unchanged
+    assert (workdir / "dct.db-wal").stat().st_size > 0
+    _sh.copy2(src, legacy / "dct.db")
+    _sh.copy2(workdir / "dct.db-wal", legacy / "dct.db-wal")
+    con.close()
+    return (workdir / "main-snapshot") if checkpoint_first else None
+
+
+def test_resumed_db_with_fresh_wal_is_resnapshotted(fake_home):
+    """R3-P1: dst byte-identical to the checkpointed MAIN file while newer
+    committed rows sit only in the source WAL — 'resumed' must re-snapshot,
+    not silently bless the stale copy before the WAL is deleted."""
+    import shutil as _sh
+
+    workdir = fake_home / "build"
+    workdir.mkdir()
+    legacy = fake_home / ".claude"
+    legacy.mkdir()
+    checkpointed_main = _build_wal_db(workdir, legacy, checkpoint_first=True)
+    dst = paths.data_dir() / "dct.db"
+    dst.parent.mkdir(parents=True)
+    _sh.copy2(checkpointed_main, dst)        # identical-to-main leftover
+    db = legacy / "dct.db"
+    (legacy / "dct.toml").write_text(f'[database]\nurl = "sqlite:///{db}"\n')
+
+    migrate.execute_migration(migrate.plan_migration())
+    assert _rows(paths.data_dir() / "dct.db") == {"row-1", "row-2-wal-only"}
+
+
+def test_backup_failure_on_real_db_aborts_not_rawcopies(fake_home, monkeypatch):
+    """R3-P1: an operational backup failure on a GENUINE sqlite db must abort
+    the unit — a raw copy of the main file would lose WAL'd rows."""
+    import sqlite3
+
+    legacy = fake_home / ".claude"
+    legacy.mkdir()
+    db = legacy / "dct.db"
+    _real_db(db, ["row-1"]).close()
+    (legacy / "dct.toml").write_text(f'[database]\nurl = "sqlite:///{db}"\n')
+
+    def boom(src_con, dst_con):
+        raise sqlite3.OperationalError("disk I/O error")
+
+    monkeypatch.setattr(migrate, "_run_backup", boom)
+    migrate.execute_migration(migrate.plan_migration())
+    assert db.exists()
+    assert not (paths.data_dir() / "dct.db").exists()
+
+
+def test_snapshot_preserves_source_permissions(fake_home):
+    """R3-P1: a 0600 legacy database must not become 0644 under the umask."""
+    import os as _os
+
+    legacy = fake_home / ".claude"
+    legacy.mkdir()
+    db = legacy / "dct.db"
+    _real_db(db, ["row-1"]).close()
+    _os.chmod(db, 0o600)
+    (legacy / "dct.toml").write_text(f'[database]\nurl = "sqlite:///{db}"\n')
+
+    migrate.execute_migration(migrate.plan_migration())
+    mode = (paths.data_dir() / "dct.db").stat().st_mode & 0o777
+    assert mode == 0o600
+
+
+def test_env_database_url_blocks_db_migration(fake_home, monkeypatch):
+    """R3-P1: with DCT_DATABASE_URL set, runtime precedence makes the env
+    target authoritative — the planner must never plan a database step (the
+    config alone may still move; its url is inert at runtime)."""
+    _legacy_install(fake_home, with_db=True)
+    monkeypatch.setenv(
+        "DCT_DATABASE_URL", paths.sqlite_url(paths.data_dir() / "dct.db")
+    )
+    kinds = [s.kind for s in migrate.plan_migration()]
+    assert "config" in kinds
+    assert "database" not in kinds and "config_fixup" not in kinds
+
+
+def test_fixup_write_failure_keeps_staged_snapshot(fake_home, monkeypatch):
+    """R3-P1: when fixup replaced a dead orphan target and the config update
+    then fails, the staged snapshot must SURVIVE (no rollback-unlink of a
+    file whose predecessor is unrecoverable) and legacy must stay intact."""
+    legacy = fake_home / ".claude"
+    legacy.mkdir()
+    db = legacy / "dct.db"
+    db.write_text("current-bytes")
+    stale = paths.data_dir() / "dct.db"
+    stale.parent.mkdir(parents=True)
+    stale.write_text("stale-orphan")
+    new_cfg = paths.config_dir() / "dct.toml"
+    new_cfg.parent.mkdir(parents=True)
+    new_cfg.write_text(f'[database]\nurl = "sqlite:///{db}"\n')
+
+    monkeypatch.setattr(migrate, "_replace_text", lambda *a, **k: False)
+    messages = migrate.execute_migration(migrate.plan_migration())
+
+    assert (paths.data_dir() / "dct.db").read_text() == "current-bytes"  # staged kept
+    assert db.exists()                                    # legacy untouched
+    assert not any("nothing changed" in m for m in messages)
+
+
+def test_live_writer_blocks_db_migration(fake_home):
+    """R3-P1: an open write transaction on the source must abort the db unit
+    (explicit BUSY) — never a snapshot that silently misses the commit."""
+    import sqlite3
+
+    legacy = fake_home / ".claude"
+    legacy.mkdir()
+    db = legacy / "dct.db"
+    _real_db(db, ["row-1"]).close()
+    (legacy / "dct.toml").write_text(f'[database]\nurl = "sqlite:///{db}"\n')
+
+    writer = sqlite3.connect(db, timeout=0.1)
+    writer.execute("BEGIN IMMEDIATE")
+    writer.execute("INSERT INTO t VALUES ('uncommitted')")
+    try:
+        messages = migrate.execute_migration(migrate.plan_migration())
+        assert any("in use" in m for m in messages)
+        assert db.exists()
+        assert not (paths.data_dir() / "dct.db").exists()
+    finally:
+        writer.rollback()
+        writer.close()
+
+
+def test_rewrite_accepts_section_header_comment(fake_home):
+    """R3-P2: '[database] # primary' is valid TOML — the rewrite must match
+    it, else fixup re-plans and fails identically forever."""
+    legacy = fake_home / ".claude"
+    legacy.mkdir()
+    db = legacy / "dct.db"
+    db.write_text("sqlite-bytes")
+    (legacy / "dct.toml").write_text(
+        f'[database] # primary\nurl = "sqlite:///{db}"\n'
+    )
+    migrate.execute_migration(migrate.plan_migration())
+    assert load_config().database_url == paths.sqlite_url(paths.data_dir() / "dct.db")
+    assert not db.exists()
+
+
+def test_config_only_migration_survives_unwritable_data_dir(fake_home):
+    """R3-P2: a PG config-only migration must not require a writable data
+    dir just for the lock — and lock setup failures must not crash the CLI."""
+    _legacy_install(fake_home, url="postgresql://h/db")
+    blocker = fake_home / ".local" / "share"
+    blocker.mkdir(parents=True)
+    (blocker / "dctools").write_text("a file where the data DIR should be")
+    migrate.execute_migration(migrate.plan_migration())
+    assert (paths.config_dir() / "dct.toml").exists()   # config still migrated
