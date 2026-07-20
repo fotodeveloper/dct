@@ -1,15 +1,53 @@
 """Configuration loading for dct.
 
-Priority: DCT_DATABASE_URL env var > ~/.claude/dct.toml > defaults.
+Config file resolution (dct/paths.py, ADR #52):
+    DCT_CONFIG_PATH env > platform config dir (e.g. ~/.config/dctools/dct.toml)
+    > legacy ~/.claude/dct.toml (kept working, one-time migrate-home notice).
+Database URL precedence:
+    DCT_DATABASE_URL env > [database].url > DCT_DATA_DIR env
+    > platform data dir (e.g. ~/.local/share/dctools/dct.db)
+    > legacy ~/.claude/dct.db.
 """
 
 import os
+import sys
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
 
-DEFAULT_CONFIG_PATH = Path.home() / ".claude" / "dct.toml"
-DEFAULT_DB_PATH = Path.home() / ".claude" / "dct.db"
+from dct import paths
+
+_legacy_notice_emitted = False
+
+
+def _stderr_is_tty() -> bool:
+    try:
+        return sys.stderr.isatty()
+    except (AttributeError, ValueError):
+        return False
+
+
+def _maybe_warn_legacy(path: Path) -> None:
+    """One-time stderr notice when default resolution lands on ~/.claude.
+
+    Only for interactive processes (tty): every hook and MCP-server boot is a
+    fresh short-lived process, so an unconditional per-process notice would
+    spam non-human consumers on every invocation."""
+    global _legacy_notice_emitted
+    if _legacy_notice_emitted or not _stderr_is_tty() or not paths.is_legacy(path):
+        return
+    print(
+        "Found a legacy DCT installation in ~/.claude.\n"
+        "Run `dct migrate-home` to move it to the platform-neutral location.",
+        file=sys.stderr,
+    )
+    _legacy_notice_emitted = True
+
+
+def _toml_str(value: object) -> str:
+    """Render a TOML basic string with backslashes and quotes escaped (W1) —
+    a raw C:\\-style path interpolated unescaped corrupts the file."""
+    return '"' + str(value).replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
 @dataclass
@@ -76,13 +114,17 @@ class Config:
 
     def __post_init__(self):
         if not self.database_url:
-            self.database_url = f"sqlite:///{DEFAULT_DB_PATH}"
+            self.database_url = paths.sqlite_url(paths.default_db_path())
         if not self.dct_root:
             self.dct_root = str(Path(__file__).resolve().parent.parent)
 
 
 def load_config(config_path: Path | None = None) -> Config:
-    path = config_path or Path(os.environ.get("DCT_CONFIG_PATH", str(DEFAULT_CONFIG_PATH)))
+    if config_path is None:
+        path = paths.default_config_path()
+        _maybe_warn_legacy(path)
+    else:
+        path = config_path
     data: dict = {}
 
     if path.exists():
@@ -133,31 +175,31 @@ def load_config(config_path: Path | None = None) -> Config:
 
 
 def save_config(config: Config, config_path: Path | None = None) -> Path:
-    path = config_path or DEFAULT_CONFIG_PATH
+    path = config_path or paths.default_config_path()
     path.parent.mkdir(parents=True, exist_ok=True)
 
     lines = []
     if config.dct_root:
-        lines.append(f'dct_root = "{config.dct_root}"\n\n')
+        lines.append(f'dct_root = {_toml_str(config.dct_root)}\n\n')
     lines.append('[database]\n')
-    lines.append(f'url = "{config.database_url}"\n\n')
+    lines.append(f'url = {_toml_str(config.database_url)}\n\n')
     lines.append('[plans]\n')
     lines.append(f'auto_resolve_uncertain = {str(config.plans.auto_resolve_uncertain).lower()}\n')
-    lines.append(f'classify_model = "{config.plans.classify_model}"\n')
+    lines.append(f'classify_model = {_toml_str(config.plans.classify_model)}\n')
     lines.append(f'classify_timeout_seconds = {config.plans.classify_timeout_seconds}\n')
     lines.append(f'surface_on_session_start = {str(config.plans.surface_on_session_start).lower()}\n')
     if config.plans.discovery_include:
-        inc = ", ".join(f'"{p}"' for p in config.plans.discovery_include)
+        inc = ", ".join(_toml_str(p) for p in config.plans.discovery_include)
         lines.append(f'discovery_include = [{inc}]\n')
     if config.plans.discovery_exclude:
-        exc = ", ".join(f'"{p}"' for p in config.plans.discovery_exclude)
+        exc = ", ".join(_toml_str(p) for p in config.plans.discovery_exclude)
         lines.append(f'discovery_exclude = [{exc}]\n')
 
     lines.append('\n[mirror]\n')
-    lines.append(f'task_to_dct = "{config.mirror.task_to_dct}"\n')
+    lines.append(f'task_to_dct = {_toml_str(config.mirror.task_to_dct)}\n')
 
     lines.append('\n[web]\n')
-    lines.append(f'host = "{config.web.host}"\n')
+    lines.append(f'host = {_toml_str(config.web.host)}\n')
     lines.append(f'port = {config.web.port}\n')
     lines.append(f'auto_fallback = {str(config.web.auto_fallback).lower()}\n')
     lines.append(f'open_browser = {str(config.web.open_browser).lower()}\n')
@@ -166,5 +208,5 @@ def save_config(config: Config, config_path: Path | None = None) -> Path:
     lines.append('\n[update]\n')
     lines.append(f'check = {str(config.update.check).lower()}\n')
 
-    path.write_text("".join(lines))
+    path.write_text("".join(lines), encoding="utf-8")
     return path

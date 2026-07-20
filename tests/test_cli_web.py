@@ -1,7 +1,8 @@
 """CLI `dct web` daemon helpers — port scan + pidfile lifecycle.
 
-All filesystem-touching helpers take an injectable path so tests NEVER touch the
-real ~/.claude/dct-web.pid (Task-9 contract).
+All filesystem-touching helpers take an injectable path so tests NEVER touch
+the real pidfile (platform state dir, e.g. ~/.local/state/dctools/dct-web.pid;
+Task-9 contract). Default-resolution tests isolate HOME instead.
 """
 
 import os
@@ -101,3 +102,44 @@ def test_detach_stdio_redirects_away_from_inherited_stdout(tmp_path):
     os.waitpid(pid, 0)
     assert leaked == b""
     assert "daemon-log-line" in log.read_text()
+
+
+# ── Runtime-file locations (ADR #52: out of ~/.claude, into the state dir) ───
+
+
+def test_default_pidfile_and_logfile_in_state_dir(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("XDG_STATE_HOME", raising=False)
+    state = home / ".local" / "state" / "dctools"
+    assert cli._web_pidfile() == state / "dct-web.pid"
+    assert cli._web_logfile() == state / "dct-web.log"
+
+
+def test_read_pidfile_default_falls_back_to_legacy(tmp_path, monkeypatch):
+    """A daemon started by pre-1.2 dct left its pidfile in ~/.claude —
+    stop/status after the upgrade must still find it."""
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("XDG_STATE_HOME", raising=False)
+    legacy = home / ".claude" / "dct-web.pid"
+    legacy.parent.mkdir(parents=True)
+    legacy.write_text("4242\nhttp://localhost:8787\n")
+    assert cli._read_pidfile() == (4242, "http://localhost:8787")
+
+
+def test_clear_pidfile_default_clears_legacy_too(tmp_path, monkeypatch):
+    """Stop must not leave a stale legacy pidfile that status would rediscover."""
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("XDG_STATE_HOME", raising=False)
+    legacy = home / ".claude" / "dct-web.pid"
+    legacy.parent.mkdir(parents=True)
+    legacy.write_text("4242\nhttp://localhost:8787\n")
+    cli._write_pidfile(4243, "http://localhost:8788")  # default → state dir
+    cli._clear_pidfile()
+    assert cli._read_pidfile() is None
+    assert not legacy.exists()

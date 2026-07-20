@@ -7,6 +7,8 @@ suppression matrix.
 
 import argparse
 import json
+import os
+import stat
 import time
 
 import pytest
@@ -392,8 +394,10 @@ def test_prune_dangling_symlinks_no_dirs(tmp_path, monkeypatch):
 def test_prune_reverifies_islink_before_unlink(tmp_path, monkeypatch):
     """TOCTOU guard (FIX 5): if the entry stops being a symlink between the scan
     and the unlink (a regular file swapped in), it must NOT be removed. Simulated
-    by making the pre-unlink ``os.path.islink`` recheck see a non-symlink while
-    the initial ``Path.is_symlink`` scan still matched."""
+    by patching the dedicated ``setup._still_symlink`` recheck seam — NOT the
+    global ``os.path.islink``, which since Python 3.13 also backs
+    ``Path.is_symlink`` (patching it globally would blind the scan filter and
+    the test's own survival assertion alike)."""
     pkg_skills = tmp_path / "pkg" / "skills"
     pkg_hooks = tmp_path / "pkg" / "hooks"
     claude_skills = tmp_path / "claude" / "skills"
@@ -408,13 +412,14 @@ def test_prune_reverifies_islink_before_unlink(tmp_path, monkeypatch):
     dangling = claude_skills / "gone"
     dangling.symlink_to(pkg_skills / "gone")  # dangling link into the package
 
-    # Recheck sees a regular file (the swap). Path.is_symlink() in the scan is
-    # unaffected (it uses os.lstat), so the entry still reaches the recheck.
-    monkeypatch.setattr(setup.os.path, "islink", lambda p: False)
+    # The pre-unlink recheck sees a regular file (the swap); the scan filter
+    # still sees the genuine symlink, so the entry reaches the recheck.
+    monkeypatch.setattr(setup, "_still_symlink", lambda p: False)
 
     removed = setup.prune_dangling_symlinks()
     assert str(dangling) not in removed
-    assert dangling.is_symlink()  # survived — never unlinked
+    # Survival asserted via lstat, independent of any symlink-predicate patching.
+    assert stat.S_ISLNK(os.lstat(dangling).st_mode)  # survived — never unlinked
 
 
 # ── CLI nudge suppression ────────────────────────────────────────────────────
@@ -530,3 +535,12 @@ def test_maybe_nudge_prints_notice_on_tty(monkeypatch, capsys):
                         lambda *a, **k: "dct 9.9.9 is available (installed 1.0.0) — run: dct upgrade")
     cli._maybe_nudge(_ns(command="list"))
     assert any("dct 9.9.9 is available" in s for s in printed)
+
+
+def test_cache_path_uses_platform_cache_dir(tmp_path, monkeypatch):
+    """ADR #52: the update-check cache moves out of ~/.claude with the rest."""
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("XDG_CACHE_HOME", raising=False)
+    assert update._cache_path() == home / ".cache" / "dctools" / "dct-update-check.json"

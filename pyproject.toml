@@ -17,7 +17,13 @@ classifiers = [
     "Programming Language :: Python :: 3.13",
     "Topic :: Software Development",
 ]
-dependencies = ["sqlalchemy>=2.0", "python-ulid>=2.0"]
+dependencies = [
+    "sqlalchemy>=2.0",
+    "python-ulid>=2.0",
+    # Windows-only: POSIX resolves XDG dirs in-house (dct/paths.py, ADR #52);
+    # >=4.9.6 for the macOS XDG fixes should the marker ever widen.
+    "platformdirs>=4.9.6; sys_platform == 'win32'",
+]
 
 [project.urls]
 Homepage = "https://dctools.dev"

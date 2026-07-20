@@ -18,3 +18,5 @@ build/
 docs/superpowers/
 # external model reviews / private working notes — not part of the public repo
 docs/other/
+# dcg code-graph machine-local data (config.json stays tracked)
+.dcg/local/

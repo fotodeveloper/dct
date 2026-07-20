@@ -8,14 +8,18 @@ import socket
 import sys
 from pathlib import Path
 
-from dct import __version__
-from dct.config import load_config, save_config, Config, DEFAULT_DB_PATH
+from dct import __version__, migrate, paths
+from dct.config import load_config, save_config, Config
 from dct.db import get_engine, create_tables
 from dct.core.engine import bootstrap_engine
 
-# ── web daemon constants ─────────────────────────────────────────────────────
-WEB_PIDFILE = Path.home() / ".claude" / "dct-web.pid"
-WEB_LOGFILE = Path.home() / ".claude" / "dct-web.log"
+# ── web daemon runtime files (platform state dir, ADR #52) ───────────────────
+def _web_pidfile() -> Path:
+    return paths.state_dir() / "dct-web.pid"
+
+
+def _web_logfile() -> Path:
+    return paths.state_dir() / "dct-web.log"
 
 
 def _get_engine():
@@ -96,8 +100,9 @@ def cmd_init(args):
         default_url = "postgresql://localhost:5432/dct"
         url = input(f"PostgreSQL URL [{default_url}]: ").strip() or default_url
     else:
-        url = f"sqlite:///{DEFAULT_DB_PATH}"
-        print(f"Using SQLite at {DEFAULT_DB_PATH}")
+        db_path = paths.default_db_path()
+        url = paths.sqlite_url(db_path)
+        print(f"Using SQLite at {db_path}")
 
     # Test connection
     try:
@@ -110,9 +115,10 @@ def cmd_init(args):
         print(f"Connection failed: {e}")
         sys.exit(1)
 
-    # Save config
+    # Save config — init always targets the platform-neutral location, even on
+    # a machine whose config was so far read from legacy ~/.claude (ADR #52).
     config = Config(database_url=url)
-    path = save_config(config)
+    path = save_config(config, paths.config_dir() / "dct.toml")
     print(f"Config saved to {path}")
 
     # Create tables
@@ -1161,12 +1167,13 @@ def _find_free_port(preferred: int, host: str = "127.0.0.1") -> int:
     raise RuntimeError(f"no free port available at or above {preferred}")
 
 
-def _write_pidfile(pid: int, url: str, path: Path = WEB_PIDFILE) -> None:
+def _write_pidfile(pid: int, url: str, path: Path | None = None) -> None:
+    path = path if path is not None else _web_pidfile()
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(f"{pid}\n{url}\n")
 
 
-def _detach_stdio(logfile: Path = WEB_LOGFILE) -> None:
+def _detach_stdio(logfile: Path | None = None) -> None:
     """Detach a daemonized child from inherited stdio.
 
     Without this the serving child keeps the parent's stdout open, so a caller
@@ -1174,6 +1181,7 @@ def _detach_stdio(logfile: Path = WEB_LOGFILE) -> None:
     for EOF. Point stdin at /dev/null and stdout+stderr at a log file, then drop
     the inherited descriptors.
     """
+    logfile = logfile if logfile is not None else _web_logfile()
     sys.stdout.flush()
     sys.stderr.flush()
     null_fd = os.open(os.devnull, os.O_RDWR)
@@ -1191,7 +1199,15 @@ def _detach_stdio(logfile: Path = WEB_LOGFILE) -> None:
             os.close(fd)
 
 
-def _read_pidfile(path: Path = WEB_PIDFILE) -> "tuple[int, str] | None":
+def _read_pidfile(path: Path | None = None) -> "tuple[int, str] | None":
+    if path is None:
+        path = _web_pidfile()
+        if not path.exists():
+            # A daemon started by pre-1.2 dct wrote its pidfile under ~/.claude;
+            # stop/status after the upgrade must still find that process.
+            legacy = paths.legacy_dir() / "dct-web.pid"
+            if legacy.exists():
+                path = legacy
     if not path.exists():
         return None
     lines = path.read_text().splitlines()
@@ -1205,11 +1221,16 @@ def _read_pidfile(path: Path = WEB_PIDFILE) -> "tuple[int, str] | None":
     return pid, url
 
 
-def _clear_pidfile(path: Path = WEB_PIDFILE) -> None:
-    try:
-        path.unlink()
-    except FileNotFoundError:
-        pass
+def _clear_pidfile(path: Path | None = None) -> None:
+    targets = [path] if path is not None else [
+        _web_pidfile(),
+        paths.legacy_dir() / "dct-web.pid",
+    ]
+    for target in targets:
+        try:
+            target.unlink()
+        except FileNotFoundError:
+            pass
 
 
 def _pid_alive(pid: int) -> bool:
@@ -1343,6 +1364,17 @@ def build_parser() -> argparse.ArgumentParser:
         "upgrade",
         help="Upgrade dct (auto-detects uv tool / pipx / pip; guides editable installs) "
              "and refresh skill/hook symlinks",
+    )
+
+    # migrate-home (legacy ~/.claude → platform-neutral locations — ADR #52)
+    p_migrate = sub.add_parser(
+        "migrate-home",
+        help="Move a legacy ~/.claude dct installation (config, sqlite db, "
+             "update cache, web state) to the platform-neutral locations",
+    )
+    p_migrate.add_argument(
+        "--dry-run", action="store_true",
+        help="Print the migration plan without changing anything",
     )
 
     # project
@@ -1600,10 +1632,30 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def cmd_migrate_home(args):
+    """Move a legacy ~/.claude installation to the platform-neutral home
+    (dct/migrate.py planner/executor; idempotent, never overwrites)."""
+    steps = migrate.plan_migration()
+    if not steps:
+        if (paths.config_dir() / "dct.toml").exists():
+            print("Nothing to migrate — already using the platform-neutral location.")
+        else:
+            print("Nothing to migrate — no legacy dct installation found in ~/.claude.")
+        return
+    if args.dry_run:
+        for step in steps:
+            print(f"would move {step.src} -> {step.dst}")
+        print(f"{len(steps)} step(s); run `dct migrate-home` without --dry-run to apply.")
+        return
+    for message in migrate.execute_migration(steps):
+        print(message)
+
+
 COMMAND_MAP = {
     "init": cmd_init,
     "server": cmd_server,
     "upgrade": cmd_upgrade,
+    "migrate-home": cmd_migrate_home,
     "add": cmd_add,
     "list": cmd_list,
     "show": cmd_show,

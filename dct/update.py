@@ -12,10 +12,11 @@ Two public entry points:
   human notice when the cached ``latest`` is strictly newer than the installed
   version, else ``None``.
 
-Cache file: ``~/.claude/dct-update-check.json`` — ``{checked_at, latest,
-current}`` where ``checked_at`` is a Unix timestamp (float seconds).
+Cache file: ``dct-update-check.json`` in the platform cache dir (e.g.
+``~/.cache/dctools/``) — ``{checked_at, latest, current}`` where
+``checked_at`` is a Unix timestamp (float seconds).
 
-Opt-out: ``[update] check = false`` in ``~/.claude/dct.toml`` (default true)
+Opt-out: ``[update] check = false`` in the dct config file (default true)
 disables both the background probe and the notice.
 """
 
@@ -28,13 +29,16 @@ import time
 from pathlib import Path
 from urllib.request import urlopen
 
-from dct import __version__
+from dct import __version__, paths
 from dct.config import load_config
 
-DEFAULT_CACHE_PATH = Path.home() / ".claude" / "dct-update-check.json"
 PYPI_URL = "https://pypi.org/pypi/dctracker/json"
 TTL_SECONDS = 24 * 60 * 60
 NETWORK_TIMEOUT = 2.0
+
+
+def _cache_path() -> Path:
+    return paths.cache_dir() / "dct-update-check.json"
 
 
 def _parse_version(value: str) -> tuple[int, ...]:
@@ -148,7 +152,7 @@ def _refresh_cache(
     This is the daemon-thread body of ``check_for_update``; exposed for direct
     (synchronous) testing.
     """
-    path = cache_path or DEFAULT_CACHE_PATH
+    path = cache_path or _cache_path()
     try:
         latest = _fetch_latest_version(url=url, timeout=timeout)
     except Exception:
@@ -192,7 +196,7 @@ def check_for_update(
         cfg = config or load_config()
         if not cfg.update.check:
             return None
-        path = cache_path or DEFAULT_CACHE_PATH
+        path = cache_path or _cache_path()
         current_now = time.time() if now is None else now
         if _cache_is_fresh(_read_cache(path), current_now):
             return None
@@ -226,7 +230,7 @@ def get_cached_notice(
         cfg = config or load_config()
         if not cfg.update.check:
             return None
-        data = _read_cache(cache_path or DEFAULT_CACHE_PATH)
+        data = _read_cache(cache_path or _cache_path())
         if not data:
             return None
         latest = data.get("latest")

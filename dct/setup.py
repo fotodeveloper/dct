@@ -16,6 +16,11 @@ CLAUDE_HOOKS_DIR = Path.home() / ".claude" / "hooks"
 CLAUDE_JSON = Path.home() / ".claude.json"
 CLAUDE_SETTINGS = Path.home() / ".claude" / "settings.json"
 
+# Pre-unlink symlink recheck — a dedicated seam (not a direct os.path.islink
+# call) so tests can fake the TOCTOU swap without patching the global
+# predicate, which since Python 3.13 also backs Path.is_symlink.
+_still_symlink = os.path.islink
+
 # Canonical wiring of the four dct hooks into ~/.claude/settings.json.
 # event/matcher come from each hook script's own header (the authoritative
 # self-description) — e.g. dct-task-mirror.sh declares PreToolUse on
@@ -262,7 +267,7 @@ def prune_dangling_symlinks() -> list[str]:
                 # between the scan and here (e.g. a regular file swapped in) is
                 # never removed. Tolerate a concurrent unlink (FileNotFoundError).
                 try:
-                    if os.path.islink(entry):
+                    if _still_symlink(entry):
                         entry.unlink()
                         removed.append(str(entry))
                 except FileNotFoundError:
