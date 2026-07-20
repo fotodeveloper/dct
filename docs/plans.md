@@ -73,12 +73,12 @@ When `/dct-import` or the hook ingests a file:
 
 | Layer | Default | To disable |
 |---|---|---|
-| Config `[plans].auto_resolve_uncertain` | `true` | set to `false` in `~/.claude/dct.toml` |
+| Config `[plans].auto_resolve_uncertain` | `true` | set to `false` in the dct config file (`dct config path` shows where) |
 | MCP `ingest_plan_file(auto_resolve_uncertain)` | `True` | pass `auto_resolve_uncertain=false` |
 | CLI `dct plan rescan --resolve-uncertain` | flag absent = off; hook adds it | hook always adds it → always on |
 | Hook `dct-plan-autoscan.sh` | calls with `--resolve-uncertain` | edit the hook if you want to skip |
 
-**Model**: haiku-4-5 (`claude-haiku-4-5-20251001`) at ~$0.001 per classification. Configurable via `[plans].classify_model` — drop to a larger model if you see accuracy regressions on your plans.
+**Model**: haiku-4-5 (`claude-haiku-4-5-20251001`) at ~$0.001 per classification. Configurable via `[classification].model` — drop to a larger model if you see accuracy regressions on your plans.
 
 **Backend**: headless `claude --print` CLI subprocess (no Anthropic SDK dependency). Reuses your existing Claude Code credentials + billing.
 

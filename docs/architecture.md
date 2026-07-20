@@ -11,8 +11,8 @@ dct is a **cross-project tool** — every surface is user-scoped, not per-projec
 | Database config | platform config dir (`~/.config/dctools/dct.toml`; legacy `~/.claude/dct.toml` fallback) | TOML read by `load_config()`; `dct config path` shows the resolved location |
 | Database | SQLite file or PostgreSQL | `[database].url` or `DCT_DATABASE_URL` |
 | MCP server | `~/.claude.json` | `claude mcp add --scope user` |
-| Skills | `~/.claude/skills/<name>` | Symlinks → `<dct_root>/skills/<name>` |
-| Hooks | `~/.claude/hooks/dct-*.sh` | Symlinks → `<dct_root>/hooks/`, wired into `~/.claude/settings.json` |
+| Skills | `~/.claude/skills/<name>` | Symlinks → `<dct-install>/dct/skills/<name>` |
+| Hooks | `~/.claude/hooks/dct-*.sh` | Symlinks → `<dct-install>/dct/hooks/`, wired into `~/.claude/settings.json` |
 
 Register dct once and it is available in every Claude Code session. Opening a new project directory needs zero dct setup.
 

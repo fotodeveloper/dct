@@ -100,7 +100,7 @@ of them on every turn was the whole of the observed latency.
 The shell does the absolute minimum: drain stdin, `jq`-check that
 `tool_name` is `TaskCreate`/`TodoWrite`, then `nohup` the backgrounded
 `dct _task-mirror` worker and exit. Nothing that reads config or the database
-runs in the foreground. The **config gate** (`[mirror].task_to_dct` =
+runs in the foreground. The **config gate** (`[integrations.claude].task_mirror` =
 `auto`/`ask`/`off`) and the **project autodetect** live inside the worker
 (`dct _task-mirror`): it reads config, resolves the project from the CWD, and
 exits silently when the mode is not `auto` or the CWD is not a registered

@@ -147,4 +147,4 @@ Write ops return a minimal ack, not the full record. `get_item` / `get_handoff` 
 
 ---
 
-**Total: 49 tools.** This list is generated from `dct/server.py`; if it drifts, `dct server` prints the live set.
+**Total: 49 tools.** This list is generated from `dct/mcp/server.py`; if it drifts, `dct server` prints the live set.

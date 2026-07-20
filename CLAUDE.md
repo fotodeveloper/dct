@@ -12,7 +12,7 @@ Deep-dives live in `docs/` and are read on demand — keep this file lean:
 - **Python 3.11+**, SQLAlchemy Core (NOT ORM), argparse
 - **Database**: PostgreSQL (primary) or SQLite (fallback/OSS)
 - **MCP**: FastMCP via `mcp[cli]`, **user-scoped** (`~/.claude.json`)
-- **Config**: `~/.claude/dct.toml`
+- **Config**: `~/.config/dctools/dct.toml` (legacy `~/.claude/dct.toml` still read; `dct migrate-home` moves it)
 
 ## Commands
 
@@ -24,7 +24,7 @@ uvx ruff check dct/ tests/            # Lint (config in pyproject.toml)
 
 # MCP server (smoke-test — boots, lists tools)
 uv run --no-project --with 'mcp[cli]' --with sqlalchemy --with 'psycopg[binary]' \
-  --with python-ulid python -c "from dct.server import mcp; print(len(mcp._tool_manager._tools), 'tools')"
+  --with python-ulid python -c "from dct.mcp.server import mcp; print(len(mcp._tool_manager._tools), 'tools')"
 ```
 
 ## Architecture

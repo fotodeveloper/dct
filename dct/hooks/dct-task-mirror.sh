@@ -5,7 +5,7 @@
 # dispatcher: drains stdin, jq-checks the tool name, then immediately
 # nohups the backgrounded `dct _task-mirror` worker and exits. Nothing
 # that touches the dct database or config runs on this path — the worker
-# owns the config gate ([mirror].task_to_dct: auto/ask/off) and the
+# owns the config gate ([integrations.claude].task_mirror: auto/ask/off) and the
 # project autodetect, so a synchronous Python cold start never blocks the
 # tool call (#354 hook latency).
 #

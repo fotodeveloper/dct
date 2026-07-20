@@ -88,7 +88,7 @@ Trigger automatically when rows.length ≥ 20 AND at least one file has ≥2 ite
 ## Hotspots (top 3 files by open-item count)
 | Path                     | Open | P1 | Titles                              |
 |--------------------------|------|----|-------------------------------------|
-| dct/server.py            | 4    | 0  | #22, #6, #14, #20                   |
+| dct/mcp/server.py            | 4    | 0  | #22, #6, #14, #20                   |
 | dct/skills/track-list/SKILL.md | 3 | 0 | #6, #14, #19                      |
 | dct/core/items.py        | 2    | 0  | #4, #23 (resolved)                  |
 ```

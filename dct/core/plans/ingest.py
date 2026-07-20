@@ -221,8 +221,8 @@ def ingest_file(
 
     `auto_resolve_uncertain`: when True, any section classified as 'uncertain'
     is sent through `classify_uncertain()` (`claude --print`). None = read
-    the default from `~/.claude/dct.toml [plans].auto_resolve_uncertain`
-    (default true).
+    the default from the dct config file's `[plans].auto_resolve_uncertain`
+    (default true; `dct config path` shows the file's location).
     """
     path = Path(file_path).resolve()
     if not path.is_file():

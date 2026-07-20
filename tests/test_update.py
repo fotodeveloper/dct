@@ -544,3 +544,30 @@ def test_cache_path_uses_platform_cache_dir(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.delenv("XDG_CACHE_HOME", raising=False)
     assert update._cache_path() == home / ".cache" / "dctools" / "dct-update-check.json"
+
+
+def test_upgrade_nudges_migrate_home_for_legacy_install(tmp_path, monkeypatch, capsys):
+    """After an upgrade, a legacy ~/.claude install should learn about
+    migrate-home right there — not only from the tty notice later."""
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    for var in ("XDG_CONFIG_HOME", "DCT_CONFIG_PATH"):
+        monkeypatch.delenv(var, raising=False)
+    (home / ".claude").mkdir()
+    (home / ".claude" / "dct.toml").write_text('[database]\nurl = "sqlite:///x.db"\n')
+    cli._maybe_print_legacy_nudge()
+    assert "migrate-home" in capsys.readouterr().out
+
+
+def test_upgrade_nudge_silent_on_migrated_install(tmp_path, monkeypatch, capsys):
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    for var in ("XDG_CONFIG_HOME", "DCT_CONFIG_PATH"):
+        monkeypatch.delenv(var, raising=False)
+    cfg = home / ".config" / "dctools" / "dct.toml"
+    cfg.parent.mkdir(parents=True)
+    cfg.write_text('[database]\nurl = "sqlite:///x.db"\n')
+    cli._maybe_print_legacy_nudge()
+    assert capsys.readouterr().out == ""

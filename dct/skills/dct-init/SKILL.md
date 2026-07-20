@@ -73,7 +73,7 @@ Check in parallel:
 
 | Location | What to look for | Conflict when… |
 |---|---|---|
-| `./.claude/skills/<name>/SKILL.md` | names matching dct's skill list (track, track-list, clog, commit, release, dct-import, dct-init, handoff, pickup) | local skill **shadows** global — typically unintentional |
+| `./.claude/skills/<name>/SKILL.md` | names matching dct's skill list (clog, commit, dct-import, dct-init, handoff, pickup, plan-resolve-uncertain, plan-status, release, track, track-list, track-resolve, track-update) | local skill **shadows** global — typically unintentional |
 | `./.claude/hooks/*changelog*.sh` | project-local changelog hooks | duplicates global dct hook behavior |
 | `./.claude/settings.json` `hooks` section | wires to local hooks | runs in addition to global ones |
 | `./CLAUDE.md` / `./.claude/CLAUDE.md` | mentions of other trackers ("linear", "jira", "TODOS.md", "ISSUES.md") | project has an existing tracker — `/dct-import` may help migrate |

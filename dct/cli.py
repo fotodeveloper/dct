@@ -764,7 +764,7 @@ def cmd_internal_task_mirror(args):
 
     Owns the config gate and project autodetect (the shell hook is a lean
     dispatcher that only drains stdin and backgrounds this worker — #354):
-      - reads [mirror].task_to_dct; anything but 'auto' is a silent no-op;
+      - reads [integrations.claude].task_mirror; anything but 'auto' is a silent no-op;
       - detects the project from CWD, silent no-op when the CWD is not a
         registered dct project.
 
@@ -882,7 +882,7 @@ def cmd_config_path(args):
 
 
 def cmd_config_get(args):
-    """Read a dotted config key — e.g. `dct config get mirror.task_to_dct`.
+    """Read a dotted config key — e.g. `dct config get integrations.claude.task_mirror`.
 
     Supports: database.url, dct_root, plans.<field>, classification.<field>,
     integrations.claude.<field>, mirror.<field> (compat view), web.<field>,
@@ -1171,6 +1171,19 @@ def cmd_upgrade(args):
     print("  Next engine bootstrap:       database schema migrations")
     print("\nRecommend running `dct upgrade` at a session boundary — an old running")
     print("MCP server against a freshly migrated schema is an edge best avoided.")
+    _maybe_print_legacy_nudge()
+
+
+def _maybe_print_legacy_nudge() -> None:
+    """One line after `dct upgrade`: a legacy ~/.claude install should learn
+    about migrate-home at the upgrade moment, not only from the tty notice
+    on some later command (ADR #52 follow-up)."""
+    if paths.is_legacy(paths.default_config_path()):
+        print(
+            "\nnote: legacy installation in ~/.claude detected — run "
+            "`dct migrate-home` to move it to the platform-neutral location "
+            "(optional; `--dry-run` previews the plan)"
+        )
 
 
 # ── Project detect (for hooks) ───────────────────────────────────────────────
@@ -1654,7 +1667,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="Show resolved config/data/cache/state locations and their sources",
     )
     p_config_get = p_config_sub.add_parser("get", help="Read a dotted config key")
-    p_config_get.add_argument("key", help="e.g. mirror.task_to_dct, plans.auto_resolve_uncertain")
+    p_config_get.add_argument(
+        "key",
+        help="e.g. integrations.claude.task_mirror, classification.model, plans.auto_resolve_uncertain",
+    )
 
     # checkpoint
     p_cp = sub.add_parser("checkpoint", aliases=["cp"], help="Manage item checkpoints (acceptance criteria)")

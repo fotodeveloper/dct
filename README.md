@@ -62,9 +62,9 @@ release day the changelog is already written:
 
 ```text
 > /release
-15 unreleased entries → stamped as 1.1.0
+15 unreleased entries → stamped as 1.4.0
 changelog.md regenerated (Keep a Changelog format)
-release: v1.1.0 committed, project version bumped
+release: v1.4.0 committed, project version bumped
 ```
 
 One command stamps the version, exports [Keep a Changelog](https://keepachangelog.com)
@@ -312,7 +312,7 @@ url = "sqlite:////home/you/.local/share/dctools/dct.db"
 # or: url = "postgresql+psycopg://localhost:5432/dct"
 ```
 
-The `DCT_DATABASE_URL` environment variable overrides `[database].url`. For the full reference (`[plans]`, `[mirror]`, `[web]` sections), the database schema, MCP scope precedence, and project auto-detection mechanics, see **[docs/architecture.md](docs/architecture.md)**.
+The `DCT_DATABASE_URL` environment variable overrides `[database].url`. For the full reference (`[classification]`, `[integrations.claude]`, `[web]` sections), the database schema, MCP scope precedence, and project auto-detection mechanics, see **[docs/architecture.md](docs/architecture.md)**.
 
 ## Testing
 
@@ -323,7 +323,7 @@ The `DCT_DATABASE_URL` environment variable overrides `[database].url`. For the 
 
 # MCP server smoke (boot + tool list)
 uv run --no-project --with 'mcp[cli]' --with sqlalchemy --with 'psycopg[binary]' \
-  python -c "import asyncio; from dct.server import mcp; \
+  python -c "import asyncio; from dct.mcp.server import mcp; \
   print(len(asyncio.run(mcp.list_tools())), 'tools')"
 ```
 
