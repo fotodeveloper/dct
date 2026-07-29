@@ -8,12 +8,14 @@ import asyncio
 
 from dct.mcp.server import mcp, _ALWAYS_LOAD_TOOLS
 
-# The exact mid-session hot-set (#349): item + checkpoint lifecycle plus the
-# changelog add. Session-edge tools (pickup/handoff/release) are deferred.
+# The exact hot-set: the mid-session drivers (#349) — item + checkpoint lifecycle
+# plus the changelog add — and the composed workflow entry points (#413), which
+# ARE the session edge. The granular session-edge tools they compose stay deferred.
 EXPECTED_HOT_SET = {
     "create_item", "get_item", "list_items", "update_item", "resolve_item",
     "add_note", "add_checkpoint", "complete_checkpoint", "reject_checkpoint",
     "add_changelog",
+    "get_context_snapshot", "pickup_work", "handoff_work",
 }
 
 # Once-per-session / specialist tools that MUST stay deferred.
@@ -35,10 +37,11 @@ def _wire_meta() -> dict[str, dict]:
     }
 
 
-def test_hot_set_is_exactly_ten():
-    """Lock the exact hot-set: 10 mid-session daily drivers, no more, no less."""
+def test_hot_set_is_exactly_thirteen():
+    """Lock the exact hot-set: 10 mid-session daily drivers + 3 workflow entry
+    points, no more, no less."""
     assert _ALWAYS_LOAD_TOOLS == EXPECTED_HOT_SET
-    assert len(_ALWAYS_LOAD_TOOLS) == 10
+    assert len(_ALWAYS_LOAD_TOOLS) == 13
 
 
 def test_always_load_names_all_exist():

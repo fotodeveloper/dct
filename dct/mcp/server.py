@@ -18,6 +18,13 @@ from mcp.server.fastmcp import FastMCP
 
 from dct.core.engine import bootstrap_engine
 
+# ONE preview implementation for the whole product (K-35, #413): the MCP list
+# views and the snapshot share dct.workflows.session._preview, so the
+# documented "200-char preview" means the same ceiling everywhere — 200 chars
+# INCLUDING the trailing ellipsis. (mcp → workflows is the sanctioned import
+# direction; workflows never imports the server.)
+from dct.workflows.session import _preview
+
 _INSTRUCTIONS = (
         "Deterministic Context Tracker — cross-project work tracking.\n\n"
         "RESOURCES (all soft-delete ledgers, never hard-deleted):\n"
@@ -50,12 +57,23 @@ _INSTRUCTIONS = (
         "   reject_checkpoint irrelevant ones. Then resolve_item (no auto-transition).\n\n"
         "SPRINT & HANDOFFS:\n"
         "- set_sprint(project, item_ids='22,21,6') atomically replaces the sprint;\n"
-        "  resolve_item auto-clears in_current_sprint (sprint = active work only).\n"
+        "  resolve_item clears the DERIVED in_current_sprint flag — membership itself\n"
+        "  is RETAINED as the sprint's completion history.\n"
+        "- Several sprints may be active in parallel; current-sprint WRITES then refuse\n"
+        "  to guess and error listing the candidates — target one via assign_item_to_sprint\n"
+        "  / handoff_work(sprint=<id or code>).\n"
         "- Lifecycle planned|active|deferred|completed|abandoned via update_sprint: park\n"
-        "  unfinished as 'deferred' (frees the one-active slot), reactivate 'active';\n"
-        "  never complete/abandon an unfinished one. review_sprint = session dashboard.\n"
+        "  unfinished as 'deferred' (hidden from current-sprint views, started_at kept),\n"
+        "  reactivate 'active'; never complete/abandon an unfinished one.\n"
+        "  review_sprint = session dashboard.\n"
         "- create_handoff(prompt, created_by, scope?) notes next session (multiple\n"
         "  unconsumed ok); consume_handoff(id) marks read, preserving the row.\n\n"
+        "WORKFLOW OPS (composed, one transaction each — start here):\n"
+        "- Session start: pickup_work(consumed_by=...) = snapshot + consume the handoff\n"
+        "  (full prompt) in one call. Session end with unfinished work:\n"
+        "  handoff_work(prompt, created_by, item_ids=...) = sprint + handoff atomically.\n"
+        "- Mid-session \"where do we stand?\": get_context_snapshot(include=...).\n"
+        "  The granular tools above remain for surgical operations.\n\n"
         "TOOL-CALL HYGIENE: pass every argument as its own top-level parameter — never\n"
         "nest one prose field in another. Free-text tools reject literal tool-call markup;\n"
         "a rejection means re-send with the fields split out."
@@ -227,17 +245,6 @@ def _to_markdown(rows: list[dict], cols: list[str]) -> str:
             cells.append(str(v).replace("|", "\\|").replace("\n", " "))
         lines.append("| " + " | ".join(cells) + " |")
     return "\n".join(lines)
-
-
-def _preview(text, limit: int = 200):
-    """Truncate free text to a preview: first `limit` chars + '…' when longer.
-
-    Non-str values (None) pass through unchanged. A string of exactly `limit`
-    chars is returned as-is; the ellipsis marks that content was dropped.
-    """
-    if isinstance(text, str) and len(text) > limit:
-        return text[:limit] + "…"
-    return text
 
 
 def _format_list(rows: list[dict], cols: list[str], format: str):
@@ -453,8 +460,9 @@ def update_item(
     """Update one or more mutable fields on an existing item. Only non-empty
     args are applied; an empty/omitted field is left unchanged.
 
-    Terminal status (resolved/wont_fix) sets resolved_at AND clears sprint
-    membership; reopening (open/in_progress) clears resolved_at. This path does
+    Terminal status (resolved/wont_fix) sets resolved_at AND clears the DERIVED
+    in_current_sprint flag — the sprint MEMBERSHIP is retained as the sprint's
+    completion history; reopening (open/in_progress) clears resolved_at. This path does
     NOT run the gate-checkpoint guard — prefer resolve_item for terminal moves.
     Sprint membership is not set here (`in_current_sprint` is read-only) — use
     set_sprint / assign_item_to_sprint / remove_item_from_sprint.
@@ -918,20 +926,28 @@ def export_changelog(project: str = "", include_unreleased: bool = True, version
 def set_sprint(project: str = "", item_ids: str = "") -> dict:
     """Atomically replace the current sprint's membership with the given ids.
 
-    The current sprint is the project's single active sprint (auto-created if
+    The current sprint is the project's PRIMARY active sprint — the most
+    recently started one; several may be active in parallel (auto-created if
     none exists). Membership lives in item_sprints — assigns the listed ids and
-    soft-removes the rest. Ids that aren't live items of this project (foreign,
-    unknown, or soft-deleted) are silently dropped, so the returned `size` /
-    `items` may be smaller than the ids you passed. **There is no "no-op" call —
-    `item_ids=""` WIPES the sprint** (equivalent to `clear_sprint`). If you want
-    to keep the current sprint, don't call this tool.
+    soft-removes the rest. STRICT: ids that aren't live items of this project
+    (foreign, unknown, or soft-deleted) return {"error": ...} listing them and
+    the sprint stays unchanged. **There is no "no-op" call — `item_ids=""`
+    WIPES the sprint** (equivalent to `clear_sprint`). If you want to keep the
+    current sprint, don't call this tool.
 
     Args:
         project: Slug. Empty = auto-detect from CWD.
         item_ids: Comma-separated ids (e.g. "22,21,6"). Empty string clears sprint.
 
-    Returns: {"project": "<slug>", "size": <int>, "items": [valid ids, sorted]}.
-        Error: {"error": "..."} on project resolution failure.
+    Returns: {"project": "<slug>", "size": <int>, "items": [ids, sorted]} —
+        size/items describe the OPEN membership after the swap (terminal
+        members are retained as history and are NOT listed).
+        Error: {"error": "..."} on project resolution failure, on ids that are
+        not live items of this project (unknown / foreign / soft-deleted — the
+        message lists them, nothing is written), or when SEVERAL sprints are
+        active: a current-sprint write refuses to guess and names the
+        candidates — use assign_item_to_sprint / remove_item_from_sprint for an
+        explicit target.
     """
     from dct.core.sprint import set_sprint as _set
 
@@ -988,8 +1004,12 @@ def review_sprint(project: str = "", since: str = "last_release") -> dict:
         unconsumed_handoffs, summary. in_sprint / stale_in_progress /
         unconsumed_handoffs are {cols, rows} tables; recent_activity is a dict
         {items_changed: {cols,rows}, checkpoints_completed: int,
-        changelog_added: int}; summary is a scalar dict. Error: {"error": "..."}
-        on invalid `since`.
+        changelog_added: int}; summary is a scalar dict. NOTE the two sprint
+        numbers measure different sets: `in_sprint` lists only the OPEN members
+        (current work) while `summary.sprint_size` / `sprint_completion` count
+        ALL members including terminal ones (resolved work stays linked as the
+        sprint's history, ADR #57) — expect len(in_sprint.rows) <= sprint_size.
+        Error: {"error": "..."} on invalid `since`.
     """
     from dct.core.sprint import get_sprint_review
     try:
@@ -1192,6 +1212,257 @@ def update_handoff(
         if not result:
             return {"error": f"Handoff #{handoff_id} not found, consumed, or deleted"}
         return {"id": result["id"], "updated_fields": applied}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+# ── Workflow ops (#413) ───────────────────────────────────────────────────────
+# Composed session-edge entry points: ONE call in place of the 4-8 granular ones
+# a /pickup or /handoff used to chain. The implementation lives in
+# dct/workflows/session.py (single transaction each) and is shared with the CLI
+# and the packaged skills — these tools only marshal MCP strings into it.
+
+
+@mcp.tool()
+def get_context_snapshot(
+    project: str = "",
+    include: str = "",
+    since: str = "last_release",
+) -> dict:
+    """One composed read of a project's state — sprint + handoff + gates + decisions + recent changes.
+
+    PREFER THIS OVER review_sprint for session-state reads — one composed call
+    covers sprint + handoff + gates + decisions + recent changes, in a SINGLE
+    transaction, so every section describes the same instant. review_sprint
+    remains the narrower legacy dashboard.
+
+    Structured data only; interpretation lives in the calling skill.
+
+    Args:
+        project: Slug. Empty = auto-detect from CWD. Requires a resolvable
+            project — an unregistered CWD errors, it does NOT span projects.
+        include: Comma-separated section names to keep ('sprint,gates'). Empty
+            (default) = ALL sections. The single sentinel 'none' = zero sections
+            (summary-only, the cheap confirm call). Valid names: sprint,
+            handoff, gates, decisions, recent_changes; an unknown name errors.
+        since: Anchor for recent_changes — "last_release" (default; max
+            released_at, all-time when the project has no release) | "all" |
+            "<N>h" (hours) | ISO date/datetime ("2026-04-10T14:00", "Z" ok).
+
+    Returns: dict ALWAYS carrying project, since, since_anchor, sections (the
+        resolved list) and summary (active_sprint_count, sprint_size,
+        sprint_completion, total_open_in_project, handoffs_pending,
+        gates_pending, stale_count). Requested sections are added as keys and
+        SKIPPED ONES ARE OMITTED (probe with `"gates" in result` — never None):
+        sprint {primary_sprint_id, active_sprints, items, checkpoints,
+        stale_in_progress}, handoff {latest (FULL prompt), others (200-char
+        previews), pending_count}, gates / decisions ({cols,rows}),
+        recent_changes {items_changed, checkpoints_completed, changelog_added}.
+        COUNTING: an item in TWO active sprints counts once per sprint in
+        active_sprints[].size/done, but only ONCE (DISTINCT) in
+        summary.sprint_size — the per-sprint sizes are not expected to sum to
+        it. CAPS: sprint.items (100), sprint.checkpoints (500),
+        sprint.stale_in_progress (50), gates (50) and handoff.others (20) are
+        row-capped and each carries "truncated": true/false; the summary
+        counters are computed over the FULL sets, and handoff.latest is never
+        truncated. Every value is JSON-native (timestamps are ISO 8601
+        strings). {"error": "..."} on an unknown section name, 'none' combined
+        with other sections, an invalid `since`, or an unresolvable project.
+    """
+    from dct.workflows.session import get_context_snapshot as _snapshot
+    from dct.workflows.session import parse_sections
+    try:
+        project_slug = _resolve_project(project, required=True)
+        assert project_slug is not None
+        return _snapshot(
+            _get_engine(), project_slug,
+            include=parse_sections(include),
+            since=since,
+        )
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@mcp.tool()
+def pickup_work(
+    project: str = "",
+    consume: str = "",
+    consumed_by: str = "",
+    handoff_id: int = 0,
+    scope: str = "",
+    since: str = "last_release",
+    include: str = "",
+) -> dict:
+    """Session-start op: context snapshot + (possibly) consume ONE handoff, atomically.
+
+    Prefer over review_sprint + list_handoffs + get_handoff + consume_handoff
+    (4-8 calls → 1-2). The picked-up handoff comes back with its FULL prompt, so
+    no follow-up get_handoff is needed.
+
+    Args:
+        project: Slug. Empty = auto-detect from CWD (must resolve).
+        consume: STRICT enum — no other token is accepted (a typo errors, it
+            never silently downgrades). '' (default) = AUTO: consume
+            `handoff_id` when given, otherwise consume ONLY when exactly ONE
+            unconsumed handoff matches (after the scope filter) — several
+            candidates mean nothing is consumed, they ride back in the handoff
+            section and you re-call with the chosen handoff_id. 'true' = consume
+            `handoff_id` or the newest match; errors when there is nothing to
+            consume. 'false' = pure read (contradictory with handoff_id).
+        consumed_by: REQUIRED whenever consumption is possible (consume ''
+            or 'true') — self-identify like create_handoff's created_by
+            ("claude-opus-4-7 @ 2026-04-17T14:30Z"). Empty errors.
+        handoff_id: Consume this exact handoff (0 = none given). WINS over
+            scope, which is then ignored EVERYWHERE — candidate selection AND
+            the returned handoff.latest. An id from another project reads as
+            "not found or already consumed" — no cross-project consume.
+        scope: Narrow candidates to one workstream tag (empty = any); also makes
+            the returned handoff section scope-coherent and adds
+            handoff.scope_matched.
+        since: recent_changes anchor — same vocabulary as get_context_snapshot.
+        include: Comma-separated sections to keep; empty = all; 'none' = none.
+
+    Returns: the get_context_snapshot dict (same sections, same caps and
+        "truncated" flags, same JSON-native values) — POST-consume, so the
+        handoff section and summary.handoffs_pending already exclude what was
+        just picked up — plus picked_up (the FULL consumed handoff row, or
+        null) and consumed (bool). With a `scope` (and no handoff_id) the
+        handoff section also carries scope_matched: how many unconsumed
+        handoffs of that scope remain AFTER the write, so 0 ("nothing for this
+        workstream") is distinguishable from "several pending, pick one"; the
+        key is absent when no scope was given. {"error": "..."} on an invalid consume token (nothing
+        is read or written), empty consumed_by while consumption is possible,
+        handoff_id with consume='false', an unknown/already-consumed handoff_id,
+        consume='true' with no candidate, an unknown section, or an unresolvable
+        project.
+    """
+    if (err := _reject_toolcall_markup(consumed_by=consumed_by, scope=scope)):
+        return err
+    consume_tokens = {"": None, "true": True, "false": False}
+    if consume not in consume_tokens:
+        return {"error": f"consume must be '' (auto), 'true' or 'false' — got '{consume}'"}
+    from dct.workflows.session import parse_sections
+    from dct.workflows.session import pickup_work as _pickup
+    try:
+        project_slug = _resolve_project(project, required=True)
+        assert project_slug is not None
+        return _pickup(
+            _get_engine(), project_slug,
+            consume=consume_tokens[consume],
+            handoff_id=handoff_id or None,
+            scope=scope or None,
+            consumed_by=consumed_by or None,
+            since=since,
+            include=parse_sections(include),
+        )
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def _parse_id_csv(value: str, field: str) -> list[int]:
+    """Comma-separated ids → ints. Empty/delimiter-only input raises — a
+    blank shell variable must never read as 'no items' (K-27, #413)."""
+    try:
+        ids = [int(x.strip()) for x in value.split(",") if x.strip()]
+    except ValueError:
+        raise ValueError(
+            f"{field} must be comma-separated integers ('22,21,6') — got '{value}'"
+        )
+    if not ids:
+        raise ValueError(
+            f"{field} parsed to an empty list (got '{value}') — omit the "
+            f"parameter to skip it; emptying a sprint is clear_sprint's job."
+        )
+    return ids
+
+
+@mcp.tool()
+def handoff_work(
+    prompt: str,
+    created_by: str,
+    project: str = "",
+    item_ids: str = "__keep__",
+    add_item_ids: str = "",
+    remove_item_ids: str = "",
+    sprint: str = "",
+    scope: str = "",
+    context_summary: str = "",
+) -> dict:
+    """Session-end op: sprint membership changes + the handoff in ONE transaction.
+
+    Prefer over set_sprint + create_handoff — atomic, one call: a handoff
+    validation failure rolls every membership write back. Sprints are
+    MULTI-SESSION (ADR #57): the default session edge keeps membership and,
+    when needed, ADDS newly discovered items / CUTS scope — full replace is a
+    conscious replanning act.
+
+    Args:
+        prompt: Free-form "for next session: ..." text (required, non-empty).
+        created_by: REQUIRED, non-empty — self-identify (e.g.
+            "claude-opus-4-7 @ 2026-04-17T14:30Z").
+        item_ids: REPLACE mode. '__keep__' (DEFAULT) = do NOT touch the sprint;
+            '22,21,6' = replace the sprint's OPEN membership with exactly those
+            ids (STRICT — unknown/foreign/soft-deleted ids error and roll the
+            whole call back; terminal members stay as the sprint's completion
+            history). '' or a delimiter-only string errors — emptying a sprint
+            is clear_sprint's job. Mutually exclusive with add/remove below.
+        add_item_ids: ADDITIVE mode — comma-separated ids to pull INTO the
+            target sprint (STRICT validation; empty string = not used).
+        remove_item_ids: ADDITIVE mode — ids to cut from the sprint's OPEN
+            scope. Removing a terminal (resolved/wont_fix) member errors —
+            that is history, not scope. Empty string = not used.
+        project: Slug. Empty = auto-detect from CWD.
+        sprint: Target among the ACTIVE sprints, by id or code. Id match takes
+            precedence; an id↔code collision between two sprints errors. Given
+            without any membership change → error (a typo must not silently
+            no-op). Empty = the only active sprint, or auto-created when none
+            is active (replace/add paths); several active and no selector →
+            error listing the candidates.
+        scope: Optional workstream tag ("sprint-v0.2") — pickup_work filters on it.
+        context_summary: Optional state snapshot stored next to the prompt.
+
+    Returns: slim ack {handoff_id, project, scope, created_at, sprint} — `sprint`
+        is {sprint_id, code, size, items} (OPEN membership after the writes) or
+        null (null ⇔ no membership change requested). NO prompt /
+        context_summary echo (fetch with get_handoff). {"error": "..."} on
+        empty prompt or created_by, malformed/empty id lists, replace combined
+        with add/remove, unknown/foreign item ids, removing a terminal member,
+        an ambiguous or non-active sprint selector, a selector without a
+        membership change, literal tool-call markup in a free-text field, or
+        an unresolvable project.
+    """
+    if (err := _reject_toolcall_markup(
+        prompt=prompt, context_summary=context_summary,
+        scope=scope, created_by=created_by,
+    )):
+        return err
+    from dct.workflows.session import handoff_work as _handoff
+    try:
+        ids: list[int] | None = None
+        if item_ids != "__keep__":
+            ids = _parse_id_csv(item_ids, "item_ids")
+        add_ids = _parse_id_csv(add_item_ids, "add_item_ids") if add_item_ids.strip() else None
+        remove_ids = (
+            _parse_id_csv(remove_item_ids, "remove_item_ids")
+            if remove_item_ids.strip() else None
+        )
+        project_slug = _resolve_project(project, required=True)
+        assert project_slug is not None
+        out = _handoff(
+            _get_engine(), project_slug,
+            prompt=prompt, created_by=created_by,
+            item_ids=ids,
+            add_item_ids=add_ids,
+            remove_item_ids=remove_ids,
+            sprint=sprint or None,
+            scope=scope or None,
+            context_summary=context_summary or None,
+        )
+        h = out["handoff"]
+        return {
+            "handoff_id": h["id"], "project": out["project"], "scope": h["scope"],
+            "created_at": h["created_at"], "sprint": out["sprint"],
+        }
     except Exception as e:
         return {"error": str(e)}
 
@@ -1529,18 +1800,20 @@ def create_sprint(
         kind: sprint | phase | milestone | block (default sprint). Subtype is
             informational — every kind shares one lifecycle.
         status: planned | active | completed | abandoned (default planned).
-            'active' stamps started_at and is capped at ONE active sprint per
-            project — creating a second active sprint errors. 'deferred' is NOT
-            a legal creation status (a sprint cannot be born parked — it has no
-            started_at yet); create it planned/active then defer via
-            update_sprint.
+            'active' stamps started_at. PARALLEL ACTIVE SPRINTS ARE LEGAL —
+            there is no one-active cap; note that current-sprint WRITES
+            (set_sprint / clear_sprint / add_item_to_current_sprint) then
+            refuse to guess a target and error listing the candidates.
+            'deferred' is NOT a legal creation status (a sprint cannot be born
+            parked — it has no started_at yet); create it planned/active then
+            defer via update_sprint.
         goal: Optional free-text objective.
 
     Returns: slim ack {id, code, kind, status, name} — scalar headers only (the
         free-text `goal` is not echoed). {"error": "..."} on failure (empty
-        name, invalid kind/status, status='deferred', duplicate code, a second
-        active sprint, or an unresolvable project — unknown slug, or empty
-        project when the CWD is not a registered project).
+        name, invalid kind/status, status='deferred', duplicate code, or an
+        unresolvable project — unknown slug, or empty project when the CWD is
+        not a registered project).
     """
     from dct.core.sprints import create_sprint as _create
     try:
@@ -1579,23 +1852,24 @@ def update_sprint(
             Any other move errors, listing the legal targets. A status equal to
             the current one is an idempotent no-op (timestamps untouched).
             Timestamp effects: ->active stamps started_at only when it was NULL
-            (reactivation preserves it) and is capped at ONE active sprint per
-            project; reopen (completed/abandoned -> active) clears the stale
-            ended_at; completed/abandoned stamp ended_at.
+            (reactivation preserves it) — there is NO one-active cap, several
+            sprints may run in parallel; reopen (completed/abandoned -> active)
+            clears the stale ended_at; completed/abandoned stamp ended_at.
         name: New name (non-empty).
         code: New short handle; re-checked for per-project uniqueness.
         kind: sprint | phase | milestone | block.
         goal: New free-text objective.
 
     'deferred' semantics: parks a started-but-paused sprint. It KEEPS its
-    started_at, frees the single active slot (so another sprint can be
-    activated), and is HIDDEN from current-sprint views (get_current_sprint /
+    started_at and is HIDDEN from current-sprint views (get_current_sprint /
     review_sprint). It stays visible via list_sprints(status='deferred').
+    Parallel active sprints are legal — deferring is for parking work, not
+    for freeing a slot.
 
     Returns: slim ack {id, code, kind, status, name} — scalar headers only (the
         free-text `goal` is not echoed). {"error": "..."} on an unknown id,
-        illegal transition, a second active sprint, a duplicate code, an invalid
-        kind/status, or no fields supplied.
+        illegal transition, a duplicate code, an invalid kind/status, or no
+        fields supplied.
     """
     from dct.core.sprints import update_sprint as _update
     kwargs: dict = {}
@@ -1951,17 +2225,23 @@ def ingest_plan_file(
 # (plans, decisions, first-class sprints, web, release admin) stay deferred.
 # Add a name here ONLY if a routine skill needs it from token zero; keep the long
 # tail deferred to spend session context wisely. Takes effect on server restart.
-# The hot-set is deliberately the 10 mid-session daily drivers — the tools a
-# working session touches turn after turn (item lifecycle, checkpoints, changelog
-# add). Session-edge tools (handoffs, sprint set, review_sprint, list_projects,
-# count_unreleased_changelog) are used once at pickup/handoff and stay deferred:
-# their one ToolSearch round-trip is cheap next to keeping them resident all session.
+# The hot-set is the mid-session daily drivers — the tools a working session
+# touches turn after turn (item lifecycle, checkpoints, changelog add) — PLUS the
+# composed workflow ENTRY POINTS (#413): they ARE the session edge, and there the
+# ToolSearch round-trip was 100% of pre-work latency (nothing else is loaded yet
+# when /pickup starts). The GRANULAR session-edge tools they compose
+# (review_sprint, set_sprint, list_handoffs, create_handoff, consume_handoff,
+# list_projects, count_unreleased_changelog) stay deferred BEHIND them: once the
+# entry point covers the routine path, reaching for a granular one is the rare
+# surgical case and can afford its one round-trip.
 _ALWAYS_LOAD_TOOLS = frozenset({
     # item + checkpoint lifecycle (track / track-list / track-update / track-resolve)
     "create_item", "get_item", "list_items", "update_item", "resolve_item",
     "add_note", "add_checkpoint", "complete_checkpoint", "reject_checkpoint",
     # changelog add (clog / commit)
     "add_changelog",
+    # workflow ops (pickup / handoff / snapshot) — #413
+    "get_context_snapshot", "pickup_work", "handoff_work",
 })
 
 

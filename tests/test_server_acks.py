@@ -14,20 +14,9 @@ Tools are called directly (FastMCP's @mcp.tool() leaves the function callable),
 with server._get_engine monkeypatched onto the in-memory fixture engine.
 """
 
-import pytest
-
 from dct.mcp import server as S
 from dct.core.decisions import create_decision as core_create_decision
 from dct.core.plans.crud import add_plan_checkpoint, add_plan_section as core_add_section, create_plan as core_create_plan
-from dct.core.projects import create_project
-
-
-@pytest.fixture
-def srv(engine, monkeypatch):
-    """Point the server at the fixture engine and seed a project slug 'test'."""
-    monkeypatch.setattr(S, "_get_engine", lambda: engine)
-    create_project(engine, slug="test", name="Test Project", path="/tmp/test")
-    return S
 
 
 # ── create_item ───────────────────────────────────────────────────────────────
