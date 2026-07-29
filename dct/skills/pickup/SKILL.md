@@ -8,58 +8,70 @@ description: >-
 
 # /pickup — Session Resume
 
-Open a new session by loading the previous session's handoff prompt + current
-sprint state, then propose a concrete first action.
+Open a new session by loading the previous session's handoff prompt + sprint
+state in ONE composed READ, then let the user decide what to do with the
+handoff before anything is written.
 
-## Deferred-tool load (do this first)
+No ToolSearch preload needed: `pickup_work` (and `get_item`) are alwaysLoad
+residents.
 
-`review_sprint`, `consume_handoff`, and `get_handoff` are deferred — load their
-schemas before first use with ONE ToolSearch call:
-
-```
-ToolSearch("select:mcp__dct__review_sprint,mcp__dct__consume_handoff,mcp__dct__get_handoff")
-```
+The flow is TWO-PHASE by design: **read first, consume only after the user
+says so.** Consuming a handoff is a write on a ledger the user may want to
+keep for audit — /pickup never makes that call on its own.
 
 ## Workflow
 
-### Step 1: Fetch review (CWD auto-detect)
-
-Happy path is a SINGLE call — `review_sprint("")` auto-detects the project from
-CWD (empty project string), no `list_projects` needed:
+### Step 1: One composed read (CWD auto-detect)
 
 ```
-mcp__dct__review_sprint(project="", since="last_release")
+mcp__dct__pickup_work(project="", consume="false")
 ```
 
-Returns:
-- `in_sprint` — currently flagged items
-- `recent_activity` — items changed since anchor
-- `stale_in_progress` — forgotten in-progress items
-- `unconsumed_handoffs` — unread drafts (with prompt previews) from previous sessions
+`consume="false"` makes this a PURE READ — nothing is written, so no
+`consumed_by` identity is needed (and passing `handoff_id` here is an error).
+One call returns everything Step 2 needs — never follow up with
+`review_sprint` / `list_handoffs` / `get_handoff`:
 
-**Fallback only when project is unresolved** (CWD not a registered project →
-`review_sprint` errors): call `mcp__dct__list_projects()` and ask via
-`AskUserQuestion` ("Which project are we working on?" → slugs + "Cancel"), then
-re-call `review_sprint(<slug>, since="last_release")`.
+- **`handoff.latest`** — the newest unconsumed handoff with its FULL prompt
+  (this is the text you show the user); `handoff.others` carries 200-char
+  previews of the rest; `handoff.pending_count` says how many are waiting.
+- **`picked_up: null` + `consumed: false`** — always, in this phase.
+- **`pending_count: 0`** — no handoff; go straight to the first-action question.
+- **`sprint`** — ALL active sprints (`active_sprints`, `primary_sprint_id`),
+  member items with `cp`, their `checkpoints` (the next pending checkpoint is
+  readable directly — no `get_item` needed for the plan preview),
+  `stale_in_progress`.
+- **`gates`** — pending gate checkpoints of in-sprint items; **`decisions`** —
+  live ADRs/open questions with previews; **`summary`** — sprint_size,
+  sprint_completion, handoffs_pending, gates_pending.
+
+**Fallback only when project is unresolved** (CWD not registered →
+`pickup_work` errors): call `mcp__dct__list_projects()` and ask via
+`AskUserQuestion` ("Which project are we working on?" → slugs + "Cancel"),
+then re-call `pickup_work(<slug>, consume="false")`.
 
 ### Step 2: Merged decision — handoff + first action (ONE AskUserQuestion)
 
-Handle the handoff pick-up decision AND the first-action decision in a SINGLE
-`AskUserQuestion` call (two questions in one dialog). Embed the full handoff
-prompt text INSIDE the question field so the user reads it before deciding —
-never rely on plain text printed the same turn.
+Handle the handoff decision AND the first-action decision in a SINGLE
+`AskUserQuestion` call. Embed the full handoff prompt text INSIDE the question
+field so the user reads it before deciding — never rely on plain text printed
+the same turn.
 
-**Question 1 — handoff** (skip this question entirely if 0 unconsumed handoffs):
-- If exactly 1 handoff:
-  - question: "Handoff #N [scope: X] from <created_at> by <created_by>:\n\n<prompt>\n\nPick up this handoff?"
+**Question 1 — handoff** (branch on Step 1's `pending_count`):
+- If exactly ONE handoff (`pending_count == 1`) — the user decides whether it
+  is followed AND whether it gets consumed:
+  - question: "Handoff #N [scope: X] from <created_at> by <created_by>:\n\n
+    <handoff.latest.prompt>\n\nPick it up?"
   - options:
-    - "Yes — consume and follow it"
-    - "Yes — follow it but keep unconsumed (for audit)"
-    - "No — start fresh, discard this handoff"
-- If multiple handoffs:
-  - question: "N handoffs waiting. Which to pick up?"
-  - options: one per handoff formatted `#N [scope] — <prompt preview>` + "None — start fresh"
-  - (fetch the full text of the chosen one with `get_handoff(id)` before acting)
+    - "Consume and follow" (recommended) — mark it consumed, work its plan
+    - "Follow but keep unconsumed (audit)" — work its plan, leave the row
+      pending so another session/reviewer still sees it
+    - "Start fresh" — ignore its plan; nothing is consumed
+- If several handoffs (`pending_count >= 2`):
+  - question: "N handoffs waiting. Which to pick up?\n\nNewest #M [scope]:\n<handoff.latest.prompt>"
+  - options: one per handoff — `#N [scope] — <preview from handoff.others>` —
+    plus "None — start fresh"
+- If `pending_count: 0` — skip Question 1 entirely.
 
 **Question 2 — first action** (always present):
 - question: "First action for this session?"
@@ -75,36 +87,61 @@ never rely on plain text printed the same turn.
 
 ### Step 3: Act on the answers (ONE parallel message)
 
-Batch the follow-up calls in a single parallel message:
-- If the user chose to consume a handoff → `mcp__dct__consume_handoff(id, consumed_by=<session_id>)`
-- If the user chose "Open #X" → `mcp__dct__get_item(X)`
+- User chose "Consume and follow" (single handoff) or picked #N among several →
+  ```
+  mcp__dct__pickup_work(project="", consume="true", handoff_id=N,
+                        include="none",
+                        consumed_by="claude-<model_id> @ <project_slug> <iso_utc>Z")
+  ```
+  `include="none"` makes the consume call cheap (no snapshot re-read) —
+  Step 1 already delivered the state.
+- User chose "Open #X" → `mcp__dct__get_item(X)` — BATCH it in the SAME
+  parallel message as the consume call above.
+- "Follow but keep unconsumed (audit)" → write nothing; work the plan you
+  already read in Step 1.
+- "Start fresh" / "None — start fresh" → consume nothing; optionally
+  `delete_handoff(id)` (deferred tool — load only if the user explicitly
+  wants a discard).
 
-("keep unconsumed" → use the prompt content but do NOT stamp consumed_at;
-"start fresh" → optionally `delete_handoff(id)`, soft, or leave it.)
-
-Then show `in_sprint` as a compact table (format from `review_sprint.in_sprint`)
-plus summary: sprint_size, sprint_completion, handoffs_pending, and the opened
-item's checkpoints as the next-step plan.
+Then show the sprint items as a compact table (from `sprint.items`) plus
+summary: sprint_size, sprint_completion, handoffs_pending, and the opened
+item's pending checkpoints (from `sprint.checkpoints`) as the next-step plan.
 
 ### Step 4: Report
 
 ```
-✓ Picked up handoff #N
-  Sprint: 3 items, 0/3 done
+✓ Picked up handoff #N (consumed | left unconsumed for audit)
+  Sprint: 3 items, 1/3 done
   Starting: #22 — "Optimize MCP response format"
   Plan: 4 pending checkpoints in this item
 ```
 
-If the project has plans with pending checkpoints (visible in
-`review_sprint`/`get_item` context), mention that **`/plan-status` shows overall
-plan progress** — a good next call when planned work is in flight.
+If the project has plans with pending checkpoints, mention that
+**`/plan-status` shows overall plan progress** — a good next call when planned
+work is in flight.
 
 ## Rules
 
 - **Every decision is an `AskUserQuestion`.** No plain-text Y/N prompts.
-- Don't auto-consume handoffs — user must approve (consume vs keep vs discard).
+- **Consumption happens ONLY after the dialog.** Step 1 is always
+  `consume="false"`; NEVER pass `consume="true"` without a user-chosen
+  `handoff_id` or an explicit user instruction.
+- `consume=""` (auto) and the CLI's `--consume always` are for AUTONOMOUS
+  flows (Codex, CI, unattended agents) where no human can be asked — never
+  this skill.
+- Race note: a parallel session may consume the same handoff between Step 1
+  and Step 3. A server-selected consume then degrades to `consumed: false`
+  (no error) — just proceed with the fresh snapshot. An explicit `handoff_id`
+  (this skill's path) instead errors "not found or already consumed": report
+  it verbatim, keep the plan you already read in Step 1, and do NOT retry in
+  a loop.
 - On empty sprint + no handoffs, don't force-create a sprint — ask user what to do.
-- Show resolved items from `review_sprint.recent_activity` only as context, not as
-  work candidates (they're done).
-- `consumed_by` should mirror `/handoff`'s `created_by` format:
-  `claude-<model_id> @ <project_slug> <iso_utc>Z`.
+- Show resolved items (they surface via `summary.sprint_completion` and
+  `recent_changes`) only as context, not as work candidates.
+- `consumed_by` MUST mirror /handoff's `created_by` format:
+  `claude-<model_id> @ <project_slug> <iso_utc>Z` — required on the Step 3
+  consume, meaningless (and unnecessary) on the Step 1 read.
+- Round-trip budget: 2 dct calls — the Step 1 read plus the Step 3 consume,
+  with `get_item` batched into the same parallel message. No handoff to
+  consume (or "keep unconsumed") = 1 call. If you find yourself calling
+  `review_sprint` or `get_handoff` here, you are off the rails.

@@ -5,7 +5,7 @@
 [![CI](https://github.com/fotodeveloper/dct/actions/workflows/ci.yml/badge.svg)](https://github.com/fotodeveloper/dct/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-Persistent, queryable memory for AI coding assistants — your assistant reads facts from a database instead of guessing. One user-scoped database tracks issues, todos, changelog entries, plans, sprints, and decisions across all your projects. Built for [Claude Code](https://claude.com/claude-code) (skills, hooks, 49 MCP tools); the MCP server and CLI work with any MCP-capable assistant.
+Persistent, queryable memory for AI coding assistants — your assistant reads facts from a database instead of guessing. One user-scoped database tracks issues, todos, changelog entries, plans, sprints, and decisions across all your projects. Built for [Claude Code](https://claude.com/claude-code) (skills, hooks, 52 MCP tools); the MCP server and CLI work with any MCP-capable assistant.
 
 Part of the **dc tools** family ([dctools.dev](https://dctools.dev)) — *deterministic context* for AI-assisted development.
 
@@ -214,7 +214,12 @@ dct sprint create "Payments hardening" --code pay-1 --goal "Close the P1 backlog
 dct sprint show 3                     # Details + linked items
 dct sprint activate 3                 # Shortcuts: activate / complete / defer
 
-# Handoffs (amend an unconsumed handoff in place; creation is /handoff or MCP)
+# Session edges (same composed ops the /pickup and /handoff skills use)
+dct pickup                            # Snapshot: sprint, handoffs, gates, decisions
+                                      # (read-only — --consume defaults to never)
+dct handoff create --prompt-file - --add-items 22,6   # Sprint change + handoff, one transaction
+                                      # --remove-items cuts scope, --items replaces;
+                                      # omit all three to leave the sprint untouched
 dct handoff update 12 --prompt "Wire the toggle into settings next"
 
 # Config
@@ -224,7 +229,7 @@ dct config path                       # Show resolved config/data locations
 
 ## MCP Tools
 
-dct ships **49 MCP tools**, registered at user scope so they're callable from any Claude Code session as `mcp__dct__<name>`. Zero-arg calls auto-detect the project from the session's working directory; pass `project=<slug>` to override. Write ops return a minimal ack (id + a few post-state scalars); fetch full context with `get_item(id)` / `get_handoff(id)`. Ten mid-session daily drivers are always resident (`alwaysLoad`); the rest of the catalogue loads on demand via ToolSearch:
+dct ships **52 MCP tools**, registered at user scope so they're callable from any Claude Code session as `mcp__dct__<name>`. Zero-arg calls auto-detect the project from the session's working directory; pass `project=<slug>` to override. Write ops return a minimal ack (id + a few post-state scalars); fetch full context with `get_item(id)` / `get_handoff(id)`. Thirteen tools are always resident (`alwaysLoad`) — ten mid-session daily drivers plus the three composed workflow ops (`pickup_work`, `handoff_work`, `get_context_snapshot`); the rest of the catalogue loads on demand via ToolSearch:
 
 | Tool | Purpose |
 |---|---|

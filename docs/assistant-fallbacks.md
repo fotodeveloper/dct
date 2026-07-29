@@ -14,6 +14,60 @@ notes, checkpoints, progress) or `get_handoff(id)` (untruncated prompt +
 context_summary). `list_handoffs` returns 200-char prompt previews — use
 `get_handoff(id)` for the full text.
 
+## `/pickup` fallback
+
+The skill is TWO-PHASE — a read, a dialog, then (only if the user says so)
+the consume. Without the skill:
+
+1. `pickup_work(project="", consume="false")` — a PURE READ, no `consumed_by`
+   needed and nothing written. `handoff.latest` carries the newest unconsumed
+   handoff with its FULL prompt; `handoff.others` are 200-char previews;
+   `handoff.pending_count` says how many wait.
+2. Show the prompt and let the USER decide: consume and follow / follow but
+   keep it unconsumed (audit) / start fresh — and, with several handoffs,
+   which one.
+3. On "consume":
+   `pickup_work(project="", consume="true", handoff_id=N, include="none", consumed_by="<agent> @ <slug> <iso_utc>Z")`
+   — `include="none"` skips the snapshot re-read (step 1 already has it).
+4. Read the next step from `sprint.checkpoints` (first `pending` row of the
+   chosen item); honor `gates` and `decisions` before acting.
+5. CLI equivalent: `dct pickup [--json]` (its `--consume` default is `never`),
+   `dct pickup --consume always --handoff-id N` for the write.
+
+Never auto-pick among several handoffs; never call `consume_handoff` here —
+`pickup_work` owns the consume. `consume=""` (auto) and `--consume always`
+belong to AUTONOMOUS flows (CI, unattended agents) where nobody can be asked.
+If a parallel session wins the race, a server-selected consume comes back
+`consumed: false` (proceed with the fresh snapshot); an explicit `handoff_id`
+errors "not found or already consumed" — report it, don't retry in a loop.
+
+## `/handoff` fallback
+
+The skill is preflight + dialogs + one atomic call. Without the skill:
+
+1. `get_context_snapshot(project="")` — sprint/gates/decisions feed the draft.
+2. Confirm the membership change + prompt text with the user. Sprints are
+   MULTI-SESSION (ADR #57): the default is "sprint untouched", the normal edge
+   is ADDITIVE (add discovered items / cut scope), and a full replace is
+   conscious replanning.
+3. `handoff_work(prompt=..., created_by="<agent> @ <slug> <iso_utc>Z", project="",
+   item_ids="__keep__" (default) | "22,21,6" (replace), add_item_ids="22,6",
+   remove_item_ids="7", sprint=<id-or-code when several active>, scope=...)` —
+   one transaction; a failed sprint write leaves no handoff. Replace and the
+   additive pair are mutually exclusive. **Never `item_ids=""`** — an empty
+   replace errors; emptying a sprint is `clear_sprint`'s job. Unknown item ids
+   abort everything (strict), removing a TERMINAL member errors (resolved work
+   is the sprint's history), and an ambiguous / membership-less `sprint`
+   selector errors too.
+4. "No prompt" case: `handoff_work` requires a prompt — with ≤ 1 active sprint
+   fall back to `set_sprint(project, item_ids=...)`; with ≥ 2 active sprints
+   `set_sprint` errors (current-sprint writes refuse to guess), so target the
+   chosen sprint via `assign_item_to_sprint(item_id, sprint_id)` /
+   `remove_item_from_sprint(item_id, sprint_id)`.
+5. CLI equivalent: `dct handoff create --prompt-file - --add-items 22,6 --scope g1`
+   (`--remove-items` cuts scope, `--items` replaces; omit all three to keep the
+   sprint).
+
 ## `/release` fallback
 
 1. Detect current project: match CWD against `mcp__dct__list_projects()` results, take longest path prefix.

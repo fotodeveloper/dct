@@ -1,6 +1,6 @@
 # dct — MCP Tools Reference
 
-Complete catalogue of the **49 MCP tools** the dct server exposes to Claude Code, grouped by domain. ← back to the [README](../README.md).
+Complete catalogue of the **52 MCP tools** the dct server exposes to Claude Code, grouped by domain. ← back to the [README](../README.md).
 
 The dct MCP server is registered at **user scope** (`~/.claude.json`), so every tool below is callable from any Claude Code session as `mcp__dct__<name>`. Most list/create tools accept an empty `project=""` and auto-detect the project from the session's working directory (longest-prefix match); pass `project=<slug>` to override.
 
@@ -12,7 +12,7 @@ New tools become callable only after the Claude Code session restarts (the MCP s
 - `get_*` → a full semantic dict (single record, all keys, nested notes/checkpoints).
 - **Write ops → a minimal ack**, not the full record echo: the created/updated `id` plus a few post-state scalars. Fetch full context deliberately — `get_item(id)` (notes, checkpoints, progress) or `get_handoff(id)` (untruncated prompt + context_summary). Per-tool ack shapes are listed below; failures return `{"error": "..."}`.
 
-**Deferral / `alwaysLoad`**: Claude Code defers all MCP tools by default. dct exempts exactly **10 mid-session daily drivers** — `create_item`, `get_item`, `list_items`, `update_item`, `resolve_item`, `add_note`, `add_checkpoint`, `complete_checkpoint`, `reject_checkpoint`, `add_changelog` — via the `anthropic/alwaysLoad` `_meta` hint so they load at session start. Every other tool (handoffs, sprints, changelog release, plans, decisions) loads on demand through a one-time ToolSearch `select:<name>` round-trip. Takes effect on server restart.
+**Deferral / `alwaysLoad`**: Claude Code defers all MCP tools by default. dct exempts exactly **13 tools** — the 10 mid-session daily drivers (`create_item`, `get_item`, `list_items`, `update_item`, `resolve_item`, `add_note`, `add_checkpoint`, `complete_checkpoint`, `reject_checkpoint`, `add_changelog`) plus the 3 composed workflow entry points (`get_context_snapshot`, `pickup_work`, `handoff_work` — they ARE the session edge, so the ToolSearch round-trip they used to pay was 100% of pre-work latency) — via the `anthropic/alwaysLoad` `_meta` hint so they load at session start. Every other tool (granular handoffs, sprints, changelog release, plans, decisions) loads on demand through a one-time ToolSearch `select:<name>` round-trip. Takes effect on server restart.
 
 ---
 
@@ -57,7 +57,13 @@ Project registration, rename, version, and changelog-location changes are **CLI-
 
 ## Sprints (11)
 
-**Current-sprint helpers** — operate on the project's single active sprint:
+**Current-sprint helpers** — operate on the project's primary active sprint
+(the most recently started; several sprints may be active in parallel).
+**Reads may fall back to the primary sprint; WRITES may not**: `set_sprint`,
+`clear_sprint`, `add_item_to_current_sprint` and `remove_item_from_current_sprint`
+ERROR when several sprints are active (listing the candidates) rather than
+guessing a target — pick one explicitly with `assign_item_to_sprint` /
+`remove_item_from_sprint` (or `handoff_work(sprint=<id-or-code>, ...)`).
 
 | Tool | Purpose |
 |---|---|
@@ -90,6 +96,25 @@ Project registration, rename, version, and changelog-location changes are **CLI-
 | `update_handoff` | Amend an unconsumed handoff in place — preserves id + created_at. |
 
 `list_handoffs` truncates the `prompt` to a 200-char preview (with a trailing `…` when longer) across all formats; call `get_handoff(id)` for the full text.
+
+## Workflow ops (3)
+
+Composed session-edge operations (#413) — ONE implementation in
+`dct/workflows/session.py` shared by MCP, the CLI (`dct pickup` /
+`dct handoff create`) and the packaged /pickup + /handoff skills. Each runs in
+a single DB transaction. **Prefer these over chaining the granular tools**:
+`pickup_work` replaces `review_sprint` + `list_handoffs` + `get_handoff` +
+`consume_handoff` (4-8 calls → 1-2); `handoff_work` replaces `set_sprint` +
+`create_handoff` (atomic — a failed sprint write leaves no handoff).
+
+| Tool | Purpose |
+|---|---|
+| `get_context_snapshot` | One composed read: all active sprints (+ per-sprint completion), open member items with `cp`, their checkpoints, pending gates, live decisions (previewed), recent changes, summary. `include` CSV skips sections (`'none'` = headers only). |
+| `pickup_work` | Snapshot + consume ONE handoff. `consume` enum: `''` auto (consumes only when exactly one candidate matches — several → caller picks and re-calls with `handoff_id`), `'true'`, `'false'` (pure read; contradictory with `handoff_id`). Snapshot reflects the state AFTER the write; the consumed row rides only in `picked_up` (full prompt). `consumed_by` required for auto/true. A parallel session winning the race on a SERVER-selected target degrades to `consumed: false` (no error, snapshot is post-race); an explicit `handoff_id` still errors "not found or already consumed". |
+| `handoff_work` | Sprint membership + handoff in one transaction. Session edges are ADDITIVE by default (ADR #57 — sprints are multi-session): `add_item_ids` / `remove_item_ids` pull items in / cut scope. `item_ids` is the REPLACE mode — `'__keep__'` (default, sprint untouched) / CSV (strict set); `''` or a delimiter-only string ERRORS (emptying a sprint is `clear_sprint`'s job), and replace is mutually exclusive with the additive pair. TERMINAL members (resolved / wont_fix) are the sprint's completion history: immune to replace, and removing one errors. All id lists are strict — unknown/foreign ids abort everything. `sprint` selects among multiple active sprints (id or code; id match takes precedence, an id↔code collision errors); ambiguity errors instead of guessing, and a selector without any membership change errors too. |
+
+Structured data only: snapshots carry facts (no `recommended_action` — the
+interpretation belongs to the consuming skill/assistant).
 
 ## Plans (11)
 
@@ -134,6 +159,8 @@ Write ops return a minimal ack, not the full record. `get_item` / `get_handoff` 
 | `complete_checkpoint` / `reject_checkpoint` / `reopen_checkpoint` | `{id, item_id, status, progress}` |
 | `add_changelog` | `{id, project, category, component}` |
 | `create_handoff` | `{id, project, scope, created_at}` |
+| `handoff_work` | `{handoff_id, project, scope, created_at, sprint: {sprint_id, code, size, items} \| null}` — no prompt echo |
+| `pickup_work` | snapshot + `{picked_up: full handoff \| null, consumed: bool}` (read-heavy op — not a slim ack) |
 | `update_handoff` | `{id, updated_fields}` (list of applied field names) |
 | `consume_handoff` | `{id, consumed_at}` |
 | `create_sprint` / `update_sprint` / `promote_section_to_sprint` | `{id, code, kind, status, name}` |
@@ -147,4 +174,4 @@ Write ops return a minimal ack, not the full record. `get_item` / `get_handoff` 
 
 ---
 
-**Total: 49 tools.** This list is generated from `dct/mcp/server.py`; if it drifts, `dct server` prints the live set.
+**Total: 52 tools.** This list is generated from `dct/mcp/server.py`; if it drifts, `dct server` prints the live set.

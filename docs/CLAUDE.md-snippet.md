@@ -54,7 +54,8 @@ Rules of thumb:
 - `idea` = exploratory, not yet decided to build
 - `improvement` = existing thing works but could be better (refactor, UX polish, perf)
 
-**MCP tools** — 49 total; most important:
+**MCP tools** — 52 total; most important:
+- `pickup_work`, `handoff_work`, `get_context_snapshot` — composed session-edge ops; prefer them over chaining the granular tools below
 - `list_projects`, `list_items`, `get_item`, `create_item`, `update_item`, `resolve_item`, `add_note`
 - `add_checkpoint`, `list_checkpoints`, `complete_checkpoint`, `reject_checkpoint`, `reopen_checkpoint`
 - `add_changelog`, `list_changelog`, `count_unreleased_changelog`, `release_changelog`, `export_changelog`
@@ -144,14 +145,23 @@ You usually don't need to specify project explicitly inside a project tree.
 
 ### Sprint + handoff in practice
 
-- Set sprint: `set_sprint(project, item_ids="22,21,6")` — atomic replace
+- Set sprint: `set_sprint(project, item_ids="22,21,6")` — atomic replace of the
+  single active sprint; with several active it ERRORS (as do `clear_sprint` and
+  the current-sprint add/remove helpers) — target one explicitly via
+  `assign_item_to_sprint` / `remove_item_from_sprint`
+- Session edge: `handoff_work(..., add_item_ids=..., remove_item_ids=...)` —
+  sprints span sessions, so a handoff ADDS/CUTS by default; `item_ids` (replace)
+  is conscious replanning and an empty replace is refused
 - Review: `review_sprint(project, since="last_release")` → in_sprint,
   recent_activity, stale_in_progress, unconsumed_handoffs, summary
-- Resolve auto-unflags sprint (sprint = active work invariant)
+- Resolving an item clears the DERIVED `in_current_sprint` flag (sprint = active
+  work invariant), but its sprint membership is RETAINED as completion history
+  and counted by `sprint_completion`
 - Park an unfinished sprint: `update_sprint(sprint_id, status="deferred")` —
-  keeps `started_at`, frees the one-active-per-project slot; reactivate later
-  with `status="active"` (≤1 active cap enforced). Never mark an unfinished
-  sprint completed/abandoned — defer it.
+  keeps `started_at`; reactivate later with `status="active"`. Parallel active
+  sprints are allowed; the "current" one is the most recently started (reads
+  only — writes refuse to guess). Never mark an unfinished sprint
+  completed/abandoned — defer it.
 - Multiple parallel handoffs supported (use `scope` tag to disambiguate)
 - `consume_handoff(id)` preserves the row — ledger, nothing hard-deleted
 

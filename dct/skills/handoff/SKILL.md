@@ -10,60 +10,80 @@ description: >-
 Finalize a coding session by (a) marking which items belong to the next sprint
 and (b) optionally writing a prompt for the next session to pick up.
 
-## Deferred-tool load (do this first)
-
-`review_sprint`, `set_sprint`, and `create_handoff` are deferred — load their
-schemas before first use with ONE ToolSearch call:
-
-```
-ToolSearch("select:mcp__dct__review_sprint,mcp__dct__set_sprint,mcp__dct__create_handoff")
-```
+No ToolSearch preload needed for the main path: `get_context_snapshot`,
+`handoff_work` and `list_items` are alwaysLoad residents.
+(`promote_checkpoint_to_item`, `resolve_item` fallbacks: `resolve_item` is
+resident; only `promote_checkpoint_to_item` needs a ToolSearch load — do it
+lazily, ONLY when the user actually picks the promote option.)
 
 ## Workflow
 
 ### Step 1: Preflight (ONE parallel message)
 
-After the ToolSearch load, gather all state in a single parallel message:
-- `mcp__dct__review_sprint(project="", since="last_release")` — CWD auto-detect;
-  returns current `in_sprint`, `recent_activity`, `stale_in_progress`.
+Gather all state in a single parallel message:
+- `mcp__dct__get_context_snapshot(project="")` — CWD auto-detect; returns all
+  active sprints (`sprint.active_sprints`, `primary_sprint_id`), member items
+  with `cp`, their `checkpoints`, `stale_in_progress`, pending `gates`, live
+  `decisions`, `recent_changes` and `summary`. Gates and decisions FEED THE
+  DRAFT: an unresolved gate or open ADR question belongs in the handoff text.
 - `mcp__dct__list_items(project="", search="CC task list")` — the cc-task-list
-  mirror probe (see Step 2, question 3). `list_items` is not deferred and has NO
-  `tags` parameter, so filter the returned rows CLIENT-SIDE: keep only rows whose
-  `tags` column contains `cc-task-list`.
+  mirror probe (see Step 2, question 3). `list_items` has NO `tags` parameter,
+  so filter the returned rows CLIENT-SIDE: keep only rows whose `tags` column
+  contains `cc-task-list`.
 
-**Fallback only when project is unresolved** (`review_sprint` errors because CWD
-is not a registered project): `mcp__dct__list_projects()` + `AskUserQuestion`
-("Which project is this handoff for?" → slugs + "Cancel"), then re-run preflight
-with the chosen slug.
+**Fallback only when project is unresolved** (`get_context_snapshot` errors
+because CWD is not a registered project): `mcp__dct__list_projects()` +
+`AskUserQuestion` ("Which project is this handoff for?" → slugs + "Cancel"),
+then re-run preflight with the chosen slug.
 
 **Empty project fallback** — if all sections are empty (no items at all, or
 everything resolved), offer via `AskUserQuestion`:
 - question: "Nothing to propose — project has no open or recent items. What now?"
 - options: `"Skip sprint proposal — just write handoff prompt"` / `"Cancel /handoff"` / `"Run /track-list to browse state first"`.
 
-### Step 2: Merged decision (ONE AskUserQuestion, up to 3 questions)
+### Step 2: Merged decision (ONE AskUserQuestion, up to 4 questions)
 
 Ask all setup decisions in a SINGLE `AskUserQuestion` call. Include only the
 questions that apply. There is NO "write a prompt?" question here — the draft
 itself is the question, in Step 3 (asking twice about the same thing wastes a
 decision; user call, 2026-07-15):
 
-1. **Sprint items** — propose: all P1 open items (always) + top 3-5 P2 open items
-   with existing checkpoints + still-open items from `recent_activity`.
-   - question: "Which items go into the next sprint?"
-   - options: proposed list as "22, 21, 6 (proposed)" | "Keep current sprint" | "Empty sprint" | "Custom list (type in)".
-   - If replacing a non-empty sprint, surface the DIFF in the question text
-     ("removing: #7; adding: #22").
-2. **Scope tag**:
+1. **Sprint membership** — sprints are MULTI-SESSION (ADR #57): a handoff
+   designates the NEXT SESSION'S SLICE, it does not re-plan the sprint. The
+   session edge is therefore ADDITIVE by default and "untouched" is the
+   default answer. Propose additions from: all P1 open items not yet in the
+   sprint + top 3-5 P2 open items with existing checkpoints + still-open items
+   from `recent_changes`.
+   - question: "Sprint membership for the next session?"
+   - options:
+     - "Sprint untouched" (DEFAULT/recommended) — carry the sprint as-is.
+     - "Add discovered items (22, 6)" — the proposed ADD list.
+     - "Cut scope (remove #7)" — the proposed REMOVE list. Removing a
+       resolved / wont_fix member is REFUSED by the server — terminal members
+       are the sprint's completion history, not scope (the escape hatch is
+       `remove_item_from_sprint`).
+     - "Replan — REPLACE open membership (22, 21, 6)" — conscious replanning
+       only. Surface the DIFF in the question text ("removing: #7; adding:
+       #22") and state that resolved members STAY as history.
+     - "Custom list (type in)" — ask which mode it is (add / remove / replace).
+   - There is NO "empty sprint" option: emptying a sprint is `clear_sprint`'s
+     job and `handoff_work` rejects an empty replace.
+2. **Target sprint** (include ONLY when `summary.active_sprint_count >= 2` and
+   the sprint is being modified): "Which active sprint gets these items?" —
+   one option per `sprint.active_sprints` entry (`#id (code) — name, size N`).
+   `handoff_work` REFUSES to guess among several actives (and so does every
+   current-sprint helper), so this must be decided before the finale — it is
+   also the sprint the "Skip — no prompt" branch writes to.
+3. **Scope tag**:
    - question: "Optional scope tag (disambiguates parallel sessions)?"
    - options: "No scope" | "sprint-v<next>" | "refactor-<area>" | "Other (type in)".
-3. **CC task disposition** (include ONLY if the Step 1 probe found a
+4. **CC task disposition** (include ONLY if the Step 1 probe found a
    `cc-task-list` item — title `"CC task list — session <id>"`, from the
    `dct/hooks/dct-task-mirror.sh` mirror):
    - question: f"Session item #{id} has N CC task-list checkpoints. What to do?"
    - options:
      - "Resolve — one-off, archive it" → `resolve_item(id, status="resolved", resolution="session ephemeral, archived on /handoff")`
-     - "Promote N checkpoints to real items" → `promote_checkpoint_to_item` per checkpoint (or a user-picked subset)
+     - "Promote N checkpoints to real items" → `promote_checkpoint_to_item` per checkpoint (load it via ToolSearch first)
      - "Keep — revisit next session" → leave as-is; next /pickup surfaces it
      - "Skip"
 
@@ -75,7 +95,8 @@ ALWAYS auto-draft once Step 2 resolves — this single dialog decides both
 "whether" and "which text", so the draft must reflect the Step 2 answers
 (sprint composition, scope, cc-task outcome). Draft 2-4 sentences: what was
 accomplished (resolved items / recent changelog), what's next (first 1-2 sprint
-items), any open design questions.
+items), any open design questions — plus pending GATES and open DECISIONS from
+the snapshot (the next session must honor them without transcript access).
 
 Present ONE single-select question. The FULL draft rides in the option
 `preview` field (side-by-side rendering), NOT in the question text — long
@@ -92,21 +113,43 @@ content belongs in previews; keep the question and option descriptions short:
 - The user MUST be able to read the entire draft inside the dialog (the preview
   panel); never rely on plain text printed the same turn.
 
-### Step 4: Finale (SEQUENTIAL — sprint first, then handoff)
+### Step 4: Finale (ONE atomic call)
 
-Do NOT batch these two writes: the handoff prompt asserts sprint membership, so a
-failed `set_sprint` must not still persist a handoff that references a sprint that
-was never written. Run them in order, and omit either call that doesn't apply
-(skip `set_sprint` on "Keep current sprint"; skip `create_handoff` when Step 3
-ended in "Skip — no prompt"):
+```
+mcp__dct__handoff_work(
+    prompt=<approved text>,
+    created_by=f"claude-{model_id} @ {project_slug} {isoformat_utc_now()}Z",
+    project="",
+    item_ids=<"__keep__" (default) | "22,21,6" ONLY for a conscious replan>,
+    add_item_ids=<"22,6" when the user chose "Add discovered items">,
+    remove_item_ids=<"7" when the user chose "Cut scope">,
+    sprint=<id-or-code, ONLY when Step 2 question 2 picked one>,
+    scope=<scope or "">,
+)
+```
 
-1. `mcp__dct__set_sprint(project, item_ids="22,21,6")` (empty string = empty sprint).
-   If it returns an error, STOP — report the failure and do NOT write the handoff.
-2. Only after `set_sprint` succeeds (or was skipped):
-   `mcp__dct__create_handoff(project=<slug>, prompt=<text>, created_by=f"claude-{model_id} @ {project_slug} {isoformat_utc_now()}Z", scope=<scope or "">)`
+Sprint membership and the handoff row are written in ONE DB transaction —
+a failed sprint write leaves NO handoff (and vice versa), so there is no
+ordering to manage and no partial state to report. Mapping from Step 2
+question 1: "Sprint untouched" → send nothing (`item_ids="__keep__"`, the
+default, no membership write); "Add" / "Cut scope" → `add_item_ids` /
+`remove_item_ids` (they may be combined); "Replan" → `item_ids=<CSV>`, which
+is mutually exclusive with the additive pair. **NEVER send `item_ids=""`** —
+an empty replace errors by design (emptying a sprint is `clear_sprint`'s job).
 
-This session-end step tolerates the one extra round-trip. Remember the returned
-handoff `id`.
+Branch: Step 3 ended in **"Skip — no prompt"** → `handoff_work` does not apply
+(prompt is required by design). Then, if and only if the sprint changed:
+- **≤ 1 active sprint** → `mcp__dct__set_sprint(project, item_ids=...)` alone
+  (replace) — it targets the single active sprint unambiguously.
+- **≥ 2 active sprints** → `set_sprint` (and every other current-sprint write)
+  now ERRORS rather than guessing which sprint you meant. Write to the sprint
+  chosen in Step 2 question 2 explicitly, one item at a time:
+  `mcp__dct__assign_item_to_sprint(item_id, sprint_id)` /
+  `mcp__dct__remove_item_from_sprint(item_id, sprint_id)` (both deferred —
+  ToolSearch-load them only in this branch).
+If the sprint was kept too, there is nothing to write at all.
+
+Remember the returned `handoff_id`.
 
 ### Step 5: Report
 
@@ -122,8 +165,24 @@ Next session: /pickup
 ## Rules
 
 - **Every user decision is an `AskUserQuestion` call.** No plain-text prompts.
-- Never call `set_sprint` without user confirming the list.
+- Never modify sprint membership without user confirming the list. The
+  default is "untouched" — a sprint spans sessions (ADR #57); a handoff
+  designates the next slice, it does not re-plan by default.
+- Terminal (resolved / wont_fix) members are the sprint's completion history:
+  a replace leaves them in place and a remove of one is refused. Never try to
+  "clean up" a sprint by dropping resolved items — that destroys
+  `sprint_completion`.
 - Never write a handoff prompt without user confirming content (the Step 3
   draft-preview dialog is that confirmation).
-- `created_by` MUST be non-empty; include model id + project + UTC timestamp.
-- On `set_sprint`, if replacing a non-empty sprint, surface the diff ("removing: #7; adding: #22") in the confirmation question.
+- `created_by` MUST be non-empty; include model id + project + UTC timestamp
+  (`handoff_work` refuses blanks).
+- With several active sprints, the target sprint is a USER decision (Step 2
+  question 2) — `handoff_work` errors rather than guessing, and so do the
+  current-sprint helpers (`set_sprint`, `clear_sprint`,
+  `add_item_to_current_sprint`, `remove_item_from_current_sprint`). Never
+  pick one silently.
+- Unknown/foreign item ids make `handoff_work` fail atomically (nothing
+  written) — report the error verbatim and re-ask, don't retry blindly.
+- Round-trip budget: preflight = 1 parallel message (2 calls), finale = 1 call.
+  If you find yourself sequencing `set_sprint` → `create_handoff`, you are off
+  the rails (that pair survives ONLY in the "Skip — no prompt" branch).

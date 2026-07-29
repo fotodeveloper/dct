@@ -48,9 +48,11 @@ dct/core/checkpoints.py  — Item checkpoint helpers
 dct/core/ids.py          — ULID generation
 dct/core/plans/          — Plans subsystem: parser.py (pure MD parser),
                            classify.py (claude --print), crud.py, ingest.py
-dct/services/            — Service layer (G1 workflow ops land here)
-dct/workflows/           — Workflow orchestration layer (G1)
-dct/mcp/server.py        — FastMCP MCP server (49 tools); dct/server.py is
+dct/services/            — Service layer (reserved for future shared app ops)
+dct/workflows/session.py — G1 composed ops: get_context_snapshot /
+                           pickup_work / handoff_work (one impl for MCP,
+                           CLI and skills; single transaction each)
+dct/mcp/server.py        — FastMCP MCP server (52 tools); dct/server.py is
                            a compat shim
 dct/cli.py               — argparse CLI entry point
 dct/export.py            — Keep a Changelog MD export

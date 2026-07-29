@@ -175,6 +175,38 @@ crash `/release` much later — the detect-or-ask flow closes that trap).
 Helper: `dct/core/version.py::detect_version`; tests:
 `tests/test_version.py::TestDetectVersion`.
 
+## Workflow layer (`dct/workflows`)
+
+`dct/workflows/session.py` hosts the G1 composed ops (#413):
+`get_context_snapshot`, `pickup_work`, `handoff_work` — ONE implementation
+consumed by the MCP tools, the CLI (`dct pickup` / `dct handoff create`) and
+the packaged /pickup + /handoff skills. `dct/services/` stays reserved for
+future shared application ops.
+
+Conventions the layer is built on:
+
+- **Conn-level privates in core.** Public core functions keep their
+  `fn(engine, ...)` signatures; each extracted a `_fn(conn, ...)` private
+  (e.g. `_create_handoff_conn`, `_set_current_sprint_items_conn`,
+  `_consume_handoff_conn`, the `_query_*` readers). Composed ops open ONE
+  `engine.begin()` and call the privates, so every op is a single
+  transaction: `handoff_work` writes sprint membership FIRST and the handoff
+  second — a handoff validation failure rolls the sprint write back.
+  Validation lives inside the conn privates so no caller can bypass it.
+- **Structured data only.** Snapshots carry facts (sprint state, handoffs,
+  gates, decisions, recent changes) — never interpretation like
+  `recommended_action`; that belongs to the consuming skill/assistant. A
+  future interpretive layer arrives additively (`annotate_snapshot`), never
+  as a base-shape change.
+- **Multi-sprint semantics.** The single-active-sprint cap is lifted:
+  several sprints may be active; the "current" one is the PRIMARY (most
+  recently started, id tie-break). Ops needing one unambiguous target
+  (`handoff_work`) take an explicit `sprint` selector and raise a conflict
+  error listing candidates instead of guessing.
+- **`review_sprint` is preserved.** The legacy dashboard keeps its exact
+  shape (web + tests depend on it) and shares the same conn-level readers,
+  so the queries stay single-sourced; deprecation is a later-group decision.
+
 ## PostgreSQL setup
 
 SQLite (the default) needs zero setup. To use PostgreSQL instead:

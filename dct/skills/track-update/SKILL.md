@@ -101,6 +101,9 @@ Batch:
 - **Every status/priority change gets a note** — no "I'll explain later" allowed.
 - **Batch confirmations are one-shot** — do NOT ask per-item if user clearly grouped them.
 - **ID normalization is uniform** — use the same regex as /track-resolve and /track-list.
-- **Terminal transitions auto-remove the item from the current sprint** (resolve
-  soft-removes its item_sprints links); sprint membership is never set via
-  `update_item` — `in_current_sprint` is derived and read-only.
+- **Terminal transitions clear the DERIVED flag, not the membership** — a
+  resolved / wont_fix item drops out of `in_current_sprint`, but its
+  `item_sprints` link STAYS as the sprint's completion history (it is what
+  `sprint_completion` counts). Sprint membership is never set via
+  `update_item` — `in_current_sprint` is derived and read-only; use
+  `assign_item_to_sprint` / `remove_item_from_sprint` for real membership.
