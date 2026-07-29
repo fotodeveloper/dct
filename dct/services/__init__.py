@@ -1,5 +1,7 @@
-"""Service layer — shared application operations above core CRUD.
+"""Service layer — reserved for shared application operations above core CRUD.
 
-Born in G0 (CP #1235) so the G1 workflow ops (get_context_snapshot,
-pickup_work, handoff_work) start life in their final home, shared by the
-MCP layer and the CLI instead of being duplicated in each."""
+Created in G0 (CP #1235) as the intended home for the G1 workflow ops, which
+ultimately landed in dct.workflows instead (K-10b): they compose conn-level
+dct.core privates inside ONE transaction, which is orchestration, not a
+service facade. Kept as the seam for future ops shared by MCP and the CLI —
+empty on purpose, so nothing here is a dependency of dct.workflows."""
