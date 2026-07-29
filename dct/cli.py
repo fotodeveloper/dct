@@ -13,6 +13,7 @@ from dct import __version__, migrate, paths
 from dct.config import load_config, save_config, Config
 from dct.db import get_engine, create_tables
 from dct.core.engine import bootstrap_engine
+from dct.core.items import TERMINAL_STATUSES
 
 # Windows-policy seam (tests flip it): dispatches the daemonization,
 # liveness-probe and signal paths that differ on win32 (W8-W10, ADR #52).
@@ -70,6 +71,59 @@ def _prompt_version(default: str = "0.1.0") -> str | None:
         return default
     shortcut = {"1": "0.0.1", "2": "0.1.0", "3": "1.0.0"}
     return shortcut.get(choice, choice)
+
+
+def _read_text_arg(text: str | None, path: str | None) -> str | None:
+    """Resolve a `--foo` / `--foo-file` flag pair to text ('-' = stdin).
+
+    The file wins when both are given. Returns None when neither is supplied,
+    so callers can tell "not passed" from an empty string. Raises (OSError) on
+    an unreadable path — call it INSIDE the command's try/except so the user
+    gets `✗ Error: ...` instead of a traceback.
+
+    Encoding is pinned to UTF-8 on BOTH paths: handoff prompts routinely carry
+    '✓', '—' and non-ASCII prose, and the platform default (cp1252 on Windows,
+    or a C-locale ASCII stdin) would mangle or reject them.
+    """
+    if path:
+        if path != "-":
+            return Path(path).read_text(encoding="utf-8")
+        # Decode the raw byte stream ourselves so a C-locale stdin still takes
+        # UTF-8. `buffer` is absent when stdin is a StringIO (tests, embedders)
+        # — then the text stream is already decoded.
+        buffer = getattr(sys.stdin, "buffer", None)
+        if buffer is None:
+            return sys.stdin.read()
+        return buffer.read().decode("utf-8")
+    return text
+
+
+def _json_default(obj):
+    """json.dumps fallback for core payloads — datetime → ISO 8601, rest → str.
+
+    Core dicts carry real datetime objects (created_at, consumed_at, ...);
+    without this every `--json` surface would raise TypeError.
+    """
+    from datetime import date, datetime
+
+    if isinstance(obj, (datetime, date)):
+        return obj.isoformat()
+    return str(obj)
+
+
+def _default_identity() -> str:
+    """Actor identity used when pickup/handoff callers omit theirs.
+
+    Shape: `<client> @ <UTC minute>` — the provenance client when the host
+    self-identifies (Claude Code, a G2 adapter), else "cli". Commands ECHO the
+    resolved value so attribution is never silent.
+    """
+    from datetime import datetime, timezone
+
+    from dct.core.provenance import get_provenance
+
+    client = get_provenance().actor_client or "cli"
+    return f"{client} @ {datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%MZ')}"
 
 
 def _print_table(headers: list[str], rows: list[list[str]], max_widths: dict[int, int] | None = None) -> None:
@@ -614,19 +668,69 @@ def cmd_delete(args):
 
 # ── Handoff commands ──────────────────────────────────────────────────────────
 
+def cmd_handoff_create(args):
+    """`dct handoff create` — session-end op: set sprint membership + leave the
+    handoff prompt in ONE transaction (workflows.session.handoff_work)."""
+    import json
+
+    from dct.workflows.session import handoff_work
+
+    engine = _get_engine()
+    try:
+        project = args.project or _detect_project(engine)
+        prompt = _read_text_arg(args.prompt, args.prompt_file)
+        identity = args.created_by or _default_identity()
+
+        def _ids(raw: str | None, flag: str) -> list[int] | None:
+            # None → flag unused; empty/garbage → error (a blank shell var
+            # must never read as "no items" or wipe anything — K-27).
+            if raw is None:
+                return None
+            try:
+                ids = [int(x.strip()) for x in raw.split(",") if x.strip()]
+            except ValueError:
+                raise ValueError(
+                    f"{flag} expects comma-separated item ids, got: {raw!r}"
+                ) from None
+            if not ids:
+                raise ValueError(f"{flag} got no ids ({raw!r}) — omit the flag instead")
+            return ids
+
+        result = handoff_work(
+            engine, project,
+            prompt=prompt or "",
+            created_by=identity,
+            item_ids=_ids(args.items, "--items"),
+            add_item_ids=_ids(args.add_items, "--add-items"),
+            remove_item_ids=_ids(args.remove_items, "--remove-items"),
+            sprint=args.sprint,
+            scope=args.scope,
+            context_summary=args.context_summary,
+        )
+    except Exception as e:
+        print(f"✗ Error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    if args.json:
+        print(json.dumps(result, indent=2, default=_json_default))
+        return
+
+    h = result["handoff"]
+    print(f"✓ Handoff #{h['id']} created (scope: {h.get('scope') or 'none'}, by {identity})")
+    sprint = result.get("sprint")
+    if sprint:
+        print(f"  sprint #{sprint['sprint_id']}: {sprint['size']} items")
+    else:
+        print("  sprint untouched")
+
+
 def cmd_handoff_update(args):
     from dct.core.handoff import update_handoff
 
     engine = _get_engine()
 
-    def _read(text, path):
-        if path:
-            return sys.stdin.read() if path == "-" else Path(path).read_text()
-        return text
-
-    prompt = _read(args.prompt, args.prompt_file)
-
     try:
+        prompt = _read_text_arg(args.prompt, args.prompt_file)
         result = update_handoff(
             engine, args.id,
             prompt=prompt or None,
@@ -640,6 +744,129 @@ def cmd_handoff_update(args):
     except Exception as e:
         print(f"✗ Error: {e}", file=sys.stderr)
         sys.exit(1)
+
+
+# ── Session pickup (#413) ─────────────────────────────────────────────────────
+
+def _cols_rows_dicts(table: dict | None) -> list[dict]:
+    """{cols, rows} → list of dicts — the compact wire shape read by name."""
+    if not table:
+        return []
+    return [dict(zip(table["cols"], row)) for row in table["rows"]]
+
+
+_CONTROL_CHARS = {c: None for c in range(0x20) if c not in (0x09, 0x0A)} | {0x7F: None}
+
+
+def _strip_controls(text: str | None) -> str:
+    """Drop C0 control characters from DB text before printing it.
+
+    Handoff prompts and item titles are free text written by another session;
+    an ESC sequence in there would repaint or clear the reader's terminal. Tabs
+    and newlines are legitimate formatting and survive — everything else below
+    0x20, plus DEL, is removed. None → "".
+    """
+    if not text:
+        return ""
+    return text.translate(_CONTROL_CHARS)
+
+
+def _render_pickup(snap: dict, identity: str | None) -> None:
+    """Human view of `dct pickup`: what was consumed, then the state that
+    matters at session start. Sections dropped via --include are simply
+    absent from the snapshot, so every lookup is guarded. ALL free text coming
+    from the DB is passed through _strip_controls — a stored escape sequence
+    must not drive the reader's terminal."""
+    picked = snap.get("picked_up")
+    summary = snap.get("summary", {})
+
+    if picked:
+        print(f"✓ Picked up handoff #{picked['id']} (consumed as {identity})")
+        print()
+        for line in _strip_controls(picked.get("prompt")).splitlines():
+            print(f"  {line}")
+    else:
+        print(f"— no handoff consumed ({summary.get('handoffs_pending', 0)} pending)")
+
+    sprint = snap.get("sprint")
+    if sprint:
+        items = _cols_rows_dicts(sprint.get("items"))
+        pending_cp = sum(
+            1 for c in _cols_rows_dicts(sprint.get("checkpoints")) if c.get("status") == "pending"
+        )
+        print(f"\nSprint items ({pending_cp} pending checkpoints):")
+        _print_table(
+            ["#", "sprint", "prio", "status", "cp", "title"],
+            [
+                [
+                    str(i["id"]), str(i.get("sprint_id") or ""), i.get("priority") or "",
+                    i.get("status") or "", "{}/{}".format(*(i.get("cp") or [0, 0])),
+                    _strip_controls(i.get("title")),
+                ]
+                for i in items
+            ],
+            max_widths={5: 60},
+        )
+
+    gates = _cols_rows_dicts(snap.get("gates"))
+    if gates:
+        print("\nPending gates:")
+        _print_table(
+            ["#", "cp", "kind", "prio", "title", "text"],
+            [
+                [
+                    str(g["item_id"]), str(g["checkpoint_id"]), g.get("kind") or "",
+                    g.get("priority") or "", _strip_controls(g.get("item_title")),
+                    _strip_controls(g.get("text")),
+                ]
+                for g in gates
+            ],
+            max_widths={4: 30, 5: 50},
+        )
+
+    if summary:
+        print(
+            f"\nSprint: size {summary.get('sprint_size', 0)}, "
+            f"done {summary.get('sprint_completion', '0/0')} · "
+            f"open in project: {summary.get('total_open_in_project', 0)} · "
+            f"handoffs pending: {summary.get('handoffs_pending', 0)} · "
+            f"gates: {summary.get('gates_pending', 0)}"
+        )
+
+
+def cmd_pickup(args):
+    """`dct pickup` — session-start op: one snapshot read + (possibly) consume
+    ONE handoff (workflows.session.pickup_work)."""
+    import json
+
+    from dct.workflows.session import parse_sections, pickup_work
+
+    engine = _get_engine()
+    consume = {"auto": None, "always": True, "never": False}[args.consume]
+    # consumed_by is REQUIRED by pickup_work whenever consumption is possible;
+    # default it (and echo it) rather than let the op fail on a missing identity.
+    identity = args.consumed_by or (None if consume is False else _default_identity())
+
+    try:
+        project = args.project or _detect_project(engine)
+        include = parse_sections(args.include)
+        snap = pickup_work(
+            engine, project,
+            consume=consume,
+            handoff_id=args.handoff_id,
+            scope=args.scope,
+            consumed_by=identity,
+            since=args.since,
+            include=include,
+        )
+    except Exception as e:
+        print(f"✗ Error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    if args.json:
+        print(json.dumps(snap, indent=2, default=_json_default))
+        return
+    _render_pickup(snap, identity)
 
 
 # ── Changelog commands ────────────────────────────────────────────────────────
@@ -1608,7 +1835,9 @@ def build_parser() -> argparse.ArgumentParser:
     # resolve
     p_resolve = sub.add_parser("resolve", help="Resolve/close an item")
     p_resolve.add_argument("id", type=int)
-    p_resolve.add_argument("--status", "-s", default="resolved", choices=["resolved", "wont_fix"])
+    p_resolve.add_argument(
+        "--status", "-s", default="resolved", choices=list(TERMINAL_STATUSES)
+    )
     p_resolve.add_argument("--resolution", "-r")
 
     # note
@@ -1741,9 +1970,61 @@ def build_parser() -> argparse.ArgumentParser:
         p_verb.add_argument("id", type=int)
         p_verb.set_defaults(_forced_status=_st)
 
-    # web (read-only browser dashboard daemon — v0.4.1)
+    # pickup (session-start op — snapshot + handoff consume, #413)
+    p_pickup = sub.add_parser(
+        "pickup",
+        help="Session-start op: project snapshot + consume the pending handoff",
+    )
+    p_pickup.add_argument("--project", help="Project slug (default: auto-detect from CWD)")
+    p_pickup.add_argument("--since", default="last_release",
+                          help="Activity window anchor for recent_changes: "
+                               "last_release (default) | all | <N>h (e.g. 24h) "
+                               "| ISO date")
+    p_pickup.add_argument("--include", default=None,
+                          help="Comma-separated snapshot sections (sprint,handoff,gates,"
+                               "decisions,recent_changes). 'none' = summary only.")
+    p_pickup.add_argument("--consume", choices=["auto", "always", "never"], default="never",
+                          help="never (default): pure read — pickup does not write; "
+                               "auto: consume an unambiguous single candidate; "
+                               "always: consume or fail (autonomous flows)")
+    p_pickup.add_argument("--handoff-id", type=int, default=None,
+                          help="Consume this specific handoff (wins over --scope)")
+    p_pickup.add_argument("--scope", default=None,
+                          help="Only consider handoffs carrying this scope tag")
+    p_pickup.add_argument("--consumed-by", default=None,
+                          help="Session identity stamped on consume "
+                               "(default: '<client> @ <UTC minute>', echoed)")
+    p_pickup.add_argument("--json", action="store_true", help="Print the raw snapshot as JSON")
+
+    # handoff (session-end ledger)
     p_handoff = sub.add_parser("handoff", help="Manage session handoffs")
     p_ho_sub = p_handoff.add_subparsers(dest="handoff_command")
+
+    p_ho_create = p_ho_sub.add_parser(
+        "create",
+        help="Session-end op: set sprint membership + leave a handoff prompt (one transaction)",
+    )
+    p_ho_create.add_argument("--prompt", default=None, help="Handoff prompt text")
+    p_ho_create.add_argument("--prompt-file", default=None,
+                             help="Read the prompt from a file ('-' = stdin)")
+    p_ho_create.add_argument("--created-by", default=None,
+                             help="Session identity (default: '<client> @ <UTC minute>', echoed)")
+    p_ho_create.add_argument("--items", default=None,
+                             help="REPLACE the sprint's OPEN membership with these ids "
+                                  "(e.g. 22,21,6) — a conscious replan; resolved members "
+                                  "stay as history. Mutually exclusive with --add-items/"
+                                  "--remove-items. Omit all item flags to keep the sprint.")
+    p_ho_create.add_argument("--add-items", default=None,
+                             help="ADD these item ids to the target sprint (additive edge)")
+    p_ho_create.add_argument("--remove-items", default=None,
+                             help="CUT these OPEN items from the sprint's scope "
+                                  "(terminal members refuse — they are history)")
+    p_ho_create.add_argument("--sprint", default=None,
+                             help="Target sprint id or code (required when several are active)")
+    p_ho_create.add_argument("--scope", default=None, help="Scope tag")
+    p_ho_create.add_argument("--context-summary", default=None, help="Context summary snapshot")
+    p_ho_create.add_argument("--project", help="Project slug (default: auto-detect from CWD)")
+    p_ho_create.add_argument("--json", action="store_true", help="Print the raw result as JSON")
 
     p_ho_update = p_ho_sub.add_parser("update", help="Amend an unconsumed handoff in place")
     p_ho_update.add_argument("id", type=int, help="Handoff id")
@@ -1752,6 +2033,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_ho_update.add_argument("--scope", default=None, help="New scope tag")
     p_ho_update.add_argument("--context-summary", default=None, help="New context summary snapshot")
 
+    # web (read-only browser dashboard daemon — v0.4.1)
     p_web = sub.add_parser("web", help="Read-only browser dashboard daemon")
     p_web_sub = p_web.add_subparsers(dest="web_command")
 
@@ -1799,6 +2081,7 @@ COMMAND_MAP = {
     "resolve": cmd_resolve,
     "note": cmd_note,
     "delete": cmd_delete,
+    "pickup": cmd_pickup,
     "_task-mirror": cmd_internal_task_mirror,
     "_web-serve": cmd_internal_web_serve,
 }
@@ -1852,6 +2135,7 @@ CHECKPOINT_COMMAND_MAP = {
 }
 
 HANDOFF_COMMAND_MAP = {
+    "create": cmd_handoff_create,
     "update": cmd_handoff_update,
 }
 

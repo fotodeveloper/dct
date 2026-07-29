@@ -6,26 +6,11 @@ same way a shell would — through `cli.main()` with a patched argv — so the
 parser wiring and dispatch are exercised end to end.
 """
 
-import sys
-
 import pytest
+from conftest import run_cli
 
 from dct import cli
-from dct.core.projects import create_project
 from dct.core.sprints import create_sprint, get_sprint, list_sprints
-
-
-@pytest.fixture
-def cli_engine(engine, monkeypatch):
-    create_project(engine, slug="proj-a", name="Project A", path="/tmp/proj-a")
-    monkeypatch.setattr(cli, "_get_engine", lambda: engine)
-    return engine
-
-
-def run_cli(monkeypatch, argv):
-    monkeypatch.setattr(sys, "argv", ["dct", *argv])
-    cli.main()
-
 
 # ── parser wiring ─────────────────────────────────────────────────────────────
 
