@@ -15,6 +15,13 @@ VALID_STATUSES = {"pending", "done", "rejected"}
 # non-empty string, the whitelist is advisory (warning for typos in future).
 KNOWN_KINDS = {"task", "dogfood", "security", "approval", "review", "cc-task"}
 
+# The kinds that do NOT gate resolve_item: 'task' (plain step) and 'cc-task'
+# (mirrored Claude Code todo — a mirror class, not a gate). EVERY other kind
+# is a gate. Single source of truth for the gate filter, shared by the core
+# readers below, analytics and the web layer; a TUPLE so it drops straight
+# into `kind.notin_(...)`.
+NON_GATE_KINDS = ("task", "cc-task")
+
 
 def _validate_status(status: str) -> str:
     if status not in VALID_STATUSES:
@@ -79,21 +86,108 @@ def list_pending_gates(engine: sa.Engine, item_id: int) -> list[dict]:
     """Return pending gate checkpoints (kind != 'task', status = 'pending') for item.
     Used by resolve_item to block resolution until gates close. cc-task is
     treated as non-gating even though kind != 'task' — it's a mirror class, not
-    a gate. Use the explicit filter in resolve_item rather than hardcoding here
-    so future gate kinds are captured by default.
+    a gate. The filter is NON_GATE_KINDS-driven (exclusion, not a whitelist),
+    so a future gate kind is captured by default.
     """
     with engine.begin() as conn:
         rows = conn.execute(
             sa.select(item_checkpoints)
             .where(
                 item_checkpoints.c.item_id == item_id,
-                item_checkpoints.c.kind.notin_(["task", "cc-task"]),
+                item_checkpoints.c.kind.notin_(NON_GATE_KINDS),
                 item_checkpoints.c.status == "pending",
                 item_checkpoints.c.deleted_at.is_(None),
             )
             .order_by(item_checkpoints.c.sort_order)
         ).fetchall()
         return [row_to_dict(r) for r in rows]
+
+
+def _sprint_checkpoints_base(project_id: int, *columns: sa.ColumnElement) -> sa.Select:
+    """SELECT skeleton shared by the two sprint-scoped checkpoint readers:
+    LIVE checkpoints of LIVE items that are in ANY active sprint of the
+    project (membership via _current_sprint_exists, so the multi-sprint and
+    terminal-member rules are defined in exactly one place).
+
+    `columns` are the projected columns; callers add their own status/kind
+    filters and ORDER BY. No ordering is applied here — an unordered base
+    would be a bug in a paged reader, so every caller must state its own."""
+    from dct.core.items import (
+        _current_sprint_exists,  # local: items imports checkpoints
+    )
+
+    return (
+        sa.select(*columns)
+        .select_from(item_checkpoints.join(items, items.c.id == item_checkpoints.c.item_id))
+        .where(
+            items.c.project_id == project_id,
+            items.c.deleted_at.is_(None),
+            item_checkpoints.c.deleted_at.is_(None),
+            _current_sprint_exists(),
+        )
+    )
+
+
+def _query_sprint_pending_gates(conn: sa.Connection, project_id: int) -> list[dict]:
+    """Pending gate checkpoints on items in ANY active sprint of the project —
+    the project-wide companion to list_pending_gates (which stays per-item as
+    resolve_item's guard). One grouped query, no N+1. Ordered P1-first, then
+    checkpoint sort_order, id tie-break.
+
+    Row shape: {item_id, checkpoint_id, kind, priority, item_title, text}.
+    """
+    from dct.core.items import _priority_order_expr  # local: items imports checkpoints
+
+    rows = conn.execute(
+        _sprint_checkpoints_base(
+            project_id,
+            item_checkpoints.c.item_id,
+            item_checkpoints.c.id.label("checkpoint_id"),
+            item_checkpoints.c.kind,
+            items.c.priority,
+            items.c.title.label("item_title"),
+            item_checkpoints.c.text,
+        )
+        .where(
+            item_checkpoints.c.kind.notin_(NON_GATE_KINDS),
+            item_checkpoints.c.status == "pending",
+        )
+        .order_by(_priority_order_expr(), item_checkpoints.c.sort_order, item_checkpoints.c.id)
+    ).fetchall()
+    return [dict(r._mapping) for r in rows]
+
+
+def _query_sprint_item_checkpoints(conn: sa.Connection, project_id: int) -> list[dict]:
+    """All live, non-rejected checkpoints of items currently in an active
+    sprint — the snapshot's TODO map (a resuming agent reads the next pending
+    step straight from here, #413 K-9). Rejected checkpoints are hidden (same
+    rule as list_checkpoints' default). Ordered item_id, sort_order, id.
+
+    Row shape: {item_id, id, status, kind, sort_order, text}.
+    """
+    rows = conn.execute(
+        _sprint_checkpoints_base(
+            project_id,
+            item_checkpoints.c.item_id,
+            item_checkpoints.c.id,
+            item_checkpoints.c.status,
+            item_checkpoints.c.kind,
+            item_checkpoints.c.sort_order,
+            item_checkpoints.c.text,
+        )
+        .where(item_checkpoints.c.status != "rejected")
+        .order_by(item_checkpoints.c.item_id, item_checkpoints.c.sort_order, item_checkpoints.c.id)
+    ).fetchall()
+    return [dict(r._mapping) for r in rows]
+
+
+def list_sprint_pending_gates(engine: sa.Engine, project_slug: str) -> list[dict]:
+    """Public wrapper over _query_sprint_pending_gates — resolves the slug and
+    runs in its own transaction. See the conn-level docstring for the shape."""
+    from dct.core.projects import resolve_project_id
+
+    with engine.begin() as conn:
+        return _query_sprint_pending_gates(conn, resolve_project_id(conn, project_slug))
 
 
 def list_checkpoints(

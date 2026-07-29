@@ -152,3 +152,155 @@ def test_get_sprint_review_shape(engine, proj):
 
     assert review["summary"]["sprint_size"] == 1
     assert review["summary"]["handoffs_pending"] == 0
+
+
+# ── K-18 metric fixes (#413): review metrics tell the truth ───────────────────
+
+def test_total_open_counts_in_progress(engine, proj):
+    """total_open_in_project = open + in_progress (in-flight work IS open work)."""
+    create_item(engine, "dct", "feature", "A")
+    b = create_item(engine, "dct", "feature", "B")
+    update_item(engine, b["id"], status="in_progress")
+
+    review = get_sprint_review(engine, "dct", since="all")
+    assert review["summary"]["total_open_in_project"] == 2
+
+
+def test_since_all_shows_recent_activity(engine, proj):
+    """since='all' means NO cutoff — activity must show everything, not nothing."""
+    a = create_item(engine, "dct", "feature", "A")
+    cp = add_checkpoint(engine, a["id"], "Step 1")
+    set_status(engine, cp["id"], "done")
+
+    review = get_sprint_review(engine, "dct", since="all")
+    changed_ids = [r[0] for r in review["recent_activity"]["items_changed"]["rows"]]
+    assert a["id"] in changed_ids
+    assert review["recent_activity"]["checkpoints_completed"] == 1
+
+
+def test_no_release_fallback_shows_activity(engine, proj):
+    """Default since=last_release with zero releases labels itself 'showing all
+    time' — the data must match the label."""
+    a = create_item(engine, "dct", "feature", "A")
+
+    review = get_sprint_review(engine, "dct")  # default since
+    assert review["since_anchor"] == "no releases — showing all time"
+    changed_ids = [r[0] for r in review["recent_activity"]["items_changed"]["rows"]]
+    assert a["id"] in changed_ids
+
+
+def test_sprint_completion_counts_resolved_members(engine, proj):
+    """Resolving a sprint member leaves the in_sprint VIEW but keeps membership,
+    so completion finally counts: 1/2, not the perpetual 0/N."""
+    a = create_item(engine, "dct", "feature", "A")
+    b = create_item(engine, "dct", "feature", "B")
+    set_sprint(engine, "dct", [a["id"], b["id"]])
+
+    resolve_item(engine, a["id"], resolution="Done")
+
+    review = get_sprint_review(engine, "dct", since="all")
+    assert review["summary"]["sprint_size"] == 2
+    assert review["summary"]["sprint_completion"] == "1/2"
+    in_sprint_ids = [r[0] for r in review["in_sprint"]["rows"]]
+    assert in_sprint_ids == [b["id"]]
+    fetched = get_item(engine, a["id"])
+    assert fetched is not None and fetched["in_current_sprint"] is False
+
+
+def test_wont_fix_member_counts_in_completion(engine, proj):
+    a = create_item(engine, "dct", "feature", "A")
+    set_sprint(engine, "dct", [a["id"]])
+    update_item(engine, a["id"], status="wont_fix")
+
+    review = get_sprint_review(engine, "dct", since="all")
+    assert review["summary"]["sprint_completion"] == "1/1"
+    assert review["in_sprint"]["rows"] == []
+
+
+def test_reopened_member_returns_to_sprint_view(engine, proj):
+    """Membership survives resolve, so reopening an item puts it back in the
+    current-sprint view and out of the completed count."""
+    a = create_item(engine, "dct", "feature", "A")
+    set_sprint(engine, "dct", [a["id"]])
+    resolve_item(engine, a["id"], resolution="Done")
+    update_item(engine, a["id"], status="open")
+
+    review = get_sprint_review(engine, "dct", since="all")
+    assert review["summary"]["sprint_completion"] == "0/1"
+    assert [r[0] for r in review["in_sprint"]["rows"]] == [a["id"]]
+
+
+# ── _to_cols_rows: JSON safety + row caps ─────────────────────────────────────
+
+def test_to_cols_rows_serializes_datetimes_and_nested_cells():
+    """K-36: no `datetime` may survive into a payload — nested cells included."""
+    import json
+
+    from dct.core.sprint import _to_cols_rows
+
+    when = datetime.fromisoformat("2026-07-28T12:00:00+00:00")
+    tbl = _to_cols_rows(
+        [{"id": 1, "at": when, "cp": [1, 2], "title": "already a string"}],
+        ["id", "at", "cp", "title"],
+    )
+    assert tbl["rows"][0] == [1, when.isoformat(), [1, 2], "already a string"]
+    json.dumps(tbl)
+
+
+def test_to_cols_rows_never_double_converts_strings():
+    """An already-ISO string must come back byte-identical, not re-parsed."""
+    from dct.core.sprint import _to_cols_rows
+
+    iso = "2026-07-28T12:00:00+00:00"
+    tbl = _to_cols_rows([{"at": iso}], ["at"])
+    assert tbl["rows"][0][0] == iso
+
+
+def test_to_cols_rows_uncapped_keeps_two_key_shape():
+    from dct.core.sprint import _to_cols_rows
+
+    tbl = _to_cols_rows([{"id": i} for i in range(5)], ["id"])
+    assert set(tbl) == {"cols", "rows"}
+    assert len(tbl["rows"]) == 5
+
+
+@pytest.mark.parametrize("n,cap,expected_rows,truncated", [
+    (0, 3, 0, False),
+    (2, 3, 2, False),
+    (3, 3, 3, False),   # exactly at the cap is NOT truncated
+    (4, 3, 3, True),
+])
+def test_to_cols_rows_cap_boundary(n, cap, expected_rows, truncated):
+    from dct.core.sprint import _to_cols_rows
+
+    tbl = _to_cols_rows([{"id": i} for i in range(n)], ["id"], cap=cap)
+    assert len(tbl["rows"]) == expected_rows
+    assert tbl["truncated"] is truncated
+
+
+# ── _query_unconsumed_handoffs: SQL-side scope filter ─────────────────────────
+
+def test_query_unconsumed_handoffs_scope_filter(engine, proj):
+    from dct.core.handoff import create_handoff
+    from dct.core.projects import resolve_project_id
+    from dct.core.sprint import _query_unconsumed_handoffs
+
+    who = "tester @ 2026-07-28T12:00Z"
+    a = create_handoff(engine, "dct", "in scope", who, scope="g1")
+    create_handoff(engine, "dct", "out of scope", who, scope="other")
+    create_handoff(engine, "dct", "no scope at all", who)
+
+    with engine.begin() as conn:
+        project_id = resolve_project_id(conn, "dct")
+        assert len(_query_unconsumed_handoffs(conn, project_id)) == 3
+        scoped = _query_unconsumed_handoffs(conn, project_id, "g1")
+    assert [h["id"] for h in scoped] == [a["id"]]
+
+
+# ── _parse_since_conn: no assert (works under python -O) ──────────────────────
+
+def test_parse_since_last_release_without_conn_raises_valueerror():
+    from dct.core.sprint import _parse_since_conn
+
+    with pytest.raises(ValueError, match="needs a connection"):
+        _parse_since_conn(None, 0, "last_release")

@@ -7,17 +7,16 @@ GET /p/<slug>/items/<int:id>   detail: markdown description, notes, checkpoints
 from flask import Blueprint, abort, render_template, request
 
 from dct.web.app import current_engine
+from dct.core.checkpoints import NON_GATE_KINDS
 from dct.core.items import list_items, get_item
 
 bp = Blueprint("items", __name__)
 
-# Checkpoint kinds that are NOT gates. Anything else is a gate (conservative
-# default — mirrors dct.core.checkpoints gate semantics).
-GATE_NONKINDS = {"task", "cc-task"}
-
 
 def is_gate(kind: str | None) -> bool:
-    return (kind or "task") not in GATE_NONKINDS
+    """Anything but a plain task / mirrored cc-task is a gate — one rule,
+    shared with core (dct.core.checkpoints.NON_GATE_KINDS)."""
+    return (kind or "task") not in NON_GATE_KINDS
 
 
 # Filter values offered in the list form. Kept here (not in templates) so the

@@ -8,6 +8,7 @@ from dct.web.app import current_engine
 from dct.core import sprints as sprints_core
 from dct.core import checkpoints as checkpoints_core
 from dct.core import projects as projects_core
+from dct.core.items import TERMINAL_STATUSES
 
 bp = Blueprint("sprints", __name__)
 
@@ -16,11 +17,20 @@ bp = Blueprint("sprints", __name__)
 def list(slug):  # noqa: A001 — Flask endpoint name is intentional (sprints.list)
     engine = current_engine()
     first_class = sprints_core.list_sprints(engine, project_slug=slug)
-    # Current sprint = the project's single active sprint; its members come from
-    # item_sprints (one source of truth, #216). No more legacy-boolean section.
+    # Current sprint = the project's primary active sprint (newest started;
+    # several may be active since G1); members come from item_sprints (one
+    # source of truth, #216). No more legacy-boolean section.
     current = sprints_core.get_current_sprint(engine, slug)
+    # Current-work view: terminal members keep their link (K-18, #413) but are
+    # shown on the sprint DETAIL page, not in the current-sprint section.
     current_items = (
-        sprints_core.list_items_in_sprint(engine, current["id"]) if current else []
+        [
+            m
+            for m in sprints_core.list_items_in_sprint(engine, current["id"])
+            if m.get("status") not in TERMINAL_STATUSES
+        ]
+        if current
+        else []
     )
     return render_template(
         "sprints/list.html",

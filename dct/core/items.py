@@ -11,11 +11,71 @@ from dct.core.projects import resolve_project_id
 VALID_TYPES = {"issue", "todo", "feature", "idea", "improvement"}
 VALID_PRIORITIES = {"P1", "P2", "P3", "future"}
 VALID_STATUSES = {"open", "in_progress", "resolved", "wont_fix"}
-TERMINAL_STATUSES = {"resolved", "wont_fix"}
+# Terminal = the item is done with (resolved) or consciously dropped
+# (wont_fix). A TUPLE, not a set: this is the single source of truth for every
+# `status.in_(...)` / `notin_(...)` filter in the codebase (core, web, CLI) and
+# SQLAlchemy wants a deterministic sequence there — membership checks and
+# `sorted()` in error messages work the same either way.
+TERMINAL_STATUSES = ("resolved", "wont_fix")
 OPEN_STATUSES = {"open", "in_progress"}
 
+# Priority values in display order, P1 first — the ranking behind
+# _priority_order_expr().
+PRIORITY_ORDER = ("P1", "P2", "P3", "future")
 
-def _validate_enum(value: str, valid: set[str], field_name: str) -> str:
+
+def _priority_order_expr() -> sa.Case:
+    """SQL sort key ranking items P1 → P2 → P3 → future (unknown values last).
+
+    Factory, not a module constant: the expression is bound to `items.c` and
+    is embedded in several statements, so each caller gets its own instance.
+    Every "priority-ordered" view (list_items, the sprint snapshot, the
+    sprint-wide gate list) MUST use this — one ranking, one place to change."""
+    return sa.case(
+        (items.c.priority == "P1", 1),
+        (items.c.priority == "P2", 2),
+        (items.c.priority == "P3", 3),
+        (items.c.priority == "future", 4),
+        else_=5,
+    )
+
+
+def _cp_progress_exprs() -> tuple[sa.Label, sa.Label]:
+    """(cp_done, cp_total) aggregate columns for a query that outer-joins
+    item_checkpoints and groups by item.
+
+    cp_done counts checkpoints in status 'done'; cp_total counts every
+    NON-rejected checkpoint (rejected ones are abandoned scope, not work) —
+    the same math get_progress reports as done/active. Both coalesce to 0 so
+    an item without checkpoints reads [0, 0] rather than [None, None]."""
+    cp_done = sa.func.coalesce(
+        sa.func.sum(sa.case((item_checkpoints.c.status == "done", 1), else_=0)),
+        0,
+    ).label("cp_done")
+    cp_total = sa.func.coalesce(
+        sa.func.sum(sa.case((item_checkpoints.c.status != "rejected", 1), else_=0)),
+        0,
+    ).label("cp_total")
+    return cp_done, cp_total
+
+
+def _membership_count_exprs() -> tuple[sa.ColumnElement, sa.ColumnElement]:
+    """(total, completed) counting columns for a sprint-membership query.
+
+    Both are COUNT(DISTINCT …) over items.c.id, so a query that fans out over
+    several link rows still counts each item once; `completed` counts only
+    items in a TERMINAL status (membership survives resolution since K-18,
+    which is what makes sprint completion computable). Scoping — one sprint,
+    a set of sprints, or every active sprint of a project — is the caller's
+    WHERE/GROUP BY; only the counting rule is shared."""
+    total = sa.func.count(sa.distinct(items.c.id))
+    completed = sa.func.count(
+        sa.distinct(sa.case((items.c.status.in_(TERMINAL_STATUSES), items.c.id)))
+    )
+    return total, completed
+
+
+def _validate_enum(value: str, valid: set[str] | tuple[str, ...], field_name: str) -> str:
     if value not in valid:
         raise ValueError(f"Invalid {field_name}: '{value}'. Valid: {', '.join(sorted(valid))}")
     return value
@@ -46,9 +106,12 @@ def _parse_tags(tags_str: str | None) -> list[str]:
 
 
 def _current_sprint_exists():
-    """Correlated EXISTS: the item has an active item_sprints link to its
-    project's active sprint. This IS `in_current_sprint` (#216) — derived on
-    read, never stored. Use as a labeled column in SELECT or directly in WHERE."""
+    """Correlated EXISTS: the item has an active item_sprints link to an
+    active sprint AND is still open work. This IS `in_current_sprint` (#216) —
+    derived on read, never stored. Terminal items (resolved / wont_fix) KEEP
+    their membership link (K-18, #413 — that is what makes sprint_completion
+    computable) but drop out of this flag and every current-work view built
+    on it. Use as a labeled column in SELECT or directly in WHERE."""
     return (
         sa.select(sa.literal(1))
         .select_from(item_sprints.join(sprints, sprints.c.id == item_sprints.c.sprint_id))
@@ -57,6 +120,7 @@ def _current_sprint_exists():
             item_sprints.c.removed_at.is_(None),
             sprints.c.status == "active",
             sprints.c.deleted_at.is_(None),
+            items.c.status.notin_(TERMINAL_STATUSES),
         )
         .exists()
     )
@@ -139,24 +203,11 @@ def list_items(
     limit: int = 50,
 ) -> list[dict]:
     # Priority ordering: P1 first, future last
-    priority_order = sa.case(
-        (items.c.priority == "P1", 1),
-        (items.c.priority == "P2", 2),
-        (items.c.priority == "P3", 3),
-        (items.c.priority == "future", 4),
-        else_=5,
-    )
+    priority_order = _priority_order_expr()
 
     # Checkpoint progress aggregated in a single query — avoids N+1.
     # cp_done = count of done, cp_total = done + pending (rejected excluded from "real" total).
-    cp_done = sa.func.coalesce(
-        sa.func.sum(sa.case((item_checkpoints.c.status == "done", 1), else_=0)),
-        0,
-    ).label("cp_done")
-    cp_total = sa.func.coalesce(
-        sa.func.sum(sa.case((item_checkpoints.c.status != "rejected", 1), else_=0)),
-        0,
-    ).label("cp_total")
+    cp_done, cp_total = _cp_progress_exprs()
 
     q = (
         sa.select(items, cp_done, cp_total, _current_sprint_exists().label("in_current_sprint"))
@@ -264,14 +315,13 @@ def update_item(engine: sa.Engine, item_id: int, **kwargs) -> dict | None:
     now = datetime.now(timezone.utc)
     values["updated_at"] = now
 
-    # Invariant: terminal status ↔ resolved_at set, AND terminal status ⇒ the
-    # item leaves the current sprint. Membership lives in item_sprints now, so
-    # "leave the sprint" = soft-remove its active links (no boolean to flip).
-    leaving_sprint = False
+    # Invariant: terminal status ↔ resolved_at set. Sprint MEMBERSHIP is kept
+    # on terminal transitions (K-18, #413) — the derived in_current_sprint flag
+    # filters terminal items out, and retained links are what make
+    # sprint_completion computable (resolved members / all members).
     if "status" in values:
         if values["status"] in TERMINAL_STATUSES:
             values.setdefault("resolved_at", now)
-            leaving_sprint = True
         elif values["status"] in OPEN_STATUSES:
             values["resolved_at"] = None
 
@@ -279,12 +329,6 @@ def update_item(engine: sa.Engine, item_id: int, **kwargs) -> dict | None:
         result = conn.execute(items.update().where(items.c.id == item_id, items.c.deleted_at.is_(None)).values(**values))
         if result.rowcount == 0:
             return None
-        if leaving_sprint:
-            conn.execute(
-                item_sprints.update()
-                .where(item_sprints.c.item_id == item_id, item_sprints.c.removed_at.is_(None))
-                .values(removed_at=now)
-            )
 
     return get_item(engine, item_id)
 
@@ -309,7 +353,7 @@ def resolve_item(
     """
     from dct.core.checkpoints import list_pending_gates
 
-    _validate_enum(status, {"resolved", "wont_fix"}, "resolve status")
+    _validate_enum(status, TERMINAL_STATUSES, "resolve status")
 
     pending_gates = list_pending_gates(engine, item_id)
     if pending_gates:
@@ -334,12 +378,9 @@ def resolve_item(
         result = conn.execute(items.update().where(items.c.id == item_id, items.c.deleted_at.is_(None)).values(**values))
         if result.rowcount == 0:
             return None
-        # Terminal status ⇒ leave the current sprint: soft-remove active links.
-        conn.execute(
-            item_sprints.update()
-            .where(item_sprints.c.item_id == item_id, item_sprints.c.removed_at.is_(None))
-            .values(removed_at=now)
-        )
+        # Sprint membership is intentionally KEPT (K-18, #413): the derived
+        # in_current_sprint flag hides terminal items from current-work views,
+        # while the retained link lets sprint_completion count this item.
 
     return get_item(engine, item_id)
 

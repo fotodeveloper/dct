@@ -116,6 +116,43 @@ def list_decisions(
         return [row_to_dict(r) for r in conn.execute(q)]
 
 
+def _query_recent_decisions(
+    conn: sa.Connection,
+    project_id: int,
+    statuses: tuple[str, ...] = ("accepted", "proposed"),
+    limit: int = 10,
+) -> list[dict]:
+    """Newest-first live decisions a resuming agent must honor. Default filter
+    keeps accepted (binding) + proposed (open questions to respect) and drops
+    superseded/rejected noise. created_at DESC, id DESC tie-break."""
+    rows = conn.execute(
+        sa.select(decisions)
+        .where(
+            decisions.c.project_id == project_id,
+            decisions.c.status.in_(list(statuses)),
+            decisions.c.deleted_at.is_(None),
+        )
+        .order_by(decisions.c.created_at.desc(), decisions.c.id.desc())
+        .limit(limit)
+    ).fetchall()
+    return [row_to_dict(r) for r in rows]
+
+
+def list_recent_decisions(
+    engine: sa.Engine,
+    project_slug: str,
+    statuses: tuple[str, ...] = ("accepted", "proposed"),
+    limit: int = 10,
+) -> list[dict]:
+    """Public wrapper over _query_recent_decisions (slug → id, own txn).
+    `list_decisions` stays the unfiltered/paged surface; this one is the
+    snapshot-sized "what still binds" view."""
+    with engine.begin() as conn:
+        return _query_recent_decisions(
+            conn, resolve_project_id(conn, project_slug), statuses, limit
+        )
+
+
 def get_decision(engine: sa.Engine, decision_id: int) -> dict | None:
     with engine.begin() as conn:
         row = conn.execute(

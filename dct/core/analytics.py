@@ -20,9 +20,10 @@ from dct.db import (
     session_handoffs, sprints, item_sprints,
 )
 
+from dct.core.checkpoints import NON_GATE_KINDS
+from dct.core.items import TERMINAL_STATUSES
+
 OPEN_STATUSES = ("open", "in_progress")
-TERMINAL_STATUSES = ("resolved", "wont_fix")
-NON_GATE_KINDS = ("task", "cc-task")  # everything else is a gate (see resolve_item)
 
 
 def _iso(dt) -> str | None:

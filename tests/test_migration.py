@@ -259,9 +259,10 @@ def test_update_item_raises_on_in_current_sprint_kwarg(engine):
         update_item(engine, item["id"], in_current_sprint=False)
 
 
-def test_terminal_status_removes_item_from_current_sprint(engine):
-    """Resolving (or any terminal transition) drops the item from the current
-    sprint by soft-removing its item_sprints links — the derived flag follows."""
+def test_terminal_status_clears_flag_but_keeps_membership(engine):
+    """A terminal transition clears the derived in_current_sprint flag, but the
+    item_sprints link is RETAINED (K-18, #413) — that link is what makes
+    sprint_completion computable. Supersedes the pre-G1 soft-remove contract."""
     from dct.core.sprints import set_current_sprint_items, get_current_sprint
     from dct.core.sprints import list_items_in_sprint
 
@@ -278,7 +279,149 @@ def test_terminal_status_removes_item_from_current_sprint(engine):
     assert got["status"] == "resolved"
     assert got["in_current_sprint"] is False
     cur = get_current_sprint(engine, "dct")
-    assert cur is not None and list_items_in_sprint(engine, cur["id"]) == []
+    assert cur is not None
+    members = list_items_in_sprint(engine, cur["id"])
+    assert [m["id"] for m in members] == [item["id"]]  # link retained (ledger)
+
+
+# ── K-42 backfill: un-remove pre-G1 machine-removed links (#413) ──────────────
+
+
+def _link_row(engine, item_id: int):
+    with engine.begin() as conn:
+        return conn.execute(
+            sa.select(item_sprints).where(item_sprints.c.item_id == item_id)
+        ).first()._mapping
+
+
+def _simulate_pre_g1_removal(engine, item_id: int):
+    """Reproduce the pre-G1 terminal transition: resolve_item stamped
+    item_sprints.removed_at with the SAME datetime it wrote to
+    items.resolved_at (one shared `now`). G1 keeps the link, so we replay the
+    old behaviour by copying resolved_at into removed_at."""
+    from dct.db import items
+
+    with engine.begin() as conn:
+        resolved_at = conn.execute(
+            sa.select(items.c.resolved_at).where(items.c.id == item_id)
+        ).scalar_one()
+        assert resolved_at is not None, "seed precondition: item must be resolved"
+        conn.execute(
+            item_sprints.update()
+            .where(item_sprints.c.item_id == item_id)
+            .values(removed_at=resolved_at)
+        )
+    return resolved_at
+
+
+def test_k42_restores_machine_removed_membership(engine):
+    """A pre-G1 legacy row (removed_at == items.resolved_at) is restored, so the
+    sprint's completion history stops reading 0/N."""
+    from dct.core.items import resolve_item
+    from dct.core.sprint import get_sprint_review, set_sprint
+
+    create_project(engine, slug="dct", name="DCT", path="/tmp/dct")
+    a = create_item(engine, "dct", "feature", "Done long ago")
+    b = create_item(engine, "dct", "feature", "Still open")
+    set_sprint(engine, "dct", [a["id"], b["id"]])
+    resolve_item(engine, a["id"], resolution="Done")
+    _simulate_pre_g1_removal(engine, a["id"])
+    assert get_sprint_review(engine, "dct", since="all")["summary"][
+        "sprint_completion"] == "0/1"  # the damage: member vanished
+
+    _apply_schema_updates(engine)
+
+    assert _link_row(engine, a["id"])["removed_at"] is None
+    review = get_sprint_review(engine, "dct", since="all")
+    assert review["summary"]["sprint_completion"] == "1/2"
+    assert review["summary"]["sprint_size"] == 2
+
+
+def test_k42_leaves_manual_removals_alone(engine):
+    """A deliberate remove_item_from_sprint used a DIFFERENT `now` than
+    resolved_at — exact equality is the whole discriminator, so the link must
+    NOT be resurrected."""
+    from dct.core.items import resolve_item
+    from dct.core.sprint import set_sprint
+    from dct.core.sprints import get_current_sprint, remove_item_from_sprint
+
+    create_project(engine, slug="dct", name="DCT", path="/tmp/dct")
+    a = create_item(engine, "dct", "feature", "Dropped from the sprint")
+    set_sprint(engine, "dct", [a["id"]])
+    sprint = get_current_sprint(engine, "dct")
+    assert sprint is not None
+    remove_item_from_sprint(engine, a["id"], sprint["id"])
+    resolve_item(engine, a["id"], resolution="Done elsewhere")
+    removed_at = _link_row(engine, a["id"])["removed_at"]
+    assert removed_at is not None
+
+    _apply_schema_updates(engine)
+
+    assert _link_row(engine, a["id"])["removed_at"] == removed_at
+
+
+def test_k42_backfill_is_idempotent(engine):
+    """Restored rows have removed_at IS NULL and can never match again; a
+    manual removal stays removed across repeated runs."""
+    from dct.core.items import resolve_item
+    from dct.core.sprint import set_sprint
+    from dct.core.sprints import get_current_sprint, remove_item_from_sprint
+
+    create_project(engine, slug="dct", name="DCT", path="/tmp/dct")
+    a = create_item(engine, "dct", "feature", "Legacy resolved")
+    b = create_item(engine, "dct", "feature", "Manually dropped")
+    set_sprint(engine, "dct", [a["id"], b["id"]])
+    sprint = get_current_sprint(engine, "dct")
+    assert sprint is not None
+    remove_item_from_sprint(engine, b["id"], sprint["id"])
+    resolve_item(engine, a["id"], resolution="Done")
+    resolve_item(engine, b["id"], resolution="Done elsewhere")
+    _simulate_pre_g1_removal(engine, a["id"])
+    b_removed_at = _link_row(engine, b["id"])["removed_at"]
+
+    _apply_schema_updates(engine)
+    first = _link_row(engine, a["id"])["assigned_at"]
+    _apply_schema_updates(engine)  # second run: pure no-op
+
+    assert _link_row(engine, a["id"])["removed_at"] is None
+    assert _link_row(engine, a["id"])["assigned_at"] == first
+    assert _link_row(engine, b["id"])["removed_at"] == b_removed_at
+
+
+def test_k26a_cross_project_link_is_reported_not_deleted(engine, capsys):
+    """K-26a is a REPORT: a live cross-project link survives the migration and
+    earns a single stderr WARNING naming the count."""
+    from dct.core.sprints import create_sprint
+
+    create_project(engine, slug="p1", name="P1", path="/tmp/p1")
+    create_project(engine, slug="p2", name="P2", path="/tmp/p2")
+    item = create_item(engine, "p1", "feature", "Belongs to p1")
+    foreign = create_sprint(engine, "p2", "P2 sprint", code="s2")
+    with engine.begin() as conn:  # only legacy damage could create this
+        conn.execute(item_sprints.insert().values(
+            item_id=item["id"], sprint_id=foreign["id"]))
+
+    _apply_schema_updates(engine)
+
+    err = capsys.readouterr().err
+    assert "WARNING" in err and "1 live cross-project sprint link(s)" in err
+    link = _link_row(engine, item["id"])
+    assert link["removed_at"] is None  # report only — nothing deleted
+
+
+def test_k26a_silent_without_cross_project_links(engine):
+    """Clean DB ⇒ no warning noise on every bootstrap."""
+    import contextlib
+    import io
+
+    create_project(engine, slug="dct", name="DCT", path="/tmp/dct")
+    create_item(engine, "dct", "feature", "A")
+
+    buf = io.StringIO()
+    with contextlib.redirect_stderr(buf):
+        _apply_schema_updates(engine)
+
+    assert buf.getvalue() == ""
 
 
 # ── manages_changelog opt-in backfill (#222) ──────────────────────────────────

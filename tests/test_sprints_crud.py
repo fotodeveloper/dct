@@ -256,7 +256,7 @@ def test_list_sprints_for_item_shows_both_assignments(engine, proj):
     assert {s["id"] for s in sprints_for_item} == {s1["id"], s2["id"]}
 
 
-# ── current sprint: ≤1 active per project = "the current sprint" (#216) ────────
+# ── current sprint: multiple actives allowed, primary = newest started (G1) ────
 
 def test_get_current_sprint_none_initially(engine, proj):
     from dct.core.sprints import get_current_sprint
@@ -279,17 +279,65 @@ def test_get_current_sprint_returns_the_active_one(engine, proj):
     assert cur["id"] == active["id"]
 
 
-def test_create_second_active_sprint_rejected(engine, proj):
-    create_sprint(engine, "dct", "First", status="active")
-    with pytest.raises(ValueError, match="already has an active sprint"):
-        create_sprint(engine, "dct", "Second", status="active")
+def test_second_active_sprint_allowed(engine, proj):
+    """G1 (#413 K-5): the ≤1-active cap is lifted — parallel active sprints
+    are legal and both stay active."""
+    a = create_sprint(engine, "dct", "First", status="active")
+    b = create_sprint(engine, "dct", "Second", status="active")
+    from dct.core.sprints import list_sprints
+    active = [s for s in list_sprints(engine, "dct", status="active")]
+    assert {s["id"] for s in active} == {a["id"], b["id"]}
 
 
-def test_activating_second_sprint_rejected(engine, proj):
-    create_sprint(engine, "dct", "First", status="active")
+def test_activating_second_sprint_allowed(engine, proj):
+    first = create_sprint(engine, "dct", "First", status="active")
     other = create_sprint(engine, "dct", "Other")      # planned
-    with pytest.raises(ValueError, match="already has an active sprint"):
-        update_sprint(engine, other["id"], status="active")
+    activated = update_sprint(engine, other["id"], status="active")
+    assert activated["status"] == "active"
+    assert activated["started_at"] is not None
+    from dct.core.sprints import list_sprints
+    active_ids = {s["id"] for s in list_sprints(engine, "dct", status="active")}
+    assert active_ids == {first["id"], other["id"]}
+
+
+def test_get_current_sprint_primary_is_newest_started(engine, proj):
+    """With several actives, the 'current' (primary) sprint is the most
+    recently started; equal started_at falls back to the higher id."""
+    from dct.core.sprints import get_current_sprint
+    from dct.db import sprints as sprints_t
+
+    a = create_sprint(engine, "dct", "Older", status="active")
+    b = create_sprint(engine, "dct", "Newer", status="active")
+    assert get_current_sprint(engine, "dct")["id"] == b["id"]
+
+    # Force identical started_at → id tie-break must pick the higher id.
+    with engine.begin() as conn:
+        conn.execute(
+            sprints_t.update()
+            .where(sprints_t.c.id.in_([a["id"], b["id"]]))
+            .values(started_at=a["started_at"])
+        )
+    assert get_current_sprint(engine, "dct")["id"] == b["id"]
+
+
+def test_list_active_sprints_orders_newest_first(engine, proj):
+    from dct.core.sprints import list_active_sprints
+    assert list_active_sprints(engine, "dct") == []
+    a = create_sprint(engine, "dct", "A", status="active")
+    create_sprint(engine, "dct", "Planned")            # excluded
+    b = create_sprint(engine, "dct", "B", status="active")
+    rows = list_active_sprints(engine, "dct")
+    assert [r["id"] for r in rows] == [b["id"], a["id"]]
+
+
+def test_list_active_sprints_excludes_deferred_and_deleted(engine, proj):
+    from dct.core.sprints import delete_sprint, list_active_sprints
+    a = create_sprint(engine, "dct", "A", status="active")
+    b = create_sprint(engine, "dct", "B", status="active")
+    c = create_sprint(engine, "dct", "C", status="active")
+    update_sprint(engine, a["id"], status="deferred")
+    delete_sprint(engine, b["id"])
+    assert [r["id"] for r in list_active_sprints(engine, "dct")] == [c["id"]]
 
 
 def test_updating_the_sole_active_sprint_does_not_trip_invariant(engine, proj):
@@ -361,15 +409,32 @@ def test_set_current_sprint_items_autocreates_sprint(engine, proj):
     assert get_current_sprint(engine, "dct") is not None
 
 
-def test_set_current_sprint_items_ignores_foreign_items(engine, proj):
-    """Items from another project must never enter this project's sprint."""
-    from dct.core.sprints import set_current_sprint_items
+def test_set_current_sprint_items_rejects_foreign_items(engine, proj):
+    """STRICT since G1 (K-8, #413): a foreign id raises and the whole
+    membership swap is rolled back — a composed handoff must never promise
+    work on an item that silently failed to join the sprint."""
+    from dct.core.sprints import get_current_sprint, set_current_sprint_items
     create_project(engine, slug="other", name="Other", path="/tmp/other")
     mine = create_item(engine, "dct", "feature", "Mine")
     foreign = create_item(engine, "other", "feature", "Foreign")
-    res = set_current_sprint_items(engine, "dct", [mine["id"], foreign["id"]])
-    members = {i["id"] for i in list_items_in_sprint(engine, res["sprint_id"])}
-    assert members == {mine["id"]}
+    with pytest.raises(ValueError, match=rf"Unknown item id\(s\).*{foreign['id']}"):
+        set_current_sprint_items(engine, "dct", [mine["id"], foreign["id"]])
+    cur = get_current_sprint(engine, "dct")
+    if cur is not None:  # auto-created sprint may exist, but membership must not
+        assert list_items_in_sprint(engine, cur["id"]) == []
+
+
+def test_set_current_sprint_items_rejects_unknown_and_deleted_ids(engine, proj):
+    from dct.core.items import delete_item
+    from dct.core.sprints import set_current_sprint_items
+    a = create_item(engine, "dct", "feature", "A")
+    ghost = create_item(engine, "dct", "feature", "Ghost")
+    delete_item(engine, ghost["id"])
+    with pytest.raises(ValueError, match=r"Unknown item id\(s\)"):
+        set_current_sprint_items(engine, "dct", [a["id"], ghost["id"], 999999])
+    # Valid call afterwards still works — the failed attempt left no debris.
+    res = set_current_sprint_items(engine, "dct", [a["id"]])
+    assert res["items"] == [a["id"]]
 
 
 def test_clear_current_sprint_removes_members_keeps_sprint(engine, proj):
@@ -442,8 +507,10 @@ def test_list_items_filter_derives_in_current_sprint(engine, proj):
     assert b["id"] in not_in
 
 
-def test_resolve_item_removes_from_current_sprint_via_links(engine, proj):
-    """resolve must drop the item from item_sprints, not just a boolean."""
+def test_resolve_item_clears_flag_but_keeps_link(engine, proj):
+    """resolve clears the derived flag but KEEPS the item_sprints link (K-18,
+    #413) — retained membership is what sprint_completion counts. Supersedes
+    the pre-G1 soft-remove contract."""
     from dct.core.sprints import set_current_sprint_items, get_current_sprint
     from dct.core.items import resolve_item, get_item
     a = create_item(engine, "dct", "feature", "A")
@@ -453,7 +520,8 @@ def test_resolve_item_removes_from_current_sprint_via_links(engine, proj):
     assert got is not None and got["in_current_sprint"] is False
     cur = get_current_sprint(engine, "dct")
     assert cur is not None
-    assert list_items_in_sprint(engine, cur["id"]) == []  # link soft-removed
+    members = list_items_in_sprint(engine, cur["id"])
+    assert [m["id"] for m in members] == [a["id"]]  # link retained (ledger)
 
 
 # ── single-item add/remove to the current sprint (the /track-update surface) ───
@@ -626,14 +694,18 @@ def test_reopen_abandoned_clears_ended_at(engine, proj):
     assert reopened["ended_at"] is None
 
 
-# ── activation cap interacts with deferred ────────────────────────────────────
+# ── reactivation alongside another active sprint (cap lifted, G1) ─────────────
 
-def test_reactivating_deferred_while_other_active_hits_cap(engine, proj):
+def test_reactivating_deferred_while_other_active_allowed(engine, proj):
+    """G1 (#413 K-5): a deferred sprint reactivates fine next to an active one;
+    started_at is preserved from the first activation."""
     a = create_sprint(engine, "dct", "A", status="active")
-    update_sprint(engine, a["id"], status="deferred")   # slot freed
-    create_sprint(engine, "dct", "B", status="active")  # takes the slot
-    with pytest.raises(ValueError, match="already has an active sprint"):
-        update_sprint(engine, a["id"], status="active")
+    a_started = a["started_at"]
+    update_sprint(engine, a["id"], status="deferred")
+    create_sprint(engine, "dct", "B", status="active")
+    reactivated = update_sprint(engine, a["id"], status="active")
+    assert reactivated["status"] == "active"
+    assert reactivated["started_at"] == a_started
 
 
 # ── acceptance scenario from handoff #46 ──────────────────────────────────────
@@ -685,3 +757,28 @@ def test_update_sprint_keep_own_code_is_fine(engine, proj):
 
 def test_update_sprint_unknown_id_returns_none(engine, proj):
     assert update_sprint(engine, 9999, status="active") is None
+
+
+# ── K-33: current-sprint WRITES refuse to guess among parallel actives ─────────
+
+def test_current_sprint_writes_refuse_ambiguity(engine, proj):
+    """set/clear/add/remove current-sprint ops error with 2 active sprints
+    instead of silently retargeting the newest one."""
+    from dct.core.sprints import (
+        add_item_to_current_sprint,
+        clear_current_sprint,
+        remove_item_from_current_sprint,
+        set_current_sprint_items,
+    )
+    a = create_item(engine, "dct", "feature", "A")
+    create_sprint(engine, "dct", "S1", status="active")
+    create_sprint(engine, "dct", "S2", status="active")
+
+    for op in (
+        lambda: set_current_sprint_items(engine, "dct", [a["id"]]),
+        lambda: clear_current_sprint(engine, "dct"),
+        lambda: add_item_to_current_sprint(engine, "dct", a["id"]),
+        lambda: remove_item_from_current_sprint(engine, "dct", a["id"]),
+    ):
+        with pytest.raises(ValueError, match="refuse to guess"):
+            op()

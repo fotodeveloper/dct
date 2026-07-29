@@ -13,6 +13,38 @@ from dct.db import session_handoffs, row_to_dict
 from dct.core.projects import resolve_project_id
 
 
+def _create_handoff_conn(
+    conn: sa.Connection,
+    project_id: int,
+    prompt: str,
+    created_by: str,
+    scope: str | None = None,
+    context_summary: str | None = None,
+) -> dict:
+    """Insert a handoff on an existing connection. Validation lives HERE so no
+    caller can bypass it — and so a ValueError raised inside a composed
+    transaction (handoff_work: sprint write first, handoff second) rolls the
+    whole operation back, sprint write included."""
+    if not prompt or not prompt.strip():
+        raise ValueError("Handoff prompt cannot be empty")
+    if not created_by or not created_by.strip():
+        raise ValueError("created_by cannot be empty — identify the session (model + timestamp)")
+
+    row = conn.execute(
+        session_handoffs.insert()
+        .values(
+            project_id=project_id,
+            prompt=prompt,
+            context_summary=context_summary,
+            scope=scope,
+            created_by=created_by,
+        )
+        .returning(session_handoffs)
+    ).first()
+    assert row is not None
+    return row_to_dict(row)
+
+
 def create_handoff(
     engine: sa.Engine,
     project_slug: str,
@@ -21,26 +53,35 @@ def create_handoff(
     scope: str | None = None,
     context_summary: str | None = None,
 ) -> dict:
-    if not prompt or not prompt.strip():
-        raise ValueError("Handoff prompt cannot be empty")
-    if not created_by or not created_by.strip():
-        raise ValueError("created_by cannot be empty — identify the session (model + timestamp)")
-
     with engine.begin() as conn:
         project_id = resolve_project_id(conn, project_slug)
-        row = conn.execute(
-            session_handoffs.insert()
-            .values(
-                project_id=project_id,
-                prompt=prompt,
-                context_summary=context_summary,
-                scope=scope,
-                created_by=created_by,
-            )
-            .returning(session_handoffs)
-        ).first()
-        assert row is not None
-        return row_to_dict(row)
+        return _create_handoff_conn(
+            conn, project_id, prompt, created_by, scope, context_summary
+        )
+
+
+def _query_unconsumed_handoffs(
+    conn: sa.Connection, project_id: int, scope: str | None = None
+) -> list[dict]:
+    """Unconsumed, undeleted handoffs, newest first (id tie-break) — full rows.
+
+    `scope` narrows the candidates to one workstream tag IN SQL. This is the
+    ONE candidate reader behind every pickup_work selection path (K-37, #413):
+    auto-consume and consume=true share it, so the scope contract cannot drift
+    between them. Conn-level so composed ops (pickup_work, get_sprint_review)
+    read it inside their own transaction.
+    """
+    q = sa.select(session_handoffs).where(
+        session_handoffs.c.project_id == project_id,
+        session_handoffs.c.consumed_at.is_(None),
+        session_handoffs.c.deleted_at.is_(None),
+    )
+    if scope:
+        q = q.where(session_handoffs.c.scope == scope)
+    handoff_rows = conn.execute(
+        q.order_by(session_handoffs.c.created_at.desc(), session_handoffs.c.id.desc())
+    ).fetchall()
+    return [row_to_dict(r) for r in handoff_rows]
 
 
 def list_handoffs(
@@ -55,7 +96,7 @@ def list_handoffs(
             q = q.where(session_handoffs.c.project_id == project_id)
         if unconsumed_only:
             q = q.where(session_handoffs.c.consumed_at.is_(None))
-        q = q.order_by(session_handoffs.c.created_at.desc())
+        q = q.order_by(session_handoffs.c.created_at.desc(), session_handoffs.c.id.desc())
         return [row_to_dict(r) for r in conn.execute(q)]
 
 
@@ -70,25 +111,40 @@ def get_handoff(engine: sa.Engine, handoff_id: int) -> dict | None:
         return row_to_dict(row) if row else None
 
 
+def _consume_handoff_conn(
+    conn: sa.Connection,
+    handoff_id: int,
+    consumed_by: str | None = None,
+) -> dict | None:
+    """UPDATE + re-read on ONE connection. The pre-G1 version updated in one
+    transaction and re-fetched in a second — a concurrent soft-delete between
+    them made a SUCCESSFUL consume return None. Single-connection collapse
+    closes that window and lets composed ops consume inside their own txn."""
+    now = datetime.now(timezone.utc)
+    result = conn.execute(
+        session_handoffs.update()
+        .where(
+            session_handoffs.c.id == handoff_id,
+            session_handoffs.c.deleted_at.is_(None),
+            session_handoffs.c.consumed_at.is_(None),
+        )
+        .values(consumed_at=now, consumed_by=consumed_by)
+    )
+    if result.rowcount == 0:
+        return None
+    row = conn.execute(
+        sa.select(session_handoffs).where(session_handoffs.c.id == handoff_id)
+    ).first()
+    return row_to_dict(row) if row else None
+
+
 def consume_handoff(
     engine: sa.Engine,
     handoff_id: int,
     consumed_by: str | None = None,
 ) -> dict | None:
-    now = datetime.now(timezone.utc)
     with engine.begin() as conn:
-        result = conn.execute(
-            session_handoffs.update()
-            .where(
-                session_handoffs.c.id == handoff_id,
-                session_handoffs.c.deleted_at.is_(None),
-                session_handoffs.c.consumed_at.is_(None),
-            )
-            .values(consumed_at=now, consumed_by=consumed_by)
-        )
-        if result.rowcount == 0:
-            return None
-    return get_handoff(engine, handoff_id)
+        return _consume_handoff_conn(conn, handoff_id, consumed_by)
 
 
 def delete_handoff(engine: sa.Engine, handoff_id: int) -> bool:

@@ -4,6 +4,7 @@ Defines all tables, engine creation, and connection helpers.
 Uses Core (not ORM) for portability between PostgreSQL and SQLite.
 """
 
+import sys
 from pathlib import Path
 
 import sqlalchemy as sa
@@ -533,6 +534,48 @@ def _apply_schema_updates(engine: sa.Engine) -> None:
         with engine.begin() as conn:
             conn.execute(sa.text("DROP INDEX IF EXISTS ix_items_sprint"))
             conn.execute(sa.text("ALTER TABLE items DROP COLUMN in_current_sprint"))
+
+    # K-42 (#413): restore membership links that pre-G1 resolve_item/update_item
+    # soft-removed on the terminal transition. Those writes stamped
+    # item_sprints.removed_at with the SAME `now` value they wrote to
+    # items.resolved_at, so an EXACT equality of the two timestamps identifies a
+    # machine-made removal with no false positives worth worrying about — a
+    # manual remove_item_from_sprint used a different `now` and MUST stay
+    # removed. Without this, historical sprints read done=0 forever (G1 retains
+    # membership; the old rows are still there to heal).
+    # Idempotent by construction: a restored row has removed_at IS NULL and can
+    # never match again.
+    if {"items", "item_sprints", "sprints"}.issubset(tables_after):
+        with engine.begin() as conn:
+            conn.execute(sa.text(
+                "UPDATE item_sprints SET removed_at = NULL "
+                "WHERE removed_at IS NOT NULL AND EXISTS ("
+                "SELECT 1 FROM items i WHERE i.id = item_sprints.item_id "
+                "AND i.resolved_at IS NOT NULL "
+                "AND i.resolved_at = item_sprints.removed_at)"
+            ))
+
+            # K-26a: cross-project links are legacy damage (an item linked to
+            # another project's sprint). REPORT ONLY — deleting them would
+            # destroy history we cannot reconstruct, and completion counts
+            # already exclude them (_sprint_membership_stats_by_sprint filters
+            # on the sprint's project). One stderr line, no mutation.
+            stray = conn.execute(sa.text(
+                "SELECT COUNT(*) FROM item_sprints ls "
+                "JOIN items i ON i.id = ls.item_id "
+                "JOIN sprints s ON s.id = ls.sprint_id "
+                "WHERE ls.removed_at IS NULL "
+                "AND i.deleted_at IS NULL AND s.deleted_at IS NULL "
+                "AND i.project_id != s.project_id"
+            )).scalar() or 0
+        if stray:
+            print(
+                f"WARNING: dct found {stray} live cross-project sprint "
+                "link(s) (item and sprint belong to different projects). "
+                "Nothing was changed — review them manually and drop the "
+                "bogus ones with remove_item_from_sprint.",
+                file=sys.stderr,
+            )
 
 
 def _migrate_legacy_sprint_flag(engine: sa.Engine) -> None:
