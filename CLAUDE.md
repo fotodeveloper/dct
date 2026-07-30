@@ -20,7 +20,7 @@ Deep-dives live in `docs/` and are read on demand — keep this file lean:
 # Development
 .venv/bin/pytest -v                    # Run tests (in-memory SQLite)
 .venv/bin/dct --version                # Check version
-uvx ruff check dct/ tests/            # Lint (config in pyproject.toml)
+uvx ruff@0.16.0 check dct/ tests/     # Lint (config in pyproject.toml; pin matches ci.yml — K-46)
 
 # MCP server (smoke-test — boots, lists tools)
 uv run --no-project --with 'mcp[cli]' --with sqlalchemy --with 'psycopg[binary]' \
