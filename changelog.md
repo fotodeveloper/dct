@@ -1,6 +1,17 @@
 # Changelog
 
 
+## [1.4.0] - 2026-07-30
+
+### Added
+
+- Wire-level regression layer for the MCP server (#429 follow-through): test_server_wire.py spawns the REAL server binary over stdio — protocol-negotiation matrix (2024-11-05 / 2025-03-26 / 2025-06-18 / 2025-11-25 echoed verbatim; a 2026-07-28 request negotiates down to a served version), instructions presence, tools/list with 52 tools and 13 anthropic/alwaysLoad _meta hints; test_server_protocol.py grows an all-52 sweep through the in-memory Client (empty-args calls — SDK validation errors and dct {"error"} payloads both arrive as well-formed responses and the session survives all 52), a schema==signature equality contract for every tool (no dropped params, no ghosts, docstring descriptions non-empty) and a str-return plain-text pin (export_changelog arrives unquoted) (tests)
+
+### Changed
+
+- CI lint gate hardened (K-46): ruff pinned to 0.16.0 in ci.yml (an unpinned uvx ruff lints with the latest release, whose growing default rule set took the same tree from 0 to 248 findings with zero code changes — bump the pin deliberately and re-zero in the same commit) and the lint job mirrored into publish.yml with build gated on it (release gate parity); CLAUDE.md dev lint command pinned to match (ci)
+- MCP SDK 2.0 migration (#429): FastMCP → MCPServer (mcp.server), pin lifted to mcp>=2,<3 and the dev-only [cli] extra dropped (K-49; upstream v1.x is in maintenance mode). alwaysLoad hot-set now rides the official @tool(meta=...) param (K-47) with an exact spec↔wire binding test; every private _tool_manager consumer (alwaysload tests, scripts/check_numbers.py, CLAUDE.md smoke) moved to public list_tools() (K-48); structured_output=False on all 52 tools keeps the migration behavior-neutral (K-51 — deliberate structured-output adoption tracked as #442), pinned end-to-end by new protocol-level tests through the SDK's in-memory Client (JSON text in content, {"error"} stays a normal result). Systemic fix en route: get_engine gives in-memory sqlite a StaticPool — SDK 2.0 runs sync tools in worker threads and the per-thread default pool handed each thread its own empty :memory: db ("no such table"); thread-crossing regression test added (server)
+
 ## [1.3.0] - 2026-07-30
 
 ### Added
