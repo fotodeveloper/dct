@@ -159,7 +159,7 @@ Write ops return a minimal ack, not the full record. `get_item` / `get_handoff` 
 | `complete_checkpoint` / `reject_checkpoint` / `reopen_checkpoint` | `{id, item_id, status, progress}` |
 | `add_changelog` | `{id, project, category, component}` |
 | `create_handoff` | `{id, project, scope, created_at}` |
-| `handoff_work` | `{handoff_id, project, scope, created_at, sprint: {sprint_id, code, size, items} \| null}` — no prompt echo |
+| `handoff_work` | `{handoff_id, project, scope, created_at, sprint: {sprint_id, code, open_size, items} \| null}` — no prompt echo |
 | `pickup_work` | snapshot + `{picked_up: full handoff \| null, consumed: bool}` (read-heavy op — not a slim ack) |
 | `update_handoff` | `{id, updated_fields}` (list of applied field names) |
 | `consume_handoff` | `{id, consumed_at}` |

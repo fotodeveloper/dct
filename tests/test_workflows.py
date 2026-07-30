@@ -343,11 +343,34 @@ def test_handoff_work_sets_sprint_and_creates_handoff(engine, proj):
         engine, "proj-a", prompt="Next: do B", created_by=WHO,
         item_ids=[a["id"], b["id"]], scope="g1",
     )
-    assert out["sprint"]["size"] == 2 and out["sprint"]["items"] == sorted([a["id"], b["id"]])
+    assert out["sprint"]["open_size"] == 2 and out["sprint"]["items"] == sorted([a["id"], b["id"]])
     assert out["handoff"]["scope"] == "g1"
     assert list_handoffs(engine, "proj-a")[0]["id"] == out["handoff"]["id"]
     cur = get_current_sprint(engine, "proj-a")
     assert cur is not None and cur["id"] == out["sprint"]["sprint_id"]
+
+
+def test_handoff_work_open_size_excludes_terminal_members(engine, proj):
+    """K-45: the ack counts OPEN members only and names the field open_size —
+    the snapshot's active_sprints[].size keeps counting open + terminal
+    history (ADR #57), so the two must not share a name."""
+    a = create_item(engine, "proj-a", "feature", "A")
+    b = create_item(engine, "proj-a", "feature", "B")
+    c = create_item(engine, "proj-a", "feature", "C")
+    handoff_work(
+        engine, "proj-a", prompt="seed", created_by=WHO,
+        item_ids=[a["id"], b["id"]],
+    )
+    resolve_item(engine, a["id"])
+    out = handoff_work(
+        engine, "proj-a", prompt="next", created_by=WHO,
+        add_item_ids=[c["id"]],
+    )
+    assert out["sprint"]["open_size"] == 2
+    assert out["sprint"]["items"] == sorted([b["id"], c["id"]])
+    assert "size" not in out["sprint"]
+    snap = get_context_snapshot(engine, "proj-a", include=["sprint"])
+    assert snap["sprint"]["active_sprints"][0]["size"] == 3
 
 
 def test_handoff_work_item_ids_none_touches_nothing(engine, proj):

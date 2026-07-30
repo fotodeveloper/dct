@@ -18,11 +18,9 @@ Two roles, deliberately kept in one module:
    "sprint completion" mean.
 """
 
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 import sqlalchemy as sa
-
-from dct.db import changelog_entries, item_checkpoints, item_sprints, items, sprints
 
 # Re-export: the implementation moved to core/handoff (which owns the
 # session_handoffs table), but get_sprint_review below and the historical
@@ -37,6 +35,7 @@ from dct.core.items import (
     _priority_order_expr,
 )
 from dct.core.projects import resolve_project_id
+from dct.db import changelog_entries, item_checkpoints, item_sprints, items, sprints
 
 
 def set_sprint(engine: sa.Engine, project_slug: str, item_ids: list[int]) -> dict:
@@ -48,13 +47,18 @@ def set_sprint(engine: sa.Engine, project_slug: str, item_ids: list[int]) -> dic
     which auto-creates the active sprint if none exists and swaps membership
     atomically. Ids are STRICT (K-8, #413): unknown / foreign / soft-deleted ids
     RAISE ValueError listing them and nothing is written — they are never
-    silently dropped. `size` counts the OPEN membership after the swap, so it
-    may still differ from len(ids) when terminal members are involved (K-24:
-    resolved members are the sprint's history and survive a replace).
+    silently dropped. `open_size` counts the OPEN membership after the swap
+    (K-45), so it may still differ from len(ids) when terminal members are
+    involved (K-24: resolved members are the sprint's history and survive a
+    replace).
     """
     from dct.core.sprints import set_current_sprint_items
     result = set_current_sprint_items(engine, project_slug, list(item_ids))
-    return {"project": project_slug, "size": result["size"], "items": result["items"]}
+    return {
+        "project": project_slug,
+        "open_size": result["open_size"],
+        "items": result["items"],
+    }
 
 
 def clear_sprint(engine: sa.Engine, project_slug: str) -> dict:
@@ -128,14 +132,14 @@ def _parse_since_conn(
     # Hour shortcuts
     if since.endswith("h") and since[:-1].isdigit():
         hours = int(since[:-1])
-        anchor = datetime.now(timezone.utc) - timedelta(hours=hours)
+        anchor = datetime.now(UTC) - timedelta(hours=hours)
         return anchor, f"last {hours}h"
 
     # ISO date / datetime
     try:
-        anchor = datetime.fromisoformat(since.replace("Z", "+00:00"))
+        anchor = datetime.fromisoformat(since)
         if anchor.tzinfo is None:
-            anchor = anchor.replace(tzinfo=timezone.utc)
+            anchor = anchor.replace(tzinfo=UTC)
         return anchor, f"since {anchor.isoformat()}"
     except ValueError:
         raise ValueError(
@@ -339,7 +343,7 @@ def _query_stale_in_progress(
     conn: sa.Connection, project_id: int, days: int = STALE_DAYS
 ) -> list[dict]:
     """in_progress items untouched for `days` — updated_at ISO-formatted."""
-    stale_anchor = datetime.now(timezone.utc) - timedelta(days=days)
+    stale_anchor = datetime.now(UTC) - timedelta(days=days)
     stale_rows = conn.execute(
         sa.select(items.c.id, items.c.title, items.c.updated_at)
         .where(

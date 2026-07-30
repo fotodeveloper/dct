@@ -385,7 +385,7 @@ def test_set_current_sprint_items_assigns(engine, proj):
     a = create_item(engine, "dct", "feature", "A")
     b = create_item(engine, "dct", "feature", "B")
     res = set_current_sprint_items(engine, "dct", [a["id"], b["id"]])
-    assert res["size"] == 2
+    assert res["open_size"] == 2
     members = {i["id"] for i in list_items_in_sprint(engine, res["sprint_id"])}
     assert members == {a["id"], b["id"]}
 
@@ -402,7 +402,7 @@ def test_set_current_sprint_items_replaces_atomically(engine, proj):
 
 
 def test_set_current_sprint_items_autocreates_sprint(engine, proj):
-    from dct.core.sprints import set_current_sprint_items, get_current_sprint
+    from dct.core.sprints import get_current_sprint, set_current_sprint_items
     assert get_current_sprint(engine, "dct") is None
     a = create_item(engine, "dct", "feature", "A")
     set_current_sprint_items(engine, "dct", [a["id"]])
@@ -439,7 +439,9 @@ def test_set_current_sprint_items_rejects_unknown_and_deleted_ids(engine, proj):
 
 def test_clear_current_sprint_removes_members_keeps_sprint(engine, proj):
     from dct.core.sprints import (
-        set_current_sprint_items, clear_current_sprint, get_current_sprint,
+        clear_current_sprint,
+        get_current_sprint,
+        set_current_sprint_items,
     )
     a = create_item(engine, "dct", "feature", "A")
     res = set_current_sprint_items(engine, "dct", [a["id"]])
@@ -457,8 +459,8 @@ def test_clear_current_sprint_no_active_is_noop(engine, proj):
 # ── derived in_current_sprint (no column; computed from item_sprints) ──────────
 
 def test_in_current_sprint_true_via_active_sprint(engine, proj):
-    from dct.core.sprints import set_current_sprint_items
     from dct.core.items import get_item
+    from dct.core.sprints import set_current_sprint_items
     a = create_item(engine, "dct", "feature", "A")
     set_current_sprint_items(engine, "dct", [a["id"]])
     got = get_item(engine, a["id"])
@@ -476,8 +478,8 @@ def test_in_current_sprint_false_when_sprint_only_planned(engine, proj):
 
 
 def test_in_current_sprint_false_after_clear(engine, proj):
-    from dct.core.sprints import set_current_sprint_items, clear_current_sprint
     from dct.core.items import get_item
+    from dct.core.sprints import clear_current_sprint, set_current_sprint_items
     a = create_item(engine, "dct", "feature", "A")
     set_current_sprint_items(engine, "dct", [a["id"]])
     clear_current_sprint(engine, "dct")
@@ -493,8 +495,8 @@ def test_new_item_not_in_current_sprint(engine, proj):
 
 
 def test_list_items_filter_derives_in_current_sprint(engine, proj):
-    from dct.core.sprints import set_current_sprint_items
     from dct.core.items import list_items
+    from dct.core.sprints import set_current_sprint_items
     a = create_item(engine, "dct", "feature", "A")
     b = create_item(engine, "dct", "feature", "B")
     set_current_sprint_items(engine, "dct", [a["id"]])
@@ -511,8 +513,8 @@ def test_resolve_item_clears_flag_but_keeps_link(engine, proj):
     """resolve clears the derived flag but KEEPS the item_sprints link (K-18,
     #413) — retained membership is what sprint_completion counts. Supersedes
     the pre-G1 soft-remove contract."""
-    from dct.core.sprints import set_current_sprint_items, get_current_sprint
-    from dct.core.items import resolve_item, get_item
+    from dct.core.items import get_item, resolve_item
+    from dct.core.sprints import get_current_sprint, set_current_sprint_items
     a = create_item(engine, "dct", "feature", "A")
     set_current_sprint_items(engine, "dct", [a["id"]])
     resolve_item(engine, a["id"], resolution="done")
@@ -527,8 +529,8 @@ def test_resolve_item_clears_flag_but_keeps_link(engine, proj):
 # ── single-item add/remove to the current sprint (the /track-update surface) ───
 
 def test_add_item_to_current_sprint_autocreates_and_flags(engine, proj):
-    from dct.core.sprints import add_item_to_current_sprint, get_current_sprint
     from dct.core.items import get_item
+    from dct.core.sprints import add_item_to_current_sprint, get_current_sprint
     a = create_item(engine, "dct", "feature", "A")
     add_item_to_current_sprint(engine, "dct", a["id"])
     assert get_current_sprint(engine, "dct") is not None
@@ -539,7 +541,9 @@ def test_add_item_to_current_sprint_autocreates_and_flags(engine, proj):
 def test_add_item_to_current_sprint_does_not_replace_existing(engine, proj):
     """Single add is additive — unlike set_sprint, it keeps current members."""
     from dct.core.sprints import (
-        set_current_sprint_items, add_item_to_current_sprint, get_current_sprint,
+        add_item_to_current_sprint,
+        get_current_sprint,
+        set_current_sprint_items,
     )
     a = create_item(engine, "dct", "feature", "A")
     b = create_item(engine, "dct", "feature", "B")
@@ -552,8 +556,11 @@ def test_add_item_to_current_sprint_does_not_replace_existing(engine, proj):
 
 
 def test_remove_item_from_current_sprint(engine, proj):
-    from dct.core.sprints import add_item_to_current_sprint, remove_item_from_current_sprint
     from dct.core.items import get_item
+    from dct.core.sprints import (
+        add_item_to_current_sprint,
+        remove_item_from_current_sprint,
+    )
     a = create_item(engine, "dct", "feature", "A")
     add_item_to_current_sprint(engine, "dct", a["id"])
     res = remove_item_from_current_sprint(engine, "dct", a["id"])

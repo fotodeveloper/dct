@@ -12,6 +12,7 @@ Response format conventions:
 Every tool returns JSON-native (dict / list / str). No double-encoded JSON.
 """
 
+import contextlib
 from datetime import datetime
 
 from mcp.server.fastmcp import FastMCP
@@ -83,14 +84,12 @@ _INSTRUCTIONS = (
 # from the cached PyPI probe when present. Guarded so a missing module / cache /
 # config can NEVER break server start; this path does ZERO network I/O (pure cache
 # read via get_cached_notice).
-try:
+with contextlib.suppress(Exception):
     from dct.update import get_cached_notice
 
     _update_notice = get_cached_notice()
     if _update_notice:
         _INSTRUCTIONS += f"\n\nUPDATE: {_update_notice}"
-except Exception:
-    pass
 
 mcp = FastMCP("dct", instructions=_INSTRUCTIONS)
 
@@ -113,6 +112,7 @@ def _resolve_project(project_arg: str, required: bool = True) -> str | None:
     if project_arg:
         return project_arg
     import os
+
     from dct.core.projects import get_project_by_path
 
     cwd = os.getcwd()
@@ -939,9 +939,10 @@ def set_sprint(project: str = "", item_ids: str = "") -> dict:
         project: Slug. Empty = auto-detect from CWD.
         item_ids: Comma-separated ids (e.g. "22,21,6"). Empty string clears sprint.
 
-    Returns: {"project": "<slug>", "size": <int>, "items": [ids, sorted]} —
-        size/items describe the OPEN membership after the swap (terminal
-        members are retained as history and are NOT listed).
+    Returns: {"project": "<slug>", "open_size": <int>, "items": [ids, sorted]}
+        — open_size/items describe the OPEN membership after the swap
+        (terminal members are retained as history and are NOT listed; the
+        snapshot's active_sprints[].size counts open + terminal instead).
         Error: {"error": "..."} on project resolution failure, on ids that are
         not live items of this project (unknown / foreign / soft-deleted — the
         message lists them, nothing is written), or when SEVERAL sprints are
@@ -1422,7 +1423,9 @@ def handoff_work(
         context_summary: Optional state snapshot stored next to the prompt.
 
     Returns: slim ack {handoff_id, project, scope, created_at, sprint} — `sprint`
-        is {sprint_id, code, size, items} (OPEN membership after the writes) or
+        is {sprint_id, code, open_size, items} (OPEN membership after the
+        writes; snapshot's active_sprints[].size counts open + terminal
+        history instead) or
         null (null ⇔ no membership change requested). NO prompt /
         context_summary echo (fetch with get_handoff). {"error": "..."} on
         empty prompt or created_by, malformed/empty id lists, replace combined

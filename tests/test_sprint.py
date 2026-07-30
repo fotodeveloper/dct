@@ -1,13 +1,16 @@
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from dct.core.items import create_item, update_item, resolve_item, get_item
 from dct.core.checkpoints import add_checkpoint, set_status
+from dct.core.items import create_item, get_item, resolve_item, update_item
 from dct.core.projects import create_project
 from dct.core.sprint import (
-    set_sprint, clear_sprint, list_sprint_items,
-    get_sprint_review, parse_since,
+    clear_sprint,
+    get_sprint_review,
+    list_sprint_items,
+    parse_since,
+    set_sprint,
 )
 
 
@@ -22,7 +25,8 @@ def test_set_sprint_flags_items(engine, proj):
     c = create_item(engine, "dct", "feature", "C")
 
     result = set_sprint(engine, "dct", [a["id"], b["id"]])
-    assert result["size"] == 2
+    assert result["open_size"] == 2
+    assert "size" not in result
     assert set(result["items"]) == {a["id"], b["id"]}
 
     flagged = list_sprint_items(engine, "dct")
@@ -106,7 +110,7 @@ def test_parse_since_hours(engine, proj):
     assert anchor is not None
     assert "24h" in label
     # anchor is ~24h ago
-    delta = datetime.now(timezone.utc) - anchor
+    delta = datetime.now(UTC) - anchor
     assert timedelta(hours=23, minutes=59) < delta < timedelta(hours=24, minutes=1)
 
 

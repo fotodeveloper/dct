@@ -263,7 +263,7 @@ def test_handoff_work_item_ids_list_sets_membership(srv):
         prompt="p", created_by=WHO, project="test", item_ids=f"{a['id']}, {b['id']}"
     )
 
-    assert out["sprint"]["size"] == 2
+    assert out["sprint"]["open_size"] == 2
     assert sorted(out["sprint"]["items"]) == sorted([a["id"], b["id"]])
     assert out["handoff_id"] is not None
 

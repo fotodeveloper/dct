@@ -27,13 +27,13 @@ Terminology:
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import sqlalchemy as sa
 
-from dct.db import item_sprints, items, row_to_dict, sprints
 from dct.core.items import TERMINAL_STATUSES, _membership_count_exprs
 from dct.core.projects import resolve_project_id
+from dct.db import item_sprints, items, row_to_dict, sprints
 
 VALID_KINDS = {"sprint", "phase", "milestone", "block"}
 VALID_STATUSES = {"planned", "active", "deferred", "completed", "abandoned"}
@@ -98,7 +98,7 @@ def create_sprint(
             if existing:
                 raise ValueError(f"Sprint with code '{code}' already exists in project")
 
-        started_at = datetime.now(timezone.utc) if status == "active" else None
+        started_at = datetime.now(UTC) if status == "active" else None
         row = conn.execute(
             sprints.insert()
             .values(
@@ -272,7 +272,7 @@ def update_sprint(engine: sa.Engine, sprint_id: int, **kwargs) -> dict | None:
     if not values:
         raise ValueError("No valid fields to update")
 
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
 
     with engine.begin() as conn:
         current = conn.execute(
@@ -344,7 +344,7 @@ def delete_sprint(engine: sa.Engine, sprint_id: int) -> bool:
     """Soft-delete a sprint. Does NOT cascade to item_sprints — links remain
     for historical query ('this item WAS in this sprint'). To hide those
     links, call `remove_item_from_sprint` per item before deleting."""
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     with engine.begin() as conn:
         result = conn.execute(
             sprints.update()
@@ -367,7 +367,7 @@ def assign_item_to_sprint(engine: sa.Engine, item_id: int, sprint_id: int) -> di
     same project — a cross-project link would leak the item's title/status
     into the other project's snapshot at every session start.
     """
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     with engine.begin() as conn:
         # Verify both rows exist, aren't soft-deleted, and share a project.
         item_row = conn.execute(
@@ -437,7 +437,7 @@ def remove_item_from_sprint(
 ) -> dict | None:
     """Soft-remove the link — sets removed_at. Returns the row, or None
     if the link never existed or was already removed."""
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     with engine.begin() as conn:
         result = conn.execute(
             item_sprints.update()
@@ -522,7 +522,7 @@ def _ensure_current_sprint_conn(
             name=sprint_name,
             kind="sprint",
             status="active",
-            started_at=datetime.now(timezone.utc),
+            started_at=datetime.now(UTC),
         )
         .returning(sprints)
     ).first()
@@ -685,8 +685,10 @@ def _set_current_sprint_items_conn(
     TERMINAL MEMBERS ARE IMMUNE (K-24, ADR #57): resolved / wont_fix members
     are the sprint's completion history — a replace only swaps the OPEN
     members and never soft-removes terminal ones, so sprint_completion
-    survives session-end replanning. Returns {"size", "items", "sprint_id"}
-    where items/size describe the OPEN membership after the swap.
+    survives session-end replanning. Returns {"open_size", "items",
+    "sprint_id"} where items/open_size describe the OPEN membership after the
+    swap — named open_size (K-45) because the snapshot's active_sprints[].size
+    counts open + terminal history, a different quantity.
     """
     if sprint_id is None:
         current = _require_unambiguous_current_conn(conn, project_id)  # K-33
@@ -694,7 +696,7 @@ def _set_current_sprint_items_conn(
         sprint_id = sprint["id"]
     else:
         _validate_target_sprint_conn(conn, project_id, sprint_id)
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
 
     valid = _validate_project_items_conn(conn, project_id, list(item_ids))
     open_members = _member_ids_conn(conn, sprint_id, open_only=True)
@@ -704,7 +706,7 @@ def _set_current_sprint_items_conn(
     _remove_members_conn(conn, sprint_id, open_members - valid, now)
 
     return {
-        "size": len(valid),
+        "open_size": len(valid),
         "items": sorted(valid),
         "sprint_id": sprint_id,
     }
@@ -771,7 +773,7 @@ def clear_current_sprint(engine: sa.Engine, project_slug: str) -> dict:
     active, ready for fresh planning; terminal members are its completion
     history and stay linked (ADR #57 — use remove_item_from_sprint for a
     manual override). No-op if there is no current sprint."""
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     with engine.begin() as conn:
         project_id = resolve_project_id(conn, project_slug)
         sprint = _require_unambiguous_current_conn(conn, project_id)  # K-33

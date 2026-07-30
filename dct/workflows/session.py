@@ -31,7 +31,7 @@ DELIBERATELY exempt — the full prompt is the no-transcript criterion (K-11).
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import sqlalchemy as sa
 
@@ -480,8 +480,10 @@ def handoff_work(
     paths; remove-only with no active sprint raises.
 
     Returns {"project", "handoff": full row, "sprint": {"sprint_id", "code",
-    "size", "items"} | None (None ⇔ no membership op requested)}; items/size
-    describe the OPEN membership after the writes.
+    "open_size", "items"} | None (None ⇔ no membership op requested)};
+    items/open_size describe the OPEN membership after the writes — named
+    open_size on purpose (K-45): the snapshot's active_sprints[].size counts
+    open + terminal history (ADR #57), a different quantity.
     """
     replace_requested = item_ids is not None
     additive_requested = add_item_ids is not None or remove_item_ids is not None
@@ -550,7 +552,7 @@ def handoff_work(
                         conn, project_id
                     )
                 sprint_id = target_sprint["id"]
-                now = datetime.now(timezone.utc)
+                now = datetime.now(UTC)
                 if add_item_ids:
                     valid = sprints_core._validate_project_items_conn(
                         conn, project_id, list(add_item_ids)
@@ -583,7 +585,7 @@ def handoff_work(
             sprint_result = {
                 "sprint_id": sprint_id,
                 "code": resolved_target.get("code"),
-                "size": len(open_after),
+                "open_size": len(open_after),
                 "items": open_after,
             }
 

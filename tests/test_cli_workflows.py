@@ -168,7 +168,7 @@ def test_handoff_create_sets_sprint_and_creates_handoff(cli_engine, monkeypatch,
     assert "✓ Handoff #" in out
     assert "scope: g1" in out
     assert WHO in out
-    assert "1 items" in out
+    assert "1 open items" in out
 
     rows = list_handoffs(cli_engine, "proj-a")
     assert [r["prompt"] for r in rows] == ["Pick up CP1242"]
@@ -195,7 +195,7 @@ def test_handoff_create_remove_items_cuts_scope(cli_engine, monkeypatch, capsys)
                           "--prompt", "fresh planning",
                           "--remove-items", str(item_id)])
 
-    assert "0 items" in capsys.readouterr().out
+    assert "0 open items" in capsys.readouterr().out
     assert list_sprint_items(cli_engine, "proj-a") == []
 
 

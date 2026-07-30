@@ -2,18 +2,20 @@
 
 import argparse
 import atexit
+import contextlib
 import os
 import signal
 import socket
 import subprocess
 import sys
+from datetime import UTC
 from pathlib import Path
 
 from dct import __version__, migrate, paths
-from dct.config import load_config, save_config, Config
-from dct.db import get_engine, create_tables
+from dct.config import Config, load_config, save_config
 from dct.core.engine import bootstrap_engine
 from dct.core.items import TERMINAL_STATUSES
+from dct.db import create_tables, get_engine
 
 # Windows-policy seam (tests flip it): dispatches the daemonization,
 # liveness-probe and signal paths that differ on win32 (W8-W10, ADR #52).
@@ -36,6 +38,7 @@ def _get_engine():
 def _detect_project(engine) -> str:
     """Auto-detect project slug from CWD. Exits if not found."""
     import os
+
     from dct.core.projects import get_project_by_path
 
     cwd = os.getcwd()
@@ -118,12 +121,12 @@ def _default_identity() -> str:
     self-identifies (Claude Code, a G2 adapter), else "cli". Commands ECHO the
     resolved value so attribution is never silent.
     """
-    from datetime import datetime, timezone
+    from datetime import datetime
 
     from dct.core.provenance import get_provenance
 
     client = get_provenance().actor_client or "cli"
-    return f"{client} @ {datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%MZ')}"
+    return f"{client} @ {datetime.now(UTC).strftime('%Y-%m-%dT%H:%MZ')}"
 
 
 def _print_table(headers: list[str], rows: list[list[str]], max_widths: dict[int, int] | None = None) -> None:
@@ -293,6 +296,7 @@ def cmd_hooks_wire(args):
 
 def cmd_project_add(args):
     import os
+
     from dct.core.projects import create_project, set_version
 
     # #227: realpath (not abspath) so a symlinked path is stored canonically and
@@ -414,7 +418,11 @@ def cmd_project_changelog_path(args):
     With a relpath → set it (validated to stay within the project root). Without
     → print the current relpath and its resolved absolute path.
     """
-    from dct.core.projects import get_project, resolve_changelog_path, set_changelog_path
+    from dct.core.projects import (
+        get_project,
+        resolve_changelog_path,
+        set_changelog_path,
+    )
 
     engine = _get_engine()
 
@@ -454,6 +462,7 @@ def cmd_plan_rescan(args):
     injection + [x] state reading (§9.2).
     """
     import os
+
     from dct.core.plans.ingest import ingest_file
     from dct.core.projects import get_project_by_path
 
@@ -719,7 +728,7 @@ def cmd_handoff_create(args):
     print(f"✓ Handoff #{h['id']} created (scope: {h.get('scope') or 'none'}, by {identity})")
     sprint = result.get("sprint")
     if sprint:
-        print(f"  sprint #{sprint['sprint_id']}: {sprint['size']} items")
+        print(f"  sprint #{sprint['sprint_id']}: {sprint['open_size']} open items")
     else:
         print("  sprint untouched")
 
@@ -922,7 +931,8 @@ def cmd_clog_count(args):
 
 def cmd_clog_release(args):
     import subprocess
-    from dct.core.changelog import release_entries, count_unreleased
+
+    from dct.core.changelog import count_unreleased, release_entries
     from dct.core.projects import get_project
     from dct.core.version import bump
 
@@ -1004,6 +1014,7 @@ def cmd_internal_task_mirror(args):
         project: dct project slug. Empty → autodetect from CWD.
     """
     import json
+
     from dct.config import load_config
 
     try:
@@ -1039,8 +1050,8 @@ def cmd_internal_task_mirror(args):
     if not todos:
         return
 
-    from dct.core.items import list_items, create_item
     from dct.core.checkpoints import add_checkpoint
+    from dct.core.items import create_item, list_items
     from dct.core.projects import get_project_by_path
 
     engine = _get_engine()
@@ -1168,7 +1179,7 @@ def cmd_checkpoint_add(args):
 
 
 def cmd_checkpoint_list(args):
-    from dct.core.checkpoints import list_checkpoints, get_progress
+    from dct.core.checkpoints import get_progress, list_checkpoints
 
     engine = _get_engine()
     cps = list_checkpoints(engine, args.item_id)
@@ -1352,7 +1363,8 @@ def cmd_upgrade(args):
     matrix so the user knows what takes effect when.
     """
     import subprocess
-    from dct.update import detect_install_method, upgrade_command, dist_pkg
+
+    from dct.update import detect_install_method, dist_pkg, upgrade_command
 
     method = detect_install_method()
 
@@ -1365,14 +1377,18 @@ def cmd_upgrade(args):
         cmd = upgrade_command(method)
         print(f"Detected install method: {method}")
         print(f"Upgrading {dist_pkg()} …  ({' '.join(cmd)})")
-        result = subprocess.run(cmd)
+        result = subprocess.run(cmd, check=False)
         if result.returncode != 0:
             print(f"✗ Upgrade command failed (exit {result.returncode})", file=sys.stderr)
             sys.exit(result.returncode)
 
     # Refresh Claude Code integration: re-link current skills/hooks (idempotent),
     # then remove links to skills/hooks that the new package no longer ships.
-    from dct.integrations.claude import install_hook, install_skills, prune_dangling_symlinks
+    from dct.integrations.claude import (
+        install_hook,
+        install_skills,
+        prune_dangling_symlinks,
+    )
 
     linked_ok = True
     removed: list[str] = []
@@ -1417,6 +1433,7 @@ def _maybe_print_legacy_nudge() -> None:
 
 def cmd_project_detect(args):
     import os
+
     from dct.core.projects import get_project_by_path
 
     engine = _get_engine()
@@ -2212,7 +2229,8 @@ def _maybe_nudge(args) -> None:
     suppressed, or opted-out command) is silent and never affects the command's
     own output or exit code.
     """
-    try:
+    # A passive nicety must never break a command.
+    with contextlib.suppress(Exception):
         if not sys.stderr.isatty() or _nudge_suppressed(args):
             return
         from dct.config import load_config
@@ -2224,8 +2242,6 @@ def _maybe_nudge(args) -> None:
         notice = get_cached_notice(config=cfg)
         if notice:
             print(notice, file=sys.stderr)
-    except Exception:
-        pass  # a passive nicety must never break a command
 
 
 def main():
