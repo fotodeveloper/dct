@@ -5,12 +5,12 @@ allowed (parallel sessions, different scopes). Consumer marks consumed_at
 (history preserved) or deleted_at (soft discard).
 """
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import sqlalchemy as sa
 
-from dct.db import session_handoffs, row_to_dict
 from dct.core.projects import resolve_project_id
+from dct.db import row_to_dict, session_handoffs
 
 
 def _create_handoff_conn(
@@ -120,7 +120,7 @@ def _consume_handoff_conn(
     transaction and re-fetched in a second — a concurrent soft-delete between
     them made a SUCCESSFUL consume return None. Single-connection collapse
     closes that window and lets composed ops consume inside their own txn."""
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     result = conn.execute(
         session_handoffs.update()
         .where(
@@ -156,7 +156,7 @@ def delete_handoff(engine: sa.Engine, handoff_id: int) -> bool:
                 session_handoffs.c.id == handoff_id,
                 session_handoffs.c.deleted_at.is_(None),
             )
-            .values(deleted_at=datetime.now(timezone.utc))
+            .values(deleted_at=datetime.now(UTC))
         )
         return result.rowcount > 0
 

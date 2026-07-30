@@ -7,7 +7,7 @@ CLAUDE_*, _still_symlink) MUST target dct.integrations.claude — patches on
 this shim do not reach the implementation's globals.
 """
 
-from dct.integrations.claude import *  # noqa: F401,F403
+from dct.integrations.claude import *
 from dct.integrations.claude import (  # noqa: F401
     CLAUDE_HOOKS_DIR,
     CLAUDE_JSON,

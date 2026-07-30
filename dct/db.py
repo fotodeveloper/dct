@@ -4,7 +4,9 @@ Defines all tables, engine creation, and connection helpers.
 Uses Core (not ORM) for portability between PostgreSQL and SQLite.
 """
 
+import contextlib
 import sys
+from datetime import UTC
 from pathlib import Path
 
 import sqlalchemy as sa
@@ -361,10 +363,9 @@ sa.Index("ix_decisions_project_kind_status", decisions.c.project_id, decisions.c
 def _set_sqlite_wal(dbapi_connection, _connection_record):
     cursor = dbapi_connection.cursor()
     cursor.execute("PRAGMA foreign_keys=ON")
-    try:
+    # WAL may be refused (e.g. network filesystems) — plain journal is fine.
+    with contextlib.suppress(Exception):
         cursor.execute("PRAGMA journal_mode=WAL")
-    except Exception:
-        pass
     cursor.close()
 
 
@@ -598,7 +599,7 @@ def _migrate_legacy_sprint_flag(engine: sa.Engine) -> None:
     column is gone, so it is always safe to call. The full-PK existence probe
     means a re-run never collides with a soft-removed link (the #215 lesson).
     """
-    from datetime import datetime, timezone
+    from datetime import datetime
 
     # The column only exists in pre-#216 DBs. Self-disable cleanly otherwise.
     if "in_current_sprint" not in {c["name"] for c in sa.inspect(engine).get_columns("items")}:
@@ -617,7 +618,7 @@ def _migrate_legacy_sprint_flag(engine: sa.Engine) -> None:
         if not flagged_rows:
             return
 
-        by_project: dict[int, list[tuple[int, "datetime"]]] = {}
+        by_project: dict[int, list[tuple[int, datetime]]] = {}
         for row in flagged_rows:
             by_project.setdefault(row.project_id, []).append((row.id, row.updated_at))
 
@@ -644,8 +645,8 @@ def _migrate_legacy_sprint_flag(engine: sa.Engine) -> None:
                         # sprint after #216. Items keep their membership for the
                         # record; the user sets a fresh current sprint via /handoff.
                         status="completed",
-                        started_at=datetime.now(timezone.utc),
-                        ended_at=datetime.now(timezone.utc),
+                        started_at=datetime.now(UTC),
+                        ended_at=datetime.now(UTC),
                     )
                     .returning(sprints.c.id)
                 ).first()

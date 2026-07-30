@@ -16,7 +16,6 @@ from dct.core.plans.ingest import (
 from dct.core.plans.parser import parse_plan
 from dct.core.projects import create_project
 
-
 ULID_A = "01HX9Z4K5M7PQRSTVWXYZ00001"
 ULID_B = "01HX9Z4K5M7PQRSTVWXYZ00002"
 
@@ -277,7 +276,11 @@ def test_ingest_re_sync_ignores_x_state(engine, proj, tmp_path, monkeypatch):
     ingest_file(engine, path, project_slug="dct", auto_resolve_uncertain=False)
 
     # User marks A as "done" in DB via complete_plan_checkpoint
-    from dct.core.plans.crud import complete_plan_checkpoint, list_plan_checkpoints, list_plans
+    from dct.core.plans.crud import (
+        complete_plan_checkpoint,
+        list_plan_checkpoints,
+        list_plans,
+    )
     plans_ = list_plans(engine, project_slug="dct")
     cps = list_plan_checkpoints(engine, plan_id=plans_[0]["id"])
     a = next(cp for cp in cps if cp["text"] == "A")

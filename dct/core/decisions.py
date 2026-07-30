@@ -10,7 +10,7 @@ Spec §4.1 + §5.1 + §9.5.
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import sqlalchemy as sa
 
@@ -206,7 +206,7 @@ def update_decision(engine: sa.Engine, decision_id: int, **kwargs) -> dict | Non
         values[k] = v
     if not values:
         raise ValueError("No valid fields to update")
-    values["updated_at"] = datetime.now(timezone.utc)
+    values["updated_at"] = datetime.now(UTC)
 
     with engine.begin() as conn:
         result = conn.execute(
@@ -232,7 +232,7 @@ def supersede_decision(
     """
     if old_decision_id == new_decision_id:
         raise ValueError("A decision cannot supersede itself")
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     with engine.begin() as conn:
         # Verify both rows exist
         old = conn.execute(
@@ -263,7 +263,7 @@ def supersede_decision(
 
 
 def delete_decision(engine: sa.Engine, decision_id: int) -> bool:
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     with engine.begin() as conn:
         result = conn.execute(
             decisions.update()

@@ -2,8 +2,8 @@
 
 import pytest
 
+from dct.core.items import add_note, create_item
 from dct.core.projects import create_project
-from dct.core.items import create_item, add_note
 from dct.web.app import create_app
 
 

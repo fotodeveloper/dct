@@ -14,10 +14,11 @@ Tools are called directly (FastMCP's @mcp.tool() leaves the function callable),
 with server._get_engine monkeypatched onto the in-memory fixture engine.
 """
 
-from dct.mcp import server as S
 from dct.core.decisions import create_decision as core_create_decision
-from dct.core.plans.crud import add_plan_checkpoint, add_plan_section as core_add_section, create_plan as core_create_plan
-
+from dct.core.plans.crud import add_plan_checkpoint
+from dct.core.plans.crud import add_plan_section as core_add_section
+from dct.core.plans.crud import create_plan as core_create_plan
+from dct.mcp import server as S
 
 # ── create_item ───────────────────────────────────────────────────────────────
 

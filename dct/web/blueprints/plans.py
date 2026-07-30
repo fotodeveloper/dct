@@ -4,15 +4,15 @@ from __future__ import annotations
 
 from flask import Blueprint, abort, g, render_template
 
-from dct.web.app import current_engine
-from dct.core.plans import crud as plans_core
 from dct.core import projects as projects_core
+from dct.core.plans import crud as plans_core
+from dct.web.app import current_engine
 
 bp = Blueprint("plans", __name__)
 
 
 @bp.route("/p/<slug>/plans")
-def list(slug):  # noqa: A001 — endpoint name plans.list is part of the contract
+def list(slug):
     engine = current_engine()
     plans = plans_core.list_plans(engine, project_slug=slug)
     return render_template("plans/list.html", slug=slug, plans=plans)

@@ -1,16 +1,23 @@
 import json
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from dct.db import (
-    get_engine, create_tables, items, item_checkpoints,
-    changelog_entries, session_handoffs,
-)
-from dct.core.projects import create_project
-from dct.core.sprints import create_sprint, assign_item_to_sprint, remove_item_from_sprint
 from dct.core import analytics
-
+from dct.core.projects import create_project
+from dct.core.sprints import (
+    assign_item_to_sprint,
+    create_sprint,
+    remove_item_from_sprint,
+)
+from dct.db import (
+    changelog_entries,
+    create_tables,
+    get_engine,
+    item_checkpoints,
+    items,
+    session_handoffs,
+)
 
 # ── fixtures / helpers ────────────────────────────────────────────────────────
 
@@ -26,22 +33,22 @@ def _mk_project(engine, slug):
 
 
 def _insert_item(engine, project_id, **kw):
-    now = datetime.now(timezone.utc)
-    vals = dict(
-        project_id=project_id,
-        item_type=kw.get("item_type", "todo"),
-        title=kw.get("title", "x"),
-        description=kw.get("description"),
-        priority=kw.get("priority", "P2"),
-        status=kw.get("status", "open"),
-        component=kw.get("component"),
-        source_file=kw.get("source_file"),
-        tags=kw.get("tags", "[]"),
-        created_at=kw.get("created_at", now),
-        updated_at=kw.get("updated_at", now),
-        resolved_at=kw.get("resolved_at"),
-        deleted_at=kw.get("deleted_at"),
-    )
+    now = datetime.now(UTC)
+    vals = {
+        "project_id": project_id,
+        "item_type": kw.get("item_type", "todo"),
+        "title": kw.get("title", "x"),
+        "description": kw.get("description"),
+        "priority": kw.get("priority", "P2"),
+        "status": kw.get("status", "open"),
+        "component": kw.get("component"),
+        "source_file": kw.get("source_file"),
+        "tags": kw.get("tags", "[]"),
+        "created_at": kw.get("created_at", now),
+        "updated_at": kw.get("updated_at", now),
+        "resolved_at": kw.get("resolved_at"),
+        "deleted_at": kw.get("deleted_at"),
+    }
     with engine.begin() as conn:
         return conn.execute(items.insert().values(**vals).returning(items.c.id)).scalar()
 
@@ -50,7 +57,7 @@ def _insert_cp(engine, item_id, status="pending", kind="task", deleted=False):
     with engine.begin() as conn:
         conn.execute(item_checkpoints.insert().values(
             item_id=item_id, text="cp", status=status, kind=kind,
-            deleted_at=(datetime.now(timezone.utc) if deleted else None),
+            deleted_at=(datetime.now(UTC) if deleted else None),
         ))
 
 
@@ -60,7 +67,7 @@ def _insert_clog(engine, project_id, category="added", version=None,
         conn.execute(changelog_entries.insert().values(
             project_id=project_id, category=category, entry="e",
             version=version,
-            created_at=created_at or datetime.now(timezone.utc),
+            created_at=created_at or datetime.now(UTC),
             released_at=released_at,
         ))
 
@@ -69,7 +76,7 @@ def _insert_handoff(engine, project_id, consumed=False):
     with engine.begin() as conn:
         conn.execute(session_handoffs.insert().values(
             project_id=project_id, prompt="p", created_by="t",
-            consumed_at=(datetime.now(timezone.utc) if consumed else None),
+            consumed_at=(datetime.now(UTC) if consumed else None),
         ))
 
 
@@ -100,7 +107,7 @@ def test_radar_empty_project_all_zero(engine):
 def test_radar_all_resolved_project_has_no_open(engine):
     pid = _mk_project(engine, "done")
     _insert_item(engine, pid, status="resolved", priority="P1",
-                 resolved_at=datetime.now(timezone.utc))
+                 resolved_at=datetime.now(UTC))
     _insert_item(engine, pid, status="wont_fix", priority="P2")
     r = analytics.radar(engine)
     p = next(x for x in r["projects"] if x["slug"] == "done")
@@ -123,7 +130,7 @@ def test_radar_priority_breakdown_counts_only_open(engine):
 
 def test_radar_stale_buckets(engine):
     pid = _mk_project(engine, "stale")
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     _insert_item(engine, pid, status="in_progress", updated_at=now - timedelta(days=8))
     _insert_item(engine, pid, status="open", updated_at=now - timedelta(days=31))
     _insert_item(engine, pid, status="in_progress", updated_at=now - timedelta(days=5))  # fresh
@@ -149,7 +156,7 @@ def test_radar_soft_deleted_rows_excluded(engine):
     pid = _mk_project(engine, "sd")
     _insert_item(engine, pid, status="open", priority="P1")
     _insert_item(engine, pid, status="open", priority="P1",
-                 deleted_at=datetime.now(timezone.utc))  # must NOT count
+                 deleted_at=datetime.now(UTC))  # must NOT count
     r = analytics.radar(engine)
     p = next(x for x in r["projects"] if x["slug"] == "sd")
     assert p["open_total"] == 1
@@ -203,7 +210,7 @@ def test_backlog_by_component(engine):
 
 def test_backlog_aging_boundary_6_7_8_days(engine):
     pid = _mk_project(engine, "age")
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     _insert_item(engine, pid, status="open", created_at=now - timedelta(days=6))   # lt_1w
     _insert_item(engine, pid, status="open", created_at=now - timedelta(days=7))   # boundary -> w1_4
     _insert_item(engine, pid, status="open", created_at=now - timedelta(days=8))   # w1_4
@@ -267,7 +274,7 @@ def test_backlog_soft_deleted_excluded_everywhere(engine):
                         tags=json.dumps(["keep"]))
     _insert_cp(engine, keep, status="pending")
     dead = _insert_item(engine, pid, status="open", priority="P1", component="ghost",
-                        tags=json.dumps(["ghost"]), deleted_at=datetime.now(timezone.utc))
+                        tags=json.dumps(["ghost"]), deleted_at=datetime.now(UTC))
     _insert_cp(engine, dead, status="done")  # parent item soft-deleted -> excluded
     h = analytics.backlog_health(engine, "ghost")
     assert "P1" not in h["by_priority"]
@@ -292,7 +299,7 @@ def test_velocity_window_length_default_weeks(engine):
 
 def test_velocity_buckets_and_backlog_growth(engine):
     pid = _mk_project(engine, "v1")
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     this_monday = _monday(now.date())
     prev2 = (this_monday - timedelta(days=14)).isoformat()
     cur = this_monday.isoformat()
@@ -312,7 +319,7 @@ def test_velocity_buckets_and_backlog_growth(engine):
 
 def test_velocity_changelog_and_release_cadence(engine):
     pid = _mk_project(engine, "v2")
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     _insert_clog(engine, pid, category="added", created_at=now)
     _insert_clog(engine, pid, category="fixed", created_at=now - timedelta(days=7))
     _insert_clog(engine, pid, category="changed", version="1.0",
@@ -332,7 +339,7 @@ def test_velocity_changelog_and_release_cadence(engine):
 
 def test_velocity_sprint_completion_excludes_deleted_and_removed(engine):
     pid = _mk_project(engine, "v3")
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     a = _insert_item(engine, pid, status="resolved", created_at=now, resolved_at=now)
     b = _insert_item(engine, pid, status="open", created_at=now)
     far = now - timedelta(days=400)

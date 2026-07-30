@@ -1,6 +1,6 @@
 """Tests for dct.core.ids — ULID generation and validation."""
 
-from dct.core.ids import new_ulid, is_valid_ulid
+from dct.core.ids import is_valid_ulid, new_ulid
 
 
 def test_new_ulid_is_26_chars():

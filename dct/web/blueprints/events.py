@@ -19,7 +19,7 @@ def _sse_events(token_source, *, poll_interval, sleep=time.sleep, should_continu
     Pure: no Flask / DB imports, so it is unit-testable with a fake token source.
     """
     if should_continue is None:
-        should_continue = lambda: True  # noqa: E731 — infinite stream for a live request
+        should_continue = lambda: True
     last = token_source()
     # Opening comment defeats proxy buffering and confirms the stream is live.
     yield ": connected\n\n"

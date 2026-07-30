@@ -1,7 +1,7 @@
 """Project CRUD operations."""
 
 import os
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import sqlalchemy as sa
 
@@ -57,7 +57,7 @@ def create_project(
             conn.execute(
                 projects.update()
                 .where(projects.c.id == deleted._mapping["id"])
-                .values(name=name, path=path, description=description, current_version=current_version, deleted_at=None, updated_at=datetime.now(timezone.utc))
+                .values(name=name, path=path, description=description, current_version=current_version, deleted_at=None, updated_at=datetime.now(UTC))
             )
             row = conn.execute(sa.select(projects).where(projects.c.id == deleted._mapping["id"])).first()
             assert row is not None, "undelete must return its row"
@@ -143,7 +143,7 @@ def delete_project(engine: sa.Engine, slug: str) -> bool:
         result = conn.execute(
             projects.update()
             .where(projects.c.slug == slug, projects.c.deleted_at.is_(None))
-            .values(deleted_at=datetime.now(timezone.utc))
+            .values(deleted_at=datetime.now(UTC))
         )
         return result.rowcount > 0
 
@@ -153,7 +153,7 @@ def set_version(engine: sa.Engine, slug: str, version: str) -> dict | None:
         result = conn.execute(
             projects.update()
             .where(projects.c.slug == slug, projects.c.deleted_at.is_(None))
-            .values(current_version=version, updated_at=datetime.now(timezone.utc))
+            .values(current_version=version, updated_at=datetime.now(UTC))
         )
         if result.rowcount == 0:
             return None
@@ -170,7 +170,7 @@ def set_manages_changelog(engine: sa.Engine, slug: str, value: bool) -> dict | N
         result = conn.execute(
             projects.update()
             .where(projects.c.slug == slug, projects.c.deleted_at.is_(None))
-            .values(manages_changelog=value, updated_at=datetime.now(timezone.utc))
+            .values(manages_changelog=value, updated_at=datetime.now(UTC))
         )
         if result.rowcount == 0:
             return None
@@ -213,7 +213,7 @@ def set_changelog_path(engine: sa.Engine, slug: str, relpath: str) -> dict | Non
         result = conn.execute(
             projects.update()
             .where(projects.c.slug == slug, projects.c.deleted_at.is_(None))
-            .values(changelog_path=rel, updated_at=datetime.now(timezone.utc))
+            .values(changelog_path=rel, updated_at=datetime.now(UTC))
         )
         if result.rowcount == 0:
             return None
@@ -269,7 +269,7 @@ def update_project(
     if not updates:
         raise ValueError("update_project: no fields supplied (pass at least one new_* kwarg)")
 
-    updates["updated_at"] = datetime.now(timezone.utc)
+    updates["updated_at"] = datetime.now(UTC)
 
     with engine.begin() as conn:
         current = conn.execute(

@@ -10,11 +10,9 @@ import argparse
 import json
 import ntpath
 
-
 from dct import cli
 from dct.core import projects as projects_mod
 from dct.integrations import claude as claude_mod
-
 
 # ── W4: CWD project auto-detection (core/projects.py) ────────────────────────
 
@@ -49,7 +47,7 @@ def test_register_mcp_fallback_preserves_utf8(tmp_path, monkeypatch):
     monkeypatch.setattr(claude_mod, "CLAUDE_JSON", cj)
     monkeypatch.setattr(claude_mod.shutil, "which", lambda _: None)
 
-    ok, how = claude_mod.register_mcp(None)
+    ok, _how = claude_mod.register_mcp(None)
 
     assert ok
     data = json.loads(cj.read_bytes().decode("utf-8"))

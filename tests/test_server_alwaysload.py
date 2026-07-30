@@ -6,7 +6,7 @@ Session-edge and specialist tools stay deferred (frugal split).
 
 import asyncio
 
-from dct.mcp.server import mcp, _ALWAYS_LOAD_TOOLS
+from dct.mcp.server import _ALWAYS_LOAD_TOOLS, mcp
 
 # The exact hot-set: the mid-session drivers (#349) — item + checkpoint lifecycle
 # plus the changelog add — and the composed workflow entry points (#413), which

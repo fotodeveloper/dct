@@ -2,8 +2,8 @@
 
 import sqlalchemy as sa
 
-from dct.config import Config
 import dct.core.engine as engine_mod
+from dct.config import Config
 from dct.core.engine import bootstrap_engine
 
 

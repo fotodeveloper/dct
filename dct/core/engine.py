@@ -11,7 +11,7 @@ the schema (no create_tables, only SELECTs).
 import sqlalchemy as sa
 
 from dct.config import load_config
-from dct.db import ensure_sqlite_dir, get_engine, create_tables
+from dct.db import create_tables, ensure_sqlite_dir, get_engine
 
 
 def bootstrap_engine(create: bool = True) -> sa.Engine:

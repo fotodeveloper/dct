@@ -13,11 +13,9 @@ import time
 
 import pytest
 
-import dct.cli as cli
 import dct.integrations.claude as setup
-import dct.update as update
-from dct.config import Config, UpdateConfig, save_config, load_config
-
+from dct import cli, update
+from dct.config import Config, UpdateConfig, load_config, save_config
 
 # ── version comparison ───────────────────────────────────────────────────────
 

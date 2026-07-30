@@ -1,10 +1,14 @@
 import pytest
 
-from dct.core.projects import create_project
 from dct.core.handoff import (
-    create_handoff, list_handoffs, get_handoff,
-    consume_handoff, delete_handoff, update_handoff,
+    consume_handoff,
+    create_handoff,
+    delete_handoff,
+    get_handoff,
+    list_handoffs,
+    update_handoff,
 )
+from dct.core.projects import create_project
 
 
 @pytest.fixture

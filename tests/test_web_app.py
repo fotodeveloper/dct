@@ -73,7 +73,9 @@ def test_to_iso_passthrough_none():
 
 
 def test_to_iso_formats_datetime():
-    assert to_iso(datetime(2026, 6, 27, 12, 0, 0)) == "2026-06-27T12:00:00"
+    # Suppression rationale: the naive datetime IS the subject — sqlite hands
+    # the web layer naive datetimes and to_iso must pass them through unchanged.
+    assert to_iso(datetime(2026, 6, 27, 12, 0, 0)) == "2026-06-27T12:00:00"  # noqa: DTZ001
 
 
 def test_parse_tags_json_text():

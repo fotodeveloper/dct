@@ -4,17 +4,17 @@ from __future__ import annotations
 
 from flask import Blueprint, abort, g, render_template
 
-from dct.web.app import current_engine
-from dct.core import sprints as sprints_core
 from dct.core import checkpoints as checkpoints_core
 from dct.core import projects as projects_core
+from dct.core import sprints as sprints_core
 from dct.core.items import TERMINAL_STATUSES
+from dct.web.app import current_engine
 
 bp = Blueprint("sprints", __name__)
 
 
 @bp.route("/p/<slug>/sprints")
-def list(slug):  # noqa: A001 — Flask endpoint name is intentional (sprints.list)
+def list(slug):
     engine = current_engine()
     first_class = sprints_core.list_sprints(engine, project_slug=slug)
     # Current sprint = the project's primary active sprint (newest started;

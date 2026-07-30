@@ -4,7 +4,7 @@ import json
 
 import pytest
 
-from dct.core.version import bump, parse_version, format_version, detect_version
+from dct.core.version import bump, detect_version, format_version, parse_version
 
 
 class TestParseFormat:
@@ -63,9 +63,8 @@ class TestBumpInvalid:
 
 class TestBumpIntegration:
     def test_release_with_bump(self, engine):
-        from dct.core.projects import create_project
         from dct.core.changelog import add_entry, release_entries
-        from dct.core.projects import get_project
+        from dct.core.projects import create_project, get_project
 
         create_project(engine, slug="proj-a", name="Project A", current_version="1.0")
         add_entry(engine, "proj-a", "added", "New feature")

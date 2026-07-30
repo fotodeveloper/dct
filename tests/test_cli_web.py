@@ -10,7 +10,6 @@ import socket
 
 from dct import cli
 
-
 # ── _find_free_port / _port_free ────────────────────────────────────────────
 
 def test_find_free_port_returns_preferred_when_free():

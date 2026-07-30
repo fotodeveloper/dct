@@ -13,18 +13,18 @@ Stable when the DB is unchanged. Read-only: SELECTs only, never DDL.
 import sqlalchemy as sa
 
 from dct.db import (
-    projects,
-    items,
-    item_notes,
-    item_checkpoints,
     changelog_entries,
+    decisions,
+    item_checkpoints,
+    item_notes,
+    item_sprints,
+    items,
+    plan_checkpoints,
+    plan_sections,
+    plans,
+    projects,
     session_handoffs,
     sprints,
-    plans,
-    plan_sections,
-    plan_checkpoints,
-    item_sprints,
-    decisions,
 )
 
 # Tables carrying an updated_at column — feed the freshness half of the token.

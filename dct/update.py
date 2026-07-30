@@ -135,7 +135,7 @@ def _write_cache(path: Path, data: dict) -> None:
 
 def _fetch_latest_version(url: str = PYPI_URL, timeout: float = NETWORK_TIMEOUT) -> str:
     """Query PyPI JSON and return ``info.version``. Raises on any failure."""
-    with urlopen(url, timeout=timeout) as resp:  # noqa: S310 — fixed https URL
+    with urlopen(url, timeout=timeout) as resp:
         payload = json.load(resp)
     return str(payload["info"]["version"])
 

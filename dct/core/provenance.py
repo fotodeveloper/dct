@@ -32,7 +32,10 @@ class Provenance:
     source: str | None = None
 
 
-_current: ContextVar[Provenance] = ContextVar("dct_provenance", default=Provenance())
+_current: ContextVar[Provenance] = ContextVar(
+    "dct_provenance",
+    default=Provenance(),  # noqa: B039 — frozen dataclass, immutable default
+)
 
 
 def set_provenance(prov: Provenance) -> None:

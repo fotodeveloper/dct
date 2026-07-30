@@ -6,5 +6,5 @@ module globals MUST target dct.mcp.server — patches on this shim do not
 reach the implementation's globals.
 """
 
-from dct.mcp.server import *  # noqa: F401,F403
+from dct.mcp.server import *
 from dct.mcp.server import mcp  # noqa: F401

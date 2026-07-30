@@ -49,6 +49,17 @@ pythonpath = ["."]
 # style in compact CLI/test code; everything else in ruff's default set applies.
 ignore = ["E701", "E741"]
 
+[tool.ruff.lint.per-file-ignores]
+# Deliberate blanket catches (BLE001): each surface converts ANY failure into
+# its error contract instead of raising — MCP tools return {"error": ...}, CLI
+# commands print "✗ Error" and exit non-zero, and the passive update probe is
+# documented "never raises".
+"dct/mcp/server.py" = ["BLE001"]
+"dct/cli.py" = ["BLE001"]
+"dct/update.py" = ["BLE001"]
+# Hook tests assert returncode explicitly — check= on every run() is noise.
+"tests/test_hook_*.py" = ["PLW1510"]
+
 [tool.setuptools]
 include-package-data = true
 

@@ -1,7 +1,11 @@
 import pytest
 
 from dct.core.changelog import (
-    add_entry, list_entries, count_unreleased, release_entries, delete_entry,
+    add_entry,
+    count_unreleased,
+    delete_entry,
+    list_entries,
+    release_entries,
 )
 from dct.core.projects import create_project
 

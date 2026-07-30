@@ -2,7 +2,6 @@
 
 from dct.core.plans.parser import classify_heading, parse_plan, slugify
 
-
 # ── Small pure helpers ───────────────────────────────────────────────────────
 
 class TestSlugify:

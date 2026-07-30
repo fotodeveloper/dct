@@ -2,8 +2,8 @@
 
 import pytest
 
-from dct.core.projects import create_project
 from dct.core.changelog import add_entry, release_entries
+from dct.core.projects import create_project
 from dct.export import export_changelog_md
 
 

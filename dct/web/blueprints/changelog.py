@@ -4,14 +4,14 @@ from __future__ import annotations
 
 from flask import Blueprint, render_template
 
-from dct.web.app import current_engine
 from dct.core import changelog as changelog_core
+from dct.web.app import current_engine
 
 bp = Blueprint("changelog", __name__)
 
 
 @bp.route("/p/<slug>/changelog")
-def list(slug):  # noqa: A001 — endpoint name changelog.list is part of the contract
+def list(slug):
     engine = current_engine()
     entries = changelog_core.list_entries(engine, slug)
     unreleased_count = changelog_core.count_unreleased(engine, slug)

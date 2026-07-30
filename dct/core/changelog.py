@@ -1,11 +1,11 @@
 """Changelog CRUD operations with soft deletes."""
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import sqlalchemy as sa
 
-from dct.db import changelog_entries, projects, row_to_dict
 from dct.core.projects import resolve_project_id
+from dct.db import changelog_entries, projects, row_to_dict
 
 VALID_CATEGORIES = {"added", "changed", "fixed", "removed"}
 
@@ -82,7 +82,7 @@ def count_unreleased(engine: sa.Engine, project_slug: str) -> int:
 
 def release_entries(engine: sa.Engine, project_slug: str, version: str) -> int:
     """Stamp all unreleased entries with a version and update project's current_version."""
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     with engine.begin() as conn:
         pid = resolve_project_id(conn, project_slug)
         result = conn.execute(
@@ -107,6 +107,6 @@ def delete_entry(engine: sa.Engine, entry_id: int) -> bool:
         result = conn.execute(
             changelog_entries.update()
             .where(changelog_entries.c.id == entry_id, changelog_entries.c.deleted_at.is_(None))
-            .values(deleted_at=datetime.now(timezone.utc))
+            .values(deleted_at=datetime.now(UTC))
         )
         return result.rowcount > 0

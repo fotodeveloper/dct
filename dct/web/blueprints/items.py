@@ -6,9 +6,9 @@ GET /p/<slug>/items/<int:id>   detail: markdown description, notes, checkpoints
 
 from flask import Blueprint, abort, render_template, request
 
-from dct.web.app import current_engine
 from dct.core.checkpoints import NON_GATE_KINDS
-from dct.core.items import list_items, get_item
+from dct.core.items import get_item, list_items
+from dct.web.app import current_engine
 
 bp = Blueprint("items", __name__)
 

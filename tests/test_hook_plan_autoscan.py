@@ -7,9 +7,9 @@ bash syntax check, and respects its exit-0-on-no-op contract.
 
 import subprocess
 
-from dct.integrations.claude import HOOKS_DIR
-
 import pytest
+
+from dct.integrations.claude import HOOKS_DIR
 
 HOOK_PATH = HOOKS_DIR / "dct-plan-autoscan.sh"
 

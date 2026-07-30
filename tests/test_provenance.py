@@ -7,8 +7,8 @@ MCP server), so no core call site changes. Creation provenance only:
 updates never touch the columns (lifecycle auditing is deferred, ADR #51).
 """
 
-import sqlalchemy as sa
 import pytest
+import sqlalchemy as sa
 
 from dct.core import provenance
 from dct.core.items import create_item

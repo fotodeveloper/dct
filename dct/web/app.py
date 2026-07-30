@@ -63,7 +63,7 @@ def create_app(engine=None, *, read_only: bool = True) -> flask.Flask:
         endpoint = (flask.request.endpoint or "") if flask.request else ""
         try:
             projects = list_projects(engine)
-        except Exception:
+        except Exception:  # noqa: BLE001 — nav must render even if the DB hiccups
             projects = []
         # Detail routes (/sprints/<id>, /plans/<id>) have no slug in the URL but
         # set flask.g.current_slug/section so the sidebar + breadcrumb still scope

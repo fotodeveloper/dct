@@ -6,7 +6,7 @@ import pytest
 
 import dct.config as config_module
 from dct import paths
-from dct.config import Config, save_config, load_config
+from dct.config import Config, load_config, save_config
 
 
 def test_save_load_roundtrip(tmp_path):

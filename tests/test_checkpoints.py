@@ -2,12 +2,17 @@
 
 import pytest
 
-from dct.core.projects import create_project
-from dct.core.items import create_item, get_item
 from dct.core.checkpoints import (
-    add_checkpoint, list_checkpoints, get_checkpoint,
-    set_status, update_text, delete_checkpoint, get_progress,
+    add_checkpoint,
+    delete_checkpoint,
+    get_checkpoint,
+    get_progress,
+    list_checkpoints,
+    set_status,
+    update_text,
 )
+from dct.core.items import create_item, get_item
+from dct.core.projects import create_project
 
 
 @pytest.fixture

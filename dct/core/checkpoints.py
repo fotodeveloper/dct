@@ -1,6 +1,6 @@
 """Checkpoint CRUD — acceptance criteria tied to items with ledger semantics."""
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import sqlalchemy as sa
 
@@ -230,7 +230,7 @@ def get_checkpoint(engine: sa.Engine, checkpoint_id: int) -> dict | None:
 
 def set_status(engine: sa.Engine, checkpoint_id: int, status: str) -> dict | None:
     _validate_status(status)
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     with engine.begin() as conn:
         result = conn.execute(
             item_checkpoints.update()
@@ -245,7 +245,7 @@ def set_status(engine: sa.Engine, checkpoint_id: int, status: str) -> dict | Non
 def update_text(engine: sa.Engine, checkpoint_id: int, text: str) -> dict | None:
     if not text or not text.strip():
         raise ValueError("Checkpoint text cannot be empty")
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     with engine.begin() as conn:
         result = conn.execute(
             item_checkpoints.update()
@@ -262,7 +262,7 @@ def delete_checkpoint(engine: sa.Engine, checkpoint_id: int) -> bool:
         result = conn.execute(
             item_checkpoints.update()
             .where(item_checkpoints.c.id == checkpoint_id, item_checkpoints.c.deleted_at.is_(None))
-            .values(deleted_at=datetime.now(timezone.utc))
+            .values(deleted_at=datetime.now(UTC))
         )
         return result.rowcount > 0
 

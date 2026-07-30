@@ -49,7 +49,7 @@ import sqlite3
 import tomllib
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 from dct import paths
@@ -394,7 +394,9 @@ def _migration_lock():
         try:
             lock_dir = paths.config_dir()
             lock_dir.mkdir(parents=True, exist_ok=True)
-            handle = open(lock_dir / ".migrate-home.lock", "w")
+            # Suppression rationale: the lock handle must outlive this try
+            # block — it is closed in the finally after the flock is done.
+            handle = open(lock_dir / ".migrate-home.lock", "w")  # noqa: SIM115
         except OSError as exc:
             yield f"error: {exc}"
             return
@@ -423,13 +425,13 @@ def execute_migration(steps: list[MigrationStep]) -> list[str]:
     with _migration_lock() as lock_status:
         if lock_status == "busy":
             return [
-                "another dct migrate-home appears to be running — aborted, "
-                "nothing changed"
+                ("another dct migrate-home appears to be running — aborted, "
+                "nothing changed")
             ]
         if lock_status != "ok":
             return [
-                f"cannot acquire the migration lock ({lock_status}) — "
-                "aborted, nothing changed"
+                (f"cannot acquire the migration lock ({lock_status}) — "
+                "aborted, nothing changed")
             ]
         return _execute_locked(steps)
 
@@ -585,7 +587,7 @@ def _run_phases(
             messages.append(f"warning: could not remove legacy {src}: {exc}")
 
     if config_published and config_step is not None:
-        stamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        stamp = datetime.now(UTC).isoformat(timespec="seconds")
         crumb = paths.legacy_dir() / "dct.toml.migrated"
         crumb.write_text(
             f"dct config moved to {config_step.dst} on {stamp}\n"

@@ -10,10 +10,14 @@ truth. They are the SQLite-side guard; PostgreSQL parity is verified live.
 import pytest
 import sqlalchemy as sa
 
-from dct.db import _apply_schema_updates, _migrate_legacy_sprint_flag
-from dct.db import sprints, item_sprints
-from dct.core.projects import create_project
 from dct.core.items import create_item, get_item, update_item
+from dct.core.projects import create_project
+from dct.db import (
+    _apply_schema_updates,
+    _migrate_legacy_sprint_flag,
+    item_sprints,
+    sprints,
+)
 
 
 def _cols(engine) -> set[str]:
@@ -111,13 +115,15 @@ def test_v02_tables_are_created_by_create_tables(engine):
 def test_v02_plans_has_ulid_unique(engine):
     """plans.ulid must be UNIQUE — duplicates should raise."""
     p = create_project(engine, slug="dct", name="DCT", path="/tmp/dct")
+    from sqlalchemy.exc import IntegrityError
+
     from dct.db import plans
     with engine.begin() as conn:
         conn.execute(plans.insert().values(
             ulid="01HX9Z4K5M7PQRSTVWXYZ00001", project_id=p["id"],
             slug="first", title="First", kind="plan",
         ))
-        with pytest.raises(Exception):  # IntegrityError subclass varies by dialect
+        with pytest.raises(IntegrityError):  # sqlite and PG both wrap as sa IntegrityError
             conn.execute(plans.insert().values(
                 ulid="01HX9Z4K5M7PQRSTVWXYZ00001", project_id=p["id"],
                 slug="second", title="Second", kind="plan",
@@ -263,8 +269,11 @@ def test_terminal_status_clears_flag_but_keeps_membership(engine):
     """A terminal transition clears the derived in_current_sprint flag, but the
     item_sprints link is RETAINED (K-18, #413) — that link is what makes
     sprint_completion computable. Supersedes the pre-G1 soft-remove contract."""
-    from dct.core.sprints import set_current_sprint_items, get_current_sprint
-    from dct.core.sprints import list_items_in_sprint
+    from dct.core.sprints import (
+        get_current_sprint,
+        list_items_in_sprint,
+        set_current_sprint_items,
+    )
 
     create_project(engine, slug="dct", name="DCT", path="/tmp/dct")
     item = create_item(engine, "dct", "issue", "Test")
@@ -446,8 +455,8 @@ def test_manages_changelog_backfill_off_without_dct_history(engine):
 
 def test_manages_changelog_backfill_on_with_dct_history(engine):
     """A project that already keeps its changelog in dct stays managed."""
-    from dct.core.projects import project_manages_changelog
     from dct.core.changelog import add_entry
+    from dct.core.projects import project_manages_changelog
     create_project(engine, slug="usesdct", name="Uses dct", path="/tmp/u")
     add_entry(engine, "usesdct", "added", "shipped a thing")
     _drop_manages_changelog(engine)
@@ -460,7 +469,7 @@ def test_manages_changelog_backfill_on_with_dct_history(engine):
 def test_manages_changelog_migration_does_not_override_explicit_choice(engine):
     """Once the column exists, re-running the migration must NOT re-backfill —
     an explicit opt-in on a project with no changelog history must survive."""
-    from dct.core.projects import set_manages_changelog, project_manages_changelog
+    from dct.core.projects import project_manages_changelog, set_manages_changelog
     create_project(engine, slug="p", name="P", path="/tmp/p")  # no changelog
     set_manages_changelog(engine, "p", True)
 
@@ -499,7 +508,7 @@ def test_changelog_path_migration_adds_column_with_default(engine):
 def test_changelog_path_migration_is_idempotent_and_preserves_value(engine):
     """Re-running with the column present is a no-op and must not clobber an
     explicit non-default value."""
-    from dct.core.projects import set_changelog_path, get_project
+    from dct.core.projects import get_project, set_changelog_path
     create_project(engine, slug="p", name="P", path="/tmp/p")
     set_changelog_path(engine, "p", "pkg/changelog.md")
 

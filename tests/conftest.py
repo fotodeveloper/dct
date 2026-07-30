@@ -10,7 +10,7 @@ import sys
 
 import pytest
 
-from dct.db import get_engine, create_tables
+from dct.db import create_tables, get_engine
 
 
 @pytest.fixture

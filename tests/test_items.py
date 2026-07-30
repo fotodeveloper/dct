@@ -1,8 +1,14 @@
 import pytest
 
 from dct.core.items import (
-    create_item, list_items, get_item, update_item,
-    resolve_item, add_note, list_notes, delete_item,
+    add_note,
+    create_item,
+    delete_item,
+    get_item,
+    list_items,
+    list_notes,
+    resolve_item,
+    update_item,
 )
 from dct.core.projects import create_project
 

@@ -30,7 +30,6 @@ import unicodedata
 from dataclasses import dataclass, field
 from typing import Literal
 
-
 ULID_PATTERN = r"[0-9A-HJKMNP-TV-Z]{26}"
 
 RE_PLAN_ANCHOR = re.compile(

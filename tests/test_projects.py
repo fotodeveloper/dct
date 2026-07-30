@@ -1,6 +1,12 @@
 import pytest
 
-from dct.core.projects import create_project, list_projects, get_project, get_project_by_path, delete_project
+from dct.core.projects import (
+    create_project,
+    delete_project,
+    get_project,
+    get_project_by_path,
+    list_projects,
+)
 
 
 def test_create_and_get(engine):
@@ -248,8 +254,8 @@ class TestUpdateProject:
 
     def test_rename_preserves_items_fk(self, engine):
         """Items created for the project must still resolve after rename."""
-        from dct.core.projects import update_project
         from dct.core.items import create_item, list_items
+        from dct.core.projects import update_project
 
         create_project(engine, slug="old-slug", name="Old")
         create_item(engine, project_slug="old-slug", item_type="todo", title="A")
@@ -279,7 +285,7 @@ class TestManagesChangelog:
         assert project_manages_changelog(engine, "a") is True
 
     def test_set_off_then_on(self, engine):
-        from dct.core.projects import set_manages_changelog, project_manages_changelog
+        from dct.core.projects import project_manages_changelog, set_manages_changelog
         create_project(engine, slug="a", name="A")
 
         off = set_manages_changelog(engine, "a", False)

@@ -37,7 +37,7 @@ def test_analytics_renders_backlog_distribution(client):
     m = re.search(
         r'<script id="velocity-data" type="application/json">(.*?)</script>',
         body,
-        re.S,
+        re.DOTALL,
     )
     assert m, "velocity JSON payload missing"
     payload = json.loads(m.group(1))
@@ -54,7 +54,7 @@ def test_analytics_embeds_velocity_json(client):
     m = re.search(
         r'<script id="velocity-data" type="application/json">(.*?)</script>',
         body,
-        re.S,
+        re.DOTALL,
     )
     assert m, "velocity JSON payload missing"
     payload = json.loads(m.group(1))

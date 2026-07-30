@@ -13,7 +13,7 @@ programmatic roadmap creation (e.g. `dct roadmap create`).
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import sqlalchemy as sa
 
@@ -169,7 +169,7 @@ def get_plan(engine: sa.Engine, plan_id: int) -> dict | None:
                 pending += 1
 
         active = total - rejected
-        percent = int(round(100 * done / active)) if active else 0
+        percent = round(100 * done / active) if active else 0
         plan_dict["sections"] = list(sections_by_id.values())
         plan_dict["progress"] = {
             "total": total, "done": done, "rejected": rejected,
@@ -219,7 +219,7 @@ def update_plan(engine: sa.Engine, plan_id: int, **kwargs) -> dict | None:
     if not values:
         raise ValueError("No valid fields to update")
 
-    values["updated_at"] = datetime.now(timezone.utc)
+    values["updated_at"] = datetime.now(UTC)
     if values.get("status") == "archived":
         values["archived_at"] = values["updated_at"]
 
@@ -243,7 +243,7 @@ def set_plan_imported(
     gate (§9.3). Subsequent rescans are re-imports; they may update
     source_hash but must not touch imported_at.
     """
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     values: dict = {"imported_at": now, "updated_at": now}
     if source_hash is not None:
         values["source_hash"] = source_hash
@@ -259,7 +259,7 @@ def set_plan_imported(
 
 
 def delete_plan(engine: sa.Engine, plan_id: int) -> bool:
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     with engine.begin() as conn:
         result = conn.execute(
             plans.update()
@@ -384,7 +384,7 @@ def update_plan_section(engine: sa.Engine, section_id: int, **kwargs) -> dict | 
         values[k] = v
     if not values:
         raise ValueError("No valid fields to update")
-    values["updated_at"] = datetime.now(timezone.utc)
+    values["updated_at"] = datetime.now(UTC)
 
     with engine.begin() as conn:
         result = conn.execute(
@@ -401,7 +401,7 @@ def update_plan_section(engine: sa.Engine, section_id: int, **kwargs) -> dict | 
 
 
 def delete_plan_section(engine: sa.Engine, section_id: int) -> bool:
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     with engine.begin() as conn:
         result = conn.execute(
             plan_sections.update()
@@ -484,7 +484,7 @@ def _set_checkpoint_status(
     engine: sa.Engine, checkpoint_id: int, new_status: str
 ) -> dict | None:
     _validate(new_status, VALID_CP_STATUSES, "status")
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     with engine.begin() as conn:
         result = conn.execute(
             plan_checkpoints.update()
@@ -554,7 +554,7 @@ def promote_section_to_item(
         engine, project_slug, item_type, effective_title,
         priority=priority,
     )
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     with engine.begin() as conn:
         conn.execute(
             plan_sections.update()
@@ -612,7 +612,7 @@ def promote_section_to_sprint(
         engine, project_slug, name=effective_name,
         code=code, kind=kind, goal=goal,
     )
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     with engine.begin() as conn:
         conn.execute(
             plan_sections.update()
@@ -664,7 +664,7 @@ def promote_checkpoint_to_item(
         engine, project_slug, item_type, effective_title,
         priority=priority,
     )
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     with engine.begin() as conn:
         conn.execute(
             plan_checkpoints.update()

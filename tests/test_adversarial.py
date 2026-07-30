@@ -2,14 +2,25 @@
 
 import pytest
 
-from dct.core.projects import create_project, get_project, get_project_by_path, delete_project
+from dct.core.changelog import add_entry, count_unreleased, delete_entry, list_entries
 from dct.core.items import (
-    create_item, list_items, get_item, update_item, resolve_item,
-    add_note, delete_item, _serialize_tags, _parse_tags,
+    _parse_tags,
+    _serialize_tags,
+    add_note,
+    create_item,
+    delete_item,
+    get_item,
+    list_items,
+    resolve_item,
+    update_item,
 )
-from dct.core.changelog import add_entry, count_unreleased, list_entries, delete_entry
+from dct.core.projects import (
+    create_project,
+    delete_project,
+    get_project,
+    get_project_by_path,
+)
 from dct.mcp import server as dct_server
-
 
 # ── Empty / blank inputs ─────────────────────────────────────────────────────
 

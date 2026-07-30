@@ -10,8 +10,8 @@ The SSE generator is tested without a live HTTP stream: a fake token source
 drives it and we assert a 'stale' frame is emitted exactly when the token changes.
 """
 
-from dct.web.changes import change_token
 from dct.web.blueprints.events import _sse_events
+from dct.web.changes import change_token
 
 
 def test_change_token_stable_across_noop(engine, seed_project):

@@ -11,17 +11,21 @@ Read-only: this module issues SELECTs only. Used by the web viewer
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone, time
+from datetime import UTC, datetime, time, timedelta
 
 import sqlalchemy as sa
 
-from dct.db import (
-    projects, items, item_checkpoints, changelog_entries,
-    session_handoffs, sprints, item_sprints,
-)
-
 from dct.core.checkpoints import NON_GATE_KINDS
 from dct.core.items import TERMINAL_STATUSES
+from dct.db import (
+    changelog_entries,
+    item_checkpoints,
+    item_sprints,
+    items,
+    projects,
+    session_handoffs,
+    sprints,
+)
 
 OPEN_STATUSES = ("open", "in_progress")
 
@@ -53,7 +57,7 @@ def radar(engine: sa.Engine) -> dict:
     in_progress counts status='in_progress'; stale_Nd counts items with status
     in (open,in_progress) whose updated_at is older than N days.
     """
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     anchor7 = now - timedelta(days=7)
     anchor30 = now - timedelta(days=30)
 
@@ -153,7 +157,7 @@ def backlog_health(engine: sa.Engine, project_slug: str) -> dict:
     """
     from dct.core.projects import resolve_project_id
 
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     a1w = now - timedelta(days=7)
     a4w = now - timedelta(days=28)
     a3m = now - timedelta(days=90)
@@ -275,7 +279,7 @@ def velocity(engine: sa.Engine, project_slug: str, weeks: int = 26) -> dict:
     """
     from dct.core.projects import resolve_project_id
 
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     today = now.date()
     this_monday = today - timedelta(days=today.weekday())
     start_monday = this_monday - timedelta(days=7 * (weeks - 1))

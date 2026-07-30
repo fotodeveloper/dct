@@ -1,7 +1,7 @@
 """Export changelog entries to Keep a Changelog markdown format."""
 
 from collections import defaultdict
-from datetime import date
+from datetime import UTC, datetime
 
 import sqlalchemy as sa
 
@@ -83,7 +83,7 @@ def _render_version_block(
     if released_at:
         date_str = released_at.strftime("%Y-%m-%d") if hasattr(released_at, "strftime") else str(released_at)[:10]
     else:
-        date_str = date.today().isoformat()
+        date_str = datetime.now(UTC).date().isoformat()
     lines.append(f"## [{version}] - {date_str}")
     lines.append("")
     _render_version_entries(entries, category_order, lines)

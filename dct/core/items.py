@@ -1,12 +1,19 @@
 """Item CRUD operations with soft deletes and validation."""
 
 import json
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import sqlalchemy as sa
 
-from dct.db import items, item_notes, item_checkpoints, item_sprints, sprints, row_to_dict
 from dct.core.projects import resolve_project_id
+from dct.db import (
+    item_checkpoints,
+    item_notes,
+    item_sprints,
+    items,
+    row_to_dict,
+    sprints,
+)
 
 VALID_TYPES = {"issue", "todo", "feature", "idea", "improvement"}
 VALID_PRIORITIES = {"P1", "P2", "P3", "future"}
@@ -250,8 +257,8 @@ def list_items(
 
 
 def get_item(engine: sa.Engine, item_id: int) -> dict | None:
-    from dct.db import item_checkpoints
     from dct.core.checkpoints import get_progress
+    from dct.db import item_checkpoints
 
     with engine.begin() as conn:
         row = conn.execute(
@@ -312,7 +319,7 @@ def update_item(engine: sa.Engine, item_id: int, **kwargs) -> dict | None:
     if not values:
         raise ValueError("No valid fields to update")
 
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     values["updated_at"] = now
 
     # Invariant: terminal status ↔ resolved_at set. Sprint MEMBERSHIP is kept
@@ -365,7 +372,7 @@ def resolve_item(
             f"(not applicable) before resolving. See CLAUDE.md 'Gate checkpoints'."
         )
 
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     values: dict = {
         "status": status,
         "resolved_at": now,
@@ -418,6 +425,6 @@ def delete_item(engine: sa.Engine, item_id: int) -> bool:
         result = conn.execute(
             items.update()
             .where(items.c.id == item_id, items.c.deleted_at.is_(None))
-            .values(deleted_at=datetime.now(timezone.utc))
+            .values(deleted_at=datetime.now(UTC))
         )
         return result.rowcount > 0

@@ -3,12 +3,12 @@ plan detail (recursive nested sections), changelog grouping, 404s."""
 
 import pytest
 
-from dct.core.projects import create_project
-from dct.core.items import create_item
-from dct.core.checkpoints import add_checkpoint
-from dct.core.sprints import create_sprint, assign_item_to_sprint
-from dct.core.plans.crud import create_plan, add_plan_section, add_plan_checkpoint
 from dct.core.changelog import add_entry, release_entries
+from dct.core.checkpoints import add_checkpoint
+from dct.core.items import create_item
+from dct.core.plans.crud import add_plan_checkpoint, add_plan_section, create_plan
+from dct.core.projects import create_project
+from dct.core.sprints import assign_item_to_sprint, create_sprint
 
 
 @pytest.fixture

@@ -305,7 +305,7 @@ def test_parallel_migrations_are_serialized(fake_home):
     _legacy_install(fake_home, with_db=True)
     lock_path = paths.config_dir() / ".migrate-home.lock"
     lock_path.parent.mkdir(parents=True, exist_ok=True)
-    holder = open(lock_path, "w")
+    holder = open(lock_path, "w")  # noqa: SIM115 — held open to keep the flock
     fcntl.flock(holder, fcntl.LOCK_EX | fcntl.LOCK_NB)
     try:
         messages = migrate.execute_migration(migrate.plan_migration())

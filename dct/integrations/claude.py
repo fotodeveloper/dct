@@ -6,7 +6,7 @@ import json
 import os
 import shutil
 import subprocess
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 
 from dct import assets
@@ -86,7 +86,7 @@ def register_mcp(config: Config) -> tuple[bool, str]:
     if claude_exe:
         cmd = [claude_exe, "mcp", "add", "dct", "--scope", "user", "--"] + server_cmd
         try:
-            result = subprocess.run(cmd, capture_output=True, text=True)
+            result = subprocess.run(cmd, capture_output=True, text=True, check=False)
         except OSError:
             # W6: on Windows `which` finds the claude.cmd shim via PATHEXT,
             # but CreateProcess cannot exec a .cmd from an argv list — fall
@@ -201,12 +201,14 @@ def wire_hooks_into_settings(settings_path: Path | None = None) -> dict:
                 "nothing was written"
             ) from exc
     if not isinstance(settings, dict):
-        raise ValueError(
+        # Suppression rationale: user-file schema validation — ValueError is
+        # the user-facing contract here, not an API argument type check.
+        raise ValueError(  # noqa: TRY004
             f"{settings_path}: top-level JSON must be an object; nothing was written"
         )
     hooks = settings.setdefault("hooks", {})
     if not isinstance(hooks, dict):
-        raise ValueError(
+        raise ValueError(  # noqa: TRY004 — same user-file validation contract
             f"{settings_path}: 'hooks' must be an object, "
             f"found {type(hooks).__name__}; nothing was written"
         )
@@ -248,7 +250,7 @@ def wire_hooks_into_settings(settings_path: Path | None = None) -> dict:
     backup = None
     if added:
         if raw is not None and raw.strip():
-            stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+            stamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
             backup_path = settings_path.with_name(
                 f"{settings_path.name}.bak-dct-{stamp}"
             )
