@@ -118,17 +118,20 @@ def derive(repo: Path) -> dict[str, str]:
         cwd=repo,
         capture_output=True,
         text=True,
+        check=False,
     )
     match = re.search(r"(\d+) tests? collected", collected.stdout)
     if not match:
         sys.exit(f"cannot derive the test count from pytest:\n{collected.stdout[-500:]}")
+
+    import asyncio
 
     from dct.mcp.server import mcp
 
     return {
         "version": pyproject["project"]["version"],
         "tests": match.group(1),
-        "tools": str(len(mcp._tool_manager._tools)),
+        "tools": str(len(asyncio.run(mcp.list_tools()))),
         "skills": str(sum(1 for p in (repo / "dct/skills").iterdir() if p.is_dir())),
         "hooks": str(len(list((repo / "dct/hooks").glob("*.sh")))),
     }

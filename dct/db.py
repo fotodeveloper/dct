@@ -389,6 +389,12 @@ def get_engine(database_url: str) -> sa.Engine:
     kwargs = {}
     if database_url.startswith("sqlite"):
         kwargs["connect_args"] = {"check_same_thread": False}
+        if database_url in ("sqlite://", "sqlite:///:memory:"):
+            # In-memory sqlite must share ONE connection (StaticPool): the
+            # default per-thread pool hands every new thread its own empty
+            # database, and the MCP SDK (2.0) runs sync tools in worker
+            # threads — tools would see "no such table" (#429).
+            kwargs["poolclass"] = sa.pool.StaticPool
 
     engine = sa.create_engine(database_url, **kwargs)
 

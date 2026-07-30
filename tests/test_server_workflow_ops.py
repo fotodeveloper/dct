@@ -10,7 +10,7 @@ translations the calling model actually drives:
   (e) the slim handoff_work ack (no prompt echo) vs the FULL picked-up prompt,
   (f) guards (markup, unresolvable project) firing BEFORE any DB access.
 
-Tools are called directly (FastMCP's @mcp.tool() leaves the function callable),
+Tools are called directly (the SDK's @mcp.tool() returns the function unchanged),
 with server._get_engine monkeypatched onto the in-memory fixture engine.
 """
 

@@ -79,7 +79,7 @@ markdown, and makes the release commit.
 - **Decision records** — ADRs, sprint amendments, inline plan decisions with multi-anchor linkage
 - **LLM-assisted classification** — uncertain plan sections auto-resolved via `claude --print` (haiku by default)
 - **Passive autoscan hook** — PostToolUse hook re-scans plan-like files in background on every edit
-- **MCP server** — native Claude Code integration via FastMCP
+- **MCP server** — native Claude Code integration via the official MCP SDK
 - **CLI** — fast `dct` command for hooks and scripts
 - **Skills** — Claude Code slash commands (`/track`, `/clog`, `/dct-import`, `/plan-status`, …)
 - **Soft deletes** — ledger pattern, nothing is ever lost
@@ -91,9 +91,9 @@ Pick one — whichever matches your Python workflow. The distribution is named *
 
 ```bash
 # Option A: uv tool (recommended — isolated, upgradable, editable for dev)
-uv tool install dctracker --with 'mcp[cli]' --with 'psycopg[binary]'
+uv tool install dctracker --with 'mcp' --with 'psycopg[binary]'
 # Or from source (dev):
-uv tool install --editable /path/to/dct --with 'mcp[cli]' --with 'psycopg[binary]'
+uv tool install --editable /path/to/dct --with 'mcp' --with 'psycopg[binary]'
 # Or straight from GitHub, no clone (e.g. to try main before a release):
 uv tool install 'dctracker[mcp,pg] @ git+https://github.com/fotodeveloper/dct'
 
@@ -327,7 +327,7 @@ The `DCT_DATABASE_URL` environment variable overrides `[database].url`. For the 
 .venv/bin/pytest tests/test_plan_ingest.py -v          # Ingest + sticky-resolved semantics
 
 # MCP server smoke (boot + tool list)
-uv run --no-project --with 'mcp[cli]' --with sqlalchemy --with 'psycopg[binary]' \
+uv run --no-project --with 'mcp' --with sqlalchemy --with 'psycopg[binary]' \
   python -c "import asyncio; from dct.mcp.server import mcp; \
   print(len(asyncio.run(mcp.list_tools())), 'tools')"
 ```

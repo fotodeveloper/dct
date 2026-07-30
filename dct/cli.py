@@ -1345,7 +1345,7 @@ def cmd_server(args):
         from dct.mcp.server import mcp
     except ImportError as e:
         print(
-            f"MCP server requires extras. Install with: pip install 'dct[mcp]'\n  (or reinstall: uv tool install --editable . --with 'mcp[cli]')\nOriginal error: {e}",
+            f"MCP server requires extras. Install with: pip install 'dct[mcp]'\n  (or reinstall: uv tool install --editable . --with 'mcp')\nOriginal error: {e}",
             file=sys.stderr,
         )
         sys.exit(1)

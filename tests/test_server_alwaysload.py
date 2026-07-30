@@ -37,6 +37,11 @@ def _wire_meta() -> dict[str, dict]:
     }
 
 
+def _registered_names() -> set[str]:
+    """All registered tool names via the PUBLIC surface (K-48: no _tool_manager)."""
+    return {t.name for t in asyncio.run(mcp.list_tools())}
+
+
 def test_hot_set_is_exactly_thirteen():
     """Lock the exact hot-set: 10 mid-session daily drivers + 3 workflow entry
     points, no more, no less."""
@@ -45,9 +50,10 @@ def test_hot_set_is_exactly_thirteen():
 
 
 def test_always_load_names_all_exist():
-    """Typo guard: every name in the hot-set must be a real registered tool."""
-    registered = set(mcp._tool_manager._tools.keys())
-    missing = _ALWAYS_LOAD_TOOLS - registered
+    """Typo guard: every name in the hot-set must be a real registered tool.
+    Since K-47 the meta rides the decorators, so a frozenset typo no longer
+    fails at import — this test is the guard now."""
+    missing = _ALWAYS_LOAD_TOOLS - _registered_names()
     assert not missing, f"hot-set names not registered as tools: {sorted(missing)}"
 
 
@@ -57,12 +63,20 @@ def test_hot_tools_emit_alwaysload_meta():
         assert wire[name].get("anthropic/alwaysLoad") is True, name
 
 
+def test_wire_hot_set_equals_spec_exactly():
+    """K-47 binding: _ALWAYS_LOAD_TOOLS is the spec, the decorators' meta= the
+    mechanism — the alwaysLoad set on the wire must equal the frozenset
+    EXACTLY, so a stray meta on a cold tool fails as loudly as a missing one."""
+    wire = _wire_meta()
+    hot_on_wire = {n for n, m in wire.items() if m.get("anthropic/alwaysLoad") is True}
+    assert hot_on_wire == set(_ALWAYS_LOAD_TOOLS)
+
+
 def test_cold_set_names_all_exist():
     """Typo/drift guard: every name asserted deferred must be a real registered
     tool — otherwise a dropped/renamed tool would pass the deferral check
     vacuously (a missing name trivially carries no alwaysLoad flag)."""
-    registered = set(mcp._tool_manager._tools.keys())
-    missing = EXPECTED_COLD - registered
+    missing = EXPECTED_COLD - _registered_names()
     assert not missing, f"EXPECTED_COLD names not registered as tools: {sorted(missing)}"
 
 

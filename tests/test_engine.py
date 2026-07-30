@@ -1,10 +1,35 @@
 """Tests for dct.core.engine.bootstrap_engine — the DRY config→engine helper."""
 
+import threading
+
 import sqlalchemy as sa
 
 import dct.core.engine as engine_mod
 from dct.config import Config
 from dct.core.engine import bootstrap_engine
+
+
+def test_memory_sqlite_is_shared_across_threads():
+    """#429: the MCP SDK (2.0) runs sync tools in worker threads — an
+    in-memory sqlite engine must hand every thread the SAME database
+    (StaticPool), not a fresh empty one per thread ("no such table")."""
+    from dct.db import create_tables, get_engine
+
+    engine = get_engine("sqlite://")
+    create_tables(engine)
+
+    seen: dict[str, object] = {}
+
+    def probe():
+        with engine.connect() as conn:
+            seen["projects"] = conn.execute(sa.text(
+                "SELECT name FROM sqlite_master WHERE name='projects'"
+            )).scalar()
+
+    t = threading.Thread(target=probe)
+    t.start()
+    t.join()
+    assert seen["projects"] == "projects"
 
 
 def test_bootstrap_engine_create_true_makes_tables(tmp_path, monkeypatch):

@@ -11,7 +11,7 @@ Deep-dives live in `docs/` and are read on demand — keep this file lean:
 
 - **Python 3.11+**, SQLAlchemy Core (NOT ORM), argparse
 - **Database**: PostgreSQL (primary) or SQLite (fallback/OSS)
-- **MCP**: FastMCP via `mcp[cli]`, **user-scoped** (`~/.claude.json`)
+- **MCP**: MCP SDK 2.0 (`MCPServer`) via `mcp`, **user-scoped** (`~/.claude.json`)
 - **Config**: `~/.config/dctools/dct.toml` (legacy `~/.claude/dct.toml` still read; `dct migrate-home` moves it)
 
 ## Commands
@@ -23,8 +23,9 @@ Deep-dives live in `docs/` and are read on demand — keep this file lean:
 uvx ruff@0.16.0 check dct/ tests/     # Lint (config in pyproject.toml; pin matches ci.yml — K-46)
 
 # MCP server (smoke-test — boots, lists tools)
-uv run --no-project --with 'mcp[cli]' --with sqlalchemy --with 'psycopg[binary]' \
-  --with python-ulid python -c "from dct.mcp.server import mcp; print(len(mcp._tool_manager._tools), 'tools')"
+uv run --no-project --with 'mcp' --with sqlalchemy --with 'psycopg[binary]' \
+  --with python-ulid python -c \
+  "import asyncio; from dct.mcp.server import mcp; print(len(asyncio.run(mcp.list_tools())), 'tools')"
 ```
 
 ## Architecture
@@ -52,8 +53,8 @@ dct/services/            — Service layer (reserved for future shared app ops)
 dct/workflows/session.py — G1 composed ops: get_context_snapshot /
                            pickup_work / handoff_work (one impl for MCP,
                            CLI and skills; single transaction each)
-dct/mcp/server.py        — FastMCP MCP server (52 tools); dct/server.py is
-                           a compat shim
+dct/mcp/server.py        — MCP server, SDK 2.0 MCPServer (52 tools);
+                           dct/server.py is a compat shim
 dct/cli.py               — argparse CLI entry point
 dct/export.py            — Keep a Changelog MD export
 dct/integrations/claude.py — Claude Code adapter: MCP registration, skill/hook
@@ -100,7 +101,7 @@ Reference implementation: `dct/hooks/check-changelog.sh`.
 
 ## MCP tool conventions
 
-FastMCP exposes each tool's **docstring verbatim as the tool description** the
+The SDK exposes each tool's **docstring verbatim as the tool description** the
 calling model reads — the docstring IS the schema the model fills in. Every
 `@mcp.tool()` docstring MUST:
 

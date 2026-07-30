@@ -5,7 +5,7 @@ and the list_handoffs prompt-preview truncation (200-char boundary, ellipsis
 marker only when truncated) across every output format. The invariant: lists
 carry a lightweight preview, the full prompt is one get_handoff(id) away.
 
-Tools are called directly (FastMCP's @mcp.tool() leaves the function callable),
+Tools are called directly (the SDK's @mcp.tool() returns the function unchanged),
 with server._get_engine monkeypatched onto the in-memory fixture engine.
 """
 

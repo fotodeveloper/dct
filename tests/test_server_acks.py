@@ -10,7 +10,7 @@ scalar headers) instead of the full core dict. These tests lock in, per tool:
   (e) error paths are unchanged (unknown ids, gate-guard refusal, markup),
   (f) get_item STILL returns the full record (notes + checkpoints + full progress).
 
-Tools are called directly (FastMCP's @mcp.tool() leaves the function callable),
+Tools are called directly (the SDK's @mcp.tool() returns the function unchanged),
 with server._get_engine monkeypatched onto the in-memory fixture engine.
 """
 

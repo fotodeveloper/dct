@@ -32,10 +32,10 @@ Changelog = "https://github.com/fotodeveloper/dct/blob/main/changelog.md"
 
 [project.optional-dependencies]
 pg = ["psycopg[binary]"]
-mcp = ["mcp[cli]>=1.2,<2"]  # SDK 2.0 removed mcp.server.fastmcp (#428); migration tracked separately
+mcp = ["mcp>=2,<3"]  # SDK 2.0 API (#429); [cli] extra dropped — dev-only typer tooling (K-49)
 web = ["flask>=3.0", "markdown>=3.5"]
 dev = ["pytest", "pytest-cov"]
-all = ["psycopg[binary]", "mcp[cli]>=1.2,<2", "flask>=3.0", "markdown>=3.5", "pytest", "pytest-cov"]
+all = ["psycopg[binary]", "mcp>=2,<3", "flask>=3.0", "markdown>=3.5", "pytest", "pytest-cov"]
 
 [project.scripts]
 dct = "dct.cli:main"

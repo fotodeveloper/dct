@@ -1,4 +1,4 @@
-"""FastMCP server for dct — exposes tracking operations as MCP tools.
+"""MCP server for dct (SDK 2.0 MCPServer) — exposes tracking operations as MCP tools.
 
 Response format conventions:
 - list_* tools return {"cols": [...], "rows": [[...]]} — a compact table.
@@ -15,7 +15,7 @@ Every tool returns JSON-native (dict / list / str). No double-encoded JSON.
 import contextlib
 from datetime import datetime
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server import MCPServer
 
 from dct.core.engine import bootstrap_engine
 
@@ -91,7 +91,40 @@ with contextlib.suppress(Exception):
     if _update_notice:
         _INSTRUCTIONS += f"\n\nUPDATE: {_update_notice}"
 
-mcp = FastMCP("dct", instructions=_INSTRUCTIONS)
+mcp = MCPServer("dct", instructions=_INSTRUCTIONS)
+
+# ── Frugal MCP deferral exemption (#241) ──────────────────────────────────────
+# Claude Code defers ALL MCP tools by default (ENABLE_TOOL_SEARCH unset), so even
+# /pickup pays a ToolSearch round-trip before it can run. We exempt only the
+# daily-driver tools — the ones the pickup / track* / clog / commit / handoff
+# skills reach for every session — via the `anthropic/alwaysLoad` _meta hint the
+# CC client reads (requires Claude Code v2.1.121+), passed as the SDK 2.0
+# official `meta=` decorator param (K-47). Specialist tools (plans, decisions,
+# first-class sprints, web, release admin) stay deferred.
+# Add a name ONLY if a routine skill needs it from token zero; keep the long
+# tail deferred to spend session context wisely. Takes effect on server restart.
+# The hot-set is the mid-session daily drivers — the tools a working session
+# touches turn after turn (item lifecycle, checkpoints, changelog add) — PLUS the
+# composed workflow ENTRY POINTS (#413): they ARE the session edge, and there the
+# ToolSearch round-trip was 100% of pre-work latency (nothing else is loaded yet
+# when /pickup starts). The GRANULAR session-edge tools they compose
+# (review_sprint, set_sprint, list_handoffs, create_handoff, consume_handoff,
+# list_projects, count_unreleased_changelog) stay deferred BEHIND them: once the
+# entry point covers the routine path, reaching for a granular one is the rare
+# surgical case and can afford its one round-trip.
+# CONTRACT: _ALWAYS_LOAD_TOOLS is the spec, the decorators' meta=_ALWAYS_LOAD_META
+# is the mechanism, and tests/test_server_alwaysload.py binds the two — the wire
+# alwaysLoad set must equal this frozenset exactly.
+_ALWAYS_LOAD_META = {"anthropic/alwaysLoad": True}
+_ALWAYS_LOAD_TOOLS = frozenset({
+    # item + checkpoint lifecycle (track / track-list / track-update / track-resolve)
+    "create_item", "get_item", "list_items", "update_item", "resolve_item",
+    "add_note", "add_checkpoint", "complete_checkpoint", "reject_checkpoint",
+    # changelog add (clog / commit)
+    "add_changelog",
+    # workflow ops (pickup / handoff / snapshot) — #413
+    "get_context_snapshot", "pickup_work", "handoff_work",
+})
 
 _engine = None
 
@@ -290,7 +323,7 @@ def _parse_bool_tri(val: str) -> bool | None:
 # ── Project tools ─────────────────────────────────────────────────────────────
 
 
-@mcp.tool()
+@mcp.tool(structured_output=False)
 def list_projects(format: str = "structured"):
     """List all registered projects. No filtering; no CWD auto-detection —
     this is a discovery tool, not a scope-narrowing one. Use
@@ -313,7 +346,7 @@ def list_projects(format: str = "structured"):
 # ── Item tools ────────────────────────────────────────────────────────────────
 
 
-@mcp.tool()
+@mcp.tool(structured_output=False, meta=_ALWAYS_LOAD_META)
 def create_item(
     item_type: str,
     title: str,
@@ -377,7 +410,7 @@ def create_item(
         return {"error": str(e)}
 
 
-@mcp.tool()
+@mcp.tool(structured_output=False, meta=_ALWAYS_LOAD_META)
 def list_items(
     project: str = "",
     status: str = "open",
@@ -430,7 +463,7 @@ def list_items(
         return {"error": str(e)}
 
 
-@mcp.tool()
+@mcp.tool(structured_output=False, meta=_ALWAYS_LOAD_META)
 def get_item(item_id: int) -> dict:
     """Get full item details — fields, notes, checkpoints, progress.
 
@@ -447,7 +480,7 @@ def get_item(item_id: int) -> dict:
     return result
 
 
-@mcp.tool()
+@mcp.tool(structured_output=False, meta=_ALWAYS_LOAD_META)
 def update_item(
     item_id: int,
     title: str = "",
@@ -517,7 +550,7 @@ def update_item(
         return {"error": str(e)}
 
 
-@mcp.tool()
+@mcp.tool(structured_output=False, meta=_ALWAYS_LOAD_META)
 def resolve_item(item_id: int, status: str = "resolved", resolution: str = "") -> dict:
     """Resolve or close an item (terminal status). Auto-clears in_current_sprint
     and stamps resolved_at.
@@ -556,7 +589,7 @@ def resolve_item(item_id: int, status: str = "resolved", resolution: str = "") -
         return {"error": str(e)}
 
 
-@mcp.tool()
+@mcp.tool(structured_output=False, meta=_ALWAYS_LOAD_META)
 def add_note(item_id: int, note: str) -> dict:
     """Append a note to an item (ledger — never overwritten).
 
@@ -585,7 +618,7 @@ def add_note(item_id: int, note: str) -> dict:
 # ── Checkpoint tools ──────────────────────────────────────────────────────────
 
 
-@mcp.tool()
+@mcp.tool(structured_output=False, meta=_ALWAYS_LOAD_META)
 def add_checkpoint(item_id: int, text: str, kind: str = "task") -> dict:
     """Add an acceptance criterion (checkpoint) to an item.
 
@@ -627,7 +660,7 @@ def add_checkpoint(item_id: int, text: str, kind: str = "task") -> dict:
         return {"error": str(e)}
 
 
-@mcp.tool()
+@mcp.tool(structured_output=False, meta=_ALWAYS_LOAD_META)
 def complete_checkpoint(checkpoint_id: int) -> dict:
     """Mark a checkpoint as done (status 'done').
 
@@ -656,7 +689,7 @@ def complete_checkpoint(checkpoint_id: int) -> dict:
         return {"error": str(e)}
 
 
-@mcp.tool()
+@mcp.tool(structured_output=False, meta=_ALWAYS_LOAD_META)
 def reject_checkpoint(checkpoint_id: int) -> dict:
     """Mark a checkpoint as rejected (status 'rejected') — ledger-preserving
     alternative to delete.
@@ -687,7 +720,7 @@ def reject_checkpoint(checkpoint_id: int) -> dict:
         return {"error": str(e)}
 
 
-@mcp.tool()
+@mcp.tool(structured_output=False)
 def reopen_checkpoint(checkpoint_id: int) -> dict:
     """Revert a checkpoint back to pending (status 'pending'), typically from done
     or rejected. Re-opening a previously rejected gate makes it pending again and
@@ -713,7 +746,7 @@ def reopen_checkpoint(checkpoint_id: int) -> dict:
         return {"error": str(e)}
 
 
-@mcp.tool()
+@mcp.tool(structured_output=False)
 def list_checkpoints(
     item_id: int,
     include_rejected: bool = False,
@@ -743,7 +776,7 @@ def list_checkpoints(
 # ── Changelog tools ───────────────────────────────────────────────────────────
 
 
-@mcp.tool()
+@mcp.tool(structured_output=False, meta=_ALWAYS_LOAD_META)
 def add_changelog(
     category: str,
     entry: str,
@@ -791,7 +824,7 @@ def add_changelog(
         return {"error": str(e)}
 
 
-@mcp.tool()
+@mcp.tool(structured_output=False)
 def list_changelog(
     project: str = "",
     unreleased_only: bool = True,
@@ -816,7 +849,7 @@ def list_changelog(
         return {"error": str(e)}
 
 
-@mcp.tool()
+@mcp.tool(structured_output=False)
 def count_unreleased_changelog(project: str = "") -> dict:
     """Count unreleased changelog entries (version=NULL) for a project.
 
@@ -835,7 +868,7 @@ def count_unreleased_changelog(project: str = "") -> dict:
         return {"error": str(e)}
 
 
-@mcp.tool()
+@mcp.tool(structured_output=False)
 def release_changelog(project: str = "", version: str = "", bump_type: str = "") -> dict:
     """Stamp every unreleased entry (version=NULL) with a version AND set the
     project's current_version to that version.
@@ -881,7 +914,7 @@ def release_changelog(project: str = "", version: str = "", bump_type: str = "")
         return {"error": str(e)}
 
 
-@mcp.tool()
+@mcp.tool(structured_output=False)
 def export_changelog(project: str = "", include_unreleased: bool = True, version: str = ""):
     """Export changelog as Keep a Changelog markdown.
 
@@ -922,7 +955,7 @@ def export_changelog(project: str = "", include_unreleased: bool = True, version
 # ── Sprint tools ──────────────────────────────────────────────────────────────
 
 
-@mcp.tool()
+@mcp.tool(structured_output=False)
 def set_sprint(project: str = "", item_ids: str = "") -> dict:
     """Atomically replace the current sprint's membership with the given ids.
 
@@ -961,7 +994,7 @@ def set_sprint(project: str = "", item_ids: str = "") -> dict:
         return {"error": str(e)}
 
 
-@mcp.tool()
+@mcp.tool(structured_output=False)
 def clear_sprint(project: str = "") -> dict:
     """Unflag every item from the project's current sprint (fresh planning).
 
@@ -983,7 +1016,7 @@ def clear_sprint(project: str = "") -> dict:
         return {"error": str(e)}
 
 
-@mcp.tool()
+@mcp.tool(structured_output=False)
 def review_sprint(project: str = "", since: str = "last_release") -> dict:
     """Session start/end dashboard — in_sprint, recent_activity, stale_in_progress, unconsumed_handoffs.
 
@@ -1024,7 +1057,7 @@ def review_sprint(project: str = "", since: str = "last_release") -> dict:
 # ── Handoff tools ─────────────────────────────────────────────────────────────
 
 
-@mcp.tool()
+@mcp.tool(structured_output=False)
 def create_handoff(
     prompt: str,
     created_by: str,
@@ -1071,7 +1104,7 @@ def create_handoff(
         return {"error": str(e)}
 
 
-@mcp.tool()
+@mcp.tool(structured_output=False)
 def list_handoffs(
     project: str = "",
     unconsumed_only: bool = True,
@@ -1105,7 +1138,7 @@ def list_handoffs(
         return {"error": str(e)}
 
 
-@mcp.tool()
+@mcp.tool(structured_output=False)
 def get_handoff(handoff_id: int) -> dict:
     """Fetch one handoff in full — the untruncated companion to list_handoffs.
 
@@ -1127,7 +1160,7 @@ def get_handoff(handoff_id: int) -> dict:
         return {"error": str(e)}
 
 
-@mcp.tool()
+@mcp.tool(structured_output=False)
 def consume_handoff(handoff_id: int, consumed_by: str = "") -> dict:
     """Mark a handoff as consumed. Preserves the row in the ledger.
 
@@ -1150,7 +1183,7 @@ def consume_handoff(handoff_id: int, consumed_by: str = "") -> dict:
         return {"error": str(e)}
 
 
-@mcp.tool()
+@mcp.tool(structured_output=False)
 def delete_handoff(handoff_id: int) -> dict:
     """Soft-delete a handoff (hide from lists). Preserves the row for audit.
 
@@ -1166,7 +1199,7 @@ def delete_handoff(handoff_id: int) -> dict:
         return {"error": str(e)}
 
 
-@mcp.tool()
+@mcp.tool(structured_output=False)
 def update_handoff(
     handoff_id: int,
     prompt: str = "",
@@ -1224,7 +1257,7 @@ def update_handoff(
 # and the packaged skills — these tools only marshal MCP strings into it.
 
 
-@mcp.tool()
+@mcp.tool(structured_output=False, meta=_ALWAYS_LOAD_META)
 def get_context_snapshot(
     project: str = "",
     include: str = "",
@@ -1284,7 +1317,7 @@ def get_context_snapshot(
         return {"error": str(e)}
 
 
-@mcp.tool()
+@mcp.tool(structured_output=False, meta=_ALWAYS_LOAD_META)
 def pickup_work(
     project: str = "",
     consume: str = "",
@@ -1377,7 +1410,7 @@ def _parse_id_csv(value: str, field: str) -> list[int]:
     return ids
 
 
-@mcp.tool()
+@mcp.tool(structured_output=False, meta=_ALWAYS_LOAD_META)
 def handoff_work(
     prompt: str,
     created_by: str,
@@ -1472,7 +1505,7 @@ def handoff_work(
 
 # ══ v0.2.0 — plans / plan_sections / plan_checkpoints ════════════════════════
 
-@mcp.tool()
+@mcp.tool(structured_output=False)
 def create_plan(
     slug: str,
     title: str,
@@ -1515,7 +1548,7 @@ def create_plan(
         return {"error": str(e)}
 
 
-@mcp.tool()
+@mcp.tool(structured_output=False)
 def list_plans(
     project: str = "",
     kind: str = "",
@@ -1550,7 +1583,7 @@ def list_plans(
     return {"cols": cols, "rows": [[r[c] for c in cols] for r in rows]}
 
 
-@mcp.tool()
+@mcp.tool(structured_output=False)
 def get_plan(plan_id: int) -> dict:
     """Full plan dict with nested sections + checkpoints + progress rollup.
 
@@ -1562,7 +1595,7 @@ def get_plan(plan_id: int) -> dict:
     return row or {"error": f"Plan #{plan_id} not found"}
 
 
-@mcp.tool()
+@mcp.tool(structured_output=False)
 def add_plan_section(
     plan_id: int,
     heading: str,
@@ -1614,7 +1647,7 @@ def add_plan_section(
         return {"error": str(e)}
 
 
-@mcp.tool()
+@mcp.tool(structured_output=False)
 def list_plan_sections(
     plan_id: int,
     parent_section_id: int = 0,
@@ -1647,7 +1680,7 @@ def list_plan_sections(
     return {"cols": cols, "rows": [[r[c] for c in cols] for r in rows]}
 
 
-@mcp.tool()
+@mcp.tool(structured_output=False)
 def complete_plan_checkpoint(checkpoint_id: int) -> dict:
     """Mark a plan checkpoint as done. Real-time; never batch completions.
 
@@ -1661,7 +1694,7 @@ def complete_plan_checkpoint(checkpoint_id: int) -> dict:
     return {"id": row["id"], "plan_section_id": row["plan_section_id"], "status": row["status"], "sort_order": row["sort_order"]}
 
 
-@mcp.tool()
+@mcp.tool(structured_output=False)
 def reject_plan_checkpoint(checkpoint_id: int) -> dict:
     """Mark a plan checkpoint as rejected (scope change, N/A). Preserves ledger.
 
@@ -1675,7 +1708,7 @@ def reject_plan_checkpoint(checkpoint_id: int) -> dict:
     return {"id": row["id"], "plan_section_id": row["plan_section_id"], "status": row["status"], "sort_order": row["sort_order"]}
 
 
-@mcp.tool()
+@mcp.tool(structured_output=False)
 def promote_section_to_item(
     section_id: int,
     item_type: str,
@@ -1709,7 +1742,7 @@ def promote_section_to_item(
         return {"error": str(e)}
 
 
-@mcp.tool()
+@mcp.tool(structured_output=False)
 def promote_checkpoint_to_item(
     checkpoint_id: int,
     item_type: str,
@@ -1743,7 +1776,7 @@ def promote_checkpoint_to_item(
         return {"error": str(e)}
 
 
-@mcp.tool()
+@mcp.tool(structured_output=False)
 def promote_section_to_sprint(
     section_id: int,
     code: str,
@@ -1784,7 +1817,7 @@ def promote_section_to_sprint(
 
 # ══ v0.2.0 — sprints / item_sprints ══════════════════════════════════════════
 
-@mcp.tool()
+@mcp.tool(structured_output=False)
 def create_sprint(
     name: str,
     project: str = "",
@@ -1830,7 +1863,7 @@ def create_sprint(
         return {"error": str(e)}
 
 
-@mcp.tool()
+@mcp.tool(structured_output=False)
 def update_sprint(
     sprint_id: int,
     status: str = "",
@@ -1895,7 +1928,7 @@ def update_sprint(
     return {"id": result["id"], "code": result["code"], "kind": result["kind"], "status": result["status"], "name": result["name"]}
 
 
-@mcp.tool()
+@mcp.tool(structured_output=False)
 def list_sprints(
     project: str = "",
     status: str = "",
@@ -1929,7 +1962,7 @@ def list_sprints(
     return {"cols": cols, "rows": [[r[c] for c in cols] for r in rows]}
 
 
-@mcp.tool()
+@mcp.tool(structured_output=False)
 def assign_item_to_sprint(item_id: int, sprint_id: int) -> dict:
     """Link an item to a sprint (both by explicit id). Idempotent: an
     already-active link is returned unchanged; a soft-removed link is
@@ -1945,7 +1978,7 @@ def assign_item_to_sprint(item_id: int, sprint_id: int) -> dict:
         return {"error": str(e)}
 
 
-@mcp.tool()
+@mcp.tool(structured_output=False)
 def remove_item_from_sprint(item_id: int, sprint_id: int) -> dict:
     """Soft-remove the item<->sprint link (both by explicit id) — sets
     removed_at while preserving assigned_at history ("this item WAS in this
@@ -1959,7 +1992,7 @@ def remove_item_from_sprint(item_id: int, sprint_id: int) -> dict:
     return row or {"error": "Link not found or already removed"}
 
 
-@mcp.tool()
+@mcp.tool(structured_output=False)
 def list_items_in_sprint(sprint_id: int, include_removed: bool = False, format: str = "structured") -> dict | list:
     """List items linked to a sprint, newest assignment first.
 
@@ -1979,7 +2012,7 @@ def list_items_in_sprint(sprint_id: int, include_removed: bool = False, format: 
     return {"cols": cols, "rows": [[r[c] for c in cols] for r in rows]}
 
 
-@mcp.tool()
+@mcp.tool(structured_output=False)
 def add_item_to_current_sprint(item_id: int, project: str = "") -> dict:
     """Add ONE item to the project's current (active) sprint, auto-creating the
     sprint if none exists. Additive — keeps existing members (unlike set_sprint,
@@ -1994,7 +2027,7 @@ def add_item_to_current_sprint(item_id: int, project: str = "") -> dict:
         return {"error": str(e)}
 
 
-@mcp.tool()
+@mcp.tool(structured_output=False)
 def remove_item_from_current_sprint(item_id: int, project: str = "") -> dict:
     """Remove ONE item from the project's current (active) sprint. No-op
     (removed=False) if there is no current sprint or the item isn't a member.
@@ -2010,7 +2043,7 @@ def remove_item_from_current_sprint(item_id: int, project: str = "") -> dict:
 
 # ══ v0.2.0 — decisions ═══════════════════════════════════════════════════════
 
-@mcp.tool()
+@mcp.tool(structured_output=False)
 def create_decision(
     kind: str,
     title: str,
@@ -2071,7 +2104,7 @@ def create_decision(
         return {"error": str(e)}
 
 
-@mcp.tool()
+@mcp.tool(structured_output=False)
 def list_decisions(
     project: str = "",
     kind: str = "",
@@ -2105,7 +2138,7 @@ def list_decisions(
     return {"cols": cols, "rows": [[r[c] for c in cols] for r in rows]}
 
 
-@mcp.tool()
+@mcp.tool(structured_output=False)
 def update_decision(
     decision_id: int,
     title: str = "",
@@ -2161,7 +2194,7 @@ def update_decision(
         return {"error": str(e)}
 
 
-@mcp.tool()
+@mcp.tool(structured_output=False)
 def supersede_decision(old_decision_id: int, new_decision_id: int) -> dict:
     """Mark decision #old_decision_id as superseded by #new_decision_id.
 
@@ -2185,7 +2218,7 @@ def supersede_decision(old_decision_id: int, new_decision_id: int) -> dict:
 
 # ══ v0.2.0 — plan ingest ═════════════════════════════════════════════════════
 
-@mcp.tool()
+@mcp.tool(structured_output=False)
 def ingest_plan_file(
     file_path: str,
     project: str = "",
@@ -2217,56 +2250,6 @@ def ingest_plan_file(
         )
     except Exception as e:
         return {"error": str(e)}
-
-
-# ── Frugal MCP deferral exemption (#241) ──────────────────────────────────────
-# Claude Code defers ALL MCP tools by default (ENABLE_TOOL_SEARCH unset), so even
-# /pickup pays a ToolSearch round-trip before it can run. We exempt only the
-# daily-driver tools — the ones the pickup / track* / clog / commit / handoff
-# skills reach for every session — by stamping the `anthropic/alwaysLoad` _meta
-# hint the CC client reads (requires Claude Code v2.1.121+). Specialist tools
-# (plans, decisions, first-class sprints, web, release admin) stay deferred.
-# Add a name here ONLY if a routine skill needs it from token zero; keep the long
-# tail deferred to spend session context wisely. Takes effect on server restart.
-# The hot-set is the mid-session daily drivers — the tools a working session
-# touches turn after turn (item lifecycle, checkpoints, changelog add) — PLUS the
-# composed workflow ENTRY POINTS (#413): they ARE the session edge, and there the
-# ToolSearch round-trip was 100% of pre-work latency (nothing else is loaded yet
-# when /pickup starts). The GRANULAR session-edge tools they compose
-# (review_sprint, set_sprint, list_handoffs, create_handoff, consume_handoff,
-# list_projects, count_unreleased_changelog) stay deferred BEHIND them: once the
-# entry point covers the routine path, reaching for a granular one is the rare
-# surgical case and can afford its one round-trip.
-_ALWAYS_LOAD_TOOLS = frozenset({
-    # item + checkpoint lifecycle (track / track-list / track-update / track-resolve)
-    "create_item", "get_item", "list_items", "update_item", "resolve_item",
-    "add_note", "add_checkpoint", "complete_checkpoint", "reject_checkpoint",
-    # changelog add (clog / commit)
-    "add_changelog",
-    # workflow ops (pickup / handoff / snapshot) — #413
-    "get_context_snapshot", "pickup_work", "handoff_work",
-})
-
-
-def _apply_always_load(server: FastMCP) -> None:
-    """Stamp the daily-driver tools with Claude Code's alwaysLoad hint so they
-    load into context at session start instead of behind a ToolSearch round-trip.
-
-    Raises at import if a hot-set name is not a registered tool — the set must
-    track real tool names, so a typo fails loud rather than silently leaving a
-    tool deferred.
-    """
-    registered = server._tool_manager._tools
-    missing = _ALWAYS_LOAD_TOOLS - registered.keys()
-    if missing:
-        raise RuntimeError(
-            f"_ALWAYS_LOAD_TOOLS names not registered as tools: {sorted(missing)}"
-        )
-    for name in _ALWAYS_LOAD_TOOLS:
-        registered[name].meta = {"anthropic/alwaysLoad": True}
-
-
-_apply_always_load(mcp)
 
 
 if __name__ == "__main__":

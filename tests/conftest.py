@@ -33,9 +33,9 @@ def seed_project(engine):
 def srv(engine, monkeypatch):
     """MCP harness: point the server at the fixture engine, seed slug 'test'.
 
-    Tools are called directly (FastMCP's @mcp.tool() leaves the function
-    callable) — `server._get_engine` is the only seam that needs patching, so
-    the returned module IS the system under test.
+    Tools are called directly (the SDK's @mcp.tool() decorator returns the
+    function unchanged) — `server._get_engine` is the only seam that needs
+    patching, so the returned module IS the system under test.
     """
     from dct.core.projects import create_project
     from dct.mcp import server as S
