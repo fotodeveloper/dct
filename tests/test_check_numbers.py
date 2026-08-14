@@ -63,6 +63,19 @@ def test_dcg_naked_tool_count_is_not_read_as_dcts(checker):
     assert tools == ["49"]
 
 
+def test_claude_code_labelled_skill_and_hook_counts_still_verify(checker):
+    """K-57 renders "13 Claude Code skills · 4 Claude Code hooks" on the site —
+    the optional label must not blind the presence assertions."""
+    text = "52 MCP tools · 13 Claude Code skills · 4 Claude Code hooks · ~1180 tests\n"
+    claims = checker.find_claims(text, checker.SITE_COUNTS, Path("x"))
+
+    assert [(c.quantity, c.rendered) for c in claims] == [
+        ("hooks", "4"),
+        ("skills", "13"),
+        ("tools", "52"),
+    ]
+
+
 # --- exact vs approximate ---
 
 def test_correct_page_produces_no_problems(checker, full_page):

@@ -44,10 +44,12 @@ TOLERANCE = 0.05
 # (pattern, quantity, approximate). One capture group each. The site renders
 # dcg's "17 tools" beside dct's "49 MCP tools", so site patterns require the
 # MCP prefix; only README, which has no dcg section, adds the naked variant.
+# Skills/hooks may carry a "Claude Code " label (K-57: they are CC-only and
+# the copy says so) — the prefix is optional so both renderings verify.
 SITE_COUNTS = [
     (r"(\d+) MCP tools", "tools", False),
-    (r"(\d+) skills", "skills", False),
-    (r"(\d+) hooks", "hooks", False),
+    (r"(\d+) (?:Claude Code )?skills", "skills", False),
+    (r"(\d+) (?:Claude Code )?hooks", "hooks", False),
 ]
 
 # README deliberately renders no volatile number. The test count used to sit in
