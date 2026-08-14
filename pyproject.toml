@@ -67,6 +67,7 @@ include-package-data = true
 dct = [
     "skills/**/*.md",
     "hooks/*.sh",
+    "assets/*.md",
     "web/templates/*",
     "web/templates/**/*",
     "web/static/*",

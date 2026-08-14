@@ -332,3 +332,99 @@ def install_skills(config: Config | None = None) -> bool:
         installed += 1
 
     return installed > 0
+
+
+# CLAUDE.md snippet markers — the managed block attach_claude_md_snippet()
+# owns inside the user's ~/.claude/CLAUDE.md. Content between them is
+# refreshed on re-attach; everything outside is never touched.
+SNIPPET_START = (
+    "<!-- dct:claude-md-snippet:start "
+    "(managed by dct init — edits inside this block are overwritten on refresh) -->"
+)
+SNIPPET_END = "<!-- dct:claude-md-snippet:end -->"
+CLAUDE_MD = Path.home() / ".claude" / "CLAUDE.md"
+
+
+def attach_claude_md_snippet(claude_md_path: Path | None = None) -> dict:
+    """Append (or refresh) the packaged dct snippet in ~/.claude/CLAUDE.md (#443).
+
+    The packaged snippet file opens with a human-facing preamble; everything
+    below its FIRST ``---`` separator is the actual instruction block. That
+    block is written between ``SNIPPET_START``/``SNIPPET_END`` markers:
+
+    - target file missing or empty → created with just the managed block;
+    - markers absent → block appended at the end (blank-line separated);
+    - markers present → content between them replaced (refresh); when the
+      refreshed text is byte-identical, nothing is written;
+    - user content outside the markers is never modified;
+    - before the first actual write of a pre-existing file, the original is
+      copied to ``CLAUDE.md.bak-dct-<timestamp>`` next to it; the write is
+      atomic (temp file + ``os.replace``) — same contract as
+      ``wire_hooks_into_settings``.
+
+    Returns ``{"status": "added" | "refreshed" | "unchanged",
+    "backup": str | None, "path": str}``. Raises ``ValueError`` — with nothing
+    written — when the packaged snippet is missing or has no ``---``
+    separator, or when the target has malformed markers (start without end,
+    or a stray end without start).
+    """
+    if claude_md_path is None:
+        claude_md_path = CLAUDE_MD
+    claude_md_path = Path(claude_md_path)
+
+    src = assets.claude_snippet_path()
+    if not src.is_file():
+        raise ValueError(f"packaged snippet missing: {src}")
+    raw_snippet = src.read_text(encoding="utf-8")
+    separator = "\n---\n"
+    if separator not in raw_snippet:
+        raise ValueError(
+            f"{src}: no '---' separator — cannot split off the preamble"
+        )
+    body = raw_snippet.split(separator, 1)[1].strip("\n")
+    block = f"{SNIPPET_START}\n{body}\n{SNIPPET_END}"
+
+    original = (
+        claude_md_path.read_text(encoding="utf-8")
+        if claude_md_path.exists()
+        else None
+    )
+
+    if original is None or not original.strip():
+        new_text = block + "\n"
+        status = "added"
+    elif SNIPPET_START in original:
+        start = original.index(SNIPPET_START)
+        end = original.find(SNIPPET_END, start)
+        if end == -1:
+            raise ValueError(
+                f"{claude_md_path}: start marker without end marker — "
+                "fix the file manually; nothing was written"
+            )
+        end += len(SNIPPET_END)
+        new_text = original[:start] + block + original[end:]
+        status = "unchanged" if new_text == original else "refreshed"
+    elif SNIPPET_END in original:
+        raise ValueError(
+            f"{claude_md_path}: end marker without start marker — "
+            "fix the file manually; nothing was written"
+        )
+    else:
+        new_text = original.rstrip("\n") + "\n\n" + block + "\n"
+        status = "added"
+
+    backup = None
+    if status != "unchanged":
+        if original is not None and original.strip():
+            stamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
+            backup_path = claude_md_path.with_name(
+                f"{claude_md_path.name}.bak-dct-{stamp}"
+            )
+            backup_path.write_text(original, encoding="utf-8")
+            backup = str(backup_path)
+        claude_md_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = claude_md_path.with_name(claude_md_path.name + ".dct-tmp")
+        tmp_path.write_text(new_text, encoding="utf-8")
+        os.replace(tmp_path, claude_md_path)
+
+    return {"status": status, "backup": backup, "path": str(claude_md_path)}

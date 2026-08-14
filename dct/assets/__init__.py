@@ -17,3 +17,8 @@ def skills_dir() -> Path:
 
 def hooks_dir() -> Path:
     return _PKG_ROOT / "hooks"
+
+
+def claude_snippet_path() -> Path:
+    """The packaged CLAUDE.md snippet `dct init` offers to attach (#443)."""
+    return Path(__file__).resolve().parent / "claude-md-snippet.md"
