@@ -3,96 +3,63 @@
 [![PyPI version](https://img.shields.io/pypi/v/dctracker.svg)](https://pypi.org/project/dctracker/)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
 [![CI](https://github.com/fotodeveloper/dct/actions/workflows/ci.yml/badge.svg)](https://github.com/fotodeveloper/dct/actions/workflows/ci.yml)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://github.com/fotodeveloper/dct/blob/main/LICENSE)
 
-Persistent, queryable memory for AI coding assistants — your assistant reads facts from a database instead of guessing. One user-scoped database tracks issues, todos, changelog entries, plans, sprints, and decisions across all your projects. Built for [Claude Code](https://claude.com/claude-code) (skills, hooks, 52 MCP tools); the MCP server and CLI work with any MCP-capable assistant.
+dct gives AI coding assistants persistent, queryable memory: project state read from a database instead of guessed. One database shared by all your projects tracks issues, todos, changelog entries, plans, sprints, decisions, and session handoffs. The MCP (Model Context Protocol) server and CLI work with any MCP-capable assistant (Cursor, Windsurf, Zed, and friends); [Claude Code](https://claude.com/claude-code) gets the deepest integration, with 13 slash-command skills and 4 automation hooks on top of the 52 MCP tools.
 
 Part of the **dc tools** family ([dctools.dev](https://dctools.dev)) — *deterministic context* for AI-assisted development.
 
 ## Why dct?
 
-You have a dozen side projects. Every Claude Code session starts cold — the assistant has no memory of what you decided last week, which bug you were mid-fix on, or why you picked SQLite over Postgres. So you re-explain, or it guesses.
+You have a dozen side projects. Every AI coding session starts cold — the assistant has no memory of what you decided last week, which bug you were mid-fix on, or why you picked SQLite over Postgres. So you re-explain, or it guesses.
 
-The usual trackers don't fill the gap. GitHub Issues and Jira are per-repo, heavyweight, and live behind an API your assistant can't casually read or write. `TODO.md` files rot the moment you stop grooming them, and you can't query "every P1 across all my repos" from a pile of markdown.
+The usual trackers don't fill the gap. Your assistant can drive GitHub Issues these days (`gh`, the official MCP server), but issues live per-repo on someone else's server, with no notion of a cross-project view, a sprint in flight, a session handoff, or a gate that keeps an item open until you've validated it — and Jira is heavier still. `TODO.md` files rot the moment you stop grooming them. Assistant memory files (CLAUDE.md, auto-memory) help, but they're prose: un-queryable, unstructured, and invisible to your other tools. dct is the structured half — typed items with priorities, state, and gates that any session, script, or MCP client can query.
 
 dct is built for exactly this:
 
-- **One user-scoped database** across all your projects — one place to ask "what's open everywhere?". Local-first: SQLite by default — nothing leaves your machine — with first-class PostgreSQL support when you want a server-grade backend.
-- **MCP-native** — the assistant reads and writes tracking directly, no copy-paste, no context loss.
-- **Changelog-first releases** — entries accumulate as you work (your assistant writes them); release day is one command, not an afternoon of `git log` archaeology.
-- **Append-only ledger** — notes, checkpoints, and handoffs are soft-deleted, never dropped. Nothing is lost.
-- **Session handoffs** — end a session with a handoff prompt; the next one picks up exactly where you left off.
+- **One user-scoped database** across all your projects — one place to ask "what's open everywhere?" Local-first: SQLite by default, so your tracking data stays on your machine, with first-class PostgreSQL support when you want a server-grade backend.
+- **A full tracking model** — issues, todos, features, ideas, and improvements, each with priority, notes, and per-item checkpoints; gate checkpoints (dogfood, security, review, approval) keep an item open until they pass.
+- **Your markdown plans, indexed** — specs, roadmaps, and ADRs stay plain markdown files; dct anchors their sections and checkpoints in the database, so plan state is queryable and promotable to items and sprints.
+- **MCP-native** — the assistant reads and writes tracking directly: no copy-paste, no context loss.
+- **Changelog-first releases** — entries accumulate as you work (your assistant writes them); release day is one command.
+- **Soft-delete ledger** — notes, checkpoints, and handoffs are removed from view at most; nothing is ever hard-deleted.
+- **Session handoffs** — end a session with a handoff prompt; the next one picks up where you left off.
 
-## The session loop: `/handoff` → `/pickup`
+The day-to-day learning curve is your assistant's, not yours. There is no UI to master and no required syntax: after a one-time `dct init` you keep talking the way you already do — "track this", "I fixed it", "what's open?" — and the assistant does the bookkeeping. The slash commands below are optional shortcuts for the same moves, and every one of them is equally an MCP tool and a CLI command, so the whole workflow runs on any MCP client.
 
-The pair you will use most. AI coding sessions end; your context shouldn't.
+## What a session looks like
 
-**Ending a session — `/handoff`** flags the items you were working on as the
-current sprint and stores a short prompt for whoever comes next (usually:
-you, tomorrow). **Starting a session — `/pickup`** reads the newest unconsumed
-handoff, shows the sprint with checkpoint progress, and proposes the first
-action — so the session starts *in the middle of the work*, not from a cold
-"what were we doing?". The sprint is the durable *what's-in-flight-right-now*
-set: it survives between sessions and cleans itself up — resolving an item
-drops it from the sprint automatically. Illustrative session start:
+Tracking happens in the conversation you're already having — one working session, and the morning after:
 
 ```text
+> track this: parser crashes on empty frontmatter
+Created issue #12 in myproj (P2, open)
+
+> I fixed the frontmatter crash
+Changelog entry added (unreleased) — issue #12 resolved
+
+> /handoff
+Sprint set (1 item); handoff prompt stored for the next session
+
+# next morning, new session
 > /pickup
-Handoff (2026-07-05, scope: sprint-15):
-  "Theme tokens are merged; wire the toggle into settings next.
-   The Safari session fix (#12) still awaits review."
-Sprint: 3 items — #12 in_progress [2/4], #31 open, #7 open
-Proposed first action: #12 — wire the theme toggle into settings.
+Handoff: "Frontmatter crash is fixed; release when CI is green."
+Proposed first action: /release
 ```
 
-Handoffs are database rows, not files: several can coexist per project
-(`scope` tags disambiguate parallel workstreams), consuming one preserves it
-in the ledger, and an unconsumed one can be amended in place. Available as
-skills in Claude Code, MCP tools, and the CLI — full catalogue in
-[docs/mcp-tools.md](docs/mcp-tools.md).
-
-## The release loop: `/clog` → `/commit` → `/release`
-
-The other daily loop. A changelog reconstructed from `git log` on release
-day is archaeology — dct makes it a side effect of working. Each time a
-change lands, your assistant records a one-line entry in the database (the
-`/clog` skill, `add_changelog` over MCP, `dct clog add` in scripts); an
-opt-in hook can even hold back `git commit` until the entry exists. By
-release day the changelog is already written:
-
-```text
-> /release
-15 unreleased entries → stamped as 1.4.0
-changelog.md regenerated (Keep a Changelog format)
-release: v1.4.0 committed, project version bumped
-```
-
-One command stamps the version, exports [Keep a Changelog](https://keepachangelog.com)
-markdown, and makes the release commit.
-
-## Features
-
-- **Centralized tracking** — one database for all your projects
-- **Hybrid changelog** — entries in DB, export to Keep a Changelog markdown at release; **opt-in enforcement** + **per-project changelog location** (repo root by default, or a subdir like `pkg/changelog.md`)
-- **Plans, specs, roadmaps, ADRs** — index markdown plans with stable ULID anchors; state in DB, content stays in markdown
-- **First-class sprints** — a named, goal-scoped *current work* set that survives across sessions and self-cleans as items resolve
-- **Decision records** — ADRs, sprint amendments, inline plan decisions with multi-anchor linkage
-- **LLM-assisted classification** — uncertain plan sections auto-resolved via `claude --print` (haiku by default)
-- **Passive autoscan hook** — PostToolUse hook re-scans plan-like files in background on every edit
-- **MCP server** — native Claude Code integration via the official MCP SDK
-- **CLI** — fast `dct` command for hooks and scripts
-- **Skills** — Claude Code slash commands (`/track`, `/clog`, `/dct-import`, `/plan-status`, …)
-- **Soft deletes** — ledger pattern, nothing is ever lost
-- **DB portable** — SQLite (zero setup) or PostgreSQL
+No forms, no context switch. `/handoff` and `/pickup` are Claude Code slash commands; on any other MCP client the same moves are the `handoff_work` and `pickup_work` tools. The three loops behind this session — tracking, session, release — are described below.
 
 ## Installation
 
-Pick one — whichever matches your Python workflow. The distribution is named **`dctracker`** (PyPI); the installed command is **`dct`**.
+Pick one — whichever matches your Python workflow. The distribution is named **`dctracker`** (PyPI); the installed command is **`dct`**. Prerequisites: Python 3.11+. Claude Code is needed only for the skills/hooks integration; the CLI and MCP server work with any MCP client.
 
 ```bash
-# Option A: uv tool (recommended — isolated, upgradable, editable for dev)
-uv tool install dctracker --with 'mcp' --with 'psycopg[binary]'
-# Or from source (dev):
+# Option A: uv tool (recommended — isolated, upgradable)
+uv tool install 'dctracker[mcp,pg]'
+# Extras: mcp = the MCP server (you want this), pg = the PostgreSQL driver
+# (skip it if you stay on the SQLite default), web = the local dashboard.
+
+# From source (dev):
 uv tool install --editable /path/to/dct --with 'mcp' --with 'psycopg[binary]'
 # Or straight from GitHub, no clone (e.g. to try main before a release):
 uv tool install 'dctracker[mcp,pg] @ git+https://github.com/fotodeveloper/dct'
@@ -100,14 +67,16 @@ uv tool install 'dctracker[mcp,pg] @ git+https://github.com/fotodeveloper/dct'
 # Option B: pipx (classic isolated install)
 pipx install 'dctracker[mcp,pg]'
 
-# Option C: uvx (zero-install, fetches per-invocation)
+# Option C: uvx (zero-install, fetches per-invocation) — server-only: pair it
+# with Option A/B if you want `dct init`, the CLI, and the hooks (they need
+# `dct` on PATH). CLI equivalent: uvx --from 'dctracker[mcp,pg]' dct init
 # In ~/.claude.json:  { "command": "uvx", "args": ["--from", "dctracker[mcp,pg]", "dct", "server"] }
 
 # Option D: pip into your venv (not recommended for global CLI)
 pip install 'dctracker[mcp,pg]'
 ```
 
-After installation `dct` must be in PATH. Verify:
+After installing, `dct` must be on your `PATH`. Verify:
 
 ```bash
 dct --version    # -> dct <version>
@@ -128,34 +97,27 @@ The interactive wizard walks through the one-time global bootstrap:
 3. **MCP server** — registered at **user scope** in `~/.claude.json` (via `claude mcp add --scope user`, with a direct-edit fallback), so `/track`, `/clog`, `/release`, and the MCP tools are available in **every** Claude Code session, from any directory.
 4. **Skills + hooks** — symlinks the skills into `~/.claude/skills/` and the four hooks into `~/.claude/hooks/`. Both ship inside the package; with an editable/dev install the symlinks point at the repo, so a fix goes live without reinstall.
 5. **Hook wiring** — with your consent, merges the hooks into `~/.claude/settings.json`. The merge is idempotent, backs up the file before the first write, and never touches hooks you already have. Re-run any time with `dct hooks wire`.
+6. **CLAUDE.md snippet** — with your consent, appends the packaged dct instructions to your personal `~/.claude/CLAUDE.md`. This is what makes plain phrases like "track this" reliable. The block is marker-managed and idempotent: re-runs refresh it, your own content is never touched, and the file is backed up before the first write. Decline and paste it later from [dct/assets/claude-md-snippet.md](https://github.com/fotodeveloper/dct/blob/main/dct/assets/claude-md-snippet.md).
 
-`dct init` writes the config to the platform config dir (`~/.config/dctools/dct.toml`; existing `~/.claude/dct.toml` installs keep working — `dct migrate-home` moves them), `~/.claude.json` (MCP entry), the skill/hook symlinks, and (opt-in) the settings.json wiring — see [docs/architecture.md](docs/architecture.md) for the full config reference and scope model.
+The wizard closes with a reminder to **start a new Claude Code session** — skills, hooks, and MCP tools all load at session start. Steps 3–6 are the Claude Code integration; without Claude Code, use the wizard for steps 1–2 and register the server in your own client instead — next section.
 
-### Your first session
+`dct init` writes the config to the platform config dir (`~/.config/dctools/dct.toml`; existing `~/.claude/dct.toml` installs keep working — `dct migrate-home` moves them), `~/.claude.json` (MCP entry), the skill/hook symlinks, and (opt-in) the settings.json wiring — see [docs/architecture.md](https://github.com/fotodeveloper/dct/blob/main/docs/architecture.md) for the full config reference and scope model.
 
-With `dct init` done, open any registered project in Claude Code and just talk:
+### Other MCP clients (Cursor, Windsurf, Zed)
 
-```text
-> track this: parser crashes on empty frontmatter
-Created issue #12 in myproj (P2, open)
+The 13 skills and 4 hooks are Claude Code integrations; everything else — the 52 MCP tools and the CLI — works from any MCP client. Register `dct server` as a stdio server in your client's MCP config, e.g. for Cursor (`~/.cursor/mcp.json`):
 
-> I fixed the frontmatter crash
-Changelog entry added (unreleased) — issue #12 resolved
-
-> /handoff
-Sprint set (1 item); handoff prompt stored for the next session
+```json
+{ "mcpServers": { "dct": { "command": "dct", "args": ["server"] } } }
 ```
 
-Tomorrow, `/pickup` resumes mid-work — that's the [session loop](#the-session-loop-handoff--pickup)
-from the top of this page. When you're ready to ship, `/release` stamps the
-accumulated changelog with a version. No forms, no context switch — tracking
-happens in the conversation you're already having.
+Then talk to your assistant as usual ("track this", "what's open?") — it drives the same tools. Slash-command equivalents: `/track` → `create_item`, `/track-list` → `list_items`, `/pickup` → `pickup_work`, `/handoff` → `handoff_work`, `/clog` → `add_changelog`, `/release` → `release_changelog`. To teach your assistant *when* to reach for them, adapt the [CLAUDE.md snippet](https://github.com/fotodeveloper/dct/blob/main/dct/assets/claude-md-snippet.md) to your client's rules file.
 
 ### Troubleshooting
 
 - **`dct: command not found` after install** — the install location isn't on your `PATH`. For `uv tool` / `pipx`, run their `ensurepath` helper (`uv tool update-shell` or `pipx ensurepath`) and restart the shell.
-- **PostgreSQL connection fails at `dct init`** — either start your local Postgres and re-run, or just pick the **SQLite** default (the answer to the backend prompt) — it needs no server and works everywhere.
-- **MCP tools don't show up in Claude Code** — the MCP server is a per-session subprocess, so newly registered tools (or a reinstall) appear only after you **restart the Claude Code session**. Start a fresh session and they'll be there.
+- **PostgreSQL connection fails at `dct init`** — either start your local Postgres and re-run, or just pick the **SQLite** default (the answer to the backend prompt) — it needs no server and works everywhere. If the error mentions `psycopg` or a missing module instead, reinstall with the `pg` extra: `uv tool install 'dctracker[mcp,pg]'`.
+- **MCP tools don't show up in your client** — the MCP server is a per-session subprocess, so newly registered tools (or a reinstall) appear only after you **restart the session** — in Claude Code and any other MCP client alike. Start a fresh session and they'll be there.
 - **Plans/decisions tools fail with `No module named 'ulid'`** — your installed tool environment predates the `python-ulid` dependency. Upgrade it: `uv tool upgrade dctracker` (or reinstall via your chosen option above).
 
 ### Updating
@@ -167,6 +129,109 @@ dct upgrade    # detects install method (uv tool / pipx / pip), upgrades, re-lin
 ```
 
 `dct upgrade` refreshes the skill/hook symlinks and prunes any that the new package dropped. Editable/dev checkouts print `git pull` guidance instead (no package to upgrade). Run it at a session boundary — skill descriptions and the MCP server pick up the new code on the next session, migrations on the next engine bootstrap.
+
+## The tracking loop: `/track` → work → `/track-resolve`
+
+The foundation everything else builds on. An **item** is one unit of work —
+an `issue`, `todo`, `feature`, `idea`, or `improvement` — with a priority
+(`P1`–`P3`, `future`), append-only notes, and **checkpoints**: acceptance
+criteria your assistant sketches before coding and checks off in real time
+as it works. Say "track this: parser crashes on empty frontmatter" and the
+item exists; say "done with #12" and it resolves, with a resolution note in
+the ledger. Because every project writes to the same database, "what's open
+everywhere?" is one query, not a tour of a dozen TODO.md files. Illustrative
+cross-project view:
+
+```text
+> /track-list P1
+myproj   #12 issue P1 in_progress [2/4]  parser crashes on empty frontmatter
+website  #31 todo  P1 open               rotate API keys before launch
+```
+
+Checkpoints can also be **gates** — `dogfood`, `security`, `review`,
+`approval`, or any custom kind you invent — that block an item from
+resolving until each is done or consciously rejected: a feature is finished
+when the database says so, not when the conversation has moved on.
+
+## The session loop: `/handoff` → `/pickup`
+
+AI coding sessions end; your context shouldn't.
+
+**Ending a session — `/handoff`** flags the items you were working on as the
+current sprint and stores a short prompt for whoever comes next (usually
+you, tomorrow). **Starting a session — `/pickup`** reads the newest unconsumed
+handoff, shows the sprint with checkpoint progress, and proposes the first
+action, so the session starts in the middle of the work rather than from a
+cold "what were we doing?" The sprint is the durable set of what's in flight
+right now: it survives between sessions and cleans itself up — resolving an
+item drops it from the sprint automatically. Illustrative session start:
+
+```text
+> /pickup
+Handoff (2026-07-05, scope: sprint-15):
+  "Theme tokens are merged; wire the toggle into settings next.
+   The Safari session fix (#12) still awaits review."
+Sprint: 3 items — #12 in_progress [2/4], #31 open, #7 open
+Proposed first action: #12 — wire the theme toggle into settings.
+```
+
+Handoffs live in the database: several can coexist per project
+(`scope` tags disambiguate parallel workstreams), consuming one preserves it
+in the ledger, and an unconsumed one can be amended in place. Available as
+skills in Claude Code, MCP tools, and the CLI — full catalogue in
+[docs/mcp-tools.md](https://github.com/fotodeveloper/dct/blob/main/docs/mcp-tools.md).
+
+## The release loop: `/clog` → `/commit` → `/release`
+
+A changelog reconstructed from `git log` on release day is archaeology —
+dct makes it a side effect of working. Each time a change lands, your
+assistant records a one-line entry in the database (the `/clog` skill,
+`add_changelog` over MCP, `dct clog add` in scripts). A Claude Code hook —
+wired with your consent at `dct init`, then on by default for every
+registered project — can even hold back `git commit` until the entry exists
+(`dct project changelog <slug> off` opts a project out). By release day the
+changelog is already written:
+
+```text
+> /release
+15 unreleased entries → stamped as 1.4.0
+changelog.md regenerated (Keep a Changelog format)
+release: v1.4.0 committed, project version bumped
+```
+
+One command stamps the version, exports [Keep a Changelog](https://keepachangelog.com)
+markdown, and makes the release commit.
+
+## Plans: your markdown, indexed
+
+You already write plans — specs, roadmaps, ADRs — in markdown. dct indexes
+them instead of replacing them: prose stays in the file (still the source of
+truth), while sections, checkpoints, and inline decisions get stable ULID
+anchors and live state (pending/done/rejected) in the database. In Claude
+Code a background hook re-scans the file on every edit; elsewhere, run
+`dct plan rescan <file>`. Uncertain section headings can be classified by an
+optional headless LLM call through your own `claude` CLI. A plan checkpoint
+can be promoted to a tracked item, a section to an item or a whole sprint —
+planning and tracking stay one system.
+
+Full guide — concepts, ULID anchors, ingest pipeline, classification rules,
+and promotion to items/sprints: **[docs/plans.md](https://github.com/fotodeveloper/dct/blob/main/docs/plans.md)**.
+
+## Features
+
+- **Centralized tracking** — one database for all your projects
+- **Session handoffs** — end a session with a stored prompt; `/pickup` resumes the next one mid-work
+- **Hybrid changelog** — entries in DB, export to Keep a Changelog markdown at release; enforcement hook wired at init with your consent, then **on by default per project** (opt out via `dct project changelog <slug> off`) + **per-project changelog location** (repo root by default, or a subdir like `pkg/changelog.md`)
+- **Plans, specs, roadmaps, ADRs** — index markdown plans with stable ULID anchors; state in DB, content stays in markdown
+- **First-class sprints** — a named, goal-scoped *current work* set that survives across sessions and self-cleans as items resolve
+- **Decision records** — ADRs, sprint amendments, inline plan decisions with multi-anchor linkage
+- **LLM-assisted classification** — uncertain plan sections auto-resolved via `claude --print` (haiku by default; optional, uses your own `claude` CLI)
+- **Passive autoscan hook** — Claude Code PostToolUse hook re-scans plan-like files in background on every edit
+- **MCP server** — 52 tools over stdio via the official MCP SDK 2.0; works with any MCP client (Claude Code, Cursor, Windsurf, …)
+- **CLI** — fast `dct` command for hooks and scripts
+- **Skills** — Claude Code slash commands (`/track`, `/clog`, `/dct-import`, `/plan-status`, …)
+- **Soft deletes** — ledger pattern, nothing is ever hard-deleted
+- **DB portable** — SQLite (zero setup) or PostgreSQL
 
 ## Usage
 
@@ -195,7 +260,7 @@ dct project list
 dct project detect                                            # Print current project slug (for hooks)
 dct project rename myproj --slug myproj2 --name "Rebranded"   # Rename in-place, project_id stable
 dct project set-version myproj 1.1                            # Post-factum version fix
-dct project changelog myproj off                              # Opt out of dct changelog enforcement
+dct project changelog myproj off      # Opt out of changelog enforcement (on by default)
 dct project changelog-path myproj docs/changelog.md           # Changelog outside repo root; default: changelog.md
 
 # Plans
@@ -229,7 +294,7 @@ dct config path                       # Show resolved config/data locations
 
 ## MCP Tools
 
-dct ships **52 MCP tools**, registered at user scope so they're callable from any Claude Code session as `mcp__dct__<name>`. Zero-arg calls auto-detect the project from the session's working directory; pass `project=<slug>` to override. Write ops return a minimal ack (id + a few post-state scalars); fetch full context with `get_item(id)` / `get_handoff(id)`. Thirteen tools are always resident (`alwaysLoad`) — ten mid-session daily drivers plus the three composed workflow ops (`pickup_work`, `handoff_work`, `get_context_snapshot`); the rest of the catalogue loads on demand via ToolSearch:
+dct ships **52 MCP tools**. Zero-arg calls auto-detect the project from the session's working directory; pass `project=<slug>` to override. Write ops return a minimal ack (id + a few post-state fields); fetch full context with `get_item(id)` / `get_handoff(id)`. In Claude Code the tools register at user scope (callable as `mcp__dct__<name>`), with thirteen daily drivers always loaded and the rest fetched on demand; other MCP clients see the full flat catalogue. Whatever the client, start with `create_item`, `list_items`, `pickup_work`, and `handoff_work`:
 
 | Tool | Purpose |
 |---|---|
@@ -244,13 +309,7 @@ dct ships **52 MCP tools**, registered at user scope so they're callable from an
 | `reject_checkpoint` | Mark a checkpoint rejected (scope change) — ledger-preserving |
 | `add_changelog` | Add an unreleased changelog entry |
 
-Session-edge tools stay deferred: `get_handoff` (full handoff dict — untruncated prompt + context_summary), `create_handoff`, `set_sprint`, `release_changelog`, and more. Full categorized catalogue: **[docs/mcp-tools.md](docs/mcp-tools.md)**.
-
-## Plans, Roadmaps & Decisions
-
-dct extends the flat items model with **hierarchical plans**: markdown plan/spec/roadmap/ADR files stay the source of truth for content, while dct indexes their structure (sections, checkpoints, decisions) with stable **ULID anchors** and owns their state (done/pending/rejected). A PostToolUse hook rescans plan-like files in the background on every edit, injecting ULIDs and syncing the DB; uncertain section headings are classified by a headless `claude --print` call (haiku).
-
-Full guide — concepts, ULID anchors, ingest pipeline, classification rules, and promotion to items/sprints: **[docs/plans.md](docs/plans.md)**.
+Session-edge tools stay deferred: `get_handoff` (full handoff dict — untruncated prompt + context_summary), `create_handoff`, `set_sprint`, `release_changelog`, and more. Full categorized catalogue: **[docs/mcp-tools.md](https://github.com/fotodeveloper/dct/blob/main/docs/mcp-tools.md)**.
 
 ## Web viewer
 
@@ -266,11 +325,11 @@ dct web stop                # SIGTERM the daemon
 
 If the preferred port (default `8787`) is busy, the daemon auto-selects the next free port (disable with `--no-fallback`). Configure defaults under `[web]` in the dct config file.
 
-![dct web viewer — read-only dashboard over all registered projects](docs/assets/web-viewer.png)
+![dct web viewer — read-only dashboard over all registered projects](https://raw.githubusercontent.com/fotodeveloper/dct/main/docs/assets/web-viewer.png)
 
 ## Integration with Claude Code
 
-dct is designed to be driven by Claude Code. To teach your assistant *when* to reach for each skill and MCP tool across every project, copy the ready-made snippet into your personal `~/.claude/CLAUDE.md`: **[docs/CLAUDE.md-snippet.md](docs/CLAUDE.md-snippet.md)**.
+Claude Code is where dct runs deepest. `dct init` offers to attach the ready-made snippet that teaches your assistant *when* to reach for each skill and MCP tool (step 6 of the wizard); to add it manually, copy **[dct/assets/claude-md-snippet.md](https://github.com/fotodeveloper/dct/blob/main/dct/assets/claude-md-snippet.md)** into your personal `~/.claude/CLAUDE.md`.
 
 ### Skills
 
@@ -300,12 +359,12 @@ dct hooks wire            # idempotent; safe after upgrades or manual edits
 
 | Hook | Event | Purpose |
 |---|---|---|
-| `dct-check-changelog.sh` | PreToolUse (`Bash`) | blocks `git commit` when app code changed but no unreleased changelog entry exists — opt-in per project via `dct project changelog <slug> on\|off` |
-| `dct-check-changelog-on-stop.sh` | Stop | session-end reminder about pending unreleased entries (same opt-in gate) |
+| `dct-check-changelog.sh` | PreToolUse (`Bash`) | blocks `git commit` when app code changed but no unreleased changelog entry exists — once the hook is wired, enforcement is **on by default** per project; opt out via `dct project changelog <slug> off` |
+| `dct-check-changelog-on-stop.sh` | Stop | session-end reminder about pending unreleased entries (same per-project gate) |
 | `dct-plan-autoscan.sh` | PostToolUse (`Edit\|Write\|MultiEdit`) | background rescan of plan-like MD files; fire-and-forget |
 | `dct-task-mirror.sh` | PreToolUse (`TodoWrite\|TaskCreate`) | mirrors Claude Code tasks into dct as `cc-task` checkpoints |
 
-Manual wiring reference (full JSON) and the five rules every dct hook follows: [docs/hooks.md](docs/hooks.md).
+Manual wiring reference (full JSON) and the five rules every dct hook follows: [docs/hooks.md](https://github.com/fotodeveloper/dct/blob/main/docs/hooks.md).
 
 ## Configuration
 
@@ -317,7 +376,7 @@ url = "sqlite:////home/you/.local/share/dctools/dct.db"
 # or: url = "postgresql+psycopg://localhost:5432/dct"
 ```
 
-The `DCT_DATABASE_URL` environment variable overrides `[database].url`. For the full reference (`[classification]`, `[integrations.claude]`, `[web]` sections), the database schema, MCP scope precedence, and project auto-detection mechanics, see **[docs/architecture.md](docs/architecture.md)**.
+The `DCT_DATABASE_URL` environment variable overrides `[database].url`. For the full reference (`[classification]`, `[integrations.claude]`, `[web]` sections), the database schema, MCP scope precedence, and project auto-detection mechanics, see **[docs/architecture.md](https://github.com/fotodeveloper/dct/blob/main/docs/architecture.md)**.
 
 ## Testing
 
@@ -335,9 +394,10 @@ uv run --no-project --with 'mcp' --with sqlalchemy --with 'psycopg[binary]' \
 ## Contributing
 
 Bug reports, feature ideas, and PRs are welcome — see
-[CONTRIBUTING.md](CONTRIBUTING.md) for dev setup (uv venv + pytest), commit
-conventions, and how to add MCP tools or skills.
+[CONTRIBUTING.md](https://github.com/fotodeveloper/dct/blob/main/CONTRIBUTING.md)
+for dev setup (uv venv + pytest), commit conventions, and how to add MCP
+tools or skills.
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT — see [LICENSE](https://github.com/fotodeveloper/dct/blob/main/LICENSE).

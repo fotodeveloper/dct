@@ -29,8 +29,8 @@ Properties of the merge:
 
 | Hook | Event / matcher | Purpose |
 |---|---|---|
-| `dct-check-changelog.sh` | `PreToolUse` / `Bash` | blocks `git commit` when app code changed but no unreleased changelog entry exists; opt-in per project (`dct project changelog <slug> on\|off`); bypasses `release:` commits and doc-only changes |
-| `dct-check-changelog-on-stop.sh` | `Stop` | session-end reminder if unreleased entries are pending (same opt-in gate) |
+| `dct-check-changelog.sh` | `PreToolUse` / `Bash` | blocks `git commit` when app code changed but no unreleased changelog entry exists; **on by default** per project once wired (`dct project changelog <slug> off` opts a project out); bypasses `release:` commits and doc-only changes |
+| `dct-check-changelog-on-stop.sh` | `Stop` | session-end reminder if unreleased entries are pending (same per-project gate) |
 | `dct-plan-autoscan.sh` | `PostToolUse` / `Edit\|Write\|MultiEdit` | background rescan of plan-like markdown (plans, specs, ADRs, roadmaps); fire-and-forget, never blocks |
 | `dct-task-mirror.sh` | `PreToolUse` / `TodoWrite\|TaskCreate` | mirrors Claude Code tasks into dct as non-blocking `cc-task` checkpoints |
 

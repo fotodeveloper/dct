@@ -81,6 +81,8 @@ Invariants:
 
 - Code and docs: English
 - Communication: match the user's language
+- README.md doubles as the PyPI long description — every link and image in it
+  MUST be an absolute URL (relative paths 404 on the dctracker PyPI page)
 - Commit format: conventional commits (`feat:`, `fix:`, `refactor:`)
 - All changes need a changelog entry before committing
 - Tests: pytest with in-memory SQLite fixture
