@@ -1,6 +1,32 @@
 # Changelog
 
 
+## [1.5.0] - 2026-09-02
+
+### Added
+
+- dct init step 6: consent-gated attach of the packaged CLAUDE.md snippet into ~/.claude/CLAUDE.md (marker-managed block, idempotent refresh, backup before first write, atomic replace; --attach-snippet/--no-attach-snippet flags); snippet moved into the package (dct/assets/claude-md-snippet.md, docs/ path keeps a pointer); init epilogue reminds to start a new session; dct upgrade refreshes a previously attached block (#443, K-66) (integrations)
+- Normalized tags: global tag dictionary + item_tags join table with idempotent bootstrap backfill from the frozen items.tags JSON column (#611) (tags)
+- Tag tools: add_tag/list_tags/merge_tag MCP tools, dct tags list/add/merge CLI group, similarity guard with force override (tags)
+- PG test lane: the suite runs against PostgreSQL when DCT_TEST_DATABASE_URL is set (per-test DROP SCHEMA isolation), plus a tests-postgres CI job on postgres:16 (#426) (tests/ci)
+
+### Changed
+
+- README: introduce the tracking loop section (item model, checkpoints, gates), complete the Why-dct pillar bullets (tracking model + markdown plans), promote the plans section above Features, add a "nothing new to learn" intro paragraph (K-52/K-54/K-55) (docs)
+- README overhaul after 11-review copy panel (K-56..K-78): scoped privacy/determinism/enforcement claims, added Other-MCP-clients setup + slash-to-tool mapping, fixed GitHub Issues/Jira strawman, reordered narrative (session demo before install), unified install command on extras, absolutized links for PyPI, line-edit pass; docs/hooks.md enforcement polarity fixed to on-by-default (docs)
+- list_items gains a tag filter (core/CLI/MCP/web), update_item replaces an item tag set, tags returned name-ASC (tags)
+- Analytics tag counts computed from the join table and rendered in the dashboard (tags)
+- check_numbers guards the packaged CLAUDE.md snippet tool count (it sat outside the gate and silently drifted to "52 total" — #341/#611); user-side dct-reference.md symlink repointed directly at the packaged snippet (docs)
+- /handoff and /pickup skills use the two-turn approval pattern — the full draft/handoff prompt is printed as plain text first, the AskUserQuestion that follows only references it (long drafts were invisible inside the dialog); prose guarded by tests/test_skill_prose.py (#615) (skills)
+- PG test lane hardening: session guard refuses any DCT_TEST_DATABASE_URL that is not a provably throwaway database (name must carry a test/ci segment, must not be the configured live DB, items ≤ 50 rows) before the first DDL; DCT_EXPECT_PG sentinel fails the CI lane if it silently falls back to SQLite (#426) (tests/ci)
+- Publish workflow passes skip-existing to the PyPI upload so a re-pushed tag (history rewrite) is a no-op instead of a failed run; assistant session URLs are banned from commit messages and covered by the OSS sniff regex (ci)
+
+### Fixed
+
+- check_numbers: skills/hooks patterns accept the optional "Claude Code" label the site now renders (K-57), with a regression test — presence assertions no longer fail on labelled counts (scripts)
+- Tags review fixes (K-21..K-44 from panel/Codex/critic triage): sprint read paths return real tag lists instead of the frozen column; backfill converges for zero-yield legacy values (single audited drop report); lookup canonicalization split from creation validation so preserved legacy names stay filterable/mergeable; link inserts retry-upsert under a savepoint; add_tag applies description on reuse; unknown-tag errors name the 3 closest tags; C0 control chars stripped; migrate-on-write keeps explicit clears from being re-seeded; bounded O(N) duplicate report against the full dictionary; update_item keeps deleted_at on its UPDATE; web 404s unknown projects instead of a tag hint; docstrings/instructions aligned (tags)
+- Item titles longer than the items.title column (500 chars) are refused with a clear ValueError on every backend instead of crashing PostgreSQL; plan promotion truncates headings/checkpoint text to the shared MAX_TITLE_LENGTH (#613) (core)
+
 ## [1.4.0] - 2026-07-30
 
 ### Added
