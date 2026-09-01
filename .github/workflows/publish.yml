@@ -63,3 +63,7 @@ jobs:
           name: dist
           path: dist/
       - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          # A re-pushed tag (e.g. after a history rewrite) rebuilds identical
+          # files; PyPI refuses duplicates — skip instead of failing the run.
+          skip-existing: true
