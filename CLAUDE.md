@@ -92,6 +92,11 @@ Invariants:
 
 - Core functions take `engine` as first parameter (no global state) and return dicts.
 - All tables have `deleted_at` — soft deletes only (ledger pattern).
+- Schema migrations are self-healing blocks in `_apply_schema_updates` that run
+  on EVERY engine bootstrap (each CLI call, each MCP start). Any "steady state /
+  re-run is a no-op" claim about a backfill MUST be locked by a test that
+  bootstraps THREE times and asserts no writes and no repeated output (#611/K-22:
+  three independent reviews found the same non-converging candidate set).
 - Every surface is **user-scoped** (one install serves all projects; details
   in [docs/architecture.md](docs/architecture.md)). Plans keep prose in
   markdown, state in DB, identity in ULID anchors
