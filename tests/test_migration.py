@@ -4,8 +4,12 @@ Post-#216 the `in_current_sprint` boolean column is GONE — sprint membership i
 derived from item_sprints + the active sprint. These tests therefore simulate a
 *pre-#216* DB (re-add the legacy column), then verify the migration seeds the
 item_sprints model from the boolean and DROPS the column, leaving one source of
-truth. They are the SQLite-side guard; PostgreSQL parity is verified live.
+truth. They run on both dialects — SQLite by default, PostgreSQL on the CI PG
+lane (DCT_TEST_DATABASE_URL, #426) — which is what makes the runner's
+BOOLEAN-literal branches (see db._apply_schema_updates) genuinely covered.
 """
+
+import json
 
 import pytest
 import sqlalchemy as sa
@@ -24,11 +28,20 @@ def _cols(engine) -> set[str]:
     return {c["name"] for c in sa.inspect(engine).get_columns("items")}
 
 
+def _bool_literal(engine, value: bool) -> str:
+    """PostgreSQL rejects INTEGER literals where a BOOLEAN is declared; SQLite
+    has no boolean type and speaks 0/1. Same split as db._apply_schema_updates."""
+    if engine.dialect.name == "postgresql":
+        return "TRUE" if value else "FALSE"
+    return "1" if value else "0"
+
+
 def _add_legacy_column(engine):
     """Re-add the legacy in_current_sprint column to mimic a pre-#216 DB."""
     with engine.begin() as conn:
         conn.execute(sa.text(
-            "ALTER TABLE items ADD COLUMN in_current_sprint BOOLEAN NOT NULL DEFAULT 0"
+            "ALTER TABLE items ADD COLUMN in_current_sprint BOOLEAN NOT NULL "
+            f"DEFAULT {_bool_literal(engine, False)}"
         ))
 
 
@@ -36,7 +49,8 @@ def _flag_legacy(engine, item_id: int):
     """Set the legacy boolean directly (the only way pre-#216 code did it)."""
     with engine.begin() as conn:
         conn.execute(
-            sa.text("UPDATE items SET in_current_sprint = 1 WHERE id = :id"),
+            sa.text("UPDATE items SET in_current_sprint = "
+                    f"{_bool_literal(engine, True)} WHERE id = :id"),
             {"id": item_id},
         )
 

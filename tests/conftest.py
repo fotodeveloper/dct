@@ -6,19 +6,186 @@ used to copy verbatim; they live here so the monkeypatch target — the one
 seam through which a test file reaches the in-memory DB — is stated once.
 """
 
+import os
+import re
 import sys
 
 import pytest
+import sqlalchemy as sa
 
 from dct.db import create_tables, get_engine
 
+# PG test lane (#426). Unset (the default) → in-memory SQLite, one fresh
+# database per test. Set → the whole suite runs against that PostgreSQL URL,
+# which MUST point at a THROWAWAY database: isolation is a per-test
+# `DROP SCHEMA public CASCADE` + `CREATE SCHEMA public`, so every object in
+# it is destroyed between tests.
+PG_TEST_URL = os.environ.get("DCT_TEST_DATABASE_URL", "")
+
+# --- Throwaway-target guard (K-31) -----------------------------------------
+# The lane's isolation step is `DROP SCHEMA public CASCADE` on whatever
+# DCT_TEST_DATABASE_URL names — one typo away from wiping a real database.
+# The guard below runs ONCE per session, BEFORE any DDL, and refuses anything
+# that does not look like a throwaway target.
+
+# A throwaway database carries a `test` or `ci` SEGMENT in its name:
+# dct_ci, dct_ci_local, foo_test pass; dct, dctest, citrus do not.
+_THROWAWAY_NAME_RE = re.compile(r"(^|_)(test|ci)(_|$)")
+
+# One test never leaves more than a handful of items behind; a target already
+# holding more than this is somebody's real data, not lane leftovers.
+MAX_LEFTOVER_ITEMS = 50
+
+_LOCAL_HOST_ALIASES = {"", "localhost", "127.0.0.1", "::1"}
+
+
+def _norm_host(url: sa.engine.URL) -> str:
+    host = (url.host or "").lower()
+    return "localhost" if host in _LOCAL_HOST_ALIASES else host
+
+
+def _db_name(url: sa.engine.URL) -> str:
+    """Last path segment of the URL's database component."""
+    return (url.database or "").rstrip("/").rsplit("/", 1)[-1]
+
+
+def throwaway_refusal_reason(
+    url: str, live_url: str = "", item_count: int | None = None
+) -> str | None:
+    """Why `url` must NOT be used as the PG lane target — or None if it may.
+
+    Pure predicate (no I/O), so it is unit-testable without a PostgreSQL
+    server; `item_count` is the caller's probe of `items` (None = the table
+    does not exist / could not be counted).
+
+    Refuses when: the URL is unparseable or names no database; the database
+    name carries no `test`/`ci` segment; the target is the configured LIVE
+    dct database (same host+database as `live_url`); or `items` already holds
+    more than MAX_LEFTOVER_ITEMS rows.
+    """
+    try:
+        parsed = sa.engine.make_url(url)
+    except Exception as exc:  # noqa: BLE001 - any parse failure is a refusal
+        return f"the URL could not be parsed ({exc})"
+
+    name = _db_name(parsed)
+    if not name:
+        return "the URL names no database"
+    if not _THROWAWAY_NAME_RE.search(name):
+        return (
+            f"database name {name!r} carries no '_test'/'_ci' segment "
+            "(expected something like 'dct_ci' or 'dct_ci_local')"
+        )
+
+    if live_url:
+        try:
+            live = sa.engine.make_url(live_url)
+        except Exception:  # noqa: BLE001 - an unparseable live URL clashes with nothing
+            live = None
+        if live is not None and _db_name(live) == name and _norm_host(live) == _norm_host(parsed):
+            return (
+                f"it resolves to the configured LIVE dct database "
+                f"({_norm_host(parsed)}/{name})"
+            )
+
+    if item_count is not None and item_count > MAX_LEFTOVER_ITEMS:
+        return (
+            f"the target already holds {item_count} rows in `items` "
+            f"(> {MAX_LEFTOVER_ITEMS}) — that is real data, not lane leftovers"
+        )
+    return None
+
+
+def _live_database_url() -> str:
+    """The configured live dct database URL, or '' when it cannot be read."""
+    try:
+        from dct.config import load_config
+
+        return load_config().database_url or ""
+    except Exception:  # noqa: BLE001 - a missing/broken config must not block the lane
+        return ""
+
+
+def _probe_item_count(url: str) -> int | None:
+    """Rows in `items` on the target — None when absent or unreadable.
+
+    Read-only: no DDL runs before the guard has passed.
+    """
+    eng = get_engine(url)
+    try:
+        with eng.connect() as conn:
+            if not sa.inspect(conn).has_table("items"):
+                return None
+            return conn.execute(sa.text("SELECT count(*) FROM items")).scalar_one()
+    except Exception:  # noqa: BLE001 - connection errors surface in the engine fixture
+        return None
+    finally:
+        eng.dispose()
+
+
+@pytest.fixture(scope="session")
+def pg_lane_target_guard():
+    """Refuse a non-throwaway PG lane target ONCE, before any test runs DDL."""
+    if not PG_TEST_URL:
+        return
+    reason = throwaway_refusal_reason(
+        PG_TEST_URL, _live_database_url(), _probe_item_count(PG_TEST_URL)
+    )
+    if reason:
+        pytest.exit(
+            "DCT_TEST_DATABASE_URL must point at a THROWAWAY database "
+            f"({reason}). Each test runs DROP SCHEMA public CASCADE on it.",
+            returncode=3,
+        )
+
 
 @pytest.fixture
-def engine():
-    """In-memory SQLite engine with all tables created."""
-    eng = get_engine("sqlite://")
-    create_tables(eng)
-    return eng
+def engine(pg_lane_target_guard):
+    """Engine with all tables created — in-memory SQLite, or the PG test lane.
+
+    See PG_TEST_URL above for the PostgreSQL variant; the default path is
+    unchanged (a private in-memory SQLite database per test). On the PG lane
+    the session-scoped `pg_lane_target_guard` has already vetted the target.
+    """
+    if not PG_TEST_URL:
+        eng = get_engine("sqlite://")
+        create_tables(eng)
+        yield eng
+        return
+
+    eng = get_engine(PG_TEST_URL)
+    try:
+        with eng.begin() as conn:
+            conn.execute(sa.text("DROP SCHEMA public CASCADE"))
+            conn.execute(sa.text("CREATE SCHEMA public"))
+        create_tables(eng)
+        yield eng
+    finally:
+        eng.dispose()
+
+
+# Tests whose ASSERTION is SQLite-specific — they cannot pass on PostgreSQL for
+# reasons that are not dct bugs. Keyed by node id suffix, each with the reason
+# the PG lane reports; nothing is excluded silently.
+PG_LANE_SKIPS = {
+    "test_adversarial.py::TestTagsEdgeCases::test_unicode_tags":
+        "asserts SQLite's BINARY collation order of tag names; PostgreSQL "
+        "orders by the database collation (ICU/libc), so the expected "
+        "sequence is dialect-defined, not a dct invariant",
+    "test_cli_workflows.py::test_pickup_strips_control_chars_from_prompt_and_titles":
+        "seeds a NUL (0x00) byte in text columns; PostgreSQL text can never "
+        "hold NUL, so the payload cannot be written in the first place",
+}
+
+
+def pytest_collection_modifyitems(items):
+    """On the PG lane (#426), skip the handful of SQLite-specific assertions."""
+    if not PG_TEST_URL:
+        return
+    for item in items:
+        for suffix, reason in PG_LANE_SKIPS.items():
+            if item.nodeid.endswith(suffix):
+                item.add_marker(pytest.mark.skip(reason=f"PG lane: {reason}"))
 
 
 @pytest.fixture

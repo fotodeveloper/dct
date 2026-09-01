@@ -19,6 +19,24 @@ Deep-dives live in `docs/` and are read on demand — keep this file lean:
 ```bash
 # Development
 .venv/bin/pytest -v                    # Run tests (in-memory SQLite)
+
+# PG test lane (#426) — the same suite against a real PostgreSQL server.
+# DCT_TEST_DATABASE_URL switches the `engine` fixture; isolation is a per-test
+# DROP SCHEMA public CASCADE, so it MUST point at a THROWAWAY database.
+# A session-scoped guard (K-31) refuses anything else BEFORE the first DDL:
+# the database NAME must carry a `test`/`ci` segment (dct_ci, dct_ci_local,
+# foo_test — `dct` is rejected), it must not resolve to the configured live
+# database, and `items` must hold <= 50 rows. Predicate:
+# tests/conftest.py::throwaway_refusal_reason, unit-tested in tests/test_pg_lane.py.
+docker run --rm -d -p 5433:5432 -e POSTGRES_PASSWORD=dct \
+  -e POSTGRES_USER=dct -e POSTGRES_DB=dct_ci --name dct-pg postgres:16
+DCT_TEST_DATABASE_URL=postgresql+psycopg://dct:dct@localhost:5433/dct_ci \
+  DCT_EXPECT_PG=1 .venv/bin/pytest -q -rs   # ~3.5 min vs ~16 s on SQLite
+# DCT_EXPECT_PG=1 arms the sentinel that fails if the lane silently fell back
+# to SQLite (K-32); it is set in ci.yml's tests-postgres job.
+# Local server instead of docker: createdb dct_ci_local, point the URL at it.
+# A handful of SQLite-specific assertions are skipped on this lane — the list
+# and the reason for each live in tests/conftest.py (PG_LANE_SKIPS).
 .venv/bin/dct --version                # Check version
 uvx ruff@0.16.0 check dct/ tests/     # Lint (config in pyproject.toml; pin matches ci.yml — K-46)
 
