@@ -392,7 +392,8 @@ def create_item(
 
     Args:
         item_type: One of: issue / todo / feature / idea / improvement.
-        title: Short title (≤ 80 chars).
+        title: Short title — hard limit 500 chars (≤ 80 recommended);
+            longer titles are refused, never truncated.
         project: Project slug. Empty = auto-detect from CWD.
         description: Prose context (no checkbox lists — use add_checkpoint instead).
         priority: P1 (blocker) / P2 (important, default) / P3 (backlog) / future.
@@ -537,7 +538,7 @@ def update_item(
 
     Args:
         item_id: Target item.
-        title: New title (non-empty).
+        title: New title (non-empty, ≤ 500 chars — ≤ 80 recommended).
         status: open / in_progress / resolved / wont_fix.
         priority: P1 / P2 / P3 / future.
         component: Component or module name.

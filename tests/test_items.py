@@ -332,3 +332,54 @@ def test_update_loses_a_race_with_delete_and_returns_none(engine, project):
             {"id": item["id"]},
         ).one()
     assert tuple(row) == ("Original", "P2")
+
+
+# ── Title length boundary (#613 / K-26) ──────────────────────────────────────
+# items.title is VARCHAR(500): PostgreSQL (the primary backend) raises
+# StringDataRightTruncation past that, SQLite silently stores it. The core
+# layer enforces the limit so the contract is dialect-independent — and it
+# REFUSES rather than truncates: losing the tail of a title silently is worse
+# than a loud error.
+
+
+def test_create_item_accepts_title_at_max_length(engine, project):
+    from dct.core.items import MAX_TITLE_LENGTH
+
+    title = "A" * MAX_TITLE_LENGTH
+    item = create_item(engine, "proj-a", "todo", title)
+    assert get_item(engine, item["id"])["title"] == title
+
+
+def test_create_item_rejects_title_one_over_max(engine, project):
+    from dct.core.items import MAX_TITLE_LENGTH
+
+    with pytest.raises(ValueError, match=str(MAX_TITLE_LENGTH)):
+        create_item(engine, "proj-a", "todo", "A" * (MAX_TITLE_LENGTH + 1))
+    assert list_items(engine, "proj-a") == []
+
+
+def test_update_item_accepts_title_at_max_length(engine, project):
+    from dct.core.items import MAX_TITLE_LENGTH
+
+    item = create_item(engine, "proj-a", "todo", "Short")
+    title = "B" * MAX_TITLE_LENGTH
+    assert update_item(engine, item["id"], title=title)["title"] == title
+
+
+def test_update_item_rejects_title_one_over_max(engine, project):
+    from dct.core.items import MAX_TITLE_LENGTH
+
+    item = create_item(engine, "proj-a", "todo", "Short")
+    with pytest.raises(ValueError, match=str(MAX_TITLE_LENGTH)):
+        update_item(engine, item["id"], title="B" * (MAX_TITLE_LENGTH + 1))
+    # Refusal is atomic: the stored title is untouched.
+    assert get_item(engine, item["id"])["title"] == "Short"
+
+
+def test_max_title_length_matches_the_column(engine):
+    """Single source of truth: the guard is derived from items.title, so a
+    column widening cannot leave the validator behind."""
+    from dct.core.items import MAX_TITLE_LENGTH
+    from dct.db import items as items_table
+
+    assert MAX_TITLE_LENGTH == items_table.c.title.type.length

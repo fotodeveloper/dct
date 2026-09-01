@@ -367,11 +367,15 @@ class TestUnicode:
         assert p is not None
 
     def test_very_long_title(self, engine):
+        """A title longer than the items.title column is REFUSED, never
+        silently truncated — dialect-independent (#613/K-26): SQLite ignores
+        VARCHAR lengths, PostgreSQL raises StringDataRightTruncation, so the
+        guard lives in the core layer."""
         create_project(engine, slug="p", name="P")
         long_title = "A" * 1000
-        item = create_item(engine, "p", "todo", long_title)
-        fetched = get_item(engine, item["id"])
-        assert fetched["title"] == long_title
+        with pytest.raises(ValueError, match="500"):
+            create_item(engine, "p", "todo", long_title)
+        assert list_items(engine, "p") == []
 
     def test_newlines_in_description(self, engine):
         create_project(engine, slug="p", name="P")

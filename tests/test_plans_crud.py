@@ -403,3 +403,24 @@ def test_promote_section_to_sprint_kind_override(engine, proj):
         engine, s["id"], code="phase-1", kind="phase",
     )
     assert sprint["kind"] == "phase"
+
+
+# ── promote_*: title length follows the items column (#613) ──────────────────
+
+def test_promote_section_truncates_over_long_heading(engine, proj):
+    from dct.core.items import MAX_TITLE_LENGTH
+
+    p = create_plan(engine, "dct", slug="p", title="P", kind="plan")
+    s = add_plan_section(engine, p["id"], "h" * (MAX_TITLE_LENGTH + 100), depth=2)
+    item = promote_section_to_item(engine, s["id"], item_type="todo")
+    assert len(item["title"]) == MAX_TITLE_LENGTH
+
+
+def test_promote_checkpoint_truncates_over_long_text(engine, proj):
+    from dct.core.items import MAX_TITLE_LENGTH
+
+    p = create_plan(engine, "dct", slug="p", title="P", kind="plan")
+    s = add_plan_section(engine, p["id"], "Section", depth=2)
+    cp = add_plan_checkpoint(engine, s["id"], "c" * (MAX_TITLE_LENGTH + 100))
+    item = promote_checkpoint_to_item(engine, cp["id"], item_type="todo")
+    assert len(item["title"]) == MAX_TITLE_LENGTH

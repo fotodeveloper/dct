@@ -530,7 +530,7 @@ def promote_section_to_item(
     a tracked sprint-feature). The section remains in the plan as a
     read-only pointer — `converted_to_item_id` marks the promotion.
     """
-    from dct.core.items import create_item
+    from dct.core.items import MAX_TITLE_LENGTH, create_item
     section = get_plan_section(engine, section_id)
     if section is None:
         raise ValueError(f"Plan section #{section_id} not found")
@@ -549,7 +549,7 @@ def promote_section_to_item(
         assert project_row is not None
         project_slug = project_row.slug
 
-    effective_title = title or section["heading"]
+    effective_title = title or section["heading"][:MAX_TITLE_LENGTH]
     item = create_item(
         engine, project_slug, item_type, effective_title,
         priority=priority,
@@ -630,7 +630,7 @@ def promote_checkpoint_to_item(
     title: str | None = None,
 ) -> dict:
     """Create an items row from a plan_checkpoint and back-link."""
-    from dct.core.items import create_item
+    from dct.core.items import MAX_TITLE_LENGTH, create_item
     with engine.begin() as conn:
         cp_row = conn.execute(
             sa.select(plan_checkpoints).where(
@@ -659,7 +659,7 @@ def promote_checkpoint_to_item(
         assert project_row is not None
         project_slug = project_row.slug
 
-    effective_title = title or cp["text"][:500]
+    effective_title = title or cp["text"][:MAX_TITLE_LENGTH]
     item = create_item(
         engine, project_slug, item_type, effective_title,
         priority=priority,

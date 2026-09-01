@@ -20,6 +20,13 @@ from dct.db import (
     sprints,
 )
 
+# items.title is VARCHAR(500): PostgreSQL (the primary backend) rejects longer
+# values with StringDataRightTruncation while SQLite silently stores them, so
+# the limit is enforced HERE — one dialect-independent contract. Derived from
+# the column, never a hand-copied literal, so widening the column moves the
+# guard with it.
+MAX_TITLE_LENGTH: int = items.c.title.type.length
+
 VALID_TYPES = {"issue", "todo", "feature", "idea", "improvement"}
 VALID_PRIORITIES = {"P1", "P2", "P3", "future"}
 VALID_STATUSES = {"open", "in_progress", "resolved", "wont_fix"}
@@ -91,6 +98,18 @@ def _validate_enum(value: str, valid: set[str] | tuple[str, ...], field_name: st
     if value not in valid:
         raise ValueError(f"Invalid {field_name}: '{value}'. Valid: {', '.join(sorted(valid))}")
     return value
+
+
+def _validate_title_length(title: str) -> str:
+    """Refuse a title the items.title column cannot hold — never truncate.
+
+    Silent truncation would lose the tail of a title on PostgreSQL-vs-SQLite
+    terms nobody controls; a loud ValueError lets the caller shorten it."""
+    if len(title) > MAX_TITLE_LENGTH:
+        raise ValueError(
+            f"Item title too long: {len(title)} chars, max {MAX_TITLE_LENGTH}"
+        )
+    return title
 
 
 def _has_tag_exists(tag_id: int):
@@ -179,6 +198,7 @@ def create_item(
     for machine callers (not exposed over MCP)."""
     if not title or not title.strip():
         raise ValueError("Item title cannot be empty")
+    _validate_title_length(title)
     _validate_enum(item_type, VALID_TYPES, "item_type")
     _validate_enum(priority, VALID_PRIORITIES, "priority")
     _validate_enum(status, VALID_STATUSES, "status")
@@ -341,6 +361,8 @@ def update_item(engine: sa.Engine, item_id: int, **kwargs) -> dict | None:
             _validate_enum(v, VALID_STATUSES, "status")
         elif k == "item_type":
             _validate_enum(v, VALID_TYPES, "item_type")
+        elif k == "title":
+            _validate_title_length(v)
         if v == "" and k in {"component", "source_file", "source_lines", "resolution", "description"}:
             v = None
         values[k] = v
