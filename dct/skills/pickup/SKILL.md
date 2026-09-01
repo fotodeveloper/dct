@@ -50,28 +50,50 @@ One call returns everything Step 2 needs — never follow up with
 `AskUserQuestion` ("Which project are we working on?" → slugs + "Cancel"),
 then re-call `pickup_work(<slug>, consume="false")`.
 
-### Step 2: Merged decision — handoff + first action (ONE AskUserQuestion)
+### Step 2: Merged decision — handoff + first action (TWO TURNS)
 
-Handle the handoff decision AND the first-action decision in a SINGLE
-`AskUserQuestion` call. Embed the full handoff prompt text INSIDE the question
-field so the user reads it before deciding — never rely on plain text printed
-the same turn.
+When there is a handoff to show, the decision is TWO TURNS and this is
+NON-NEGOTIABLE. **Why: the `AskUserQuestion` dialog truncates and hides long
+text**, so a handoff prompt carried inside the question (or an option label,
+description or `preview`) is a prompt the user CANNOT read — they would be
+deciding on text they have never seen.
+
+**Turn 1 — print the handoff prompt(s) as plain message text, nothing else.**
+No tool call in this turn. Emit the FULL `handoff.latest.prompt` verbatim (and
+its `context_summary` if present), clearly delimited, with the header line
+`Handoff #N [scope: X] from <created_at> by <created_by>`:
+
+```
+Handoff #N [scope: X] from <created_at> by <created_by>
+--- BEGIN HANDOFF PROMPT ---
+<the full prompt text, verbatim>
+--- END HANDOFF PROMPT ---
+```
+
+With `pending_count >= 2`, print the newest in full the same way and list the
+others as their `handoff.others` previews (`#N [scope] — <preview>`), one per
+line.
+
+**Turn 2 — ONE `AskUserQuestion` that REFERENCES what was printed and contains
+NONE of its content.** Handle the handoff decision AND the first-action
+decision in that SINGLE call; keep every question, option label and description
+short and self-contained.
 
 **Question 1 — handoff** (branch on Step 1's `pending_count`):
 - If exactly ONE handoff (`pending_count == 1`) — the user decides whether it
   is followed AND whether it gets consumed:
-  - question: "Handoff #N [scope: X] from <created_at> by <created_by>:\n\n
-    <handoff.latest.prompt>\n\nPick it up?"
+  - question: "Pick up handoff #N shown above?"
   - options:
     - "Consume and follow" (recommended) — mark it consumed, work its plan
     - "Follow but keep unconsumed (audit)" — work its plan, leave the row
       pending so another session/reviewer still sees it
     - "Start fresh" — ignore its plan; nothing is consumed
 - If several handoffs (`pending_count >= 2`):
-  - question: "N handoffs waiting. Which to pick up?\n\nNewest #M [scope]:\n<handoff.latest.prompt>"
-  - options: one per handoff — `#N [scope] — <preview from handoff.others>` —
-    plus "None — start fresh"
-- If `pending_count: 0` — skip Question 1 entirely.
+  - question: "N handoffs listed above. Which to pick up?"
+  - options: one per handoff — `#N [scope]` (id only; the previews were
+    printed in Turn 1) — plus "None — start fresh"
+- If `pending_count: 0` — skip Question 1 entirely AND skip Turn 1: with
+  nothing to read, ask the first-action question directly.
 
 **Question 2 — first action** (always present):
 - question: "First action for this session?"
@@ -123,6 +145,11 @@ work is in flight.
 ## Rules
 
 - **Every decision is an `AskUserQuestion`.** No plain-text Y/N prompts.
+- **Long text NEVER goes inside an `AskUserQuestion`.** The dialog truncates
+  and hides it. A handoff prompt, context_summary or snapshot the user must
+  read is printed as plain message text in its own turn FIRST; the dialog that
+  follows only references it ("shown above") with short, self-contained
+  options.
 - **Consumption happens ONLY after the dialog.** Step 1 is always
   `consume="false"`; NEVER pass `consume="true"` without a user-chosen
   `handoff_id` or an explicit user instruction.
