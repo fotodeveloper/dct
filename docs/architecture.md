@@ -18,11 +18,11 @@ Register dct once and it is available in every Claude Code session. Opening a ne
 
 ## Database Schema
 
-SQLAlchemy Core tables (not the ORM) with a `deleted_at` column for soft deletes (ledger pattern — nothing is ever hard-deleted). 12 tables:
+SQLAlchemy Core tables (not the ORM) with a `deleted_at` column for soft deletes (ledger pattern — nothing is ever hard-deleted). 14 tables:
 
 **Core**:
 - `projects` — slug, name, path, current_version, manages_changelog, changelog_path
-- `items` — project_id, type, title, priority, status, component, source_file, tags, resolution, in_current_sprint (legacy boolean, derived from `item_sprints`)
+- `items` — project_id, type, title, priority, status, component, source_file, source_lines, resolution, tags (**DEPRECATED** — see below). Sprint membership is **not** a column: `in_current_sprint` is derived at read time from `item_sprints` (#216 dropped the legacy boolean).
 - `item_notes` — item_id, note (append-only)
 - `item_checkpoints` — item_id, text, status, kind, sort_order
 - `changelog_entries` — project_id, version, category, entry, component, source_file, related_item_id
@@ -36,17 +36,27 @@ SQLAlchemy Core tables (not the ORM) with a `deleted_at` column for soft deletes
 - `item_sprints` — link table (item_id, sprint_id, assigned_at, removed_at)
 - `decisions` — ulid, project_id, kind, ref_code, title, context, decision, consequences, alternatives, status, superseded_by, source_file, plan_id, plan_section_id, sprint_id
 
+**Tags** (#611):
+- `tags` — global tag dictionary: name (UNIQUE among active rows), description. Deliberately **no `project_id`** — the dictionary is user-scoped, so one name means the same thing in every project, while the item lists that filter on it stay project-scoped.
+- `item_tags` — link table (item_id, tag_id, assigned_at, removed_at), mirroring `item_sprints`: composite PK, links are soft-removed and reactivated in place.
+
+`items.tags` (the old JSON-array-in-TEXT column) is **deprecated and frozen**:
+nothing writes it any more, `_backfill_item_tags` is its only sanctioned reader,
+and it is dropped at 2.0.0.
+
 ### Migrations
 
 Full DDL lives in:
 - `migrations/001_init.sql`
 - `migrations/002_sprint_and_handoff.sql`
 - `migrations/003_plans_sprints_decisions.sql`
+- `migrations/004_tags.sql`
 
 At runtime, the engine applies schema via `metadata.create_all()` plus an idempotent `_apply_schema_updates()` that:
 - adds later columns in place (e.g. `item_checkpoints.kind` for gate checkpoints),
 - handles dialect-specific bool literals (PostgreSQL strict, SQLite permissive), and
-- auto-migrates legacy `items.in_current_sprint=TRUE` flags into the new `item_sprints` table as a per-project "legacy sprint".
+- auto-migrates legacy `items.in_current_sprint=TRUE` flags into the new `item_sprints` table as a per-project "legacy sprint" (then drops the column), and
+- backfills `tags` / `item_tags` from the frozen `items.tags` JSON column (`_backfill_item_tags`): tolerant parse (bad JSON is dropped with a stderr note, never raised), per-item anti-join guard so re-tagged items are never re-seeded, and a one-shot stderr similarity report suggesting `dct tags merge` for near-duplicates — a suggestion, never a block.
 
 Schema updates run on the first engine bootstrap of a new-code session — verify destructive changes against a throwaway database and keep each step idempotent.
 

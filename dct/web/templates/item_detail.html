@@ -21,7 +21,9 @@
     <span class="badge pri-{{ item.priority }}">{{ item.priority }}</span>
     <span class="badge status-{{ item.status }}">{{ item.status }}</span>
     {% if item.component %}<span class="badge component">{{ item.component }}</span>{% endif %}
-    {% for t in item.tags %}<span class="tag">{{ t }}</span>{% endfor %}
+    {# Absolute route to the project's item list — a bare ?tag= on the detail
+       URL would be ignored by this route (K-17). #}
+    {% for t in item.tags %}<a class="tag" href="{{ url_for('items.list', slug=slug, tag=t) }}">{{ t }}</a>{% endfor %}
   </div>
 
   {% if item.source_file %}

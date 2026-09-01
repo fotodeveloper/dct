@@ -2,7 +2,7 @@
 
 JSON-native conversions shared by every blueprint:
 - datetimes -> ISO 8601 strings,
-- the JSON-in-TEXT `tags` column -> a real list,
+- the deprecated JSON-in-TEXT `tags` column -> a real list (legacy reads only),
 - markdown prose -> sanitized HTML (raw HTML escaped, never executed).
 """
 
@@ -24,7 +24,12 @@ def to_iso(dt) -> str | None:
 
 
 def parse_tags(raw) -> list[str]:
-    """Tolerant parse of the `tags` field.
+    """Tolerant parse of the DEPRECATED JSON-in-TEXT ``items.tags`` column.
+
+    NOT on the items read path any more (#611): tags now live in the
+    ``tags``/``item_tags`` dictionary and core returns them as ``list[str]``.
+    The column is frozen until 2.0.0, so this filter stays available for raw
+    reads of it (and as a registered Jinja filter).
 
     Accepts JSON-encoded TEXT (``'["a","b"]'``), ``None``, an already-decoded
     list, or a bare string. Always returns ``list[str]`` and never raises.

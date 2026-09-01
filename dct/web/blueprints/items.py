@@ -8,6 +8,8 @@ from flask import Blueprint, abort, render_template, request
 
 from dct.core.checkpoints import NON_GATE_KINDS
 from dct.core.items import get_item, list_items
+from dct.core.projects import get_project
+from dct.core.tags import tag_id_for_name_conn
 from dct.web.app import current_engine
 
 bp = Blueprint("items", __name__)
@@ -48,6 +50,10 @@ def _clean(value: str | None) -> str | None:
 @bp.route("/p/<slug>/items")
 def list(slug):
     engine = current_engine()
+    # Resolve the project FIRST, like every other project route: an unknown or
+    # soft-deleted slug is a 404, not a 200 with an empty table.
+    if get_project(engine, slug) is None:
+        abort(404)
     filters = {
         "item_type": _clean(request.args.get("type")),
         "priority": _clean(request.args.get("priority")),
@@ -55,7 +61,22 @@ def list(slug):
         "component": _clean(request.args.get("component")),
         "search": _clean(request.args.get("q")),
     }
-    rows = list_items(
+    # The tag dictionary is CLOSED: core raises ValueError for an unknown (or
+    # unnormalizable) name. A querystring must never 500 — surface the message
+    # as an empty result plus a hint rendered by the table partial. The lookup
+    # is done UP FRONT so the except covers the tag resolution ONLY: a
+    # ValueError from the item query itself is a real bug and must propagate,
+    # never be mislabelled as an unknown-tag hint.
+    tag = _clean(request.args.get("tag"))
+    tag_error = None
+    if tag:
+        with engine.connect() as conn:
+            try:
+                tag_id_for_name_conn(conn, tag)
+            except ValueError as exc:
+                tag_error = str(exc)
+
+    rows = [] if tag_error else list_items(
         engine,
         project_slug=slug,
         item_type=filters["item_type"],
@@ -63,14 +84,9 @@ def list(slug):
         status=filters["status"],
         component=filters["component"],
         search=filters["search"],
+        tag=tag,
         limit=500,
     )
-
-    # Optional tag filter — applied in Python because list_items has no tag
-    # parameter; tags are already parsed to list[str] in the returned dicts.
-    tag = _clean(request.args.get("tag"))
-    if tag:
-        rows = [r for r in rows if tag in (r.get("tags") or [])]
 
     # Sorting — list_items returns priority-then-newest; re-sort in Python for
     # the other modes (no extra query). "priority" keeps the core order.
@@ -89,6 +105,7 @@ def list(slug):
         "items": rows,
         "filters": filters,
         "tag": tag or "",
+        "tag_error": tag_error,
         "sort": sort,
         "type_options": TYPE_OPTIONS,
         "priority_options": PRIORITY_OPTIONS,

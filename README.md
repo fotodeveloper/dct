@@ -5,7 +5,7 @@
 [![CI](https://github.com/fotodeveloper/dct/actions/workflows/ci.yml/badge.svg)](https://github.com/fotodeveloper/dct/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://github.com/fotodeveloper/dct/blob/main/LICENSE)
 
-dct gives AI coding assistants persistent, queryable memory: project state read from a database instead of guessed. One database shared by all your projects tracks issues, todos, changelog entries, plans, sprints, decisions, and session handoffs. The MCP (Model Context Protocol) server and CLI work with any MCP-capable assistant (Cursor, Windsurf, Zed, and friends); [Claude Code](https://claude.com/claude-code) gets the deepest integration, with 13 slash-command skills and 4 automation hooks on top of the 52 MCP tools.
+dct gives AI coding assistants persistent, queryable memory: project state read from a database instead of guessed. One database shared by all your projects tracks issues, todos, changelog entries, plans, sprints, decisions, and session handoffs. The MCP (Model Context Protocol) server and CLI work with any MCP-capable assistant (Cursor, Windsurf, Zed, and friends); [Claude Code](https://claude.com/claude-code) gets the deepest integration, with 13 slash-command skills and 4 automation hooks on top of the 55 MCP tools.
 
 Part of the **dc tools** family ([dctools.dev](https://dctools.dev)) — *deterministic context* for AI-assisted development.
 
@@ -105,7 +105,7 @@ The wizard closes with a reminder to **start a new Claude Code session** — ski
 
 ### Other MCP clients (Cursor, Windsurf, Zed)
 
-The 13 skills and 4 hooks are Claude Code integrations; everything else — the 52 MCP tools and the CLI — works from any MCP client. Register `dct server` as a stdio server in your client's MCP config, e.g. for Cursor (`~/.cursor/mcp.json`):
+The 13 skills and 4 hooks are Claude Code integrations; everything else — the 55 MCP tools and the CLI — works from any MCP client. Register `dct server` as a stdio server in your client's MCP config, e.g. for Cursor (`~/.cursor/mcp.json`):
 
 ```json
 { "mcpServers": { "dct": { "command": "dct", "args": ["server"] } } }
@@ -227,7 +227,7 @@ and promotion to items/sprints: **[docs/plans.md](https://github.com/fotodevelop
 - **Decision records** — ADRs, sprint amendments, inline plan decisions with multi-anchor linkage
 - **LLM-assisted classification** — uncertain plan sections auto-resolved via `claude --print` (haiku by default; optional, uses your own `claude` CLI)
 - **Passive autoscan hook** — Claude Code PostToolUse hook re-scans plan-like files in background on every edit
-- **MCP server** — 52 tools over stdio via the official MCP SDK 2.0; works with any MCP client (Claude Code, Cursor, Windsurf, …)
+- **MCP server** — 55 tools over stdio via the official MCP SDK 2.0; works with any MCP client (Claude Code, Cursor, Windsurf, …)
 - **CLI** — fast `dct` command for hooks and scripts
 - **Skills** — Claude Code slash commands (`/track`, `/clog`, `/dct-import`, `/plan-status`, …)
 - **Soft deletes** — ledger pattern, nothing is ever hard-deleted
@@ -242,10 +242,17 @@ and promotion to items/sprints: **[docs/plans.md](https://github.com/fotodevelop
 dct add myproj todo "Fix parser crash" --priority P1 --tags "parser,crash"
 dct list                              # All open items, all projects
 dct list myproj --priority P1         # P1 items in myproj
+dct list myproj --tag parser          # Items carrying the "parser" tag
 dct show 42                           # Full item details with notes
 dct update 42 --status in_progress
+dct update 42 --tags "perf,arch"      # Full replace of the tag set (--tags "" clears)
 dct note 42 "Found root cause in tokenizer"
 dct resolve 42 --resolution "Fixed in commit abc123"
+
+# Tags (global dictionary, shared by every project)
+dct tags list
+dct tags add perf --description "performance work"
+dct tags merge test tests             # Fold "test" into "tests"
 
 # Changelog (project auto-detected from CWD; --project overrides)
 dct clog add added "New Python parser support" --project myproj
@@ -294,7 +301,7 @@ dct config path                       # Show resolved config/data locations
 
 ## MCP Tools
 
-dct ships **52 MCP tools**. Zero-arg calls auto-detect the project from the session's working directory; pass `project=<slug>` to override. Write ops return a minimal ack (id + a few post-state fields); fetch full context with `get_item(id)` / `get_handoff(id)`. In Claude Code the tools register at user scope (callable as `mcp__dct__<name>`), with thirteen daily drivers always loaded and the rest fetched on demand; other MCP clients see the full flat catalogue. Whatever the client, start with `create_item`, `list_items`, `pickup_work`, and `handoff_work`:
+dct ships **55 MCP tools**. Zero-arg calls auto-detect the project from the session's working directory; pass `project=<slug>` to override. Write ops return a minimal ack (id + a few post-state fields); fetch full context with `get_item(id)` / `get_handoff(id)`. In Claude Code the tools register at user scope (callable as `mcp__dct__<name>`), with thirteen daily drivers always loaded and the rest fetched on demand; other MCP clients see the full flat catalogue. Whatever the client, start with `create_item`, `list_items`, `pickup_work`, and `handoff_work`:
 
 | Tool | Purpose |
 |---|---|

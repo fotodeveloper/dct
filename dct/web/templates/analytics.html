@@ -28,6 +28,17 @@
       </p>
     </div>
 
+    {% if health.tags %}
+    <div class="tag-freq">
+      <h4>Tags (open backlog)</h4>
+      <div class="tag-row">
+        {% for t in health.tags %}
+        <a class="tag" href="{{ url_for('items.list', slug=slug, tag=t.tag) }}">{{ t.tag }} <span class="tag-count">{{ t.count }}</span></a>
+        {% endfor %}
+      </div>
+    </div>
+    {% endif %}
+
     {% if health.hotspots.components or health.hotspots.files %}
     <div class="hotspots">
       <h4>Hotspots (&ge;2 open)</h4>

@@ -1,7 +1,4 @@
-import json
 from datetime import UTC, datetime, timedelta
-
-import pytest
 
 from dct.core import analytics
 from dct.core.projects import create_project
@@ -12,20 +9,15 @@ from dct.core.sprints import (
 )
 from dct.db import (
     changelog_entries,
-    create_tables,
-    get_engine,
     item_checkpoints,
     items,
     session_handoffs,
 )
 
 # ── fixtures / helpers ────────────────────────────────────────────────────────
-
-@pytest.fixture
-def engine():
-    eng = get_engine("sqlite://")
-    create_tables(eng)
-    return eng
+#
+# `engine` comes from conftest — a local copy of it would pin the analytics
+# GROUP BY paths to SQLite and hide them from the PG lane (#426).
 
 
 def _mk_project(engine, slug):
@@ -43,7 +35,6 @@ def _insert_item(engine, project_id, **kw):
         "status": kw.get("status", "open"),
         "component": kw.get("component"),
         "source_file": kw.get("source_file"),
-        "tags": kw.get("tags", "[]"),
         "created_at": kw.get("created_at", now),
         "updated_at": kw.get("updated_at", now),
         "resolved_at": kw.get("resolved_at"),
@@ -51,6 +42,34 @@ def _insert_item(engine, project_id, **kw):
     }
     with engine.begin() as conn:
         return conn.execute(items.insert().values(**vals).returning(items.c.id)).scalar()
+
+
+def _tag_item(engine, item_id, name, removed=False, tag_deleted=False):
+    """Link a tag through the join table — the ONLY tag storage after #611.
+
+    `force=True` on the dictionary write keeps the similarity guard (a UX rule
+    for humans typing names) out of fixtures that deliberately use near-miss
+    names like alpha/alphas.
+
+    Imported lazily so the tag work (#611) fails only the tag tests in this
+    file, not collection of the whole module.
+    """
+    from dct.core.tags import add_tag
+    from dct.db import item_tags
+    from dct.db import tags as tags_table
+
+    tag_id = add_tag(engine, name, force=True)["id"]
+    now = datetime.now(UTC)
+    with engine.begin() as conn:
+        conn.execute(item_tags.insert().values(
+            item_id=item_id, tag_id=tag_id, assigned_at=now,
+            removed_at=(now if removed else None),
+        ))
+        if tag_deleted:
+            conn.execute(tags_table.update()
+                         .where(tags_table.c.id == tag_id)
+                         .values(deleted_at=now))
+    return tag_id
 
 
 def _insert_cp(engine, item_id, status="pending", kind="task", deleted=False):
@@ -233,15 +252,75 @@ def test_backlog_hotspots_threshold_two(engine):
     assert h["hotspots"]["files"] == [{"name": "a.py", "count": 2}]
 
 
-def test_backlog_tags_defensive_parse(engine):
+def test_backlog_tags_counted_through_the_join_table(engine):
+    """#611: tag frequency is a GROUP BY over item_tags — no JSON parsing, so
+    there is nothing left to be defensive about (the old `_safe_tags` test is
+    gone with the helper). Ranking stays -count, then name."""
     pid = _mk_project(engine, "tags")
-    _insert_item(engine, pid, status="open", tags=json.dumps(["alpha", "beta"]))
-    _insert_item(engine, pid, status="open", tags=json.dumps(["alpha"]))
-    _insert_item(engine, pid, status="open", tags="{not valid json")  # must not crash
-    _insert_item(engine, pid, status="open", tags=None)               # must not crash
+    a = _insert_item(engine, pid, status="open")
+    b = _insert_item(engine, pid, status="open")
+    _insert_item(engine, pid, status="open")  # untagged — contributes nothing
+    _tag_item(engine, a, "alpha")
+    _tag_item(engine, a, "beta")
+    _tag_item(engine, b, "alpha")
+
     h = analytics.backlog_health(engine, "tags")
-    counts = {t["tag"]: t["count"] for t in h["tags"]}
-    assert counts == {"alpha": 2, "beta": 1}
+
+    assert h["tags"] == [{"tag": "alpha", "count": 2}, {"tag": "beta", "count": 1}]
+
+
+def test_backlog_tags_exclude_soft_removed_links_and_deleted_tags(engine):
+    """Three independent exclusions, each a separate soft-delete flag: a removed
+    LINK, a retired DICTIONARY row, and a deleted ITEM must all vanish from the
+    counts — a JOIN that forgets one of them silently inflates the histogram."""
+    pid = _mk_project(engine, "tagx")
+    live = _insert_item(engine, pid, status="open")
+    dead_item = _insert_item(engine, pid, status="open", deleted_at=datetime.now(UTC))
+    _tag_item(engine, live, "keep")
+    _tag_item(engine, live, "unlinked", removed=True)
+    _tag_item(engine, live, "retired", tag_deleted=True)
+    _tag_item(engine, dead_item, "keep")
+
+    h = analytics.backlog_health(engine, "tagx")
+
+    assert h["tags"] == [{"tag": "keep", "count": 1}]
+
+
+def test_backlog_tags_count_only_open_items(engine):
+    """The histogram is a BACKLOG view: a resolved item's tag drops out of the
+    count even though its link is still active."""
+    pid = _mk_project(engine, "tagd")
+    a = _insert_item(engine, pid, status="open")
+    _tag_item(engine, a, "alpha")
+    b = _insert_item(engine, pid, status="resolved")  # not open backlog
+    _tag_item(engine, b, "alpha")
+
+    h = analytics.backlog_health(engine, "tagd")
+
+    assert h["tags"] == [{"tag": "alpha", "count": 1}]
+
+
+def test_backlog_tags_count_items_not_links(engine):
+    """An item carrying the same tag twice is structurally impossible (composite
+    PK), but a reactivated link must never double-count either (K-42).
+
+    Full link lifecycle on ONE open item: link → soft-remove → reactivate. The
+    count is 1 at every stage; a query that counted link ROWS (or joined a link
+    history) would report 2 after the reactivation.
+    """
+    from dct.core.items import update_item
+
+    pid = _mk_project(engine, "tagr")
+    a = _insert_item(engine, pid, status="open")
+
+    update_item(engine, a, tags=["alpha"])
+    assert analytics.backlog_health(engine, "tagr")["tags"] == [{"tag": "alpha", "count": 1}]
+
+    update_item(engine, a, tags=[])  # soft-removes the link, keeps the PK row
+    assert analytics.backlog_health(engine, "tagr")["tags"] == []
+
+    update_item(engine, a, tags=["alpha"])  # reactivates the SAME link row
+    assert analytics.backlog_health(engine, "tagr")["tags"] == [{"tag": "alpha", "count": 1}]
 
 
 def test_backlog_checkpoint_stats(engine):
@@ -270,11 +349,12 @@ def test_backlog_checkpoint_zero_no_division_error(engine):
 
 def test_backlog_soft_deleted_excluded_everywhere(engine):
     pid = _mk_project(engine, "ghost")
-    keep = _insert_item(engine, pid, status="open", priority="P2", component="real",
-                        tags=json.dumps(["keep"]))
+    keep = _insert_item(engine, pid, status="open", priority="P2", component="real")
+    _tag_item(engine, keep, "keep")
     _insert_cp(engine, keep, status="pending")
     dead = _insert_item(engine, pid, status="open", priority="P1", component="ghost",
-                        tags=json.dumps(["ghost"]), deleted_at=datetime.now(UTC))
+                        deleted_at=datetime.now(UTC))
+    _tag_item(engine, dead, "ghost")
     _insert_cp(engine, dead, status="done")  # parent item soft-deleted -> excluded
     h = analytics.backlog_health(engine, "ghost")
     assert "P1" not in h["by_priority"]

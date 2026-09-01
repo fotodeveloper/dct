@@ -59,6 +59,11 @@ SITE_COUNTS = [
 # worth failing a build over.
 README_PATTERNS = [(r"(\d+) MCP tools", "tools", False)]
 
+# The packaged CLAUDE.md snippet (attached to users' global config by
+# `dct init`) renders the tool count too. It sat outside this gate and
+# silently drifted to "52 total" once (#341/#611) — same exact tier as README.
+SNIPPET_PATTERNS = [(r"\*\*MCP tools\*\* — (\d+) total", "tools", False)]
+
 # Per-file contracts: exactly the numbers that page is expected to render.
 SITE_PATTERNS = {
     "public/index.html": SITE_COUNTS
@@ -226,7 +231,10 @@ def main() -> int:
     derived = derive(REPO)
     print("derived: " + " · ".join(f"{k}={v}" for k, v in sorted(derived.items())))
 
-    targets = [(REPO / "README.md", README_PATTERNS)]
+    targets = [
+        (REPO / "README.md", README_PATTERNS),
+        (REPO / "dct/assets/claude-md-snippet.md", SNIPPET_PATTERNS),
+    ]
     if args.site:
         targets += [(args.site / rel, pats) for rel, pats in SITE_PATTERNS.items()]
 

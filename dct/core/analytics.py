@@ -21,10 +21,12 @@ from dct.db import (
     changelog_entries,
     item_checkpoints,
     item_sprints,
+    item_tags,
     items,
     projects,
     session_handoffs,
     sprints,
+    tags,
 )
 
 OPEN_STATUSES = ("open", "in_progress")
@@ -33,21 +35,6 @@ OPEN_STATUSES = ("open", "in_progress")
 def _iso(dt) -> str | None:
     """datetime -> ISO 8601 string; None passthrough."""
     return dt.isoformat() if dt is not None else None
-
-
-def _safe_tags(raw) -> list[str]:
-    """Tolerant tag parse: JSON-TEXT | None | garbage -> list[str].
-
-    Reuses items._parse_tags (returns [] on malformed JSON) and additionally
-    guards against non-list / non-str payloads so an adversarial `tags` value
-    can never crash an aggregate.
-    """
-    from dct.core.items import _parse_tags
-
-    parsed = _parse_tags(raw)
-    if not isinstance(parsed, list):
-        return []
-    return [t for t in parsed if isinstance(t, str) and t]
 
 
 def radar(engine: sa.Engine) -> dict:
@@ -215,7 +202,22 @@ def backlog_health(engine: sa.Engine, project_slug: str) -> dict:
 
         hotspots = {"components": _hotspot(items.c.component), "files": _hotspot(items.c.source_file)}
 
-        tag_rows = conn.execute(sa.select(items.c.tags).where(open_base)).fetchall()
+        # Tag frequency (#611): one GROUP BY over the join table — no JSON
+        # parsing left to be defensive about. COUNT(DISTINCT item) so the
+        # number is items-per-tag; soft-removed links and soft-deleted
+        # dictionary rows are excluded, soft-deleted items via `open_base`.
+        item_count = sa.func.count(sa.distinct(items.c.id))
+        tag_rows = conn.execute(
+            sa.select(tags.c.name, item_count.label("cnt"))
+            .select_from(
+                item_tags
+                .join(items, items.c.id == item_tags.c.item_id)
+                .join(tags, tags.c.id == item_tags.c.tag_id)
+            )
+            .where(open_base, item_tags.c.removed_at.is_(None), tags.c.deleted_at.is_(None))
+            .group_by(tags.c.name)
+            .order_by(item_count.desc(), tags.c.name)
+        ).fetchall()
 
         cp_join = item_checkpoints.join(items, items.c.id == item_checkpoints.c.item_id)
         cp_filter = sa.and_(
@@ -238,15 +240,7 @@ def backlog_health(engine: sa.Engine, project_slug: str) -> dict:
         ).fetchall()
         gates_by_kind = {r.kind: int(r.cnt) for r in gate_rows}
 
-    # tag frequency (parsed defensively outside the connection)
-    tag_counts: dict[str, int] = {}
-    for r in tag_rows:
-        for t in _safe_tags(r[0]):
-            tag_counts[t] = tag_counts.get(t, 0) + 1
-    tags = [
-        {"tag": t, "count": c}
-        for t, c in sorted(tag_counts.items(), key=lambda kv: (-kv[1], kv[0]))
-    ]
+    tag_freq = [{"tag": r.name, "count": int(r.cnt)} for r in tag_rows]
 
     done = cp_by.get("done", 0)
     pending = cp_by.get("pending", 0)
@@ -261,7 +255,7 @@ def backlog_health(engine: sa.Engine, project_slug: str) -> dict:
         "by_component": by_component,
         "aging": aging,
         "hotspots": hotspots,
-        "tags": tags,
+        "tags": tag_freq,
         "checkpoints": {
             "pending": pending,
             "done": done,

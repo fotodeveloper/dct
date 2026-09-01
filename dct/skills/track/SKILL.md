@@ -46,7 +46,15 @@ From the conversation context, determine:
 - **component**: Module or subsystem (optional)
 - **source_file**: Relative path where the item lives (optional)
 - **source_lines**: Line range, e.g. "42-58" (optional)
-- **tags**: Comma-separated labels (optional)
+- **tags**: List of labels (optional) — a JSON array, e.g. `["parser","crash"]`.
+  Tags are dictionary-backed and **global** (shared by every project): names are
+  normalized (trimmed, lowercased) and unknown ones auto-register. A name too
+  SIMILAR to an existing tag is REFUSED with a suggestion in the error
+  (`Tag 'test' is similar to existing 'tests' — reuse it, or call
+  add_tag(name='test', force=true) to create anyway`). Reuse the suggested tag,
+  or — when the near-duplicate is genuinely wanted — call
+  `mcp__dct__add_tag(name=..., force=true)` first, then retry the create. The
+  refusal rolls the whole create back, so no orphan item is left behind.
 
 ### Step 2: Confirm with user
 
@@ -60,6 +68,9 @@ Track this?
   File:     cmd/parse.go:42-58
   Tags:     parser, crash
 ```
+
+Show the tags as they will be STORED (normalized — trimmed and lowercased), so
+the user confirms what actually lands in the dictionary.
 
 Wait for confirmation or corrections. If user said "just add it" or similar,
 skip confirmation.

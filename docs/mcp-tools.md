@@ -1,6 +1,6 @@
 # dct — MCP Tools Reference
 
-Complete catalogue of the **52 MCP tools** the dct server exposes to Claude Code, grouped by domain. ← back to the [README](../README.md).
+Complete catalogue of the **55 MCP tools** the dct server exposes to Claude Code, grouped by domain. ← back to the [README](../README.md).
 
 The dct MCP server is registered at **user scope** (`~/.claude.json`), so every tool below is callable from any Claude Code session as `mcp__dct__<name>`. Most list/create tools accept an empty `project=""` and auto-detect the project from the session's working directory (longest-prefix match); pass `project=<slug>` to override.
 
@@ -29,9 +29,9 @@ Project registration, rename, version, and changelog-location changes are **CLI-
 | Tool | Purpose |
 |---|---|
 | `create_item` | Create a tracked item (issue / todo / feature / idea / improvement). |
-| `list_items` | List tracked items in compact `{cols, rows}` form. |
+| `list_items` | List tracked items in compact `{cols, rows}` form; `tag=<name>` narrows to items carrying that tag (unknown tag → `{"error": ...}` naming the closest known tags — up to 3, plus a count of the rest and a pointer to `list_tags`). |
 | `get_item` | Get full item details — fields, notes, checkpoints, progress. |
-| `update_item` | Update one or more mutable fields on an existing item. |
+| `update_item` | Update one or more mutable fields on an existing item. `tags` is a FULL REPLACE of the item's tag set (omit = unchanged, `[]` = clear). |
 | `resolve_item` | Resolve or close an item (terminal status); auto-clears sprint flag, runs the gate-checkpoint guard. |
 | `add_note` | Append a note to an item (append-only ledger). |
 
@@ -143,6 +143,24 @@ See [docs/plans.md](plans.md) for the plan lifecycle, ULID anchors, and ingest p
 | `update_decision` | Edit a decision's fields in place (empty string = leave unchanged). |
 | `supersede_decision` | Mark one decision as superseded by another. |
 
+## Tags (3)
+
+Tags live in a **global** (user-scoped, no `project_id`) dictionary table plus an
+`item_tags` link table — one name means the same thing in every project, while
+the item lists that use it stay project-scoped. Names are normalized (collapsed
+whitespace, lowercase) and unknown names auto-register on first use; a name too
+**similar** to an existing one is refused with a structured suggestion, and
+`add_tag(name=..., force=true)` is the deliberate override.
+
+| Tool | Purpose |
+|---|---|
+| `add_tag` | Register a tag in the global dictionary (idempotent; similarity guard, `force=true` overrides; a non-empty `description` is applied when an existing active tag is reused; re-adding a soft-deleted name resurrects the same row with its id — links a `merge_tag` moved stay on the target). |
+| `list_tags` | List the global tag dictionary with per-tag `item_count` (counts are global, name-ASC; unused tags show `item_count=0`). |
+| `merge_tag` | Fold one tag into another — active links move to the target, the source row is soft-deleted, history is preserved. |
+
+Item-side tag writes stay on the item tools: `create_item(tags=[...])`,
+`update_item(tags=[...])` (full replace), `list_items(tag=...)`.
+
 ---
 
 ## Write-op ack shapes
@@ -169,9 +187,11 @@ Write ops return a minimal ack, not the full record. `get_item` / `get_handoff` 
 | `add_plan_section` | `{id, ulid, heading, depth, section_type, status, sort_order}` |
 | `complete_plan_checkpoint` / `reject_plan_checkpoint` | `{id, plan_section_id, status, sort_order}` |
 | `promote_section_to_item` / `promote_checkpoint_to_item` | `{id, item_type, priority, status, title}` |
+| `add_tag` | `{id, name, created}` (`created` is `false` when an existing tag was reused) |
+| `merge_tag` | `{from, into, items_moved}` |
 
 `assign_item_to_sprint` / `remove_item_from_sprint` and the current-sprint add/remove ops return their link rows unchanged (all ids/timestamps, no free-text to strip).
 
 ---
 
-**Total: 52 tools.** This list is generated from `dct/mcp/server.py`; if it drifts, `dct server` prints the live set.
+**Total: 55 tools.** This list is generated from `dct/mcp/server.py`; if it drifts, `dct server` prints the live set.

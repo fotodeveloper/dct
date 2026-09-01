@@ -40,7 +40,7 @@ _INSTRUCTIONS = (
         "- list_* return {cols:[...], rows:[[...]]}: cols names the fields once, rows are\n"
         "  value arrays in that order (short fields first, long free-text last). Legends —\n"
         "  item: id, item_type, priority, status, in_current_sprint, cp=[done,total],\n"
-        "  component, tags, created_at, title, description; changelog: id, version,\n"
+        "  component, tags (list[str]), created_at, title, description; changelog: id, version,\n"
         "  category, component, related_item_id, created_at, released_at, entry;\n"
         "  checkpoint: id, status, sort_order, text; handoff: id, scope, created_by,\n"
         "  created_at, consumed_at, prompt (200-char preview). format='markdown' (lossy)\n"
@@ -50,6 +50,13 @@ _INSTRUCTIONS = (
         "list_handoffs) span ALL projects, while project-required tools — every write\n"
         "op AND review_sprint — error. Pass an explicit slug when unsure.\n\n"
         "ID NORMALIZATION: '#42', '42', 'ITEM-42', '0042' all mean item_id=42.\n\n"
+        "TAGS: one GLOBAL (cross-project) dictionary of normalized names —\n"
+        "list_items(tag='oss') filters on it (unknown name = error naming the closest\n"
+        "known tags), update_item(tags=[...]) FULL-REPLACES an item's tags (omit =\n"
+        "unchanged, [] = clear). Dictionary admin (deferred): add_tag (a name confusable\n"
+        "with an existing one is refused — reuse it or re-call with force=true; a\n"
+        "non-empty description updates an existing tag), list_tags,\n"
+        "merge_tag(from_name, into_name).\n\n"
         "WORKFLOW:\n"
         "1. list_items / get_item to find/inspect; an item's checkpoints are your TODO\n"
         "   list (sort_order). REMEMBER ids from create_item/add_checkpoint/create_handoff.\n"
@@ -188,8 +195,19 @@ def _reject_toolcall_markup(**fields) -> dict | None:
     parameters collapsed into one field as raw text. Returning the error makes
     the tool fail loud (no row written) and tells the model how to retry.
     Non-string / empty values are skipped. Matching is case-insensitive.
+
+    List values (K-13: `tags` on create_item / update_item) are inspected
+    ELEMENT BY ELEMENT — a mangled call can collapse siblings into one array
+    entry just as easily as into a scalar field — and the offending element is
+    reported as 'field[i]'.
     """
+    flat: list[tuple[str, object]] = []
     for name, value in fields.items():
+        if isinstance(value, list | tuple):
+            flat.extend((f"{name}[{i}]", element) for i, element in enumerate(value))
+        else:
+            flat.append((name, value))
+    for name, value in flat:
         if not isinstance(value, str) or not value:
             continue
         low = value.lower()
@@ -298,6 +316,7 @@ CHANGELOG_COLS = [
     "created_at", "released_at", "entry",
 ]
 CHECKPOINT_COLS = ["id", "status", "sort_order", "text"]
+TAG_COLS = ["id", "name", "item_count", "created_at", "description"]
 PROJECT_COLS = ["id", "slug", "current_version", "name", "path", "changelog_path"]
 HANDOFF_COLS = [
     "id", "scope", "created_by", "created_at", "consumed_at", "prompt",
@@ -381,13 +400,18 @@ def create_item(
         source_file: Relative file path.
         source_lines: Line range (e.g. "42-58").
         tags: List of tag strings. Pass as a JSON array, e.g. ["oss","tests"].
+            Names are normalized (trimmed, lowercased) and registered in the
+            GLOBAL tag dictionary. A name confusable with an existing tag is
+            REFUSED and the whole call rolls back (no orphan item) — reuse the
+            suggested name, or register yours first with add_tag(force=true).
 
     Returns: slim ack {id, project, item_type, priority, status, title} —
         `project` is the resolved slug (auto-detect safety echo). NOT the full
         item dict (no description/tags echo); call get_item for the rest.
-        {"error": "..."} on invalid enum, markup, or an unresolvable project.
+        {"error": "..."} on invalid enum, markup, a refused tag name, or an
+        unresolvable project.
     """
-    if (err := _reject_toolcall_markup(title=title, description=description)):
+    if (err := _reject_toolcall_markup(title=title, description=description, tags=tags)):
         return err
     from dct.core.items import create_item as _create
 
@@ -419,13 +443,14 @@ def list_items(
     component: str = "",
     in_current_sprint: str = "",
     search: str = "",
+    tag: str = "",
     limit: int = 50,
     format: str = "structured",
 ):
     """List tracked items in compact {cols,rows} form.
 
     Each row carries a `cp` field with [done, total] checkpoint progress
-    computed in a single SQL query (no N+1).
+    computed in a single SQL query (no N+1), and a `tags` list[str] (name-ASC).
 
     Args:
         project: slug; empty = CWD auto-detect, unregistered CWD = cross-project
@@ -436,11 +461,19 @@ def list_items(
         component: Filter by component name.
         in_current_sprint: '' (any, default), 'true' (only sprint), 'false' (non-sprint).
         search: Substring in title + description.
-        limit: Max rows (default 50).
+        tag: ONE tag name (normalized — trimmed, lowercased); keeps only items
+            carrying it. The dictionary is CLOSED: an unknown name returns
+            {"error": ...} naming the closest known tags (up to 3, plus a count
+            of the rest — call list_tags for the full dictionary), never a
+            silently empty page.
+            Composes with `project` (the dictionary is global, item lists stay
+            project-scoped). Use list_tags to see what exists.
+        limit: Max rows (default 50). 0 = no limit.
         format: 'structured' (default, {cols,rows}), 'markdown', 'dict'.
 
     Returns: {"cols": [...], "rows": [[...]]} by default, list[dict] for
         format="dict", or markdown str for format="markdown".
+        {"error": "..."} on an unknown tag.
     """
     from dct.core.items import list_items as _list
 
@@ -452,6 +485,7 @@ def list_items(
     if priority: kwargs["priority"] = priority
     if component: kwargs["component"] = component
     if search: kwargs["search"] = search
+    if tag: kwargs["tag"] = tag
     sprint_filter = _parse_bool_tri(in_current_sprint)
     if sprint_filter is not None:
         kwargs["in_current_sprint"] = sprint_filter
@@ -489,6 +523,7 @@ def update_item(
     component: str = "",
     resolution: str = "",
     description: str = "",
+    tags: list[str] | None = None,
 ) -> dict:
     """Update one or more mutable fields on an existing item. Only non-empty
     args are applied; an empty/omitted field is left unchanged.
@@ -508,19 +543,32 @@ def update_item(
         component: Component or module name.
         resolution: Resolution / rationale note.
         description: Prose context.
+        tags: FULL REPLACE of the item's tag set — the list you pass becomes the
+            item's tags exactly. Omit (or null) = tags unchanged; [] = clear all
+            tags. Names are normalized (trimmed, lowercased) against the GLOBAL
+            dictionary; a name confusable with an existing tag is REFUSED with
+            {"error": ...} naming the suggestion — reuse it, or register yours
+            first via add_tag(name=..., force=true) and repeat this call.
+            A refused tag name rolls back the ENTIRE update — no field is
+            applied, not even the non-tag ones; re-issue the WHOLE call once
+            the tag is resolved.
 
     Clearing a field — pass literal '__clear__' to null a NULLABLE field
     (component, resolution, description). NOT for title/status/priority: title
-    would blank out and status/priority would fail enum validation.
+    would blank out and status/priority would fail enum validation. Tags use
+    their own convention above ([], not '__clear__').
 
     Returns: slim POST-state ack {id, item_type, status, priority, title,
         component, in_current_sprint, resolved_at, progress} — scalars reflect
         the row AFTER the update (a '__clear__'ed component shows null here);
         progress is {done, pending, active}. NOT the full item dict (no
-        notes/checkpoints/description echo). {"error": "..."} on unknown id or
-        markup.
+        notes/checkpoints/tags/description echo) — call get_item to read the
+        resulting tag list back. {"error": "..."} on unknown id, a refused tag
+        name, or markup.
     """
-    if (err := _reject_toolcall_markup(title=title, description=description, resolution=resolution)):
+    if (err := _reject_toolcall_markup(
+        title=title, description=description, resolution=resolution, tags=tags
+    )):
         return err
     from dct.core.items import update_item as _update
 
@@ -533,6 +581,10 @@ def update_item(
             kwargs[field] = ""
         elif value:
             kwargs[field] = value
+    # Sentinel (K-16): only an explicit list reaches core — None means "leave
+    # the tags alone", so it must NOT be passed through as a kwarg.
+    if tags is not None:
+        kwargs["tags"] = tags
 
     try:
         result = _update(_get_engine(), item_id, **kwargs)
@@ -611,6 +663,104 @@ def add_note(item_id: int, note: str) -> dict:
         engine = _get_engine()
         n = _add_note(engine, item_id, note)
         return {"id": n["id"], "item_id": n["item_id"], "item_title": _item_title(engine, n["item_id"])}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+# ── Tag tools ─────────────────────────────────────────────────────────────────
+# Deferred by design (no _ALWAYS_LOAD_META): the hot-set stays the 13 daily
+# drivers. Tagging itself rides on create_item / update_item / list_items, which
+# are already loaded; these three are the dictionary-admin surface.
+
+
+@mcp.tool(structured_output=False)
+def add_tag(name: str, description: str = "", force: bool = False) -> dict:
+    """Register a tag in the GLOBAL (user-scoped, cross-project) dictionary.
+
+    Idempotent: an existing active name is REUSED (never duplicated) and comes
+    back with created=false, and a non-empty `description` is applied to that
+    existing row on reuse. A soft-deleted name is resurrected as the SAME
+    dictionary row (stable id): links that were never re-pointed become active
+    again, but links an earlier merge_tag moved onto another tag STAY on that
+    target — resurrection does not undo a merge.
+
+    FRAGMENTATION GUARD: a name confusable with an existing one ('test' next to
+    'tests') is refused with {"error": ...} naming the suggestion. The guard is
+    advisory — repeat the call with force=true when the new name is genuinely
+    distinct. An EXACT existing name is reused regardless of `force`.
+
+    Args:
+        name: Tag name. Normalized before storage (whitespace collapsed,
+            lowercased); rejected when empty, containing a comma (the CLI CSV
+            separator), or longer than 50 chars after normalization.
+        description: Optional prose describing what the tag is for.
+        force: True bypasses the similarity guard only.
+
+    Returns: slim ack {id, name, created} — `name` is the NORMALIZED form,
+        `created` is False when an active row was reused. {"error": "..."} on an
+        invalid name, a refused similar name, or markup.
+    """
+    if (err := _reject_toolcall_markup(name=name, description=description)):
+        return err
+    from dct.core.tags import add_tag as _add
+
+    try:
+        return _add(_get_engine(), name, description=description or None, force=force)
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@mcp.tool(structured_output=False)
+def list_tags(format: str = "structured"):
+    """List the whole tag dictionary, name-ASC, with usage counts.
+
+    NO `project` param: the dictionary is GLOBAL, and so are the counts —
+    `item_count` spans every project (item LISTS stay project-scoped; the
+    asymmetry is deliberate). Counts exclude soft-removed links and soft-deleted
+    items; an unused tag is listed with item_count=0.
+
+    Args:
+        format: 'structured' (default, {cols,rows}), 'markdown', 'dict'.
+
+    Returns: {"cols": ["id","name","item_count","created_at","description"],
+        "rows": [[...]]} by default, list[dict] for format="dict", or a markdown
+        table for format="markdown".
+    """
+    from dct.core.tags import list_tags as _list
+
+    try:
+        return _format_list(_list(_get_engine()), TAG_COLS, format)
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@mcp.tool(structured_output=False)
+def merge_tag(from_name: str, into_name: str) -> dict:
+    """Consolidate two tags: move every ACTIVE link of `from_name` onto
+    `into_name`, then retire the source row (soft delete).
+
+    The action to take on a similarity suggestion. Ledger-preserving: historical
+    (already removed) links of the source keep their own timestamps, and an item
+    that carried BOTH tags ends with exactly one active link. One-way by design —
+    add_tag can resurrect the source NAME later, but the moved links stay on the
+    target.
+
+    Args:
+        from_name: Source tag, retired by this call (named `from_name` because
+            `from` is a Python keyword). Must be an ACTIVE tag.
+        into_name: Target tag that absorbs the links. Must be an ACTIVE tag.
+
+    Returns: slim ack {"from", "into", "items_moved"} — normalized names plus
+        the number of items relinked. {"error": "..."} when either name is
+        unknown/retired (the message names the known tags), when both normalize
+        to the SAME name (self-merge), or on markup.
+    """
+    if (err := _reject_toolcall_markup(from_name=from_name, into_name=into_name)):
+        return err
+    from dct.core.tags import merge_tags as _merge
+
+    try:
+        return _merge(_get_engine(), from_name, into_name)
     except Exception as e:
         return {"error": str(e)}
 

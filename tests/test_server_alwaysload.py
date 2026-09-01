@@ -25,6 +25,8 @@ EXPECTED_COLD = {
     "get_handoff",
     "create_decision", "create_plan", "export_changelog",
     "list_sprints", "ingest_plan_file", "supersede_decision",
+    # tag dictionary admin (#611) — tagging itself rides on the hot item tools
+    "add_tag", "list_tags", "merge_tag",
 }
 
 

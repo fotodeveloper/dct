@@ -76,6 +76,18 @@ This is the audit trail — future /pickup will read these notes via `get_item`.
 
 Title, component, description, tags edits — notes welcome but not required.
 
+### Editing tags
+
+`update_item(item_id, tags=[...])` is a **FULL REPLACE** of the item's tag set,
+not an append: omit `tags` to leave it untouched, pass `[]` to clear it. To add
+one tag, read the current set with `get_item(id)` first and send the union.
+
+Tags are dictionary-backed and global: names are normalized (trimmed,
+lowercased) and unknown ones auto-register, but a name too SIMILAR to an
+existing tag is refused with a suggestion in the error (e.g. `test` vs `tests`).
+Reuse the suggested tag, or — when the near-duplicate is genuinely wanted — call
+`mcp__dct__add_tag(name=..., force=true)` first and retry the update.
+
 Then call `mcp__dct__update_item(item_id, ...)` with changed fields.
 For batch updates, loop per-id with the same kwargs.
 

@@ -4,8 +4,6 @@ import pytest
 
 from dct.core.changelog import add_entry, count_unreleased, delete_entry, list_entries
 from dct.core.items import (
-    _parse_tags,
-    _serialize_tags,
     add_note,
     create_item,
     delete_item,
@@ -70,45 +68,89 @@ class TestEmptyInputs:
 
 
 class TestTagsEdgeCases:
-    """Core `_serialize_tags` accepts list[str] | None only (see #31).
-    String-form normalization (CSV) happens at CLI boundary; JSON array
-    handling happens at MCP boundary. Core stays pure.
+    """#611 reverses the old whitespace contract (plan decision 2).
+
+    The pre-#611 core stored tags as a JSON blob and deliberately did NOT trim —
+    `[" perf ", "   "]` went to the DB verbatim, so ' perf ' and 'perf' were two
+    different tags and a whitespace-only string was a legal tag. The normalized
+    dictionary makes that a data-integrity bug, so core now normalizes at the
+    boundary (lowercase + collapsed whitespace) and REJECTS what cannot be a
+    tag. What survives from #31 is the list-only input contract: CSV splitting
+    stays at the CLI boundary, JSON arrays at the MCP boundary.
     """
 
     def test_none_tags(self, engine):
-        assert _serialize_tags(None) == "[]"
+        create_project(engine, slug="p", name="P")
+        assert create_item(engine, "p", "todo", "Task", tags=None)["tags"] == []
 
     def test_empty_list_tags(self, engine):
-        assert _serialize_tags([]) == "[]"
+        create_project(engine, slug="p", name="P")
+        assert create_item(engine, "p", "todo", "Task", tags=[])["tags"] == []
 
-    def test_list_with_empty_strings(self, engine):
-        assert _serialize_tags(["", "", ""]) == "[]"
+    def test_core_normalizes_case_and_whitespace(self, engine):
+        """Reversal of `test_list_preserves_whitespace_in_tags`: ' Perf ' and
+        'PERF' must collapse onto the single dictionary entry 'perf'."""
+        create_project(engine, slug="p", name="P")
+        item = create_item(engine, "p", "todo", "Task", tags=[" Perf ", "PERF", "arch"])
+        assert item["tags"] == ["arch", "perf"]
+
+    def test_empty_string_tag_is_rejected(self, engine):
+        """Was silently filtered out; now it is a loud error — a caller building
+        tags from a bad split deserves to hear about it."""
+        create_project(engine, slug="p", name="P")
+        with pytest.raises(ValueError):
+            create_item(engine, "p", "todo", "Task", tags=["perf", ""])
+
+    def test_whitespace_only_tag_is_rejected(self, engine):
+        create_project(engine, slug="p", name="P")
+        with pytest.raises(ValueError):
+            create_item(engine, "p", "todo", "Task", tags=["   "])
+
+    def test_comma_inside_a_tag_is_rejected(self, engine):
+        """A comma could never survive the CLI's `--tags a,b` round-trip."""
+        create_project(engine, slug="p", name="P")
+        with pytest.raises(ValueError, match="comma"):
+            create_item(engine, "p", "todo", "Task", tags=["a,b"])
+
+    def test_absurdly_long_tag_is_rejected(self, engine):
+        from dct.core.tags import MAX_TAG_LENGTH
+
+        create_project(engine, slug="p", name="P")
+        with pytest.raises(ValueError):
+            create_item(engine, "p", "todo", "Task", tags=["x" * (MAX_TAG_LENGTH + 1)])
 
     def test_string_input_raises(self, engine):
         """Historical bug #31: accepting str here caused JSON-array-as-string
         to be split naively on ',' producing mangled fragments."""
+        create_project(engine, slug="p", name="P")
         with pytest.raises(AssertionError, match="tags must be list"):
-            _serialize_tags("a,b,c")  # type: ignore[arg-type]
+            create_item(engine, "p", "todo", "Task", tags="a,b,c")  # type: ignore[arg-type]
 
     def test_json_array_string_raises(self, engine):
         """Passing the JSON-stringified form must fail loudly, not be quietly
         stored as-is (original bug symptom). Clients serializing list→string
         are now rejected at schema boundary (server.py) or CLI boundary."""
+        create_project(engine, slug="p", name="P")
         with pytest.raises(AssertionError, match="tags must be list"):
-            _serialize_tags('["a","b"]')  # type: ignore[arg-type]
+            create_item(engine, "p", "todo", "Task", tags='["a","b"]')  # type: ignore[arg-type]
 
-    def test_list_preserves_whitespace_in_tags(self, engine):
-        """Core does not trim — normalization is the caller's job (CLI does it).
-        Empty strings are filtered (falsy), whitespace-only strings are NOT
-        (truthy in Python). Callers passing ' ' must accept it goes to DB."""
-        result = _serialize_tags([" perf ", "arch", "", "   "])
-        assert _parse_tags(result) == [" perf ", "arch", "   "]
+    def test_non_str_element_raises(self, engine):
+        create_project(engine, slug="p", name="P")
+        with pytest.raises(AssertionError, match="tags must be list"):
+            create_item(engine, "p", "todo", "Task", tags=["perf", 42])  # type: ignore[list-item]
 
     def test_unicode_tags(self, engine):
+        """Normalization is case-folding + whitespace collapse only — scripts
+        without case mapping must survive byte-for-byte, and ŻÓŁĆ must fold to
+        the SAME entry as żółć rather than forking the dictionary."""
         create_project(engine, slug="p", name="P")
-        item = create_item(engine, "p", "todo", "Task", tags=["日本語", "émojis", "żółć"])
-        assert "日本語" in item["tags"]
-        assert "żółć" in item["tags"]
+        item = create_item(engine, "p", "todo", "Task", tags=["日本語", "émojis", "ŻÓŁĆ"])
+        assert item["tags"] == ["émojis", "żółć", "日本語"]
+
+        other = create_item(engine, "p", "todo", "Task 2", tags=["żółć"])
+        assert other["tags"] == ["żółć"]
+        from dct.core.tags import list_tags
+        assert [t["name"] for t in list_tags(engine) if t["name"] == "żółć"] == ["żółć"]
 
 
 # ── Path matching ─────────────────────────────────────────────────────────────

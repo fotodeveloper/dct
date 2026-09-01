@@ -248,6 +248,11 @@ body.just-refreshed .live-dot { background: var(--accent); box-shadow: 0 0 0 7px
   padding: .02rem .45rem;
   margin: 0 .25rem .25rem 0;
 }
+a.tag { text-decoration: none; }
+a.tag:hover { color: var(--ink); border-color: var(--accent); text-decoration: none; }
+.tag-count { opacity: .7; }
+.tag-row { display: flex; flex-wrap: wrap; }
+.tag-error { color: var(--muted); font-size: .82rem; margin: .4rem 0; }
 
 /* ── Radar (home) ──────────────────────────────────────────────────────── */
 .radar-totals {

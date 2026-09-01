@@ -1,15 +1,20 @@
 """Item CRUD operations with soft deletes and validation."""
 
-import json
 from datetime import UTC, datetime
 
 import sqlalchemy as sa
 
 from dct.core.projects import resolve_project_id
+from dct.core.tags import (
+    set_item_tags_conn,
+    tag_id_for_name_conn,
+    tags_for_items_conn,
+)
 from dct.db import (
     item_checkpoints,
     item_notes,
     item_sprints,
+    item_tags,
     items,
     row_to_dict,
     sprints,
@@ -88,28 +93,21 @@ def _validate_enum(value: str, valid: set[str] | tuple[str, ...], field_name: st
     return value
 
 
-def _serialize_tags(tags: list[str] | None) -> str:
-    """Serialize tags for DB storage. Accepts list[str] only — callers that
-    receive CSV/string input (CLI `--tags "a,b"`) MUST split into list before
-    calling core. Historical bug: accepting `str` here meant MCP clients that
-    couldn't send array types ended up passing the JSON-stringified list,
-    which was then naively split on `,` into mangled fragments. Fix lifts
-    normalization to the boundary (MCP = list[str] schema; CLI = split in
-    `cmd_add`); core stays pure.
-    """
-    if tags is None:
-        return "[]"
-    assert isinstance(tags, list), f"tags must be list[str], got {type(tags).__name__}"
-    return json.dumps([t for t in tags if t])
+def _has_tag_exists(tag_id: int):
+    """Correlated EXISTS: the item carries an ACTIVE link to `tag_id`.
 
-
-def _parse_tags(tags_str: str | None) -> list[str]:
-    if not tags_str:
-        return []
-    try:
-        return json.loads(tags_str)
-    except (json.JSONDecodeError, TypeError):
-        return []
+    A WHERE predicate, deliberately not a join — joining item_tags into the
+    list query would fan out the checkpoint aggregates (#611)."""
+    return (
+        sa.select(sa.literal(1))
+        .select_from(item_tags)
+        .where(
+            item_tags.c.item_id == items.c.id,
+            item_tags.c.tag_id == tag_id,
+            item_tags.c.removed_at.is_(None),
+        )
+        .exists()
+    )
 
 
 def _current_sprint_exists():
@@ -133,20 +131,24 @@ def _current_sprint_exists():
     )
 
 
-def _item_to_dict(row: sa.Row) -> dict:
+def _item_to_dict(row: sa.Row, tag_names: list[str] | None = None) -> dict:
     d = row_to_dict(row)
-    d["tags"] = _parse_tags(d.get("tags"))
+    # The `tags` column is frozen-deprecated (#611): drop whatever it holds and
+    # publish the names read from item_tags instead.
+    d.pop("tags", None)
+    d["tags"] = list(tag_names or [])
     if "in_current_sprint" in d:  # present only when the derived column was selected
         d["in_current_sprint"] = bool(d["in_current_sprint"])
     return d
 
 
-def _item_with_cp_to_dict(row_mapping) -> dict:
+def _item_with_cp_to_dict(row_mapping, tag_names: list[str] | None = None) -> dict:
     """Convert an items row enriched with cp_done/cp_total aggregates into a dict
     with a compact `cp: [done, total]` field replacing the two raw columns.
     """
     d = dict(row_mapping)
-    d["tags"] = _parse_tags(d.get("tags"))
+    d.pop("tags", None)
+    d["tags"] = list(tag_names or [])
     if "in_current_sprint" in d:
         d["in_current_sprint"] = bool(d["in_current_sprint"])
     done = int(d.pop("cp_done", 0) or 0)
@@ -167,7 +169,14 @@ def create_item(
     source_file: str | None = None,
     source_lines: str | None = None,
     tags: list[str] | None = None,
+    *,
+    force_tags: bool = False,
 ) -> dict:
+    """Create an item. `tags` is list[str] (CSV splitting stays at the CLI
+    boundary, #31); names are normalized and registered in the global tag
+    dictionary. A name the similarity guard refuses rolls the WHOLE call back —
+    no orphan item, no dictionary row. `force_tags=True` bypasses that guard
+    for machine callers (not exposed over MCP)."""
     if not title or not title.strip():
         raise ValueError("Item title cannot be empty")
     _validate_enum(item_type, VALID_TYPES, "item_type")
@@ -188,12 +197,15 @@ def create_item(
                 component=component,
                 source_file=source_file,
                 source_lines=source_lines,
-                tags=_serialize_tags(tags),
             )
             .returning(items)
         ).first()
         assert row is not None
-        d = _item_to_dict(row)
+        # Same transaction as the INSERT: a refused tag rolls the item back too.
+        tag_names = set_item_tags_conn(
+            conn, row.id, tags if tags is not None else [], force=force_tags,
+        )
+        d = _item_to_dict(row, tag_names)
         d["in_current_sprint"] = False  # a brand-new item belongs to no sprint
         return d
 
@@ -207,8 +219,17 @@ def list_items(
     component: str | None = None,
     search: str | None = None,
     in_current_sprint: bool | None = None,
+    tag: str | None = None,
     limit: int = 50,
 ) -> list[dict]:
+    """Priority-ordered item page.
+
+    `tag` filters on an ACTIVE item_tags link (closed dictionary — an unknown
+    name raises ValueError naming the known tags). Tags themselves come from a
+    SECOND query over the materialized page (1 + ceil(n/500) queries), never
+    from a join: joining here would fan out the checkpoint aggregates.
+    `limit=0` means no limit (existing semantics).
+    """
     # Priority ordering: P1 first, future last
     priority_order = _priority_order_expr()
 
@@ -253,7 +274,11 @@ def list_items(
         if project_slug:
             pid = resolve_project_id(conn, project_slug)
             q = q.where(items.c.project_id == pid)
-        return [_item_with_cp_to_dict(r._mapping) for r in conn.execute(q)]
+        if tag:
+            q = q.where(_has_tag_exists(tag_id_for_name_conn(conn, tag)))
+        rows = [r._mapping for r in conn.execute(q)]
+        tags_by_item = tags_for_items_conn(conn, [r["id"] for r in rows])
+        return [_item_with_cp_to_dict(r, tags_by_item.get(r["id"])) for r in rows]
 
 
 def get_item(engine: sa.Engine, item_id: int) -> dict | None:
@@ -267,7 +292,7 @@ def get_item(engine: sa.Engine, item_id: int) -> dict | None:
         ).first()
         if not row:
             return None
-        d = _item_to_dict(row)
+        d = _item_to_dict(row, tags_for_items_conn(conn, [item_id]).get(item_id))
         notes = conn.execute(
             sa.select(item_notes)
             .where(item_notes.c.item_id == item_id, item_notes.c.deleted_at.is_(None))
@@ -299,7 +324,13 @@ def update_item(engine: sa.Engine, item_id: int, **kwargs) -> dict | None:
             "See docs/superpowers/specs/2026-04-17-plans-roadmaps-decisions-design.md §5.2."
         )
 
-    allowed = {"title", "description", "priority", "status", "component", "source_file", "source_lines", "tags", "resolution", "item_type"}
+    # Tags are no longer a column (#611) — pull them out of kwargs as a
+    # SENTINEL (K-16): absent AND explicit None both mean "leave tags alone",
+    # only an explicit list (including []) replaces them.
+    tags = kwargs.pop("tags", None)
+    force_tags = kwargs.pop("force_tags", False)
+
+    allowed = {"title", "description", "priority", "status", "component", "source_file", "source_lines", "resolution", "item_type"}
     values = {}
     for k, v in kwargs.items():
         if k not in allowed or v is None:
@@ -310,13 +341,11 @@ def update_item(engine: sa.Engine, item_id: int, **kwargs) -> dict | None:
             _validate_enum(v, VALID_STATUSES, "status")
         elif k == "item_type":
             _validate_enum(v, VALID_TYPES, "item_type")
-        elif k == "tags":
-            v = _serialize_tags(v)
         if v == "" and k in {"component", "source_file", "source_lines", "resolution", "description"}:
             v = None
         values[k] = v
 
-    if not values:
+    if not values and tags is None:
         raise ValueError("No valid fields to update")
 
     now = datetime.now(UTC)
@@ -333,9 +362,25 @@ def update_item(engine: sa.Engine, item_id: int, **kwargs) -> dict | None:
             values["resolved_at"] = None
 
     with engine.begin() as conn:
-        result = conn.execute(items.update().where(items.c.id == item_id, items.c.deleted_at.is_(None)).values(**values))
+        # K-11: existence is checked BEFORE any tag resolution, so a typo'd id
+        # can never register tags in the dictionary as a side effect.
+        exists = conn.execute(
+            sa.select(items.c.id).where(items.c.id == item_id, items.c.deleted_at.is_(None))
+        ).first()
+        if exists is None:
+            return None
+        # K-37: the UPDATE repeats the soft-delete guard. The SELECT above is a
+        # separate statement, so without it a concurrent delete_item between the
+        # two would let this write resurrect a soft-deleted row.
+        result = conn.execute(
+            items.update()
+            .where(items.c.id == item_id, items.c.deleted_at.is_(None))
+            .values(**values)
+        )
         if result.rowcount == 0:
             return None
+        if tags is not None:
+            set_item_tags_conn(conn, item_id, tags, force=force_tags, now=now)
 
     return get_item(engine, item_id)
 

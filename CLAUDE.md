@@ -44,6 +44,8 @@ dct/core/sprint.py       — Current-sprint ops; delegates to item_sprints
 dct/core/sprints.py      — First-class sprints (single source of truth)
 dct/core/handoff.py      — Session handoffs (cross-session prompt ledger)
 dct/core/decisions.py    — ADR / sprint-amendment / open-question records
+dct/core/tags.py         — Global tag dictionary + item_tags links (similarity
+                           guard, merge)
 dct/core/version.py      — Version bump + project-file autodetect
 dct/core/checkpoints.py  — Item checkpoint helpers
 dct/core/ids.py          — ULID generation
@@ -53,7 +55,7 @@ dct/services/            — Service layer (reserved for future shared app ops)
 dct/workflows/session.py — G1 composed ops: get_context_snapshot /
                            pickup_work / handoff_work (one impl for MCP,
                            CLI and skills; single transaction each)
-dct/mcp/server.py        — MCP server, SDK 2.0 MCPServer (52 tools);
+dct/mcp/server.py        — MCP server, SDK 2.0 MCPServer (55 tools);
                            dct/server.py is a compat shim
 dct/cli.py               — argparse CLI entry point
 dct/export.py            — Keep a Changelog MD export
@@ -151,7 +153,8 @@ add the gate — rejecting is always available.
 ## OSS hygiene
 
 Never commit author-specific data: private project slugs, personal brand
-names, home-directory paths, private version strings. Use placeholders
+names, home-directory paths, private version strings, assistant session or
+artifact URLs (`claude.ai/code/…` — the `Claude-Session:` trailer is banned). Use placeholders
 (`proj-a`, `My Project`, `/tmp/proj-a`, generic semver) from the first
 keystroke. Sniff-regex, exemptions (`changelog.md`) and release-time
 enforcement: [docs/maintainers.md](docs/maintainers.md).

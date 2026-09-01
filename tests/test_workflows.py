@@ -120,6 +120,34 @@ def test_snapshot_sprint_section_multi_sprint(engine, proj):
     assert snap["summary"]["sprint_size"] == 2
 
 
+def test_snapshot_sprint_items_pin_their_columns_and_never_leak_tags(engine, proj):
+    """K-23 regression guard: the snapshot's sprint-item rows are a PINNED
+    projection (`_query_sprint_items_with_cp` selects explicit columns), so a
+    tagged item must not widen the table nor smuggle the frozen `items.tags`
+    column in. Both the {cols,rows} table and the checkpoint table are checked
+    — cols is the wire contract every skill indexes into.
+    """
+    a = create_item(engine, "proj-a", "feature", "A", tags=["alpha", "beta"])
+    add_checkpoint(engine, a["id"], "Step one")
+    set_current_sprint_items(engine, "proj-a", [a["id"]])
+
+    tbl = get_context_snapshot(engine, "proj-a")["sprint"]["items"]
+
+    assert tbl["cols"] == ["id", "sprint_id", "priority", "status", "cp", "title"]
+    assert "tags" not in tbl["cols"]
+    assert tbl["rows"] and all(len(r) == len(tbl["cols"]) for r in tbl["rows"])
+    assert dict(zip(tbl["cols"], tbl["rows"][0]))["id"] == a["id"]
+
+    # The conn-level reader itself must not carry a `tags` key either — the
+    # {cols,rows} projection is a formatter, not the guard.
+    from dct.core.projects import resolve_project_id
+    from dct.core.sprint import _query_sprint_items_with_cp
+
+    with engine.begin() as conn:
+        raw = _query_sprint_items_with_cp(conn, resolve_project_id(conn, "proj-a"))
+    assert [set(r) for r in raw] == [{"id", "sprint_id", "priority", "status", "cp", "title"}]
+
+
 def test_snapshot_sprint_checkpoints_expose_next_step(engine, proj):
     """K-9 / plan #12 §18: the next pending checkpoint is readable from ONE
     snapshot — no follow-up get_item required."""

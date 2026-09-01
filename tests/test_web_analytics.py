@@ -71,3 +71,14 @@ def test_analytics_embeds_velocity_json(client):
 
 def test_analytics_unknown_project_returns_404(client):
     assert client.get("/p/nope/analytics").status_code == 404
+
+
+def test_analytics_renders_tag_chips_with_counts(engine, client):
+    """health.tags is computed through the item_tags join — and rendered (K-4)."""
+    create_item(engine, "test", "todo", "Tagged one", tags=["backend"])
+    create_item(engine, "test", "todo", "Tagged two", tags=["backend"])
+    body = client.get("/p/test/analytics").get_data(as_text=True)
+    assert "backend" in body
+    assert '<span class="tag-count">2</span>' in body
+    # Chip links into the project's item list, filtered by that tag.
+    assert "/p/test/items?tag=backend" in body

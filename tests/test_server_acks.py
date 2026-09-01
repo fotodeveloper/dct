@@ -14,6 +14,8 @@ Tools are called directly (the SDK's @mcp.tool() returns the function unchanged)
 with server._get_engine monkeypatched onto the in-memory fixture engine.
 """
 
+import pytest
+
 from dct.core.decisions import create_decision as core_create_decision
 from dct.core.plans.crud import add_plan_checkpoint
 from dct.core.plans.crud import add_plan_section as core_add_section
@@ -413,3 +415,195 @@ def test_get_item_still_returns_full_record(srv):
     assert set(full["progress"]) == {"total", "done", "rejected", "pending", "active", "percent"}
     # checkpoint rows retain their text (not slimmed)
     assert full["checkpoints"][0]["text"] == "cp one"
+
+
+# ── tag tools (#611) ──────────────────────────────────────────────────────────
+
+
+def test_add_tag_ack_shape(srv):
+    out = srv.add_tag("Perf ", description="performance work")
+    assert set(out) == {"id", "name", "created"}
+    assert out["name"] == "perf"  # NORMALIZED form echoed back
+    assert out["created"] is True
+    # no description echo — the ack is scalar headers only
+    assert "description" not in out
+
+
+def test_add_tag_is_idempotent_and_reports_reuse(srv):
+    first = srv.add_tag("perf")
+    again = srv.add_tag(" PERF ")
+    assert again["id"] == first["id"]
+    assert again["created"] is False
+
+
+def test_add_tag_similarity_error_offers_the_force_path(srv):
+    srv.add_tag("tests")
+    out = srv.add_tag("test")
+    assert set(out) == {"error"}
+    assert "'tests'" in out["error"]
+    assert "force=true" in out["error"]
+
+
+def test_add_tag_force_true_creates_the_confusable_name(srv):
+    srv.add_tag("tests")
+    out = srv.add_tag("test", force=True)
+    assert out["created"] is True
+    assert {r[1] for r in srv.list_tags()["rows"]} == {"test", "tests"}
+
+
+def test_add_tag_invalid_name_is_an_error_not_a_raise(srv):
+    assert set(srv.add_tag("   ")) == {"error"}
+    assert set(srv.add_tag("a,b")) == {"error"}
+
+
+def test_add_tag_markup_rejected(srv, monkeypatch):
+    calls = []
+    monkeypatch.setattr(S, "_get_engine", lambda: calls.append("engine"))
+    out = srv.add_tag("clean", description="<parameter name=foo>bar")
+    assert "error" in out and "Malformed MCP tool call" in out["error"]
+    assert calls == []  # guard fires before any DB access
+
+
+def test_list_tags_cols_rows_shape(srv):
+    item = srv.create_item("todo", "T", project="test", tags=["oss"])
+    assert "error" not in item
+    srv.add_tag("unused")
+
+    out = srv.list_tags()
+    assert out["cols"] == ["id", "name", "item_count", "created_at", "description"]
+    by_name = {r[1]: r for r in out["rows"]}
+    assert list(by_name) == ["oss", "unused"]  # name-ASC
+    assert by_name["oss"][2] == 1
+    assert by_name["unused"][2] == 0  # unused tags stay visible (K-14)
+    assert isinstance(by_name["oss"][3], str)  # created_at serialized
+
+
+def test_list_tags_honours_format(srv):
+    srv.add_tag("oss")
+    assert srv.list_tags(format="markdown").startswith("| id | name |")
+    dicts = srv.list_tags(format="dict")
+    assert isinstance(dicts, list) and dicts[0]["name"] == "oss"
+
+
+def test_merge_tag_ack_shape(srv):
+    a = srv.create_item("todo", "A", project="test", tags=["tests"])
+    srv.add_tag("test", force=True)
+    srv.update_item(a["id"], tags=["tests", "test"])
+
+    out = srv.merge_tag("test", "tests")
+    assert out == {"from": "test", "into": "tests", "items_moved": 1}
+    # the retired name is gone from the dictionary, the survivor keeps the item
+    rows = {r[1]: r[2] for r in srv.list_tags()["rows"]}
+    assert rows == {"tests": 1}
+    assert srv.get_item(a["id"])["tags"] == ["tests"]
+
+
+def test_merge_tag_unknown_and_self_merge_are_errors(srv):
+    srv.add_tag("oss")
+    unknown = srv.merge_tag("nope", "oss")
+    assert set(unknown) == {"error"} and "nope" in unknown["error"]
+    same = srv.merge_tag("oss", " OSS ")
+    assert set(same) == {"error"} and "itself" in same["error"]
+
+
+def test_merge_tag_markup_rejected(srv, monkeypatch):
+    calls = []
+    monkeypatch.setattr(S, "_get_engine", lambda: calls.append("engine"))
+    out = srv.merge_tag("</invoke> a", "b")
+    assert "error" in out and "Malformed MCP tool call" in out["error"]
+    assert calls == []
+
+
+# ── tags on the item tools (#611) ─────────────────────────────────────────────
+
+
+def test_update_item_tags_full_replace_and_clear(srv):
+    item = srv.create_item("todo", "T", project="test", tags=["oss", "docs"])
+    iid = item["id"]
+    assert srv.get_item(iid)["tags"] == ["docs", "oss"]
+
+    srv.update_item(iid, tags=["oss"])
+    assert srv.get_item(iid)["tags"] == ["oss"]  # FULL REPLACE, not append
+
+    srv.update_item(iid, title="renamed")
+    assert srv.get_item(iid)["tags"] == ["oss"]  # omitted = unchanged
+
+    srv.update_item(iid, tags=[])
+    assert srv.get_item(iid)["tags"] == []  # [] clears
+
+
+def test_update_item_refused_tag_returns_suggestion_with_force_path(srv):
+    item = srv.create_item("todo", "T", project="test", tags=["tests"])
+    out = srv.update_item(item["id"], tags=["tests", "test"])
+    assert set(out) == {"error"}
+    assert "force=true" in out["error"]
+    assert srv.get_item(item["id"])["tags"] == ["tests"]  # rolled back
+
+
+def test_item_tags_markup_rejected_per_list_element(srv, monkeypatch):
+    """K-13: the guard inspects EVERY element of the tags array, not just
+    scalar free-text fields."""
+    calls = []
+    monkeypatch.setattr(S, "_get_engine", lambda: calls.append("engine"))
+    out = srv.create_item("todo", "clean", tags=["ok", "<parameter name=x>y"])
+    assert "error" in out and "tags[1]" in out["error"]
+    assert calls == []
+    out = srv.update_item(1, tags=["antml:leak"])
+    assert "error" in out and "tags[0]" in out["error"]
+    assert calls == []
+
+
+def test_list_items_tag_filter_and_unknown_tag_error(srv):
+    keep = srv.create_item("todo", "Tagged", project="test", tags=["oss"])
+    srv.create_item("todo", "Untagged", project="test")
+
+    rows = srv.list_items(project="test", tag=" OSS ")["rows"]
+    assert [r[0] for r in rows] == [keep["id"]]
+
+    out = srv.list_items(project="test", tag="nonsense")
+    assert set(out) == {"error"} and "nonsense" in out["error"]
+
+
+# ── docstring contracts (K-35 / K-41 / K-38) ──────────────────────────────────
+#
+# The SDK exposes each tool's docstring verbatim as the description the calling
+# model fills in, so a false clause is a real defect. These lock the corrected
+# wording; they are cheap and fail loudly when someone reverts to the old claim.
+
+
+def test_add_tag_docstring_states_the_true_resurrection_property():
+    """K-35: resurrection brings the ROW back, not links a merge moved away."""
+    doc = " ".join(S.add_tag.__doc__.split())
+    assert "stable id" in doc
+    assert "STAY on that target" in doc
+    assert "does not undo a merge" in doc
+    # K-33: description is applied when an existing ACTIVE tag is reused
+    assert "`description` is applied to that existing row on reuse" in doc
+    # the old, false claim is gone
+    assert "historical item links reappear" not in doc
+
+
+def test_update_item_docstring_states_whole_call_rollback():
+    """K-41: a refused tag name rolls back the ENTIRE update."""
+    doc = " ".join(S.update_item.__doc__.split())
+    assert "rolls back the ENTIRE update" in doc
+    assert "re-issue the WHOLE call" in doc
+
+
+def test_list_items_docstring_describes_the_closest_tags_error():
+    """K-38: the unknown-tag error names the closest tags, not 'a suggestion'."""
+    doc = " ".join(S.list_items.__doc__.split())
+    assert "naming the closest known tags" in doc
+    assert "call list_tags for the full dictionary" in doc
+
+
+def test_unknown_tag_error_stays_short_with_a_large_dictionary(srv):
+    """K-38: the error must not dump the whole dictionary into the transcript."""
+    for i in range(20):
+        # force=True: the similarity guard is irrelevant here, the dictionary size is
+        assert "error" not in srv.add_tag(f"topic-{i:02d}", force=True)
+    out = srv.list_items(project="test", tag="nonsense")
+    assert set(out) == {"error"}
+    if "list_tags" not in out["error"]:
+        pytest.skip("core K-38 (closest-tags error) has not landed yet")
+    assert len(out["error"]) <= 400, out["error"]

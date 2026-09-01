@@ -75,7 +75,9 @@ def list_sprint_items(engine: sa.Engine, project_slug: str) -> list[dict]:
     v0.2+ (#216): membership comes from item_sprints via the active sprint.
     Terminal members (resolved / wont_fix) keep their link (K-18, #413) but are
     a completion statistic, not current work — this view filters them out.
-    Returns [] when there is no current sprint."""
+    Rows inherit list_items_in_sprint's `tags` contract (K-21, #611): active
+    item_tags names as list[str], name-ASC — never the frozen items.tags
+    column. Returns [] when there is no current sprint."""
     from dct.core.sprints import get_current_sprint, list_items_in_sprint
     sprint = get_current_sprint(engine, project_slug)
     if not sprint:

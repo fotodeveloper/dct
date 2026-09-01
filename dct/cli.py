@@ -593,8 +593,15 @@ def cmd_list(args):
         kwargs["priority"] = args.priority
     if args.search:
         kwargs["search"] = args.search
+    if args.tag:
+        kwargs["tag"] = args.tag
 
-    items = list_items(engine, **kwargs)
+    try:
+        items = list_items(engine, **kwargs)
+    except ValueError as e:
+        # Unknown tag — the core error carries the known-names suggestion.
+        print(f"✗ Error: {e}", file=sys.stderr)
+        sys.exit(1)
     headers = ["#", "Project", "Type", "Pri", "Status", "Title"]
 
     # Build project_id → slug cache
@@ -658,6 +665,10 @@ def cmd_update(args):
         kwargs["component"] = args.component
     if args.resolution:
         kwargs["resolution"] = args.resolution
+    if args.tags is not None:
+        # `is not None` on purpose: `--tags ""` is a legal CLEAR (empty list),
+        # while omitting the flag leaves the item's tags untouched.
+        kwargs["tags"] = [t.strip() for t in args.tags.split(",") if t.strip()]
 
     try:
         item = update_item(engine, args.id, **kwargs)
@@ -1118,7 +1129,10 @@ def cmd_internal_task_mirror(args):
     else:
         item = create_item(
             engine, project_slug, "todo", title,
-            tags=["cc-task-list", "auto"],
+            # Machine caller: the similarity guard is a UX rule for humans
+            # typing names — it must never crash the fire-and-forget hook
+            # (plan decision 4 / K-5).
+            tags=["cc-task-list", "auto"], force_tags=True,
         )
         item_id = item["id"]
 
@@ -1368,6 +1382,55 @@ def cmd_sprint_update(args):
     except Exception as e:
         print(f"✗ Error: {e}", file=sys.stderr)
         sys.exit(1)
+
+
+# ── Tag dictionary (#611) ────────────────────────────────────────────────────
+
+def cmd_tag_list(args):
+    """The whole tag dictionary with usage counts — GLOBAL, not project-scoped
+    (the dictionary is user-scoped by design; item lists stay project-scoped)."""
+    from dct.core.tags import list_tags
+
+    engine = _get_engine()
+    rows_in = list_tags(engine)
+    headers = ["#", "Name", "Items", "Created", "Description"]
+    rows = [
+        [
+            str(t["id"]), t["name"], str(t["item_count"]),
+            _fmt_date(t.get("created_at")), t.get("description") or "",
+        ]
+        for t in rows_in
+    ]
+    _print_table(headers, rows, max_widths={4: 50})
+
+
+def cmd_tag_add(args):
+    from dct.core.tags import add_tag
+
+    engine = _get_engine()
+    try:
+        tag = add_tag(engine, args.name, description=args.description or None,
+                      force=args.force)
+    except Exception as e:
+        print(f"✗ Error: {e}", file=sys.stderr)
+        sys.exit(1)
+    verb = "created" if tag["created"] else "exists"
+    print(f"✓ Tag #{tag['id']} {verb} — {tag['name']}")
+
+
+def cmd_tag_merge(args):
+    from dct.core.tags import merge_tags
+
+    engine = _get_engine()
+    try:
+        res = merge_tags(engine, args.from_name, args.into_name)
+    except Exception as e:
+        print(f"✗ Error: {e}", file=sys.stderr)
+        sys.exit(1)
+    print(
+        f"✓ Merged '{res['from']}' → '{res['into']}' "
+        f"({res['items_moved']} item(s) moved)"
+    )
 
 
 # ── MCP server (stdio) ───────────────────────────────────────────────────────
@@ -1891,6 +1954,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_list.add_argument("--type", "-t")
     p_list.add_argument("--priority", "-p")
     p_list.add_argument("--search", "-q")
+    p_list.add_argument("--tag", help="Only items carrying this tag "
+                                      "(unknown tag → error listing known tags)")
 
     # show
     p_show = sub.add_parser("show", help="Show item details")
@@ -1904,6 +1969,13 @@ def build_parser() -> argparse.ArgumentParser:
     p_update.add_argument("--priority", "-p")
     p_update.add_argument("--component", "-c")
     p_update.add_argument("--resolution")
+    # No "-t" short alias here on purpose (K-25): "-t" already means --type on
+    # `list` and --tags on `add`, so on `update` it would silently tag an item
+    # with what the user meant as a type. Long flag only.
+    p_update.add_argument("--tags", default=None,
+                          help="Comma-separated tags — FULL REPLACE of the item's "
+                               "tags. Omit to leave them unchanged; --tags \"\" "
+                               "clears them all.")
 
     # resolve
     p_resolve = sub.add_parser("resolve", help="Resolve/close an item")
@@ -2042,6 +2114,25 @@ def build_parser() -> argparse.ArgumentParser:
         )
         p_verb.add_argument("id", type=int)
         p_verb.set_defaults(_forced_status=_st)
+
+    # tags (global, user-scoped dictionary — #611)
+    p_tags = sub.add_parser("tags", help="Manage the tag dictionary")
+    p_tags_sub = p_tags.add_subparsers(dest="tags_command")
+
+    p_tags_sub.add_parser("list", help="List all tags with usage counts (global)")
+
+    p_tag_add = p_tags_sub.add_parser("add", help="Register a tag")
+    p_tag_add.add_argument("name")
+    p_tag_add.add_argument("--description", "-d")
+    p_tag_add.add_argument("--force", action="store_true",
+                           help="Create even when the name is similar to an "
+                                "existing tag (the similarity guard is advisory)")
+
+    p_tag_merge = p_tags_sub.add_parser(
+        "merge", help="Move every active link of <from> onto <into>, retire <from>"
+    )
+    p_tag_merge.add_argument("from_name", metavar="from")
+    p_tag_merge.add_argument("into_name", metavar="into")
 
     # pickup (session-start op — snapshot + handoff consume, #413)
     p_pickup = sub.add_parser(
@@ -2223,6 +2314,12 @@ SPRINT_COMMAND_MAP = {
     "complete": cmd_sprint_update,
 }
 
+TAGS_COMMAND_MAP = {
+    "list": cmd_tag_list,
+    "add": cmd_tag_add,
+    "merge": cmd_tag_merge,
+}
+
 
 # ── Passive update nudge (#356) ──────────────────────────────────────────────
 
@@ -2344,6 +2441,12 @@ def main():
         handler = SPRINT_COMMAND_MAP.get(args.sprint_command)
         if not handler:
             parser.parse_args(["sprint", "--help"])
+            return
+        handler(args)
+    elif args.command == "tags":
+        handler = TAGS_COMMAND_MAP.get(args.tags_command)
+        if not handler:
+            parser.parse_args(["tags", "--help"])
             return
         handler(args)
     elif args.command == "plan":

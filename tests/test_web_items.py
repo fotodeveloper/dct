@@ -140,3 +140,99 @@ def test_markdown_is_sanitized(engine, client):
     body = r.get_data(as_text=True)
     assert "<script>alert(1)</script>" not in body
     assert "alert(1)" in body  # escaped, still visible as text
+
+
+# ── tag filter + chips (#611) ───────────────────────────────────────────────
+
+
+def test_filter_tag_narrows_server_side(client, seeded):
+    """?tag= is pushed into core list_items, not filtered in Python."""
+    r = client.get("/p/proj-a/items?tag=backend")
+    assert r.status_code == 200
+    body = r.get_data(as_text=True)
+    assert "Alpha feature" in body
+    assert "Beta bug" not in body
+    assert "Gamma chore" not in body
+
+
+def test_filter_tag_is_normalized(client, seeded):
+    """Case/whitespace variants resolve to the same dictionary row."""
+    body = client.get("/p/proj-a/items?tag=+Backend+").get_data(as_text=True)
+    assert "Alpha feature" in body
+    assert "Beta bug" not in body
+
+
+def test_unknown_tag_renders_empty_state_with_hint_not_500(client, seeded):
+    """A closed dictionary must not turn a querystring into a 500 (K-18)."""
+    r = client.get("/p/proj-a/items?tag=nonsense")
+    assert r.status_code == 200
+    body = r.get_data(as_text=True)
+    assert "Unknown tag" in body
+    assert "nonsense" in body
+    assert "Alpha feature" not in body
+    assert "Beta bug" not in body
+
+
+def test_unknown_tag_hint_also_on_htmx_fragment(client, seeded):
+    """One partial serves the full page and the HX fragment — both show it."""
+    frag = client.get(
+        "/p/proj-a/items?tag=nonsense",
+        headers={"HX-Request": "true", "HX-Target": "items-table"},
+    )
+    assert frag.status_code == 200
+    body = frag.get_data(as_text=True)
+    assert "<html" not in body.lower()
+    assert "Unknown tag" in body
+
+
+def test_unnormalizable_tag_does_not_500(client, seeded):
+    """normalize_tag_name rejects commas — still a 200 with a hint."""
+    r = client.get("/p/proj-a/items?tag=a,b")
+    assert r.status_code == 200
+    assert "Alpha feature" not in r.get_data(as_text=True)
+
+
+def test_unknown_slug_404s_not_empty_table(client, seeded):
+    """K-40: the list route resolves the project FIRST, like every other
+    project route — an unknown slug is a 404, never a 200 with an empty
+    table that reads as "this project has no items"."""
+    assert client.get("/p/nope/items").status_code == 404
+    # Also with a tag filter attached — the tag hint must not swallow the 404.
+    assert client.get("/p/nope/items?tag=backend").status_code == 404
+
+
+def test_unknown_tag_hint_survives_the_narrowed_except(client, seeded):
+    """The ValueError catch covers ONLY the tag lookup, but the user-facing
+    behaviour is unchanged: unknown tag → 200 + hint, known slug intact."""
+    r = client.get("/p/proj-a/items?tag=nonsense")
+    assert r.status_code == 200
+    body = r.get_data(as_text=True)
+    assert "Unknown tag" in body
+    assert "Alpha feature" not in body
+
+
+def test_list_query_value_error_is_not_swallowed_as_a_tag_hint(client, seeded, monkeypatch):
+    """A ValueError raised by the ITEM query (not the tag lookup) must
+    propagate — swallowing it would render a bogus "unknown tag" hint."""
+    import dct.web.blueprints.items as items_bp
+
+    def boom(*a, **kw):
+        raise ValueError("something else entirely")
+
+    monkeypatch.setattr(items_bp, "list_items", boom)
+    r = client.get("/p/proj-a/items?tag=backend")
+    assert r.status_code == 500  # a real error, surfaced as one
+    assert "Unknown tag" not in r.get_data(as_text=True)
+
+
+def test_list_tag_chips_link_to_filtered_list(client, seeded):
+    body = client.get("/p/proj-a/items").get_data(as_text=True)
+    assert '/p/proj-a/items?tag=backend' in body
+
+
+def test_detail_tag_chips_link_to_project_list_route(client, seeded):
+    """Chips on the detail page point at the LIST route, never a bare ?tag=
+    on the current URL (the detail route ignores the filter) — K-17."""
+    body = client.get(f"/p/proj-a/items/{seeded}").get_data(as_text=True)
+    assert '/p/proj-a/items?tag=urgent' in body
+    assert f'/p/proj-a/items/{seeded}?tag=' not in body

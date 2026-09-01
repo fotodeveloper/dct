@@ -516,3 +516,438 @@ def test_changelog_path_migration_is_idempotent_and_preserves_value(engine):
     _apply_schema_updates(engine)
 
     assert get_project(engine, "p")["changelog_path"] == "pkg/changelog.md"
+
+
+# ── items.tags JSON → tags / item_tags backfill (#611) ────────────────────────
+#
+# `items.tags` is frozen-deprecated (DROP at 2.0.0) and the backfill is its only
+# sanctioned reader. Every test here writes the column with raw SQL — that is
+# what a pre-#611 process did, and it is the ONLY way to produce the input this
+# block consumes. The failure mode being guarded is severe: this runs on EVERY
+# bootstrap, so a raise here bricks every dct command.
+
+
+def _set_legacy_tags(engine, item_id: int, raw):
+    """Write the frozen JSON column the way pre-#611 code did."""
+    with engine.begin() as conn:
+        conn.execute(
+            sa.text("UPDATE items SET tags = :t WHERE id = :id"),
+            {"t": raw, "id": item_id},
+        )
+
+
+def _tag_dict_names(engine) -> list[str]:
+    from dct.db import tags as tags_table
+
+    with engine.begin() as conn:
+        return [
+            r[0] for r in conn.execute(
+                sa.select(tags_table.c.name)
+                .where(tags_table.c.deleted_at.is_(None))
+                .order_by(tags_table.c.name)
+            )
+        ]
+
+
+def _tag_link_rows(engine, item_id: int | None = None) -> list[dict]:
+    from dct.db import item_tags
+
+    q = sa.select(item_tags)
+    if item_id is not None:
+        q = q.where(item_tags.c.item_id == item_id)
+    with engine.begin() as conn:
+        return [dict(r._mapping) for r in conn.execute(q)]
+
+
+def _items_updated_at(engine, item_id: int):
+    from dct.db import items
+
+    with engine.begin() as conn:
+        return conn.execute(
+            sa.select(items.c.updated_at).where(items.c.id == item_id)
+        ).scalar_one()
+
+
+def _seed_legacy_item(engine, raw, title="Legacy tagged"):
+    """A project + item whose frozen column holds `raw` and which has no links."""
+    create_project(engine, slug="dct", name="DCT", path="/tmp/dct")
+    item = create_item(engine, "dct", "issue", title)
+    _set_legacy_tags(engine, item["id"], raw)
+    assert _tag_link_rows(engine, item["id"]) == []  # precondition
+    return item
+
+
+def test_tags_backfill_seeds_links_from_legacy_json(engine):
+    """Names are normalized (lowercase/trim) and the link is stamped with the
+    item's own updated_at — the tag existed since that edit, not since the
+    upgrade, and stamping `now` would falsify every 'recently tagged' read."""
+    item = _seed_legacy_item(engine, '["Perf", " arch "]')
+    updated_at = _items_updated_at(engine, item["id"])
+
+    _apply_schema_updates(engine)
+
+    got = get_item(engine, item["id"])
+    assert got["tags"] == ["arch", "perf"]
+    links = _tag_link_rows(engine, item["id"])
+    assert len(links) == 2
+    assert {link["assigned_at"] for link in links} == {updated_at}
+    assert all(link["removed_at"] is None for link in links)
+
+
+def test_tags_backfill_rerun_is_a_noop(engine):
+    """Steady state: every later bootstrap must leave row counts AND timestamps
+    exactly as they were — no re-INSERT, no re-stamp."""
+    item = _seed_legacy_item(engine, '["perf", "arch"]')
+    _apply_schema_updates(engine)
+    before = sorted(
+        (link["tag_id"], link["assigned_at"], link["removed_at"])
+        for link in _tag_link_rows(engine, item["id"])
+    )
+
+    _apply_schema_updates(engine)
+    _apply_schema_updates(engine)
+
+    after = sorted(
+        (link["tag_id"], link["assigned_at"], link["removed_at"])
+        for link in _tag_link_rows(engine, item["id"])
+    )
+    assert after == before
+    assert _tag_dict_names(engine) == ["arch", "perf"]
+
+
+def test_tags_backfill_does_not_reseed_a_cleared_item(engine):
+    """The per-ITEM guard (not per-pair): once an item has spoken through the
+    join table it owns its tag set. The frozen column still holds the old JSON
+    forever, so a per-pair guard would resurrect tags the user deliberately
+    removed on every single bootstrap."""
+    item = _seed_legacy_item(engine, '["perf", "arch"]')
+    _apply_schema_updates(engine)
+    update_item(engine, item["id"], tags=[])
+    assert get_item(engine, item["id"])["tags"] == []
+
+    _apply_schema_updates(engine)
+
+    assert get_item(engine, item["id"])["tags"] == []
+
+
+def test_tags_backfill_does_not_reseed_after_retagging(engine):
+    item = _seed_legacy_item(engine, '["perf", "arch"]')
+    _apply_schema_updates(engine)
+    update_item(engine, item["id"], tags=["docs"])
+
+    _apply_schema_updates(engine)
+
+    assert get_item(engine, item["id"])["tags"] == ["docs"]
+
+
+def test_tags_backfill_collapses_case_variants_within_one_item(engine):
+    """['Perf','perf',' PERF '] is ONE tag — three links would violate the
+    composite PK, and three dictionary rows would defeat the whole point."""
+    item = _seed_legacy_item(engine, '["Perf", "perf", " PERF "]')
+
+    _apply_schema_updates(engine)
+
+    assert get_item(engine, item["id"])["tags"] == ["perf"]
+    assert len(_tag_link_rows(engine, item["id"])) == 1
+    assert _tag_dict_names(engine) == ["perf"]
+
+
+@pytest.mark.parametrize("raw", [
+    "{not valid",       # not JSON at all
+    '"str"',            # valid JSON, not a list
+    "[1, 2]",           # list of non-str
+    '["", "   "]',      # empty after normalization
+    "null",
+    "{}",
+    None,               # NULL column
+    "[]",
+    "",                 # empty string
+])
+def test_tags_backfill_tolerates_adversarial_column_values(engine, raw):
+    """Never raise, never write junk. A raise here would break bootstrap for
+    EVERY command — the heaviest failure mode of this change."""
+    item = _seed_legacy_item(engine, raw)
+
+    _apply_schema_updates(engine)  # must not raise
+
+    assert get_item(engine, item["id"])["tags"] == []
+    assert _tag_dict_names(engine) == []
+    assert _tag_link_rows(engine) == []
+
+
+def test_tags_backfill_keeps_good_values_from_a_mixed_list(engine, capsys):
+    """Partial garbage drops only the bad elements, and the drop is REPORTED
+    with the item id — a silent drop is data loss nobody can audit."""
+    item = _seed_legacy_item(engine, '["perf", 5, "", null]')
+
+    _apply_schema_updates(engine)
+
+    assert get_item(engine, item["id"])["tags"] == ["perf"]
+    assert str(item["id"]) in capsys.readouterr().err
+
+
+def test_tags_backfill_preserves_legacy_names_with_commas_and_over_length(engine):
+    """K-7: the comma and 50-char rules are API rules for NEW tags. Legacy data
+    is history — dropping it silently would be unauditable data loss, so the
+    backfill keeps every non-empty string it finds."""
+    long_name = "x" * 80
+    item = _seed_legacy_item(engine, json.dumps(["Legacy, With Comma", long_name, "  Spaced  "]))
+
+    _apply_schema_updates(engine)
+
+    names = _tag_dict_names(engine)
+    assert "legacy, with comma" in names
+    assert long_name in names
+    assert "spaced" in names
+    assert len(_tag_link_rows(engine, item["id"])) == 3
+
+
+def test_tags_backfill_does_not_apply_the_similarity_guard(engine, capsys):
+    """Historical names are not typos to be corrected: 'test' and 'tests' both
+    register, and the run REPORTS the pair as a consolidation suggestion
+    without blocking the bootstrap or merging anything."""
+    create_project(engine, slug="dct", name="DCT", path="/tmp/dct")
+    a = create_item(engine, "dct", "issue", "A")
+    b = create_item(engine, "dct", "issue", "B")
+    _set_legacy_tags(engine, a["id"], '["test"]')
+    _set_legacy_tags(engine, b["id"], '["tests"]')
+
+    _apply_schema_updates(engine)  # must not raise
+
+    assert _tag_dict_names(engine) == ["test", "tests"]
+    assert get_item(engine, a["id"])["tags"] == ["test"]
+    assert get_item(engine, b["id"])["tags"] == ["tests"]
+    err = capsys.readouterr().err
+    assert "test" in err and "tests" in err
+    assert "duplicate" in err.lower()  # a suggestion, not an action
+
+
+def test_tags_backfill_picks_up_a_mixed_writer_item_on_the_next_bootstrap(engine):
+    """K-8: after an upgrade an OLD MCP process can still create items that
+    write the JSON column. The backfill is not one-shot — the next bootstrap
+    must adopt them (this is why there is no 'migration done' marker row)."""
+    create_project(engine, slug="dct", name="DCT", path="/tmp/dct")
+    _apply_schema_updates(engine)  # bootstrap 1: nothing to migrate
+
+    item = create_item(engine, "dct", "issue", "Written by an old process")
+    _set_legacy_tags(engine, item["id"], '["perf"]')
+    assert _tag_link_rows(engine, item["id"]) == []  # nothing adopted it yet
+
+    _apply_schema_updates(engine)  # bootstrap 2
+
+    assert get_item(engine, item["id"])["tags"] == ["perf"]
+    assert len(_tag_link_rows(engine, item["id"])) == 1  # adopted, not just read
+    assert _tag_dict_names(engine) == ["perf"]
+
+
+def test_tags_backfill_self_disables_once_the_column_is_dropped(engine):
+    """At 2.0.0 the frozen column goes away; the block must vanish with it
+    rather than crashing every bootstrap on a missing column."""
+    from dct.db import _backfill_item_tags
+
+    create_project(engine, slug="dct", name="DCT", path="/tmp/dct")
+    create_item(engine, "dct", "issue", "Post-2.0 item")
+    with engine.begin() as conn:
+        conn.execute(sa.text("ALTER TABLE items DROP COLUMN tags"))
+
+    _backfill_item_tags(engine)     # must not raise
+    _apply_schema_updates(engine)   # must not raise
+
+    assert _tag_link_rows(engine) == []
+
+
+# ── K-22 / K-30 / K-34: convergence + bounded similarity report ───────────────
+
+
+def _write_statements(engine, fn) -> list[str]:
+    """Run `fn`, return every INSERT/UPDATE/DELETE the engine actually issued.
+
+    The point of the K-22 steady state is not just "no visible change" but "no
+    write transaction at all" — the backfill runs on EVERY dct bootstrap, so a
+    per-command write against an unconvergeable item is a permanent tax.
+    """
+    seen: list[str] = []
+
+    def record(conn, cursor, statement, parameters, context, executemany):
+        head = statement.strip().split(None, 1)[0].upper() if statement.strip() else ""
+        if head in {"INSERT", "UPDATE", "DELETE"}:
+            seen.append(statement)
+
+    sa.event.listen(engine, "before_cursor_execute", record)
+    try:
+        fn()
+    finally:
+        sa.event.remove(engine, "before_cursor_execute", record)
+    return seen
+
+
+def _backfill_candidate_count(engine) -> int:
+    """The backfill's own anti-join: items with a non-empty frozen column and
+    no item_tags row at all. Non-zero in steady state == a non-converging run."""
+    with engine.begin() as conn:
+        return conn.execute(sa.text(
+            "SELECT COUNT(*) FROM items i "
+            "WHERE i.tags IS NOT NULL AND i.tags NOT IN ('', '[]') "
+            "AND NOT EXISTS (SELECT 1 FROM item_tags t WHERE t.item_id = i.id)"
+        )).scalar()
+
+
+def _legacy_tags_column(engine, item_id: int):
+    with engine.begin() as conn:
+        return conn.execute(
+            sa.text("SELECT tags FROM items WHERE id = :id"), {"id": item_id}
+        ).scalar()
+
+
+@pytest.mark.parametrize("raw, warns", [
+    ("{not valid", True),      # not JSON at all
+    ('"str"', True),           # valid JSON, not a list
+    ("[1, 2]", True),          # list of non-str
+    ('["", "   "]', True),     # empty after normalization
+    ("null", True),
+    ("{}", True),
+    ("[ ]", False),            # parses to an empty list: nothing to drop
+])
+def test_tags_backfill_converges_on_zero_yield_items(engine, capsys, raw, warns):
+    """K-22: an item whose frozen column yields NO usable name can never get an
+    item_tags row, so the per-item anti-join keeps re-selecting it forever — a
+    write transaction plus a repeated warning on every single dct command.
+
+    Owner decision (a): once the drop has been REPORTED, the backfill — the
+    column's only sanctioned writer — blanks it to '[]', so the item leaves the
+    candidate set for good. One warning total, then silence.
+    """
+    from dct.db import _backfill_item_tags
+
+    item = _seed_legacy_item(engine, raw)
+
+    _backfill_item_tags(engine)
+    first_err = capsys.readouterr().err
+    writes = _write_statements(engine, lambda: _backfill_item_tags(engine))
+    _backfill_item_tags(engine)
+    later_err = capsys.readouterr().err
+
+    assert first_err.count("dropped") == (1 if warns else 0)
+    if warns:
+        assert str(item["id"]) in first_err
+    assert later_err == ""                       # runs 2 and 3 say nothing
+    assert writes == []                          # ... and write nothing
+    assert _backfill_candidate_count(engine) == 0
+    assert _legacy_tags_column(engine, item["id"]) == "[]"
+    assert _tag_dict_names(engine) == []
+    assert _tag_link_rows(engine) == []
+    assert get_item(engine, item["id"])["tags"] == []
+
+
+def test_tags_backfill_keeps_the_column_of_a_yielding_item(engine):
+    """The K-22 write exception is scoped to ZERO-yield items. An item that
+    migrated at least one name leaves the candidate set through its item_tags
+    row, so its frozen column stays as history (partial garbage included)."""
+    from dct.db import _backfill_item_tags
+
+    raw = '["perf", 5]'
+    item = _seed_legacy_item(engine, raw)
+
+    _backfill_item_tags(engine)
+
+    assert get_item(engine, item["id"])["tags"] == ["perf"]
+    assert _legacy_tags_column(engine, item["id"]) == raw
+    assert _backfill_candidate_count(engine) == 0
+
+
+def test_tags_backfill_similarity_report_spans_the_whole_dictionary(engine, capsys):
+    """K-30: the migrated names are compared against the FULL active dictionary,
+    not only against each other. 'test' already exists (registered through the
+    normal API), a legacy item brings in 'tests' — the pair must be reported."""
+    from dct.db import _backfill_item_tags
+
+    create_project(engine, slug="dct", name="DCT", path="/tmp/dct")
+    create_item(engine, "dct", "issue", "Modern", tags=["test"])
+    legacy = create_item(engine, "dct", "issue", "Legacy")
+    _set_legacy_tags(engine, legacy["id"], '["tests"]')
+
+    _backfill_item_tags(engine)
+
+    err = capsys.readouterr().err
+    assert "possible duplicates: test/tests" in err
+    assert _tag_dict_names(engine) == ["test", "tests"]
+
+
+def test_tags_backfill_similarity_report_is_skipped_over_the_scan_limit(engine, capsys):
+    """K-34: a huge dictionary must not turn the bootstrap into an O(n^2)
+    SequenceMatcher run. Past the limit the report degrades to ONE line
+    pointing at `dct tags list` — never a stall, never a silent drop."""
+    from dct.db import _REPORT_SCAN_LIMIT, _backfill_item_tags
+    from dct.db import tags as tags_table
+
+    create_project(engine, slug="dct", name="DCT", path="/tmp/dct")
+    with engine.begin() as conn:
+        conn.execute(
+            tags_table.insert(),
+            [{"name": f"bulk-{i:04d}"} for i in range(_REPORT_SCAN_LIMIT + 1)],
+        )
+    legacy = create_item(engine, "dct", "issue", "Legacy")
+    _set_legacy_tags(engine, legacy["id"], '["bulk-0000s"]')
+
+    _backfill_item_tags(engine)
+
+    err = capsys.readouterr().err
+    assert "possible duplicates not scanned" in err
+    assert f"({_REPORT_SCAN_LIMIT + 2} names)" in err
+    assert "dct tags list" in err
+    assert "consider consolidating" not in err
+    assert get_item(engine, legacy["id"])["tags"] == ["bulk-0000s"]
+
+
+# The guard vector table from the #611 plan: the pairs the full SequenceMatcher
+# scan flags (left) and the ones it deliberately lets through (right).
+_GUARD_FLAGGED = [
+    ("test", "tests"),          # .889
+    ("tag", "tags"),            # .857
+    ("ui", "uis"),              # .800 — plural rule only, below the threshold
+    ("security", "securty"),    # .933
+    ("auth", "oauth"),          # .889 — different first character
+]
+_GUARD_PASSED = [
+    ("refactor", "refactoring"),
+    ("test", "text"),
+    ("test", "testing"),
+    ("perf", "performance"),
+    ("db", "database"),
+]
+
+
+@pytest.mark.parametrize("left, right", _GUARD_FLAGGED)
+def test_similarity_shortlist_keeps_every_flagged_pair(left, right):
+    """K-34: the prefilter is an optimisation, so it must be a SUPERSET of the
+    full scan's hits. A first-character bucket would silently lose auth/oauth —
+    the shortlist uses the two bounds that actually cap SequenceMatcher's ratio
+    (length and shared characters), which cannot drop a real hit."""
+    from dct.core.tags import SIMILARITY_THRESHOLD
+    from dct.db import _similarity_shortlist
+
+    assert right in _similarity_shortlist(left, [right], SIMILARITY_THRESHOLD)
+    assert left in _similarity_shortlist(right, [left], SIMILARITY_THRESHOLD)
+
+
+def test_similarity_shortlist_matches_the_full_scan_on_the_vector_table():
+    """Property: for every name in the plan's vector table, running _similar on
+    the shortlist yields exactly what running it on ALL names yields."""
+    from dct.core.tags import SIMILARITY_THRESHOLD, _similar
+    from dct.db import _similarity_shortlist
+
+    names = sorted({n for pair in _GUARD_FLAGGED + _GUARD_PASSED for n in pair})
+    for name in names:
+        full = _similar(name, names)
+        short = _similar(name, _similarity_shortlist(name, names, SIMILARITY_THRESHOLD))
+        assert short == full, name
+
+
+def test_similarity_shortlist_drops_obvious_non_candidates():
+    """... while actually pruning: nothing that cannot reach the threshold
+    survives (otherwise the prefilter buys nothing)."""
+    from dct.core.tags import SIMILARITY_THRESHOLD
+    from dct.db import _similarity_shortlist
+
+    assert _similarity_shortlist("perf", ["performance", "database", "xyz"],
+                                 SIMILARITY_THRESHOLD) == []

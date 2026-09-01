@@ -54,13 +54,14 @@ Rules of thumb:
 - `idea` = exploratory, not yet decided to build
 - `improvement` = existing thing works but could be better (refactor, UX polish, perf)
 
-**MCP tools** — 52 total; most important:
+**MCP tools** — 55 total; most important:
 - `pickup_work`, `handoff_work`, `get_context_snapshot` — composed session-edge ops; prefer them over chaining the granular tools below
 - `list_projects`, `list_items`, `get_item`, `create_item`, `update_item`, `resolve_item`, `add_note`
 - `add_checkpoint`, `list_checkpoints`, `complete_checkpoint`, `reject_checkpoint`, `reopen_checkpoint`
 - `add_changelog`, `list_changelog`, `count_unreleased_changelog`, `release_changelog`, `export_changelog`
 - `set_sprint`, `clear_sprint`, `review_sprint`, `list_sprints`, `update_sprint`
 - `create_handoff`, `list_handoffs`, `get_handoff`, `consume_handoff`, `delete_handoff`
+- `add_tag`, `list_tags`, `merge_tag` — global tag dictionary admin (deferred; load via ToolSearch)
 
 ### When to auto-invoke
 
@@ -164,6 +165,19 @@ You usually don't need to specify project explicitly inside a project tree.
   completed/abandoned — defer it.
 - Multiple parallel handoffs supported (use `scope` tag to disambiguate)
 - `consume_handoff(id)` preserves the row — ledger, nothing hard-deleted
+
+### Tags
+
+- Tags are a GLOBAL, dictionary-backed vocabulary (cross-project); items link to it.
+- Filter: `list_items(tag="perf")` — composes with `project` scoping; unknown tag
+  → error naming the known tags (closed dictionary).
+- Edit: `update_item(id, tags=[...])` is a FULL REPLACE (`[]` clears, omit = unchanged);
+  to append, `get_item` first and pass the union.
+- New names auto-register after normalization (lowercase/trim). A name SIMILAR to an
+  existing tag (test vs tests) is refused with a suggestion — reuse the suggested tag,
+  or consciously `add_tag(name, force=true)` and retry.
+- Consolidate duplicates with `merge_tag(from_name, into_name)` (links move, source
+  tag soft-deleted, history preserved).
 
 ### What NOT to do
 

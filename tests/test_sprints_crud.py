@@ -789,3 +789,67 @@ def test_current_sprint_writes_refuse_ambiguity(engine, proj):
     ):
         with pytest.raises(ValueError, match="refuse to guess"):
             op()
+
+
+# ── K-21 (#611): sprint member rows publish item_tags, not the frozen column ───
+
+def test_list_items_in_sprint_publishes_active_tag_names(engine, proj):
+    """Members must carry the SAME `tags` contract as list_items / get_item:
+    list[str] of ACTIVE item_tags names, name-ASC — never the frozen
+    `items.tags` column (which materializes as the string '[]')."""
+    from dct.core.items import update_item
+
+    s = create_sprint(engine, "dct", "S")
+    tagged = create_item(engine, "dct", "issue", "Tagged", tags=["zeta", "alpha"])
+    plain = create_item(engine, "dct", "issue", "Plain")
+    assign_item_to_sprint(engine, tagged["id"], s["id"])
+    assign_item_to_sprint(engine, plain["id"], s["id"])
+    # A soft-removed link must not resurface as a name.
+    update_item(engine, tagged["id"], tags=["zeta", "alpha", "gone"])
+    update_item(engine, tagged["id"], tags=["zeta", "alpha"])
+
+    by_id = {m["id"]: m for m in list_items_in_sprint(engine, s["id"])}
+
+    assert by_id[tagged["id"]]["tags"] == ["alpha", "zeta"]  # name-ASC
+    assert by_id[plain["id"]]["tags"] == []
+    for member in by_id.values():
+        assert isinstance(member["tags"], list)
+        assert all(isinstance(n, str) for n in member["tags"])
+
+
+def test_list_items_in_sprint_tags_match_get_item(engine, proj):
+    """Property: the sprint view and get_item never disagree about an item's
+    tags — one enrichment path, one answer."""
+    from dct.core.items import get_item
+
+    s = create_sprint(engine, "dct", "S")
+    item = create_item(engine, "dct", "feature", "F", tags=["oss", "api"])
+    assign_item_to_sprint(engine, item["id"], s["id"])
+
+    member = list_items_in_sprint(engine, s["id"])[0]
+    assert member["tags"] == get_item(engine, item["id"])["tags"] == ["api", "oss"]
+
+
+def test_list_items_in_sprint_include_removed_still_enriches(engine, proj):
+    """The historical view (include_removed=True) must not fall back to the
+    frozen column for soft-removed members."""
+    s = create_sprint(engine, "dct", "S")
+    item = create_item(engine, "dct", "issue", "A", tags=["alpha"])
+    assign_item_to_sprint(engine, item["id"], s["id"])
+    remove_item_from_sprint(engine, item["id"], s["id"])
+
+    historical = list_items_in_sprint(engine, s["id"], include_removed=True)
+    assert [m["tags"] for m in historical] == [["alpha"]]
+
+
+def test_current_sprint_items_publish_active_tag_names(engine, proj):
+    """The current-sprint helper (core.sprint.list_sprint_items) inherits the
+    enrichment — it is the /pickup + web surface."""
+    from dct.core.sprint import list_sprint_items
+    from dct.core.sprints import set_current_sprint_items
+
+    item = create_item(engine, "dct", "feature", "F", tags=["beta", "alpha"])
+    set_current_sprint_items(engine, "dct", [item["id"]])
+
+    members = list_sprint_items(engine, "dct")
+    assert [m["tags"] for m in members] == [["alpha", "beta"]]

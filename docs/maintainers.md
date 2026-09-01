@@ -31,8 +31,10 @@ Write with anonymous placeholders from the first keystroke:
    touched files before staging:
 
    ```bash
-   rg -l '<private-slug-1>|<private-slug-2>|/Users/|/home/|C:\\\\Users' \
+   rg -l '<private-slug-1>|<private-slug-2>|/Users/|/home/|C:\\\\Users|claude\.ai/code' \
       -- tests skills README.md CLAUDE.md dct/
+   # commit messages are history too — session/artifact URLs must never land:
+   git log --all --grep='claude\.ai/code' --oneline
    ```
 
    Swap the `<private-slug-*>` placeholders for your own private project

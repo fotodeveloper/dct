@@ -49,6 +49,12 @@ pythonpath = ["."]
 # style in compact CLI/test code; everything else in ruff's default set applies.
 ignore = ["E701", "E741"]
 
+[tool.ruff.lint.isort]
+# Pin first-party classification: ruff otherwise infers it from what exists on
+# disk, so a TDD-red test importing a module that is not written yet gets its
+# import block reported as un-sorted (I001) until the module lands.
+known-first-party = ["dct"]
+
 [tool.ruff.lint.per-file-ignores]
 # Deliberate blanket catches (BLE001): each surface converts ANY failure into
 # its error contract instead of raising — MCP tools return {"error": ...}, CLI

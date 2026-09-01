@@ -31,8 +31,9 @@ from datetime import UTC, datetime
 
 import sqlalchemy as sa
 
-from dct.core.items import TERMINAL_STATUSES, _membership_count_exprs
+from dct.core.items import TERMINAL_STATUSES, _item_to_dict, _membership_count_exprs
 from dct.core.projects import resolve_project_id
+from dct.core.tags import tags_for_items_conn
 from dct.db import item_sprints, items, row_to_dict, sprints
 
 VALID_KINDS = {"sprint", "phase", "milestone", "block"}
@@ -463,7 +464,14 @@ def remove_item_from_sprint(
 def list_items_in_sprint(
     engine: sa.Engine, sprint_id: int, include_removed: bool = False
 ) -> list[dict]:
-    """Return item rows currently (or historically) linked to a sprint."""
+    """Return item rows currently (or historically) linked to a sprint.
+
+    Rows carry the SAME `tags` contract as list_items / get_item (K-21, #611):
+    the frozen `items.tags` column is dropped and replaced by the ACTIVE
+    item_tags names as list[str], name-ASC. Tags come from ONE extra query over
+    the materialized page (tags_for_items_conn), never from a join and never
+    N+1.
+    """
     with engine.begin() as conn:
         q = (
             sa.select(items)
@@ -473,7 +481,9 @@ def list_items_in_sprint(
         )
         if not include_removed:
             q = q.where(item_sprints.c.removed_at.is_(None))
-        return [row_to_dict(r) for r in conn.execute(q)]
+        rows = conn.execute(q).fetchall()
+        tags_by_item = tags_for_items_conn(conn, [r._mapping["id"] for r in rows])
+        return [_item_to_dict(r, tags_by_item.get(r._mapping["id"])) for r in rows]
 
 
 def list_sprints_for_item(

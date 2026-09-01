@@ -5,7 +5,9 @@ Uses Core (not ORM) for portability between PostgreSQL and SQLite.
 """
 
 import contextlib
+import json
 import sys
+from collections import Counter
 from datetime import UTC
 from pathlib import Path
 
@@ -29,6 +31,7 @@ PROVENANCE_TABLES = (
     "sprints",
     "decisions",
     "plans",
+    "tags",
 )
 
 
@@ -84,6 +87,11 @@ items = sa.Table(
     sa.Column("component", sa.String(100)),
     sa.Column("source_file", sa.String(500)),
     sa.Column("source_lines", sa.String(100)),
+    # DEPRECATED — frozen, DROP at 2.0.0. Tags live in tags / item_tags since
+    # #611; _backfill_item_tags is the ONLY sanctioned reader of this column —
+    # and its ONLY writer, in exactly one case (K-22): after reporting an item
+    # whose JSON yields no usable name, it blanks that item's value to '[]' so
+    # the un-migratable row stops being re-selected on every bootstrap.
     sa.Column("tags", sa.Text, server_default="[]"),
     sa.Column("resolution", sa.Text),
     # NB: sprint membership is NOT a column. `in_current_sprint` is derived at
@@ -252,6 +260,32 @@ item_sprints = sa.Table(
     sa.Column("removed_at", sa.DateTime),
 )
 
+# ── v1.5 schema: tags ─────────────────────────────────────────────────────────
+
+tags = sa.Table(
+    "tags",
+    metadata,
+    sa.Column("id", sa.Integer, primary_key=True, autoincrement=True),
+    # GLOBAL / user-scoped: deliberately NO project_id (owner decision, #611) —
+    # one name means the same thing in every project.
+    sa.Column("name", sa.Text, nullable=False),  # no DB length limit: the
+    # 50-char rule is an API rule for NEW names only, so legacy names migrated
+    # from the frozen items.tags column always fit (K-7).
+    sa.Column("description", sa.Text),
+    sa.Column("created_at", sa.DateTime, nullable=False, server_default=sa.text("CURRENT_TIMESTAMP")),
+    sa.Column("deleted_at", sa.DateTime),
+    *_provenance_columns(),
+)
+
+item_tags = sa.Table(  # mirror of item_sprints: composite PK, soft-removed links
+    "item_tags",
+    metadata,
+    sa.Column("item_id", sa.Integer, sa.ForeignKey("items.id"), primary_key=True),
+    sa.Column("tag_id", sa.Integer, sa.ForeignKey("tags.id"), primary_key=True),
+    sa.Column("assigned_at", sa.DateTime, nullable=False, server_default=sa.text("CURRENT_TIMESTAMP")),
+    sa.Column("removed_at", sa.DateTime),
+)
+
 decisions = sa.Table(
     "decisions",
     metadata,
@@ -358,6 +392,22 @@ sa.Index(
     postgresql_where=sa.and_(decisions.c.ref_code.isnot(None), decisions.c.deleted_at.is_(None)),
 )
 sa.Index("ix_decisions_project_kind_status", decisions.c.project_id, decisions.c.kind, decisions.c.status, decisions.c.deleted_at)
+
+# v1.5 tag indexes — the dictionary's only hard constraint (the similarity
+# guard is advisory) plus the reverse lookup behind the list_items tag filter.
+sa.Index(
+    "ix_tags_name_active",
+    tags.c.name,
+    unique=True,
+    sqlite_where=tags.c.deleted_at.is_(None),
+    postgresql_where=tags.c.deleted_at.is_(None),
+)
+sa.Index(
+    "ix_item_tags_tag_active",
+    item_tags.c.tag_id,
+    sqlite_where=item_tags.c.removed_at.is_(None),
+    postgresql_where=item_tags.c.removed_at.is_(None),
+)
 
 
 def _set_sqlite_wal(dbapi_connection, _connection_record):
@@ -583,6 +633,203 @@ def _apply_schema_updates(engine: sa.Engine) -> None:
                 "bogus ones with remove_item_from_sprint.",
                 file=sys.stderr,
             )
+
+    # #611: seed tags / item_tags from the frozen items.tags JSON column. Runs
+    # on EVERY bootstrap (no marker row — the facts are the truth) so an item
+    # written by a still-running pre-#611 process is adopted next time (K-8).
+    _backfill_item_tags(engine)
+
+
+def _parse_legacy_tags_json(raw) -> tuple[list[str], list]:
+    """Tolerant parse of one frozen `items.tags` value -> (names, dropped).
+
+    NEVER raises: this feeds a block that runs on every bootstrap, so a raise
+    here would brick every dct command. Bad JSON, a non-list payload and
+    non-str / empty elements are dropped and REPORTED by the caller.
+
+    K-7: legacy names are HISTORY, not input to the API — only lowercase/trim
+    is applied. The comma and MAX_TAG_LENGTH rules are deliberately NOT
+    enforced, so nothing is ever silently lost by length or punctuation.
+    """
+    if raw is None or raw == "":
+        return [], []
+    try:
+        parsed = json.loads(raw)
+    except (TypeError, ValueError):
+        return [], [raw]
+    if not isinstance(parsed, list):
+        return [], [raw]
+
+    names: list[str] = []
+    dropped: list = []
+    for element in parsed:
+        if not isinstance(element, str):
+            dropped.append(element)
+            continue
+        normalized = " ".join(element.split()).lower()
+        if not normalized:
+            dropped.append(element)
+            continue
+        names.append(normalized)
+    return list(dict.fromkeys(names)), dropped
+
+
+def _backfill_item_tags(engine: sa.Engine) -> None:
+    """Seed tags / item_tags from the frozen items.tags JSON column (#611).
+
+    Self-healing, not one-shot (the _migrate_legacy_sprint_flag pattern):
+    candidates are items whose JSON column is non-empty and which have NO
+    item_tags row at all. The anti-join guard is per-ITEM on purpose — once an
+    item has spoken through the join table it owns its tag set, so clearing or
+    re-tagging is never undone by the next bootstrap (a per-PAIR guard would
+    resurrect removed tags forever, since the frozen column keeps the old JSON).
+
+    K-22 — the ONE write to the frozen column: an item whose JSON yields no
+    usable name never gets an item_tags row, so the per-item anti-join would
+    re-select it on every bootstrap forever (a write transaction and a repeated
+    warning per dct command). After the drop has been REPORTED (stderr, item id
+    + the raw values), this function — the column's only sanctioned writer —
+    overwrites that item's `items.tags` with '[]', which removes it from the
+    candidate set. Scoped to ZERO-yield items: an item that migrated at least
+    one name keeps its column as history. `updated_at` is deliberately left
+    alone — this is a migration bookkeeping write, not an edit of the item.
+
+    Self-disables once the column is dropped at 2.0.0.
+    """
+    from dct.core.tags import _active_names_conn, _add_tag_conn, _ensure_link_conn
+
+    inspector = sa.inspect(engine)
+    tables = set(inspector.get_table_names())
+    # NB two different scopes: `tables` is about the tags/item_tags TABLES,
+    # `item_cols` about the frozen COLUMN on items. Both must be present.
+    if not {"items", "tags", "item_tags"}.issubset(tables):
+        return
+    item_cols = {c["name"] for c in inspector.get_columns("items")}
+    if "tags" not in item_cols:
+        return
+
+    no_links = ~(
+        sa.select(sa.literal(1))
+        .select_from(item_tags)
+        .where(item_tags.c.item_id == items.c.id)
+        .exists()
+    )
+    candidates_q = sa.select(items.c.id, items.c.tags, items.c.updated_at).where(
+        items.c.tags.isnot(None),
+        items.c.tags.notin_(("", "[]")),
+        no_links,
+    )
+
+    # Steady state is ONE cheap anti-join probe on a read connection — no write
+    # transaction is opened when there is nothing to migrate.
+    with engine.connect() as conn:
+        if conn.execute(candidates_q.limit(1)).first() is None:
+            return
+
+    migrated_names: set[str] = set()
+    dictionary: list[str] = []
+    with engine.begin() as conn:
+        # K-9: the candidate set is re-SELECTed INSIDE the write transaction, so
+        # the anti-join and the inserts see one consistent snapshot — no window
+        # for a concurrent re-tagging to be overwritten.
+        for row in conn.execute(candidates_q).fetchall():
+            names, dropped = _parse_legacy_tags_json(row.tags)
+            if dropped:
+                # Printed BEFORE the converging write below is committed: a drop
+                # the user never saw is unauditable data loss, so the report can
+                # only ever run ahead of the blanking, never behind it.
+                print(
+                    f"WARNING: dct tag backfill — item #{row.id}: dropped "
+                    f"{len(dropped)} unusable tag value(s) {dropped!r}",
+                    file=sys.stderr,
+                )
+            for name in names:
+                # No similarity guard here: historical names are not typos to
+                # be corrected (the post-run report suggests consolidation).
+                tag_id = _add_tag_conn(conn, name, force=True)["id"]
+                _ensure_link_conn(conn, row.id, tag_id, row.updated_at)
+                migrated_names.add(name)
+            if not names:
+                # K-22: nothing usable in there and no link to fall back on —
+                # converge by emptying the frozen column (see the docstring).
+                conn.execute(
+                    sa.update(items).where(items.c.id == row.id).values(tags="[]")
+                )
+        if migrated_names:
+            # K-30: read the FULL active dictionary (not just this batch) while
+            # the write transaction is still open — the get-or-create above has
+            # already populated it, so a legacy 'tests' meets an existing 'test'.
+            dictionary = _active_names_conn(conn)
+
+    if migrated_names:
+        _report_possible_duplicates(sorted(migrated_names), dictionary)
+
+
+# K-34: past this many active tag names the post-backfill scan degrades to a
+# single pointer line. The scan is O(migrated x dictionary) and migrated names
+# are themselves in the dictionary, so this one number bounds the whole report.
+_REPORT_SCAN_LIMIT = 300
+
+
+def _similarity_shortlist(candidate: str, names, threshold: float) -> list[str]:
+    """Names that COULD reach `threshold` — a cheap SUPERSET of `_similar`'s hits.
+
+    K-34: SequenceMatcher with autojunk=False is quadratic in the name lengths,
+    so it must not run on every pair. Both bounds below are real upper bounds on
+    ratio = 2*M/(len(a)+len(b)), because the matched blocks are a common
+    subsequence: M <= min(len(a), len(b)) and M <= |multiset(a) & multiset(b)|.
+    Anything the shortlist drops therefore could not have been flagged.
+
+    Bucketing by first character was rejected: it drops auth/oauth (.889), a
+    pair the guard's own vector table flags. The plural rule (a == b + "s") is
+    kept unconditionally — it fires below the ratio threshold (ui/uis at .800).
+    """
+    counts = Counter(candidate)
+    length = len(candidate)
+    keep: list[str] = []
+    for other in names:
+        if other == candidate:
+            continue
+        if candidate == other + "s" or other == candidate + "s":
+            keep.append(other)
+            continue
+        total = length + len(other)
+        if 2 * min(length, len(other)) < threshold * total:
+            continue
+        if 2 * sum((counts & Counter(other)).values()) < threshold * total:
+            continue
+        keep.append(other)
+    return keep
+
+
+def _report_possible_duplicates(migrated: list[str], dictionary: list[str]) -> None:
+    """Post-backfill consolidation SUGGESTION on stderr — never a block, never
+    an auto-merge (that is the user's call, via `dct tags merge` / merge_tag).
+
+    `migrated` is compared against the whole active `dictionary` (K-30), through
+    the cheap prefilter and under the hard scan limit (K-34).
+    """
+    from dct.core.tags import SIMILARITY_THRESHOLD, _similar
+
+    if len(dictionary) > _REPORT_SCAN_LIMIT:
+        print(
+            "NOTE: dct tag backfill — possible duplicates not scanned "
+            f"({len(dictionary)} names); run `dct tags list` to review.",
+            file=sys.stderr,
+        )
+        return
+
+    pairs = set()
+    for name in migrated:
+        shortlist = _similarity_shortlist(name, dictionary, SIMILARITY_THRESHOLD)
+        for other in _similar(name, shortlist):
+            pairs.add(tuple(sorted((name, other))))
+    for left, right in sorted(pairs):
+        print(
+            f"NOTE: dct tag backfill — possible duplicates: {left}/{right} — "
+            "consider consolidating with `dct tags merge`.",
+            file=sys.stderr,
+        )
 
 
 def _migrate_legacy_sprint_flag(engine: sa.Engine) -> None:

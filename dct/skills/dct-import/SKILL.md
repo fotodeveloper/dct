@@ -164,13 +164,20 @@ Mapping (**plan-as-parent** strategy):
 ```
 
 Mapping:
-- Heading → `title` (strip the ID prefix or capture it as tag)
+- Heading → `title` (strip the ID prefix or capture it as tag — see the tag note below)
 - `**Where**:` → `source_file` (+ `source_lines` if line range present)
 - `**Problem**:` + `**Fix**:` → merged into `description`
 - `**Severity**:` → `priority` (P1/P2/P3)
 - `**Status**:` → `status` (map "open"/"in progress"/"done"/"resolved")
 - `item_type="issue"` (that's what this format represents)
 - Prefix like `ORCH-3` → `tags=["orch"]` (derive bucket tag from prefix)
+
+**Tag note**: tags come from a global, normalized dictionary. A derived bucket
+tag can trip the similarity guard against a name that already exists (`orch` vs
+`orchestrator`) — the create is then REFUSED with a suggestion and the item is
+rolled back. Default to the suggested existing tag; when the new bucket is
+genuinely wanted, call `mcp__dct__add_tag(name=..., force=true)` once, then
+re-run the import batch.
 
 ### Format D — Plan-as-parent (1.5k+ line planning doc)
 

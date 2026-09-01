@@ -12,19 +12,15 @@ import sqlalchemy as sa
 
 from dct.core import provenance
 from dct.core.items import create_item
-from dct.db import create_tables, get_engine
+from dct.core.tags import add_tag
+from dct.db import PROVENANCE_COLUMNS, PROVENANCE_TABLES, create_tables, get_engine
 
-PROV_COLS = ("actor_type", "actor_client", "session_id", "source")
-LEDGER_TABLES = (
-    "items",
-    "item_notes",
-    "item_checkpoints",
-    "changelog_entries",
-    "session_handoffs",
-    "sprints",
-    "decisions",
-    "plans",
-)
+# K-44: both names are READ FROM dct.db, never re-typed here. A hand-kept copy
+# silently stops covering a table the moment one is added (it missed `tags`,
+# #611) — the whole point of this file is that EVERY provenance-bearing ledger
+# is checked.
+PROV_COLS = PROVENANCE_COLUMNS
+LEDGER_TABLES = PROVENANCE_TABLES
 
 
 @pytest.fixture(autouse=True)
@@ -52,15 +48,27 @@ def test_insert_carries_active_provenance(engine, seed_project):
         )
     )
     item = create_item(engine, project_slug="test", item_type="todo", title="t")
+    # The tag dictionary is a ledger too (#611): its INSERT must pick the
+    # ContextVar up through the same Core column defaults.
+    tag = add_tag(engine, "provenance-check")
     with engine.connect() as conn:
-        row = conn.execute(
+        item_row = conn.execute(
             sa.text(
                 "SELECT actor_type, actor_client, session_id, source "
                 "FROM items WHERE id = :id"
             ),
             {"id": item["id"]},
         ).one()
-    assert tuple(row) == ("agent", "claude-code", "sess-123", "mcp")
+        tag_row = conn.execute(
+            sa.text(
+                "SELECT actor_type, actor_client, session_id, source "
+                "FROM tags WHERE id = :id"
+            ),
+            {"id": tag["id"]},
+        ).one()
+    expected = ("agent", "claude-code", "sess-123", "mcp")
+    assert tuple(item_row) == expected
+    assert tuple(tag_row) == expected
 
 
 def test_insert_without_context_leaves_nulls(engine, seed_project):

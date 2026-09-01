@@ -26,10 +26,12 @@ Gather all state in a single parallel message:
   with `cp`, their `checkpoints`, `stale_in_progress`, pending `gates`, live
   `decisions`, `recent_changes` and `summary`. Gates and decisions FEED THE
   DRAFT: an unresolved gate or open ADR question belongs in the handoff text.
-- `mcp__dct__list_items(project="", search="CC task list")` — the cc-task-list
-  mirror probe (see Step 2, question 3). `list_items` has NO `tags` parameter,
-  so filter the returned rows CLIENT-SIDE: keep only rows whose `tags` column
-  contains `cc-task-list`.
+- `mcp__dct__list_items(project="", search="CC task list", tag="cc-task-list")` —
+  the cc-task-list mirror probe (see Step 2, question 3). The `tag` filter runs
+  SERVER-SIDE; no client-side post-filtering is needed. The tag dictionary is
+  closed: if `cc-task-list` was never registered the call returns
+  `{"error": ...}` — that means "no mirror items exist", so treat it as an empty
+  result and carry on, never as a failed preflight.
 
 **Fallback only when project is unresolved** (`get_context_snapshot` errors
 because CWD is not a registered project): `mcp__dct__list_projects()` +

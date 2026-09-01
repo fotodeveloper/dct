@@ -48,7 +48,9 @@ ID normalization (from `#42`, `42`, `ITEM-42`, `item-42`, `ITEM_42`, `item_42`, 
 
 ### Step 2: Query
 
-Call `mcp__dct__list_items(project, status, item_type, priority, component, in_current_sprint, search, limit, format="structured")`.
+Call `mcp__dct__list_items(project, status, item_type, priority, component, in_current_sprint, search, tag, limit, format="structured")`.
+
+`tag` narrows to items carrying that tag (server-side; the dictionary is global, the listing stays project-scoped). An unknown tag returns `{"error": ...}` naming the closest known tags (up to 3, plus a count of the rest and a pointer to `list_tags`) — surface it, do not silently fall back to an unfiltered list.
 
 Response shape:
 ```
