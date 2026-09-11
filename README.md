@@ -115,7 +115,8 @@ dct doctor --client codex --json
 Reconnect/start a fresh Codex session. The adapter installs MCP configuration,
 `pickup`, `handoff`, `track` and `clog` skills, and managed `AGENTS.md`
 instructions. It preserves existing configuration and reports conflicting
-files. Codex uses explicit workflows; Claude's automatic hooks are not ported.
+files. Native Codex hooks cover changelog checks, stop reminders, apply-patch
+autoscan and plan snapshots after review and trust through `/hooks`.
 See the [integration guide and capability matrix](https://github.com/fotodeveloper/dct/blob/main/docs/integrations.md)
 for repair, upgrade, uninstall, runtime diagnostics and limitations.
 

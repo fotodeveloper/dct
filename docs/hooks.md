@@ -1,5 +1,79 @@
 # dct hooks — wiring reference
 
+## Native Codex hooks
+
+`dct integrate install codex` (or `repair codex`) adds four native definitions
+to `$CODEX_HOME/hooks.json`, using the Python environment that installed DCT.
+The runtime bridge is packaged as `dct.integrations.codex_hooks`; it reuses the
+existing changelog and autoscan policy scripts below.
+
+| Event / matcher | Behavior |
+|---|---|
+| `PreToolUse` / `^Bash$` | Check a recognized Git commit using the shared changelog policy. Only an explicit policy denial blocks. |
+| `Stop` | Convert the shared reminder to nonblocking Codex `systemMessage` JSON. |
+| `PostToolUse` / `^apply_patch$` (async) | On successful patches, dispatch existing plan files within the worktree to the shared autoscan script. |
+| `PostToolUse` / `^update_plan$` (async) | Record successful native plan snapshots as auxiliary, non-gating DCT checkpoints. |
+
+Codex maps `exec_command` to the canonical hook name `Bash`. `apply_patch`
+provides the patch in `tool_input.command`, rather than a single `file_path`.
+The bridge handles add/update/move destinations, skips deletions and failed
+operations, and prevents autoscan from crossing the worktree boundary. Shell
+edits are not an autoscan source; use `dct plan rescan` explicitly for those.
+
+Commit detection supports literal Git commands, `git -C`, and leading literal
+`cd ... && git ...`. Dynamic working directories and unsupported shell constructs
+are skipped rather than checking a different project. Hooks are workflow
+guardrails, not an exhaustive shell-security boundary. The shared policy checks
+the index as it exists before the tool runs: stage changes in a separate command
+when relying on the check, rather than combining staging and commit or relying
+on `git commit -a`. Bash, jq, Git and DCT on
+PATH are required by the reused shell policies; missing dependencies degrade
+gracefully. Runtime validation currently targets the local POSIX client.
+
+### Review and trust
+
+Installing definitions does **not** trust them. In a fresh Codex CLI session,
+open `/hooks`, review the four DCT commands and trust the definitions you intend
+to run. Codex skips new or changed non-managed hooks until their current hashes
+are trusted. DCT never writes Codex trust storage or enables a trust bypass.
+`dct doctor --client codex` checks installation separately and reports that
+runtime trust must be checked in Codex. See the
+[official hook contract](https://learn.chatgpt.com/docs/hooks).
+
+The installer keeps a separate ownership sidecar. Repair and upgrade refresh
+only unchanged owned definitions; other hooks and modified entries are retained.
+Explicit repair replaces recognized missing legacy references in place when
+the event and single-handler group allow it. Shared or mismatched groups remain
+for manual review: removing their positions could invalidate another hook's
+trust in the verified Codex client. Existing scripts and custom commands are not
+claimed as owned. Upgrade does not introduce hooks into an installation that
+never opted in. Uninstall removes unchanged owned definitions and retains
+modified or unrelated hooks for review. Empty matcher groups are deliberately
+left as position placeholders: in the verified Codex client, deleting a group
+can change the keys and invalidate trust of later, unrelated hooks. Do not
+compact these groups without reviewing the affected hooks again in Codex.
+
+### Native plan history
+
+`[integrations.codex].task_mirror` is independent of the Claude setting:
+`auto` records snapshots; `ask` and `off` skip them. Codex records require actual
+`session_id` and `turn_id`; no synthetic identity is substituted. Session and
+turn together separate plans because subagents may share the parent session ID.
+
+Each changed snapshot appends observations. Equal steps remain distinct rows;
+exact event replays are skipped transactionally. Native status is preserved in
+the text, while checkpoint status remains pending with the historical non-gating
+`cc-task` kind. This is an append-only observation history, not bidirectional
+plan synchronization or automatic acceptance of DCT work. Codex mirror writes
+carry `actor_client=codex`, the real session and `source=hook`.
+
+Mirroring applies when the client exposes and emits `update_plan`. Its emission
+has not yet been demonstrated in the tested noninteractive Sol configuration;
+model statements about tool availability are not proof of the exposed catalog.
+The decoder and transactional mirror are covered by isolated event/worker tests.
+
+## Claude Code hooks
+
 `dct init` installs four hooks as symlinks in `~/.claude/hooks/` and (with your
 consent) wires them into `~/.claude/settings.json`. This page is the manual
 reference for that wiring — useful when you skipped the automatic step, manage

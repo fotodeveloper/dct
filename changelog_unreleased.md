@@ -9,6 +9,7 @@
 
 ## Added
 
+- Add native Codex hook definitions and a bounded event bridge for shared changelog checks, stop reminders, worktree-scoped autoscan and append-only plan mirroring; keep installation separate from Codex trust (#690).
 - Share an integration contract and conservative user-file ownership helpers across Claude Code and Codex.
 - Add the Codex MCP adapter, four packaged workflow skills and managed AGENTS.md instructions.
 - Add `dct integrate install/status/repair/uninstall` and read-only `dct doctor --json` with per-Python dependency checks, including current editable-source requirements.

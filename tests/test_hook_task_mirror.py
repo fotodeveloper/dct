@@ -211,3 +211,8 @@ def test_worker_reads_session_id_from_payload(engine, seed_project, monkeypatch)
     )
     titles = [r["title"] for r in _cc_items(engine)]
     assert "CC task list — session from-payload" in titles
+
+
+def test_worker_preserves_legacy_empty_mode_fallback(engine, seed_project, monkeypatch):
+    _run_worker(engine, monkeypatch, PAYLOAD, mode="", project="test")
+    assert len(_cc_items(engine)) == 1

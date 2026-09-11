@@ -25,6 +25,9 @@ def install_integration(adapter) -> dict:
     steps = {}
     for name in ("install_mcp", "install_skills", "install_instructions"):
         steps[name] = getattr(adapter, name)()
+    install_hooks = getattr(adapter, 'install_hooks', None)
+    if callable(install_hooks):
+        steps['install_hooks'] = install_hooks()
     return {"client": adapter.name, "steps": steps, **integration_status(adapter)}
 
 
@@ -54,10 +57,16 @@ def refresh_integrations() -> list[dict]:
                 removed = []
                 if adapter.instructions_path.is_file() and START in adapter.instructions_path.read_text(encoding="utf-8"):
                     adapter.install_instructions()
+                refresh_hooks = getattr(adapter, 'refresh_hooks', None)
+                if callable(refresh_hooks):
+                    refresh_hooks()
             # Upgrade refreshes opted-in assets, not the complete integration.
             # Missing instruction blocks or hook wiring are not upgrade failures.
+            asset_names = {"skills", "hook_assets"}
+            if name == "codex":
+                asset_names.update({"hooks", "hooks_trust", "hook_dependencies"})
             asset_checks = [check for check in adapter.doctor()
-                            if check["check"] in {"skills", "hook_assets"}
+                            if check["check"] in asset_names
                             or check["check"].startswith("skill:")]
             failures = [check["message"] for check in asset_checks if check["status"] == "error"]
             result = {"client": name, "ok": not failures, "removed": removed, "checks": asset_checks}

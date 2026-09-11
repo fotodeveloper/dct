@@ -38,10 +38,12 @@ A nonempty `AGENTS.override.md` takes precedence over `AGENTS.md`; doctor
 reports this as an error. Merge needed override instructions manually before
 removing or emptying the override. Repair does not modify that user-owned file.
 
-Codex workflows are explicit. Claude hook scripts and event matchers are not
-installed into Codex: automatic task mirroring, plan autoscan and changelog
-hooks are not implemented by this adapter. Existing DCT hook references are
-reported for review. Official host documentation:
+Codex supports explicit skills and native hook definitions for changelog checks,
+stop reminders, apply-patch autoscan and plan-snapshot mirroring. The runtime
+bridge translates Codex payloads and reuses shared DCT policies. After explicit
+installation, review and trust the definitions through Codex `/hooks`; files
+alone do not establish active hooks. See the [hook guide](hooks.md) for platform
+dependencies, supported events, ownership and limitations. Official host documentation:
 [MCP](https://learn.chatgpt.com/docs/extend/mcp?surface=cli) and
 [skills](https://learn.chatgpt.com/docs/build-skills).
 
@@ -65,9 +67,11 @@ steps installed. Fix the reported problem and repeat repair. Do not run concurre
 installers on the same configuration file.
 
 Upgrade refreshes detected integrations without introducing new instruction
-blocks or hook wiring. Uninstall removes proven-owned assets, never database
-state. Customized or pre-existing MCP entries remain. Legacy Claude hook settings
-and MCP registrations lack ownership metadata and require manual review.
+blocks or hook opt-ins. Native Codex hook definitions are refreshed only when
+their ownership sidecar already exists. Uninstall removes proven-owned assets
+and unchanged native definitions, never database state. Customized or pre-existing
+MCP entries remain. Legacy Claude hook settings and MCP registrations lack
+ownership metadata and require manual review.
 
 ## Runtime diagnostics
 
@@ -94,7 +98,7 @@ upgrades, model calls or network requests.
 | Shared tracking/session MCP tools | Yes | Yes | Yes |
 | Integration installer | Yes | Yes | Manual |
 | Managed workflow skills | Existing collection | pickup, handoff, track, clog | Host-dependent |
-| Task mirror/autoscan/changelog hooks | Claude events | Not implemented | Host-dependent |
+| Task mirror/autoscan/changelog hooks | Claude events | Native events; explicit trust required | Host-dependent |
 | Managed instructions | CLAUDE.md | AGENTS.md | Manual |
 | Integration diagnostics | Yes | Yes | Core runtime checks |
 

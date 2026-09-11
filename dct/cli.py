@@ -1038,26 +1038,17 @@ def cmd_clog_export(args):
 # ── Checkpoint commands ──────────────────────────────────────────────────────
 
 def cmd_internal_task_mirror(args):
-    """Internal: worker for hooks/dct-task-mirror.sh.
+    """Internal task-mirror worker; read one native hook payload from stdin.
 
-    Reads a Claude Code hook JSON payload on stdin, extracts TaskCreate /
-    TodoWrite todos, find-or-creates a session-scoped item in dct, and
-    appends each todo as a `kind='cc-task'` checkpoint. Non-blocking —
-    safe to fail silently (hook is fire-and-forget).
+    Claude remains the default and preserves TaskCreate/TodoWrite append-only
+    behavior. The Codex bridge supplies only successful update_plan events;
+    --client codex selects its independent config gate and requires actual
+    session_id plus turn_id. Native statuses are observations in checkpoint
+    text, not authoritative task completion or bidirectional synchronization.
 
-    Owns the config gate and project autodetect (the shell hook is a lean
-    dispatcher that only drains stdin and backgrounds this worker — #354):
-      - reads [integrations.claude].task_mirror; anything but 'auto' is a silent no-op;
-      - detects the project from CWD, silent no-op when the CWD is not a
-        registered dct project.
-
-    Intentionally named with an underscore prefix — not user-facing, just
-    the target of the task-mirror hook. Re-expose via the `dct` entry point
-    so the venv-installed Python is used (hooks cannot reliably find it).
-
-    Args:
-        session-id: Claude Code session_id. Empty → read payload .session_id.
-        project: dct project slug. Empty → autodetect from CWD.
+    Config ask/off modes, empty tasks and missing Codex identity return before
+    database bootstrap. Empty project resolves from the process CWD; an
+    unregistered directory is a silent no-op for this background worker.
     """
     import json
 
@@ -1068,78 +1059,28 @@ def cmd_internal_task_mirror(args):
     except json.JSONDecodeError:
         return  # fire-and-forget: swallow, exit clean
 
-    # Config gate (moved off the shell fast-path). auto → mirror; ask/off/
-    # anything else → silent no-op.
-    mode = load_config().integrations.claude.task_mirror or "auto"
+    client = getattr(args, "client", "claude")
+    cfg = load_config()
+    mode = getattr(cfg.integrations, client).task_mirror
+    if client == "claude":
+        mode = mode or "auto"  # preserve the legacy worker's empty-value fallback
     if mode != "auto":
         return
+    from dct.workflows.task_mirror import mirror_tasks, tasks_from_payload
 
-    tool_input = payload.get("tool_input") or {}
-    todos: list[str] = []
-    if isinstance(tool_input.get("todos"), list):
-        todos = [
-            (t.get("content") or t.get("subject") or "")
-            for t in tool_input["todos"]
-            if isinstance(t, dict)
-        ]
-    else:
-        single = (
-            tool_input.get("subject")
-            or tool_input.get("description")
-            or tool_input.get("prompt")
-            or ""
-        )
-        if single:
-            todos = [single]
-
-    todos = [t.strip() for t in todos if t and t.strip()]
-    if not todos:
+    if not tasks_from_payload(payload, client):
         return
-
-    from dct.core.checkpoints import add_checkpoint
-    from dct.core.items import create_item, list_items
-    from dct.core.projects import get_project_by_path
-
-    engine = _get_engine()
-
-    # Silent project autodetect — a fire-and-forget worker must never raise
-    # or exit non-zero when the CWD is not a registered project.
-    project_slug = args.project
-    if not project_slug:
-        import os
-
-        detected = get_project_by_path(engine, os.getcwd())
-        if not detected:
+    if client == "codex":
+        identity = (args.session_id or payload.get("session_id"),
+                    getattr(args, "turn_id", "") or payload.get("turn_id"))
+        if not all(isinstance(value, str) and value.strip() for value in identity):
             return
-        project_slug = detected["slug"]
-
-    session_id = args.session_id or payload.get("session_id") or "unknown"
-    title = f"CC task list — session {session_id}"
-
-    existing = [
-        row
-        for row in list_items(
-            engine, project_slug=project_slug, search="CC task list",
-            status=None, limit=100,
-        )
-        if row.get("title") == title
-    ]
-    if existing:
-        item_id = existing[0]["id"]
-    else:
-        item = create_item(
-            engine, project_slug, "todo", title,
-            # Machine caller: the similarity guard is a UX rule for humans
-            # typing names — it must never crash the fire-and-forget hook
-            # (plan decision 4 / K-5).
-            tags=["cc-task-list", "auto"], force_tags=True,
-        )
-        item_id = item["id"]
-
-    for t in todos:
-        add_checkpoint(engine, item_id, f"[cc] {t}", kind="cc-task")
-
-    print(f"mirror ok: item #{item_id}, {len(todos)} checkpoint(s) added")
+    result = mirror_tasks(
+        _get_engine(), payload, client=client, project=args.project,
+        session_id=args.session_id, turn_id=getattr(args, "turn_id", ""),
+    )
+    if result:
+        print(f"mirror ok: item #{result['item_id']}, {result['added']} checkpoint(s) added")
 
 
 def cmd_config_path(args):
@@ -2072,6 +2013,8 @@ def build_parser() -> argparse.ArgumentParser:
         "_task-mirror",
         help="Internal — worker for dct-task-mirror.sh hook. Reads hook JSON on stdin.",
     )
+    p_tm.add_argument("--client", choices=("claude", "codex"), default="claude")
+    p_tm.add_argument("--turn-id", default="")
     p_tm.add_argument("--session-id", default="")
     p_tm.add_argument("--project", default="")
 

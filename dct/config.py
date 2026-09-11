@@ -89,8 +89,18 @@ class ClaudeIntegrationConfig:
 
 
 @dataclass
+class CodexIntegrationConfig:
+    """Native Codex plan mirroring: auto appends snapshots; ask/off skip.
+
+    Independent of the legacy Claude setting; unknown values fail closed.
+    """
+    task_mirror: str = "auto"
+
+
+@dataclass
 class IntegrationsConfig:
     claude: ClaudeIntegrationConfig = field(default_factory=ClaudeIntegrationConfig)
+    codex: CodexIntegrationConfig = field(default_factory=CodexIntegrationConfig)
 
 
 @dataclass
@@ -208,8 +218,12 @@ def load_config(config_path: Path | None = None) -> Config:
     )
     if mirror_mode not in ("auto", "ask", "off"):
         mirror_mode = "auto"
+    codex_mode = data.get("integrations", {}).get("codex", {}).get("task_mirror", "auto")
+    if codex_mode not in ("auto", "ask", "off"):
+        codex_mode = "off"
     integrations = IntegrationsConfig(
-        claude=ClaudeIntegrationConfig(task_mirror=mirror_mode)
+        claude=ClaudeIntegrationConfig(task_mirror=mirror_mode),
+        codex=CodexIntegrationConfig(task_mirror=codex_mode),
     )
     mirror = MirrorConfig(task_to_dct=mirror_mode)
 
@@ -259,6 +273,9 @@ def save_config(config: Config, config_path: Path | None = None) -> Path:
 
     lines.append('\n[integrations.claude]\n')
     lines.append(f'task_mirror = {_toml_str(config.integrations.claude.task_mirror)}\n')
+
+    lines.append('\n[integrations.codex]\n')
+    lines.append(f'task_mirror = {_toml_str(config.integrations.codex.task_mirror)}\n')
 
     lines.append('\n[web]\n')
     lines.append(f'host = {_toml_str(config.web.host)}\n')

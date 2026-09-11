@@ -82,6 +82,8 @@ dct/integrations/claude.py — Claude Code adapter: MCP registration, skill/hook
                            symlinks, settings.json wiring (`dct hooks wire`);
                            dct/setup.py is a compat shim
 dct/integrations/codex.py — Codex MCP, workflow skills and managed AGENTS.md
+dct/integrations/codex_hooks.py — Native event bridge over shared hook policies
+dct/workflows/task_mirror.py — Append-only client plan/task observations
 dct/integrations/base.py — Shared contract and conservative file ownership
 dct/integrations/doctor.py — Read-only per-runtime dependency diagnostics
 dct/assets/              — Indirection for packaged asset dirs (physical
