@@ -43,7 +43,6 @@ from dct.core.checkpoints import (
 )
 from dct.core.decisions import _query_recent_decisions
 from dct.core.handoff import _query_unconsumed_handoffs
-from dct.core.projects import resolve_project_id
 from dct.core.sprint import (
     _json_safe,
     _parse_since_conn,
@@ -54,6 +53,7 @@ from dct.core.sprint import (
     _query_total_open,
     _to_cols_rows,
 )
+from dct.db import project_transaction
 
 SNAPSHOT_SECTIONS = ("sprint", "handoff", "gates", "decisions", "recent_changes")
 
@@ -310,8 +310,7 @@ def get_context_snapshot(
     json.dumps-able as-is (K-36).
     """
     sections = _resolve_sections(include)
-    with engine.begin() as conn:
-        project_id = resolve_project_id(conn, project_slug)
+    with project_transaction(engine, project_slug) as (conn, project_id):
         return _build_snapshot(conn, project_id, project_slug, sections, since)
 
 
@@ -360,7 +359,43 @@ def pickup_work(
     workstream") is distinguishable from "several pending, pick one". The key
     is OMITTED when no scope was given. Snapshot read + consume share one
     transaction; the whole return is json.dumps-able (K-36).
+
+    A PostgreSQL serialization conflict with a standalone consumer rolls back
+    the attempt. A server-selected target then degrades to ONE fresh pure read
+    (never consumes a different handoff); an explicit id keeps its not-found
+    error. Other database errors propagate unchanged.
     """
+    try:
+        return _pickup_work_once(
+            engine, project_slug, consume=consume, handoff_id=handoff_id,
+            scope=scope, consumed_by=consumed_by, since=since, include=include,
+        )
+    except sa.exc.DBAPIError as exc:
+        state = getattr(exc.orig, "sqlstate", None) or getattr(exc.orig, "pgcode", None)
+        if state != "40001" or consume is False:
+            raise
+        if handoff_id is not None:
+            raise ValueError(_HANDOFF_NOT_FOUND.format(id=handoff_id)) from exc
+        # The failed transaction has rolled back AND released its lock before
+        # this read begins. Retrying consumption could steal a NEW handoff.
+        return _pickup_work_once(
+            engine, project_slug, consume=False, scope=scope,
+            consumed_by=consumed_by, since=since, include=include,
+        )
+
+
+def _pickup_work_once(
+    engine: sa.Engine,
+    project_slug: str,
+    *,
+    consume: bool | None = None,
+    handoff_id: int | None = None,
+    scope: str | None = None,
+    consumed_by: str | None = None,
+    since: str = "last_release",
+    include: list[str] | None = None,
+) -> dict:
+    """One transaction attempt; serialization recovery belongs to pickup_work."""
     if consume is False and handoff_id is not None:
         raise ValueError(
             "handoff_id together with consume=false is contradictory — "
@@ -375,8 +410,7 @@ def pickup_work(
         )
 
     sections = _resolve_sections(include)
-    with engine.begin() as conn:
-        project_id = resolve_project_id(conn, project_slug)
+    with project_transaction(engine, project_slug, write=may_consume) as (conn, project_id):
 
         # ONE candidate list for BOTH consume paths (K-37): the scope filter
         # lives in SQL, so auto and consume=true can never disagree about what
@@ -506,8 +540,7 @@ def handoff_work(
             f"or drop the selector."
         )
 
-    with engine.begin() as conn:
-        project_id = resolve_project_id(conn, project_slug)
+    with project_transaction(engine, project_slug, write=True) as (conn, project_id):
 
         sprint_result: dict | None = None
         if membership_op:

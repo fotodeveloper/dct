@@ -8,7 +8,7 @@ Flow per spec §9.1.3:
   5. first-import (no plans row, or imported_at=NULL) vs re-sync.
   6. Upsert plans + sections + checkpoints (parent FK resolution via ulid→id map).
   7. On first import only: respect MD checkbox `[x]` as `status='done'`.
-  8. Optional: resolve uncertain sections via `claude --print`.
+  8. Optional: resolve uncertain sections via the configured provider.
   9. Stamp imported_at on first import; always update source_hash.
 
 Deliberately keeps no global state — all intermediate maps are local.
@@ -220,7 +220,7 @@ def ingest_file(
     """Ingest a markdown plan file into dct.
 
     `auto_resolve_uncertain`: when True, any section classified as 'uncertain'
-    is sent through `classify_uncertain()` (`claude --print`). None = read
+    is sent through rules-first `classify_uncertain()`. None = read
     the default from the dct config file's `[plans].auto_resolve_uncertain`
     (default true; `dct config path` shows the file's location).
     """
@@ -231,11 +231,7 @@ def ingest_file(
     cfg = load_config()
     if auto_resolve_uncertain is None:
         auto_resolve_uncertain = cfg.plans.auto_resolve_uncertain
-    # [classification] dispatch (ADR #52 shape; full provider matrix is G2):
-    # 'command' shells out below with the configured model/timeout THREADED
-    # (round-1 audit: these were parsed but never passed — user overrides
-    # were silently ignored); anything else behaves as 'disabled'.
-    if cfg.classification.provider != "command":
+    if cfg.classification.provider not in {"rules", "command"}:
         auto_resolve_uncertain = False
 
     content = path.read_text(encoding="utf-8")
@@ -293,6 +289,8 @@ def ingest_file(
                 preview="",
                 model=cfg.classification.model,
                 timeout_seconds=cfg.classification.timeout_seconds,
+                provider=cfg.classification.provider,
+                command=cfg.classification.command,
             )
             if resolved:
                 section_type = resolved

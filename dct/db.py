@@ -7,6 +7,7 @@ Uses Core (not ORM) for portability between PostgreSQL and SQLite.
 import contextlib
 import json
 import sys
+import time
 from collections import Counter
 from datetime import UTC
 from pathlib import Path
@@ -452,6 +453,70 @@ def get_engine(database_url: str) -> sa.Engine:
         event.listen(engine, "connect", _set_sqlite_wal)
 
     return engine
+
+
+@contextlib.contextmanager
+def project_transaction(engine: sa.Engine, project_slug: str, *, write: bool = False):
+    """A consistent project snapshot, optionally serializing composed writers.
+
+    SQLite explicitly begins before SELECT (the driver's legacy mode does
+    not); writers reserve the database before reading. PostgreSQL uses
+    REPEATABLE READ, acquiring a session advisory lock BEFORE the transaction
+    for writers so a waiting session cannot retain a stale pre-lock snapshot.
+    The lock identifies the project PRIMARY KEY, not its name or content.
+
+    PostgreSQL serialization covers callers of this helper; unrelated CRUD
+    writers still follow their own concurrency contracts. The database's
+    global isolation policy is unchanged. Lock waits are bounded to five
+    seconds, matching SQLite's default connection timeout.
+    """
+    # Local import: projects uses the table definitions in this module.
+    from dct.core.projects import resolve_project_id
+
+    with engine.connect() as conn:
+        locked_project = None
+        try:
+            if conn.dialect.name == "postgresql":
+                if write:
+                    conn.execution_options(isolation_level="AUTOCOMMIT")
+                    project_id = resolve_project_id(conn, project_slug)
+                    deadline = time.monotonic() + 5
+                    while True:
+                        try:
+                            acquired = conn.execute(sa.text(
+                                "SELECT pg_try_advisory_lock(430, :project_id)"
+                            ), {"project_id": project_id}).scalar_one()
+                        except BaseException:
+                            # An uncertain acquisition must never return a
+                            # potentially locked physical session to the pool.
+                            conn.invalidate()
+                            raise
+                        if acquired:
+                            locked_project = project_id
+                            break
+                        if time.monotonic() >= deadline:
+                            raise TimeoutError("Timed out waiting for the DCT project transaction lock")
+                        time.sleep(0.05)
+                    conn.rollback()  # end SQLAlchemy's autocommit bookkeeping
+                conn.execution_options(isolation_level="REPEATABLE READ")
+
+            with conn.begin():
+                if conn.dialect.name == "sqlite":
+                    conn.exec_driver_sql("BEGIN IMMEDIATE" if write else "BEGIN")
+                project_id = resolve_project_id(conn, project_slug)
+                yield conn, project_id
+        finally:
+            if locked_project is not None:
+                try:
+                    conn.rollback()
+                    conn.execution_options(isolation_level="AUTOCOMMIT")
+                    conn.execute(sa.text(
+                        "SELECT pg_advisory_unlock(430, :project_id)"
+                    ), {"project_id": locked_project})
+                    conn.rollback()
+                except BaseException:
+                    conn.invalidate()
+                    raise
 
 
 def create_tables(engine: sa.Engine) -> None:

@@ -66,13 +66,12 @@ class ClassificationConfig:
     """[classification] section — pluggable uncertain-section classifier
     (ADR #52, plan #12 §11; keys formerly [plans].classify_*).
 
-    provider: 'command' (default — shell out to `command`) or 'disabled'
-              (leave uncertain sections as-is). Other providers (rules/
-              openai/ollama/…) are G2 scope; an unknown value behaves as
-              'disabled' rather than silently shelling out.
-    command:  argv base for provider='command'.
+    provider: 'rules' (default, deterministic parser rules), 'command'
+              (optional enrichment) or 'disabled'. Unknown providers are disabled.
+    command: argv base for provider='command'; prompt appended as one argument.
+              Claude commands retain legacy --model support.
     """
-    provider: str = "command"
+    provider: str = "rules"
     command: list[str] = field(default_factory=lambda: ["claude", "--print"])
     model: str = "claude-haiku-4-5-20251001"
     timeout_seconds: int = 30
@@ -178,9 +177,15 @@ def load_config(config_path: Path | None = None) -> Config:
     # (ADR #52 rename window; new keys win when both are present).
     cls_section = data.get("classification", {})
     cls_defaults = ClassificationConfig()
+    explicit_legacy = any(key in cls_section for key in ("command", "model", "timeout_seconds")) or any(
+        key in plans_section for key in ("classify_model", "classify_timeout_seconds")
+    )
+    command = cls_section.get("command", cls_defaults.command)
+    if not isinstance(command, list) or not all(isinstance(part, str) for part in command):
+        raise ValueError("classification.command must be an array of strings")
     classification = ClassificationConfig(
-        provider=str(cls_section.get("provider", cls_defaults.provider)),
-        command=[str(c) for c in cls_section.get("command", cls_defaults.command)],
+        provider=str(cls_section.get("provider", "command" if explicit_legacy else cls_defaults.provider)),
+        command=command,
         model=str(
             cls_section.get("model")
             or plans_section.get("classify_model")

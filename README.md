@@ -47,11 +47,11 @@ Handoff: "Frontmatter crash is fixed; release when CI is green."
 Proposed first action: /release
 ```
 
-No forms, no context switch. `/handoff` and `/pickup` are Claude Code slash commands; on any other MCP client the same moves are the `handoff_work` and `pickup_work` tools. The three loops behind this session — tracking, session, release — are described below.
+No forms, no context switch. Handoff and pickup workflows are packaged as skills for Claude Code and Codex; other MCP clients use the `handoff_work` and `pickup_work` tools directly. The three loops behind this session — tracking, session, release — are described below.
 
 ## Installation
 
-Pick one — whichever matches your Python workflow. The distribution is named **`dctracker`** (PyPI); the installed command is **`dct`**. Prerequisites: Python 3.11+. Claude Code is needed only for the skills/hooks integration; the CLI and MCP server work with any MCP client.
+Pick one — whichever matches your Python workflow. The distribution is named **`dctracker`** (PyPI); the installed command is **`dct`**. Prerequisites: Python 3.11+. Claude Code is needed for its automatic hooks; Codex has its own workflow skills. The CLI and MCP server work independently of either client.
 
 ```bash
 # Option A: uv tool (recommended — isolated, upgradable)
@@ -103,9 +103,32 @@ The wizard closes with a reminder to **start a new Claude Code session** — ski
 
 `dct init` writes the config to the platform config dir (`~/.config/dctools/dct.toml`; existing `~/.claude/dct.toml` installs keep working — `dct migrate-home` moves them), `~/.claude.json` (MCP entry), the skill/hook symlinks, and (opt-in) the settings.json wiring — see [docs/architecture.md](https://github.com/fotodeveloper/dct/blob/main/docs/architecture.md) for the full config reference and scope model.
 
+### Codex
+
+After installing the MCP extra, run:
+
+```bash
+dct integrate install codex
+dct doctor --client codex --json
+```
+
+Reconnect/start a fresh Codex session. The adapter installs MCP configuration,
+`pickup`, `handoff`, `track` and `clog` skills, and managed `AGENTS.md`
+instructions. It preserves existing configuration and reports conflicting
+files. Codex uses explicit workflows; Claude's automatic hooks are not ported.
+See the [integration guide and capability matrix](https://github.com/fotodeveloper/dct/blob/main/docs/integrations.md)
+for repair, upgrade, uninstall, runtime diagnostics and limitations.
+
+Fresh Claude → Codex handoff and the installed pickup skill were exercised on
+an isolated database without passing the previous transcript. A small measured
+comparison used more input tokens for DCT than for an equivalent compact context
+file (58,271 versus 36,340, with different cache hits). DCT's demonstrated benefit
+here is recovering structured work state; this test does not establish token
+savings. See the [acceptance evidence and benchmark method](https://github.com/fotodeveloper/dct/blob/main/docs/codex-acceptance.md).
+
 ### Other MCP clients (Cursor, Windsurf, Zed)
 
-The 13 skills and 4 hooks are Claude Code integrations; everything else — the 55 MCP tools and the CLI — works from any MCP client. Register `dct server` as a stdio server in your client's MCP config, e.g. for Cursor (`~/.cursor/mcp.json`):
+The 13 Claude Code skills, 4 Claude hooks and four Codex skills are host integrations. The 55 MCP tools and the CLI provide the common tracking surface. Register `dct server` as a stdio server in your client's MCP config, e.g. for Cursor (`~/.cursor/mcp.json`):
 
 ```json
 { "mcpServers": { "dct": { "command": "dct", "args": ["server"] } } }

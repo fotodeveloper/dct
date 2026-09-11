@@ -1,5 +1,6 @@
 """Host-client integration adapters (ADR #51 §6.3).
 
-One module per client: claude.py (Claude Code — skills/hooks symlinks, MCP
-registration, settings wiring). A future codex.py lands here with the same
-shape. Core/db/services/workflows/mcp must never import from this package."""
+One module per client implements base.ClientIntegration: claude.py preserves
+the legacy installer; codex.py provides MCP, skills and managed instructions.
+manager.py dispatches lifecycle operations; doctor.py checks runtime drift.
+Core/db/services/workflows/mcp must never import from this package."""

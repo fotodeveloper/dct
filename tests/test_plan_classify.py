@@ -60,9 +60,9 @@ def test_sanitize_rejects_empty():
     assert _sanitize_response("   \n\n") is None
 
 
-def test_sanitize_takes_first_word_only():
-    """Model sometimes adds a short explanation — take the first word."""
-    assert _sanitize_response("sprint because of date prefix") == "sprint"
+def test_sanitize_rejects_explanation():
+    """Ambiguous prose must not silently become an authoritative label."""
+    assert _sanitize_response("sprint because of date prefix") is None
 
 
 def test_sanitize_rejects_multiword_invalid():
@@ -73,7 +73,7 @@ def test_sanitize_rejects_multiword_invalid():
 
 def test_classify_returns_none_when_claude_not_in_path(monkeypatch):
     monkeypatch.setattr(classify.shutil, "which", lambda cmd: None)
-    assert classify_uncertain("Sprint 1") is None
+    assert classify_uncertain("Unknown heading", provider="command") is None
 
 
 def test_classify_happy_path(monkeypatch):
@@ -82,7 +82,7 @@ def test_classify_happy_path(monkeypatch):
         classify.subprocess, "run",
         lambda *a, **kw: _FakeResult(stdout="sprint\n"),
     )
-    assert classify_uncertain("Sprint 1") == "sprint"
+    assert classify_uncertain("Unknown heading", provider="command") == "sprint"
 
 
 def test_classify_returns_none_on_nonzero_exit(monkeypatch):
@@ -91,7 +91,7 @@ def test_classify_returns_none_on_nonzero_exit(monkeypatch):
         classify.subprocess, "run",
         lambda *a, **kw: _FakeResult(returncode=1, stderr="boom"),
     )
-    assert classify_uncertain("Sprint 1") is None
+    assert classify_uncertain("Unknown heading", provider="command") is None
 
 
 def test_classify_returns_none_on_empty_stdout(monkeypatch):
@@ -100,7 +100,7 @@ def test_classify_returns_none_on_empty_stdout(monkeypatch):
         classify.subprocess, "run",
         lambda *a, **kw: _FakeResult(stdout=""),
     )
-    assert classify_uncertain("Sprint 1") is None
+    assert classify_uncertain("Unknown heading", provider="command") is None
 
 
 def test_classify_returns_none_on_timeout(monkeypatch):
@@ -110,7 +110,7 @@ def test_classify_returns_none_on_timeout(monkeypatch):
         raise subprocess.TimeoutExpired(cmd=a[0], timeout=kw.get("timeout", 30))
 
     monkeypatch.setattr(classify.subprocess, "run", _raise_timeout)
-    assert classify_uncertain("Sprint 1") is None
+    assert classify_uncertain("Unknown heading", provider="command") is None
 
 
 def test_classify_returns_none_on_oserror(monkeypatch):
@@ -120,7 +120,7 @@ def test_classify_returns_none_on_oserror(monkeypatch):
         raise OSError("permission denied")
 
     monkeypatch.setattr(classify.subprocess, "run", _raise_oserror)
-    assert classify_uncertain("Sprint 1") is None
+    assert classify_uncertain("Unknown heading", provider="command") is None
 
 
 def test_classify_rejects_invalid_label_from_model(monkeypatch):
@@ -129,7 +129,7 @@ def test_classify_rejects_invalid_label_from_model(monkeypatch):
         classify.subprocess, "run",
         lambda *a, **kw: _FakeResult(stdout="rubbish_label"),
     )
-    assert classify_uncertain("Weird heading") is None
+    assert classify_uncertain("Weird heading", provider="command") is None
 
 
 def test_classify_passes_model_and_timeout_to_subprocess(monkeypatch):
@@ -144,7 +144,7 @@ def test_classify_passes_model_and_timeout_to_subprocess(monkeypatch):
     monkeypatch.setattr(classify.shutil, "which", lambda cmd: "/usr/bin/claude")
     monkeypatch.setattr(classify.subprocess, "run", _capture)
     result = classify_uncertain(
-        "Task M0.1", model="claude-sonnet-4-6", timeout_seconds=5
+        "Unknown heading", provider="command", model="claude-sonnet-4-6", timeout_seconds=5
     )
     assert result == "task"
     assert captured["cmd"][:4] == ["claude", "--print", "--model", "claude-sonnet-4-6"]
@@ -226,3 +226,65 @@ def test_provider_disabled_skips_classifier(tmp_path, monkeypatch, engine):
     ingest_mod.ingest_file(engine, str(plan_md), "cls2", auto_resolve_uncertain=True)
 
     assert called == []
+
+
+def test_rules_default_never_spawns_and_preserves_uncertainty(monkeypatch):
+    def forbidden(*args, **kwargs):
+        raise AssertionError('rules must not invoke an external process')
+
+    monkeypatch.setattr(classify.subprocess, 'run', forbidden)
+    monkeypatch.setattr(classify.shutil, 'which', forbidden)
+    assert classify_uncertain('Sprint 1') == 'sprint'
+    assert classify_uncertain('Unfamiliar topic') is None
+
+
+def test_custom_command_argv_is_honored_without_claude_flags(monkeypatch):
+    captured = {}
+    monkeypatch.setattr(classify.shutil, 'which', lambda command: command)
+
+    def run(argv, **kwargs):
+        captured['argv'] = argv
+        return _FakeResult(stdout='reference')
+
+    monkeypatch.setattr(classify.subprocess, 'run', run)
+    assert classify_uncertain('Unfamiliar topic', provider='command',
+                              command=['/tmp/custom classifier', '--label']) == 'reference'
+    assert captured['argv'][:2] == ['/tmp/custom classifier', '--label']
+    assert len(captured['argv']) == 3
+    assert 'Unfamiliar topic' in captured['argv'][-1]
+
+
+def test_command_error_prose_does_not_guess_label(monkeypatch):
+    monkeypatch.setattr(classify.shutil, 'which', lambda command: command)
+    monkeypatch.setattr(classify.subprocess, 'run',
+                        lambda *args, **kwargs: _FakeResult(stdout='task or phase'))
+    assert classify_uncertain('Unfamiliar topic', provider='command') is None
+
+
+def test_ingest_executes_explicit_custom_command(tmp_path, monkeypatch, engine):
+    from dct.config import Config, save_config
+    from dct.core.plans.ingest import ingest_file
+    from dct.core.projects import create_project
+
+    config = Config(database_url='sqlite:///unused.db')
+    config.classification.provider = 'command'
+    config.classification.command = ['custom-classifier', '--label']
+    config_path = tmp_path / 'config.toml'
+    save_config(config, config_path)
+    monkeypatch.setenv('DCT_CONFIG_PATH', str(config_path))
+    commands = []
+    monkeypatch.setattr(classify.shutil, 'which', lambda command: command)
+
+    def run(argv, **kwargs):
+        commands.append(argv)
+        return _FakeResult(stdout='reference')
+
+    monkeypatch.setattr(classify.subprocess, 'run', run)
+    create_project(engine, slug='portable', name='Portable', path=str(tmp_path))
+    plan = tmp_path / 'plan.md'
+    plan.write_text('# 1. Plan\n\n## Unfamiliar topic\n')
+    report = ingest_file(engine, str(plan), 'portable')
+    assert report['uncertain_resolved'] == 1
+    assert report['uncertain_remaining'] == 0
+    assert len(commands) == 1
+    assert commands[0][:2] == ['custom-classifier', '--label']

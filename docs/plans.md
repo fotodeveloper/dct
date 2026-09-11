@@ -64,25 +64,18 @@ When `/dct-import` or the hook ingests a file:
 3. **Write-back** (atomic, `os.replace` via `<file>.dct-tmp`) — the MD file is mutated to embed new ULID HTML comments; original text / ordering / code blocks preserved. Idempotent: subsequent runs do not re-inject.
 4. **Hash** → `sha256(file)` stored as `plans.source_hash`. Second ingest of an unchanged file is a no-op (hash short-circuit).
 5. **Upsert** plans/sections/checkpoints. On first import reads `[x]` as historical done-state. On rescan, MD brackets are ignored (DB owns state).
-6. **Classify uncertain sections** (if `auto_resolve_uncertain=true`, default) — invoke `claude --print --model <haiku>` on each `section_type='uncertain'` row and apply the resolved label. LLM failure / timeout / missing `claude` binary → row stays uncertain; never raises.
-7. **Sticky resolved**: a row previously resolved (via LLM or manual) is never downgraded back to `uncertain` on a later rescan, even if the current parser output re-infers uncertainty.
+6. **Classify uncertain sections** (when enabled) — apply the configured provider. Local rules are the default; unknown headings remain `uncertain`. An explicitly configured command can enrich them.
+7. **Sticky resolved**: a row previously resolved (via command or manually) is never downgraded back to `uncertain` on a later rescan.
 
-## LLM classification — always-on by default
+## Rules-first classification
 
-**The default flow runs the LLM for every uncertain section, every ingest.** Three knobs:
+New configurations use `[classification].provider = "rules"`, reusing the parser's deterministic rules without invoking a model. Unknown headings remain `uncertain` with `needs_llm_review=true`. Set `provider = "disabled"` to skip enrichment entirely.
 
-| Layer | Default | To disable |
-|---|---|---|
-| Config `[plans].auto_resolve_uncertain` | `true` | set to `false` in the dct config file (`dct config path` shows where) |
-| MCP `ingest_plan_file(auto_resolve_uncertain)` | `True` | pass `auto_resolve_uncertain=false` |
-| CLI `dct plan rescan --resolve-uncertain` | flag absent = off; hook adds it | hook always adds it → always on |
-| Hook `dct-plan-autoscan.sh` | calls with `--resolve-uncertain` | edit the hook if you want to skip |
+To retain optional Claude enrichment, explicitly set `provider = "command"` and `command = ["claude", "--print"]`. Existing configurations with an explicit command/model/timeout or legacy `[plans].classify_*` values continue to select the command provider unless a provider is explicitly specified.
 
-**Model**: haiku-4-5 (`claude-haiku-4-5-20251001`) at ~$0.001 per classification. Configurable via `[classification].model` — drop to a larger model if you see accuracy regressions on your plans.
+Commands run as argv without a shell, with the classification prompt appended as one argument. Only a Claude executable receives the legacy `--model` option. A custom command receives its configured arguments unchanged plus the prompt. Missing executables, timeouts, errors and ambiguous output leave the section uncertain. Remote provider implementations and persistent classification provenance remain future work.
 
-**Backend**: headless `claude --print` CLI subprocess (no Anthropic SDK dependency). Reuses your existing Claude Code credentials + billing.
-
-**Graceful degradation**: if the `claude` binary is not in PATH, the subprocess fails, or the response is not a valid label, the section stays `uncertain` with `needs_llm_review=true`. Run the `/plan-resolve-uncertain` skill later to retry, or override manually.
+`[plans].auto_resolve_uncertain` and the existing CLI/MCP switches still control whether the configured provider is consulted. Enabling resolution does not implicitly enable a network model.
 
 ## Classification rules
 

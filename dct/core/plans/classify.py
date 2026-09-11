@@ -1,20 +1,17 @@
-"""LLM classification of uncertain plan sections — headless Claude CLI wrapper.
+"""Rules-first plan classification with an optional configured command.
 
-We do NOT take an Anthropic SDK dependency; instead we delegate to whichever
-`claude` binary the user already has in PATH (i.e. Claude Code's CLI). This
-reuses the user's credentials, billing, and model configuration with zero
-extra setup. Hidden cost: CC prepends its system prompt + CLAUDE.md, adding
-a few k input tokens per call. Haiku at current prices makes this noise
-($0.001/classification).
-
-If `claude` is not in PATH, the function returns None — callers treat that
-as "leave the section uncertain; no classification possible".
+Unknown headings remain uncertain unless the user explicitly enables a command.
+The command receives the classification prompt as its final argument, with no
+shell interpolation. Legacy Claude commands additionally receive --model.
 """
 
 from __future__ import annotations
 
 import shutil
 import subprocess
+from pathlib import Path
+
+from dct.core.plans.parser import classify_heading
 
 VALID_SECTION_TYPES: frozenset[str] = frozenset({
     "sprint", "phase", "task", "block", "milestone",
@@ -46,14 +43,12 @@ def _sanitize_response(raw: str) -> str | None:
     """Normalize model output and return a valid section_type or None.
 
     Handles: whitespace, trailing newlines, wrapping quotes/backticks,
-    accidental multi-word output (we take the first word). Case-insensitive.
+    A response containing explanations or multiple labels is rejected.
     """
     stripped = raw.strip().strip("`\"' ")
     if not stripped:
         return None
-    # First "word" — splits on any whitespace including newlines.
-    first = stripped.split()[0].strip("`\"',.")
-    label = first.lower()
+    label = stripped.lower()
     return label if label in VALID_SECTION_TYPES else None
 
 
@@ -63,32 +58,42 @@ def classify_uncertain(
     preview: str = "",
     model: str = DEFAULT_MODEL,
     timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS,
+    *,
+    provider: str = "rules",
+    command: list[str] | None = None,
 ) -> str | None:
-    """Classify an uncertain plan section via `claude --print` headless mode.
+    """Reuse parser rules, optionally enriching unknown headings via a command.
 
-    Returns a label from VALID_SECTION_TYPES, or None if:
-    - `claude` binary is not in PATH,
-    - the subprocess fails / times out / exits non-zero,
-    - the model response cannot be sanitized to a valid label.
-
-    Never raises — the caller treats None as "leave uncertain".
+    Rules are authoritative. With provider='rules' (default), unknown headings
+    return None. 'disabled' and unknown providers never execute commands.
+    For provider='command', argv is preserved and the prompt is appended; only
+    a Claude executable receives legacy --model flags (unless already supplied).
+    Missing commands, invalid output, timeouts and process errors return None.
     """
-    if not shutil.which("claude"):
+    if provider not in {"rules", "command"}:
         return None
-
-    prompt = _build_prompt(heading, parent_heading, preview)
+    label, confidence = classify_heading(heading)
+    if confidence == "high" and label in VALID_SECTION_TYPES:
+        return label
+    if provider != "command":
+        return None
+    argv = ["claude", "--print"] if command is None else command
+    if (not isinstance(argv, list) or not argv
+            or not all(isinstance(part, str) and part and "\0" not in part for part in argv)):
+        return None
+    if not shutil.which(argv[0]):
+        return None
+    argv = list(argv)
+    if (Path(argv[0]).name.lower() in {"claude", "claude.exe", "claude.cmd"}
+            and "--model" not in argv and not any(part.startswith("--model=") for part in argv)):
+        argv.extend(["--model", model])
+    argv.append(_build_prompt(heading, parent_heading, preview))
     try:
         result = subprocess.run(
-            ["claude", "--print", "--model", model, prompt],
-            capture_output=True,
-            text=True,
-            timeout=timeout_seconds,
-            check=False,
+            argv, capture_output=True, text=True, timeout=timeout_seconds, check=False,
         )
-    except (subprocess.TimeoutExpired, OSError):
+    except (subprocess.TimeoutExpired, OSError, ValueError):
         return None
-
     if result.returncode != 0:
         return None
-
     return _sanitize_response(result.stdout)

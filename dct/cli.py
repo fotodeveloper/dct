@@ -1453,7 +1453,7 @@ def cmd_server(args):
 # ── Upgrade ──────────────────────────────────────────────────────────────────
 
 def cmd_upgrade(args):
-    """Upgrade the installed dct package and refresh its Claude Code symlinks.
+    """Upgrade the installed package and refresh detected client integrations.
 
     Detects the install method (editable / uv tool / pipx / pip), runs the
     matching upgrade, re-links skills + hooks (idempotent) and prunes dangling
@@ -1480,44 +1480,16 @@ def cmd_upgrade(args):
             print(f"✗ Upgrade command failed (exit {result.returncode})", file=sys.stderr)
             sys.exit(result.returncode)
 
-    # Refresh Claude Code integration: re-link current skills/hooks (idempotent),
-    # then remove links to skills/hooks that the new package no longer ships.
-    from dct.integrations.claude import (
-        CLAUDE_MD,
-        SNIPPET_START,
-        attach_claude_md_snippet,
-        install_hook,
-        install_skills,
-        prune_dangling_symlinks,
-    )
+    from dct.integrations.manager import refresh_integrations
 
-    linked_ok = True
-    removed: list[str] = []
-    try:
-        install_skills()
-        install_hook()
-        removed = prune_dangling_symlinks()
-    except Exception as e:  # never let link maintenance abort the command
-        linked_ok = False
-        print(f"  ⚠ Skills/hooks re-link failed: {e}", file=sys.stderr)
-        print("    Run `dct init` to repair the Claude Code integration.", file=sys.stderr)
-
-    if linked_ok:
-        print("  ✓ Skills and hooks re-linked")
-        if removed:
-            print(f"  ✓ Removed {len(removed)} dangling link(s):")
-            for path in removed:
-                print(f"      - {path}")
-
-    # Refresh the managed CLAUDE.md block, but only where the user previously
-    # attached it (markers present) — upgrade never introduces the snippet.
-    try:
-        if CLAUDE_MD.is_file() and SNIPPET_START in CLAUDE_MD.read_text(encoding="utf-8"):
-            result = attach_claude_md_snippet()
-            if result["status"] == "refreshed":
-                print("  ✓ CLAUDE.md snippet refreshed")
-    except (ValueError, OSError) as e:  # never let the refresh abort the upgrade
-        print(f"  ⚠ CLAUDE.md snippet refresh skipped: {e}", file=sys.stderr)
+    for result in refresh_integrations():
+        if result["ok"]:
+            print(f"  ✓ {result['client']}: Packaged integration assets refreshed")
+            for path in result["removed"]:
+                print(f"    Removed dangling link: {path}")
+        else:
+            print(f"  ⚠ {result['client']}: {result['error']}", file=sys.stderr)
+            print(f"    Run `dct integrate repair {result['client']}` (legacy Claude: `dct init`).", file=sys.stderr)
 
     print("\nWhat takes effect when:")
     print("  Now (this shell):            dct CLI, hooks, skill bodies")
@@ -1809,11 +1781,81 @@ def cmd_web_status(args):
 
 # ── Argument parser ──────────────────────────────────────────────────────────
 
+def _print_integration_result(result: dict, as_json: bool) -> None:
+    import json
+
+    if as_json:
+        print(json.dumps(result, ensure_ascii=False))
+        return
+    if "client" in result:
+        if result.get("action") == "uninstall":
+            print(f"{result['client']}: integration removal processed")
+            details = result.get("result", {})
+            if details.get("message"):
+                print(f"  {details['message']}")
+            for path in details.get("preserved", []):
+                print(f"  preserved: {path}")
+        else:
+            print(f"{result['client']}: {'ready' if result.get('ok') else 'attention required'}")
+    for row in result.get("checks", []):
+        print(f"  {row['status']}: {row['check']} — {row['message']}")
+    for integration in result.get("integrations", []):
+        _print_integration_result(integration, False)
+    if "error" in result:
+        print(f"error: {result['error']}")
+
+
+def cmd_integrate(args):
+    """Manage one client without bootstrapping or changing the DCT database."""
+    from contextlib import redirect_stdout
+
+    from dct.integrations.manager import (
+        get_integration,
+        install_integration,
+        integration_status,
+    )
+
+    try:
+        adapter = get_integration(args.client)
+        # Legacy installers print notes. Keep --json stdout machine-readable.
+        with redirect_stdout(sys.stderr):
+            if args.action in ("install", "repair"):
+                result = install_integration(adapter)
+            elif args.action == "uninstall":
+                outcome = adapter.uninstall()
+                result = {"client": args.client, "action": "uninstall",
+                          "ok": outcome.get("status") != "error", "result": outcome}
+            else:
+                result = integration_status(adapter)
+    except (OSError, ValueError) as exc:
+        result = {"client": args.client, "ok": False, "error": str(exc)}
+    _print_integration_result(result, args.json)
+    if not result["ok"]:
+        raise SystemExit(1)
+
+
+def cmd_doctor(args):
+    from dct.integrations.doctor import doctor
+
+    result = doctor(args.client, args.python)
+    _print_integration_result(result, args.json)
+    if not result["ok"]:
+        raise SystemExit(1)
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="dct", description="Deterministic Context Tracker — cross-project tracking")
     parser.add_argument("--version", action="version", version=f"dct {__version__}")
 
     sub = parser.add_subparsers(dest="command")
+
+    p_integrate = sub.add_parser("integrate", help="Install, inspect or repair a client integration")
+    p_integrate.add_argument("action", choices=("install", "status", "repair", "uninstall"))
+    p_integrate.add_argument("client", choices=("claude", "codex"))
+    p_integrate.add_argument("--json", action="store_true", help="Return machine-readable JSON")
+    p_doctor = sub.add_parser("doctor", help="Read-only configuration and runtime diagnostics")
+    p_doctor.add_argument("--client", choices=("claude", "codex"))
+    p_doctor.add_argument("--python", action="append", default=[], help="Also check this Python environment (repeatable)")
+    p_doctor.add_argument("--json", action="store_true", help="Return machine-readable JSON")
 
     # init
     p_init = sub.add_parser("init", help="Interactive setup")
@@ -2234,6 +2276,8 @@ def cmd_migrate_home(args):
 
 
 COMMAND_MAP = {
+    "integrate": cmd_integrate,
+    "doctor": cmd_doctor,
     "init": cmd_init,
     "server": cmd_server,
     "upgrade": cmd_upgrade,
@@ -2342,7 +2386,7 @@ def _nudge_suppressed(args) -> bool:
     count, config get). The caller additionally gates on ``stderr.isatty()``.
     """
     cmd = getattr(args, "command", None) or ""
-    if not cmd or cmd.startswith("_"):
+    if not cmd or cmd.startswith("_") or cmd in ("doctor", "integrate"):
         return True
     sub = (
         getattr(args, "project_command", None)

@@ -34,7 +34,7 @@ import sqlalchemy as sa
 from dct.core.items import TERMINAL_STATUSES, _item_to_dict, _membership_count_exprs
 from dct.core.projects import resolve_project_id
 from dct.core.tags import tags_for_items_conn
-from dct.db import item_sprints, items, row_to_dict, sprints
+from dct.db import item_sprints, items, project_transaction, row_to_dict, sprints
 
 VALID_KINDS = {"sprint", "phase", "milestone", "block"}
 VALID_STATUSES = {"planned", "active", "deferred", "completed", "abandoned"}
@@ -368,61 +368,51 @@ def assign_item_to_sprint(engine: sa.Engine, item_id: int, sprint_id: int) -> di
     same project — a cross-project link would leak the item's title/status
     into the other project's snapshot at every session start.
     """
-    now = datetime.now(UTC)
     with engine.begin() as conn:
-        # Verify both rows exist, aren't soft-deleted, and share a project.
-        item_row = conn.execute(
-            sa.select(items.c.id, items.c.project_id).where(
-                items.c.id == item_id, items.c.deleted_at.is_(None)
-            )
-        ).first()
-        if not item_row:
-            raise ValueError(f"Item #{item_id} not found")
+        return _assign_item_to_sprint_conn(conn, item_id, sprint_id)
 
-        sprint_row = conn.execute(
-            sa.select(sprints.c.id, sprints.c.project_id).where(
-                sprints.c.id == sprint_id, sprints.c.deleted_at.is_(None)
-            )
-        ).first()
-        if not sprint_row:
-            raise ValueError(f"Sprint #{sprint_id} not found")
 
-        if item_row._mapping["project_id"] != sprint_row._mapping["project_id"]:
-            raise ValueError(
-                f"Item #{item_id} and sprint #{sprint_id} belong to different "
-                f"projects — cross-project sprint membership is not allowed."
-            )
+def _assign_item_to_sprint_conn(conn: sa.Connection, item_id: int, sprint_id: int) -> dict:
+    now = datetime.now(UTC)
+    # Verify both rows exist, aren't soft-deleted, and share a project.
+    item_row = conn.execute(
+        sa.select(items.c.id, items.c.project_id).where(
+            items.c.id == item_id, items.c.deleted_at.is_(None)
+        )
+    ).first()
+    if not item_row:
+        raise ValueError(f"Item #{item_id} not found")
 
-        existing = conn.execute(
-            sa.select(item_sprints).where(
-                item_sprints.c.item_id == item_id,
-                item_sprints.c.sprint_id == sprint_id,
-            )
-        ).first()
-        if existing:
-            if existing._mapping["removed_at"] is not None:
-                conn.execute(
-                    item_sprints.update()
-                    .where(
-                        item_sprints.c.item_id == item_id,
-                        item_sprints.c.sprint_id == sprint_id,
-                    )
-                    .values(removed_at=None, assigned_at=now)
-                )
-            link_row = conn.execute(
-                sa.select(item_sprints).where(
+    sprint_row = conn.execute(
+        sa.select(sprints.c.id, sprints.c.project_id).where(
+            sprints.c.id == sprint_id, sprints.c.deleted_at.is_(None)
+        )
+    ).first()
+    if not sprint_row:
+        raise ValueError(f"Sprint #{sprint_id} not found")
+
+    if item_row._mapping["project_id"] != sprint_row._mapping["project_id"]:
+        raise ValueError(
+            f"Item #{item_id} and sprint #{sprint_id} belong to different "
+            f"projects — cross-project sprint membership is not allowed."
+        )
+
+    existing = conn.execute(
+        sa.select(item_sprints).where(
+            item_sprints.c.item_id == item_id,
+            item_sprints.c.sprint_id == sprint_id,
+        )
+    ).first()
+    if existing:
+        if existing._mapping["removed_at"] is not None:
+            conn.execute(
+                item_sprints.update()
+                .where(
                     item_sprints.c.item_id == item_id,
                     item_sprints.c.sprint_id == sprint_id,
                 )
-            ).first()
-            assert link_row is not None
-            return row_to_dict(link_row)
-
-        conn.execute(
-            item_sprints.insert().values(
-                item_id=item_id, sprint_id=sprint_id, assigned_at=now
+                .values(removed_at=None, assigned_at=now)
             )
-        )
         link_row = conn.execute(
             sa.select(item_sprints).where(
                 item_sprints.c.item_id == item_id,
@@ -431,6 +421,21 @@ def assign_item_to_sprint(engine: sa.Engine, item_id: int, sprint_id: int) -> di
         ).first()
         assert link_row is not None
         return row_to_dict(link_row)
+
+    conn.execute(
+        item_sprints.insert().values(
+            item_id=item_id, sprint_id=sprint_id, assigned_at=now
+        )
+    )
+    link_row = conn.execute(
+        sa.select(item_sprints).where(
+            item_sprints.c.item_id == item_id,
+            item_sprints.c.sprint_id == sprint_id,
+        )
+    ).first()
+    assert link_row is not None
+    return row_to_dict(link_row)
+
 
 
 def remove_item_from_sprint(
@@ -438,27 +443,32 @@ def remove_item_from_sprint(
 ) -> dict | None:
     """Soft-remove the link — sets removed_at. Returns the row, or None
     if the link never existed or was already removed."""
-    now = datetime.now(UTC)
     with engine.begin() as conn:
-        result = conn.execute(
-            item_sprints.update()
-            .where(
-                item_sprints.c.item_id == item_id,
-                item_sprints.c.sprint_id == sprint_id,
-                item_sprints.c.removed_at.is_(None),
-            )
-            .values(removed_at=now)
+        return _remove_item_from_sprint_conn(conn, item_id, sprint_id)
+
+
+def _remove_item_from_sprint_conn(conn: sa.Connection, item_id: int, sprint_id: int) -> dict | None:
+    now = datetime.now(UTC)
+    result = conn.execute(
+        item_sprints.update()
+        .where(
+            item_sprints.c.item_id == item_id,
+            item_sprints.c.sprint_id == sprint_id,
+            item_sprints.c.removed_at.is_(None),
         )
-        if result.rowcount == 0:
-            return None
-        link_row = conn.execute(
-            sa.select(item_sprints).where(
-                item_sprints.c.item_id == item_id,
-                item_sprints.c.sprint_id == sprint_id,
-            )
-        ).first()
-        assert link_row is not None
-        return row_to_dict(link_row)
+        .values(removed_at=now)
+    )
+    if result.rowcount == 0:
+        return None
+    link_row = conn.execute(
+        sa.select(item_sprints).where(
+            item_sprints.c.item_id == item_id,
+            item_sprints.c.sprint_id == sprint_id,
+        )
+    ).first()
+    assert link_row is not None
+    return row_to_dict(link_row)
+
 
 
 def list_items_in_sprint(
@@ -515,10 +525,9 @@ def _ensure_current_sprint_conn(
 ) -> dict:
     """Return the project's primary active sprint, creating+activating one
     (default name 'Current sprint') when none is active. Conn-level so composed
-    ops run get-or-create inside their OWN transaction — a convenience (and an
-    all-or-nothing rollback), NOT a concurrency guarantee: under PostgreSQL
-    READ COMMITTED two sessions can still both miss the sprint and both create
-    one. Serializing that (advisory lock / unique index) is tracked separately."""
+    ops run get-or-create inside their OWN transaction. Callers must use
+    project_transaction(write=True) so concurrent auto-creation serializes
+    before reading the active sprint set (#430)."""
     existing = _get_current_sprint_conn(conn, project_id)
     if existing:
         return existing
@@ -545,8 +554,7 @@ def ensure_current_sprint(
 ) -> dict:
     """Return the project's current (primary active) sprint, creating+activating
     one if none exists. Idempotent: a second call returns the same sprint."""
-    with engine.begin() as conn:
-        project_id = resolve_project_id(conn, project_slug)
+    with project_transaction(engine, project_slug, write=True) as (conn, project_id):
         return _ensure_current_sprint_conn(conn, project_id, name)
 
 
@@ -772,8 +780,7 @@ def set_current_sprint_items(
     offenders) and the whole swap — including any auto-created sprint — rolls
     back. One transaction; the sprint is never left half-set.
     """
-    with engine.begin() as conn:
-        project_id = resolve_project_id(conn, project_slug)
+    with project_transaction(engine, project_slug, write=True) as (conn, project_id):
         out = _set_current_sprint_items_conn(conn, project_id, item_ids)
     return {"project": project_slug, **out}
 
@@ -784,8 +791,7 @@ def clear_current_sprint(engine: sa.Engine, project_slug: str) -> dict:
     history and stay linked (ADR #57 — use remove_item_from_sprint for a
     manual override). No-op if there is no current sprint."""
     now = datetime.now(UTC)
-    with engine.begin() as conn:
-        project_id = resolve_project_id(conn, project_slug)
+    with project_transaction(engine, project_slug, write=True) as (conn, project_id):
         sprint = _require_unambiguous_current_conn(conn, project_id)  # K-33
         if not sprint:
             return {"project": project_slug, "cleared": 0}
@@ -799,13 +805,13 @@ def add_item_to_current_sprint(engine: sa.Engine, project_slug: str, item_id: in
     — unlike set_current_sprint_items it does not touch other members. Idempotent
     (create-or-reactivate). With SEVERAL active sprints this refuses to guess
     (K-33) — use assign_item_to_sprint(item_id, sprint_id) instead.
+    Selection, auto-creation and linking share one serialized transaction.
     Returns {project, sprint_id, item_id, active}."""
-    with engine.begin() as conn:
-        project_id = resolve_project_id(conn, project_slug)
+    with project_transaction(engine, project_slug, write=True) as (conn, project_id):
         sprint = _require_unambiguous_current_conn(conn, project_id)  # K-33
-    if sprint is None:
-        sprint = ensure_current_sprint(engine, project_slug)
-    link = assign_item_to_sprint(engine, item_id, sprint["id"])
+        if sprint is None:
+            sprint = _ensure_current_sprint_conn(conn, project_id)
+        link = _assign_item_to_sprint_conn(conn, item_id, sprint["id"])
     return {
         "project": project_slug,
         "sprint_id": sprint["id"],
@@ -819,10 +825,9 @@ def remove_item_from_current_sprint(engine: sa.Engine, project_slug: str, item_i
     if there is no current sprint or the item is not an active member. With
     SEVERAL active sprints this refuses to guess (K-33) — use
     remove_item_from_sprint(item_id, sprint_id) instead."""
-    with engine.begin() as conn:
-        project_id = resolve_project_id(conn, project_slug)
+    with project_transaction(engine, project_slug, write=True) as (conn, project_id):
         sprint = _require_unambiguous_current_conn(conn, project_id)  # K-33
-    if not sprint:
-        return {"project": project_slug, "removed": False}
-    res = remove_item_from_sprint(engine, item_id, sprint["id"])
+        if not sprint:
+            return {"project": project_slug, "removed": False}
+        res = _remove_item_from_sprint_conn(conn, item_id, sprint["id"])
     return {"project": project_slug, "removed": res is not None}

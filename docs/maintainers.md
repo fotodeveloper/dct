@@ -73,6 +73,18 @@ sync → `release: vX.Y.Z` commit → tag) is documented step by step in
 must stay identical to `ci.yml`'s — a release gate weaker than the branch
 gate published 1.2.0 while CI was red on 3.11.
 
+### Integration verification
+
+Test installers and upgrades with temporary client homes. Mocking one legacy
+Claude installer is insufficient once upgrade also detects Codex: every client
+branch must be isolated from the developer's files. Run production `dct server`
+wire tests with explicit temporary database/config paths. A working handshake
+is separate from fresh-client skill acceptance.
+
+Keep configuration symlinks attached to their targets, and refresh copied assets
+only when their ownership inventory still matches. Probe each actual Python in
+isolated mode so the working directory cannot shadow installed wheel metadata.
+
 ### Advertised numbers
 
 Every number dct quotes about itself is derived, never retyped. Between the

@@ -178,6 +178,8 @@ def _resolve_project(project_arg: str, required: bool = True) -> str | None:
 # cleanly and nothing bad is stored. CLI args and plan-ingest markdown never
 # produce this markup, so the guard is intentionally MCP-only (not in core).
 _TOOLCALL_MARKERS = (
+    "<function_calls>",
+    "</function_calls>",
     "<parameter>",
     "<parameter name=",
     "</parameter>",
@@ -195,6 +197,8 @@ def _reject_toolcall_markup(**fields) -> dict | None:
     parameters collapsed into one field as raw text. Returning the error makes
     the tool fail loud (no row written) and tells the model how to retry.
     Non-string / empty values are skipped. Matching is case-insensitive.
+    Bare function_calls wrappers are rejected too, even without nested
+    invocation or parameter tags (#427).
 
     List values (K-13: `tags` on create_item / update_item) are inspected
     ELEMENT BY ELEMENT — a mangled call can collapse siblings into one array

@@ -1,6 +1,7 @@
 # dct — Deterministic Context Tracker
 
-Cross-project work tracking tool for Claude Code. Items, changelog, notes — all in one database.
+Cross-project work tracking for MCP clients, with Claude Code and Codex adapters.
+Items, changelog, notes — all in one database.
 
 Deep-dives live in `docs/` and are read on demand — keep this file lean:
 [architecture & config](docs/architecture.md) · [plans subsystem](docs/plans.md) ·
@@ -11,7 +12,7 @@ Deep-dives live in `docs/` and are read on demand — keep this file lean:
 
 - **Python 3.11+**, SQLAlchemy Core (NOT ORM), argparse
 - **Database**: PostgreSQL (primary) or SQLite (fallback/OSS)
-- **MCP**: MCP SDK 2.0 (`MCPServer`) via `mcp`, **user-scoped** (`~/.claude.json`)
+- **MCP**: MCP SDK 2.2 (`MCPServer`), user-scoped client configuration
 - **Config**: `~/.config/dctools/dct.toml` (legacy `~/.claude/dct.toml` still read; `dct migrate-home` moves it)
 
 ## Commands
@@ -38,7 +39,7 @@ DCT_TEST_DATABASE_URL=postgresql+psycopg://dct:dct@localhost:5433/dct_ci \
 # A handful of SQLite-specific assertions are skipped on this lane — the list
 # and the reason for each live in tests/conftest.py (PG_LANE_SKIPS).
 .venv/bin/dct --version                # Check version
-uvx ruff@0.16.0 check dct/ tests/     # Lint (config in pyproject.toml; pin matches ci.yml — K-46)
+uvx ruff@0.16.7 check dct/ tests/     # Lint (config in pyproject.toml; pin matches ci.yml — K-46)
 
 # MCP server (smoke-test — boots, lists tools)
 uv run --no-project --with 'mcp' --with sqlalchemy --with 'psycopg[binary]' \
@@ -68,18 +69,21 @@ dct/core/version.py      — Version bump + project-file autodetect
 dct/core/checkpoints.py  — Item checkpoint helpers
 dct/core/ids.py          — ULID generation
 dct/core/plans/          — Plans subsystem: parser.py (pure MD parser),
-                           classify.py (claude --print), crud.py, ingest.py
+                           classify.py (rules + optional command), crud.py, ingest.py
 dct/services/            — Service layer (reserved for future shared app ops)
 dct/workflows/session.py — G1 composed ops: get_context_snapshot /
                            pickup_work / handoff_work (one impl for MCP,
                            CLI and skills; single transaction each)
-dct/mcp/server.py        — MCP server, SDK 2.0 MCPServer (55 tools);
+dct/mcp/server.py        — MCP server, SDK 2.2 MCPServer (55 tools);
                            dct/server.py is a compat shim
 dct/cli.py               — argparse CLI entry point
 dct/export.py            — Keep a Changelog MD export
 dct/integrations/claude.py — Claude Code adapter: MCP registration, skill/hook
                            symlinks, settings.json wiring (`dct hooks wire`);
                            dct/setup.py is a compat shim
+dct/integrations/codex.py — Codex MCP, workflow skills and managed AGENTS.md
+dct/integrations/base.py — Shared contract and conservative file ownership
+dct/integrations/doctor.py — Read-only per-runtime dependency diagnostics
 dct/assets/              — Indirection for packaged asset dirs (physical
                            skills/ + hooks/ stay put until 2.0.0 — host
                            symlinks point into them)

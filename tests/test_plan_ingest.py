@@ -376,3 +376,22 @@ def test_ingest_report_dataclass_serializes():
     assert d["plan_id"] == 1
     assert d["sections_created"] == 0
     assert d["warnings"] == []
+
+
+def test_default_ingest_without_external_client_preserves_unknown(engine, proj, tmp_path, monkeypatch):
+    from dct.config import Config, save_config
+
+    cfg_path = tmp_path / 'config.toml'
+    save_config(Config(database_url='sqlite:///unused.db'), cfg_path)
+    monkeypatch.setenv('DCT_CONFIG_PATH', str(cfg_path))
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError('default ingest must not invoke external classification')
+
+    monkeypatch.setattr(classify_mod.subprocess, 'run', forbidden)
+    monkeypatch.setattr(classify_mod.shutil, 'which', forbidden)
+    path = tmp_path / 'portable.md'
+    path.write_text('# 1. Portable plan\n\n## Sprint 1\n\n## Unknown topic\n')
+    report = ingest_file(engine, str(path), project_slug='dct')
+    assert report['uncertain_resolved'] == 0
+    assert report['uncertain_remaining'] == 1

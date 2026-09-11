@@ -277,7 +277,7 @@ def test_dead_plans_keys_are_gone(tmp_path):
 
 def test_classification_defaults():
     cfg = Config(database_url="sqlite:///x.db")
-    assert cfg.classification.provider == "command"
+    assert cfg.classification.provider == "rules"
     assert cfg.classification.command == ["claude", "--print"]
     assert cfg.integrations.claude.task_mirror == "auto"
 
@@ -298,3 +298,23 @@ def test_cmd_config_path_prints_resolved_locations(fake_home, capsys):
     assert str(paths.data_dir()) in out or str(fake_home / ".claude" / "dct.db") in out
     assert str(paths.cache_dir()) in out
     assert str(paths.state_dir()) in out
+
+
+@pytest.mark.parametrize('section,expected', [
+    ('', 'rules'),
+    ('[classification]\ncommand = ["custom", "--classify"]\n', 'command'),
+    ('[plans]\nclassify_model = "legacy"\n', 'command'),
+    ('[classification]\nprovider = "rules"\ncommand = ["custom"]\n', 'rules'),
+    ('[classification]\nprovider = "disabled"\nmodel = "legacy"\n', 'disabled'),
+])
+def test_classification_explicit_provider_and_legacy_aliases(tmp_path, section, expected):
+    path = tmp_path / 'dct.toml'
+    path.write_text('[database]\nurl = "sqlite:///x.db"\n' + section)
+    assert load_config(path).classification.provider == expected
+
+
+def test_classification_rejects_string_argv(tmp_path):
+    path = tmp_path / 'dct.toml'
+    path.write_text('[classification]\ncommand = "custom --classify"\n')
+    with pytest.raises(ValueError, match='array of strings'):
+        load_config(path)

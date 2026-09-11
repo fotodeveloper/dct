@@ -18,7 +18,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
-      - run: uvx ruff@0.16.0 check dct/ tests/
+      - run: uvx ruff@0.16.7 check dct/ tests/
 
   # Keep this matrix identical to ci.yml's. A narrower gate here published
   # 1.2.0 while CI was red on 3.11 — the release gate must never be weaker

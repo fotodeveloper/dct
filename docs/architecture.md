@@ -72,14 +72,14 @@ url = "postgresql+psycopg://localhost:5432/dct"
 # or: url = "sqlite:////home/you/.local/share/dctools/dct.db"
 
 [plans]
-# LLM classification of uncertain plan sections — always-on by default
+# Resolution is enabled; local classification rules require no model
 auto_resolve_uncertain = true
 
 [classification]
 # Pluggable classifier (ADR #52; formerly [plans].classify_* — old keys
-# still read as permanent aliases). provider: "command" | "disabled"
+# still read as permanent aliases). provider: "rules" | "command" | "disabled"
 # (other providers are future scope; unknown values behave as "disabled").
-provider = "command"
+provider = "rules"
 command = ["claude", "--print"]
 model = "claude-haiku-4-5-20251001"
 timeout_seconds = 30

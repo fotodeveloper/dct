@@ -49,6 +49,33 @@ def test_create_item_markup_rejected(srv, monkeypatch):
     assert calls == []  # guard fires before any DB access
 
 
+@pytest.mark.parametrize("marker", [
+    "<function_calls>", "</function_calls>",
+    "<FuNcTiOn_CaLlS>", "</FuNcTiOn_CaLlS>",
+])
+@pytest.mark.parametrize("field", ["description", "tags"])
+def test_function_calls_wrappers_rejected_before_db_access(monkeypatch, marker, field):
+    """#427: a bare wrapper is refused in prose and inside a tag list."""
+    def unexpected_db_access():
+        pytest.fail("Malformed tool calls must be rejected before DB access")
+
+    monkeypatch.setattr(S, "_get_engine", unexpected_db_access)
+    text = f"before {marker} after"
+    value = ["clean", text] if field == "tags" else text
+    out = S.create_item("todo", "clean", project="test", **{field: value})
+
+    assert set(out) == {"error"}
+    assert "Malformed MCP tool call" in out["error"]
+    assert marker.lower() in out["error"]
+    assert f"field '{'tags[1]' if field == 'tags' else field}'" in out["error"]
+
+
+def test_function_calls_plain_text_is_still_saved(srv):
+    text = "The function_calls wrapper groups calls; ordinary <p>HTML</p> is prose."
+    item = srv.create_item("todo", "clean", project="test", description=text)
+    assert srv.get_item(item["id"])["description"] == text
+
+
 # ── add_checkpoint ────────────────────────────────────────────────────────────
 
 

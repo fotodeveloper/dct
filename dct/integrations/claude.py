@@ -4,13 +4,21 @@ symlinks into the host's ~/.claude, wire hooks into settings.json."""
 
 import json
 import os
+import shlex
 import shutil
 import subprocess
-from datetime import UTC, datetime
 from pathlib import Path
 
 from dct import assets
 from dct.config import Config
+from dct.integrations.base import (
+    ClientIntegration,
+    _copy_inventory,
+    atomic_write,
+    is_managed_copy,
+    managed_instructions,
+    mark_managed_copy,
+)
 
 
 def _link_or_copy(src: Path, dst: Path) -> None:
@@ -23,6 +31,7 @@ def _link_or_copy(src: Path, dst: Path) -> None:
     except OSError:
         if src.is_dir():
             shutil.copytree(src, dst)
+            mark_managed_copy(dst)
         else:
             shutil.copy2(src, dst)
         print(
@@ -105,14 +114,17 @@ def register_mcp(config: Config) -> tuple[bool, str]:
     if CLAUDE_JSON.exists():
         with open(CLAUDE_JSON, encoding="utf-8") as f:
             data = json.load(f)
-    data.setdefault("mcpServers", {})["dct"] = {
-        "type": "stdio",
-        "command": server_cmd[0],
-        "args": server_cmd[1:],
+    if not isinstance(data, dict) or not isinstance(data.get("mcpServers", {}), dict):
+        raise ValueError("Claude MCP configuration must contain an object; nothing was written")  # noqa: TRY004 — user-file validation contract
+    servers = data.setdefault("mcpServers", {})
+    if "dct" in servers:
+        # Existing entries may use wrappers, extra args, env, or custom fields.
+        # Their presence is not ownership permission to normalize them.
+        return True, "already registered (existing configuration preserved)"
+    servers["dct"] = {
+        "type": "stdio", "command": server_cmd[0], "args": server_cmd[1:],
     }
-    with open(CLAUDE_JSON, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
-        f.write("\n")
+    atomic_write(CLAUDE_JSON, json.dumps(data, indent=2, ensure_ascii=False) + "\n")
     return True, "registered via direct ~/.claude.json edit"
 
 
@@ -230,7 +242,7 @@ def wire_hooks_into_settings(settings_path: Path | None = None) -> dict:
         if any(name in cmd for cmd in existing_commands):
             skipped.append(name)
             continue
-        entry = {"type": "command", "command": f"bash {CLAUDE_HOOKS_DIR / name}"}
+        entry = {"type": "command", "command": f"bash {shlex.quote(str(CLAUDE_HOOKS_DIR / name))}"}
         if spec["timeout"] is not None:
             entry["timeout"] = spec["timeout"]
         groups = hooks.setdefault(spec["event"], [])
@@ -249,17 +261,9 @@ def wire_hooks_into_settings(settings_path: Path | None = None) -> dict:
 
     backup = None
     if added:
-        if raw is not None and raw.strip():
-            stamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
-            backup_path = settings_path.with_name(
-                f"{settings_path.name}.bak-dct-{stamp}"
-            )
-            backup_path.write_text(raw, encoding="utf-8")
-            backup = str(backup_path)
-        settings_path.parent.mkdir(parents=True, exist_ok=True)
-        tmp_path = settings_path.with_name(settings_path.name + ".dct-tmp")
-        tmp_path.write_text(json.dumps(settings, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-        os.replace(tmp_path, settings_path)
+        backup = atomic_write(
+            settings_path, json.dumps(settings, indent=2, ensure_ascii=False) + "\n"
+        )
 
     return {
         "added": added,
@@ -314,6 +318,8 @@ def install_skills(config: Config | None = None) -> bool:
     install, the repo working tree for an editable one (where a repo fix is
     live without reinstall). ``config`` is accepted for call-site symmetry with
     the other install_* helpers but is unused (default ``None``).
+    Fallback copies carry a content manifest: only unchanged managed copies
+    refresh on upgrade. Unmarked or locally modified directories are preserved.
     """
     CLAUDE_SKILLS_DIR.mkdir(parents=True, exist_ok=True)
     installed = 0
@@ -326,7 +332,9 @@ def install_skills(config: Config | None = None) -> bool:
         if dst.is_symlink():
             dst.unlink()
         elif dst.exists():
-            continue  # don't overwrite non-symlink dirs
+            if not is_managed_copy(dst):
+                continue  # preserve unmarked or locally modified directories
+            shutil.rmtree(dst)
 
         _link_or_copy(src, dst)
         installed += 1
@@ -382,49 +390,154 @@ def attach_claude_md_snippet(claude_md_path: Path | None = None) -> dict:
             f"{src}: no '---' separator — cannot split off the preamble"
         )
     body = raw_snippet.split(separator, 1)[1].strip("\n")
-    block = f"{SNIPPET_START}\n{body}\n{SNIPPET_END}"
+    return managed_instructions(claude_md_path, body, SNIPPET_START, SNIPPET_END)
 
-    original = (
-        claude_md_path.read_text(encoding="utf-8")
-        if claude_md_path.exists()
-        else None
-    )
 
-    if original is None or not original.strip():
-        new_text = block + "\n"
-        status = "added"
-    elif SNIPPET_START in original:
-        start = original.index(SNIPPET_START)
-        end = original.find(SNIPPET_END, start)
-        if end == -1:
-            raise ValueError(
-                f"{claude_md_path}: start marker without end marker — "
-                "fix the file manually; nothing was written"
+class ClaudeIntegration(ClientIntegration):
+    """Claude adapter preserving the legacy installer API and user configuration."""
+
+    name = "claude"
+
+    def detect(self) -> bool:
+        try:
+            data = json.loads(CLAUDE_JSON.read_text(encoding="utf-8"))
+            if isinstance(data, dict) and "dct" in data.get("mcpServers", {}):
+                return True
+        except (OSError, ValueError, TypeError):
+            pass
+        if any((CLAUDE_SKILLS_DIR / name).is_symlink()
+               or is_managed_copy(CLAUDE_SKILLS_DIR / name) for name in discover_skills()):
+            return True
+        return CLAUDE_MD.is_file() and SNIPPET_START in CLAUDE_MD.read_text(encoding="utf-8")
+
+    def install_mcp(self) -> dict:
+        ok, message = register_mcp(None)
+        return {"status": "ok" if ok else "error", "message": message}
+
+    def install_skills(self) -> dict:
+        installed = install_skills()
+        hooks = install_hook()
+        wiring = wire_hooks_into_settings()
+        return {"status": "ok", "installed": installed, "hooks": hooks, "wiring": wiring}
+
+    def install_instructions(self) -> dict:
+        return attach_claude_md_snippet()
+
+    def doctor(self) -> list[dict]:
+        rows = []
+        try:
+            data = json.loads(CLAUDE_JSON.read_text(encoding="utf-8"))
+            entry = data.get("mcpServers", {}).get("dct")
+            if not isinstance(entry, dict):
+                raise ValueError("DCT MCP missing")  # noqa: TRY004 — user-file validation contract
+            command, args, env = entry.get("command"), entry.get("args", []), entry.get("env", {})
+            env_valid = isinstance(env, dict) and all(isinstance(k, str) and isinstance(v, str) for k, v in env.items())
+            args_valid = isinstance(args, list) and all(isinstance(arg, str) for arg in args)
+            found = isinstance(command, str) and bool(command) and env_valid and bool(
+                shutil.which(command, path=env.get("PATH"))
             )
-        end += len(SNIPPET_END)
-        new_text = original[:start] + block + original[end:]
-        status = "unchanged" if new_text == original else "refreshed"
-    elif SNIPPET_END in original:
-        raise ValueError(
-            f"{claude_md_path}: end marker without start marker — "
-            "fix the file manually; nothing was written"
-        )
-    else:
-        new_text = original.rstrip("\n") + "\n\n" + block + "\n"
-        status = "added"
+            enabled = entry.get("disabled") is not True and entry.get("enabled") is not False
+            valid = found and args_valid and enabled
+            rows.append({"check": "mcp", "status": "ok" if valid else "error",
+                         "message": "DCT MCP executable and configuration present; connection requires a fresh client session"
+                         if valid else "DCT MCP disabled, executable missing, or args/env invalid"})
+        except (OSError, ValueError, AttributeError, TypeError):
+            rows.append({"check": "mcp", "status": "error", "message": "Claude MCP config unavailable or invalid"})
+        invalid = []
+        for name in discover_skills():
+            path = CLAUDE_SKILLS_DIR / name
+            try:
+                valid = ((path.is_symlink() and path.resolve() == (SKILLS_DIR / name).resolve())
+                         or (is_managed_copy(path) and _copy_inventory(path) == _copy_inventory(SKILLS_DIR / name)))
+            except (OSError, ValueError):
+                valid = False
+            if not valid or not (path / "SKILL.md").is_file():
+                invalid.append(name)
+        rows.append({"check": "skills", "status": "error" if invalid else "ok",
+                     "message": "Missing, modified or unowned skills: " + ", ".join(invalid)
+                     if invalid else "Packaged skills present"})
+        try:
+            body = CLAUDE_MD.read_text(encoding="utf-8")
+        except OSError:
+            body = ""
+        block_valid = body.count(SNIPPET_START) == body.count(SNIPPET_END) == 1
+        if block_valid:
+            block_valid = body.index(SNIPPET_START) < body.index(SNIPPET_END)
+        rows.append({"check": "instructions", "status": "ok" if block_valid else "error",
+                     "message": "DCT managed instruction block" if block_valid else "Missing or malformed DCT instruction block"})
+        missing_hooks = []
+        for spec in HOOK_WIRING:
+            path = CLAUDE_HOOKS_DIR / spec["script"]
+            source = HOOKS_DIR / spec["script"]
+            if not source.is_file():
+                source = HOOKS_DIR / spec["script"].removeprefix("dct-")
+            try:
+                valid = path.read_bytes() == source.read_bytes()
+                if path.is_symlink():
+                    valid = valid and path.resolve() == source.resolve()
+            except OSError:
+                valid = False
+            if not valid:
+                missing_hooks.append(spec["script"])
+        rows.append({"check": "hook_assets", "status": "error" if missing_hooks else "ok",
+                     "message": "Missing or outdated hook files: " + ", ".join(missing_hooks)
+                     if missing_hooks else "Current packaged hook files present"})
+        try:
+            settings = json.loads(CLAUDE_SETTINGS.read_text(encoding="utf-8"))
+            commands = [hook.get("command", "") for groups in settings.get("hooks", {}).values()
+                        for group in groups for hook in group.get("hooks", [])
+                        if isinstance(hook, dict)]
+            for spec in HOOK_WIRING:
+                expected = str(CLAUDE_HOOKS_DIR / spec["script"])
+                matching = False
+                for command in commands:
+                    try:
+                        parts = shlex.split(command)
+                        matching |= expected in parts or any(
+                            str(Path(part).expanduser()) == expected for part in parts
+                        )
+                    except (ValueError, TypeError):
+                        continue
+                if not matching and spec["script"] not in missing_hooks:
+                    missing_hooks.append(spec["script"])
+        except (OSError, ValueError, AttributeError, TypeError):
+            missing_hooks = [spec["script"] for spec in HOOK_WIRING]
+        rows.append({"check": "hooks", "status": "error" if missing_hooks else "ok",
+                     "message": "Missing hook files or wiring: " + ", ".join(missing_hooks)
+                     if missing_hooks else "Hook files and wiring present"})
+        return rows
 
-    backup = None
-    if status != "unchanged":
-        if original is not None and original.strip():
-            stamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
-            backup_path = claude_md_path.with_name(
-                f"{claude_md_path.name}.bak-dct-{stamp}"
-            )
-            backup_path.write_text(original, encoding="utf-8")
-            backup = str(backup_path)
-        claude_md_path.parent.mkdir(parents=True, exist_ok=True)
-        tmp_path = claude_md_path.with_name(claude_md_path.name + ".dct-tmp")
-        tmp_path.write_text(new_text, encoding="utf-8")
-        os.replace(tmp_path, claude_md_path)
+    def uninstall(self) -> dict:
+        """Remove proven-owned assets only; keep MCP and hooks settings for review.
 
-    return {"status": status, "backup": backup, "path": str(claude_md_path)}
+        Older installers did not record ownership of JSON entries or hook copies.
+        Never infer permission to remove those from a familiar name alone.
+        """
+        removed = []
+        for directory, source in ((CLAUDE_SKILLS_DIR, SKILLS_DIR), (CLAUDE_HOOKS_DIR, HOOKS_DIR)):
+            if not directory.is_dir():
+                continue
+            for entry in directory.iterdir():
+                owned_link = entry.is_symlink() and entry.resolve().is_relative_to(source.resolve())
+                if owned_link:
+                    entry.unlink()
+                elif directory == CLAUDE_SKILLS_DIR and is_managed_copy(entry):
+                    shutil.rmtree(entry)
+                else:
+                    continue
+                removed.append(str(entry))
+        if CLAUDE_MD.exists():
+            original = CLAUDE_MD.read_text(encoding="utf-8")
+            if original.count(SNIPPET_START) == original.count(SNIPPET_END) == 1:
+                start, end = original.index(SNIPPET_START), original.index(SNIPPET_END)
+                if end > start:
+                    atomic_write(CLAUDE_MD, original[:start] + original[end + len(SNIPPET_END):])
+                    removed.append(str(CLAUDE_MD) + " (managed block)")
+        preserved = []
+        for path in (CLAUDE_JSON, CLAUDE_SETTINGS):
+            if path.is_file():
+                preserved.append(str(path))
+        return {"status": "partial" if preserved else "ok", "removed": removed,
+                "preserved": preserved,
+                "message": "MCP entries and hook settings preserved for manual review; remove DCT references before restarting the client"
+                if preserved else "Owned integration assets removed"}

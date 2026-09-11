@@ -503,7 +503,11 @@ def test_register_probe_join_noop_when_opted_out(tmp_path, monkeypatch):
 def test_upgrade_warns_when_relink_fails(monkeypatch, capsys):
     """FIX 7: when the skill/hook re-link raises, print a warning naming the error
     and suggesting `dct init` — NOT the success line."""
+    from dct.integrations.codex import CodexIntegration
+
     monkeypatch.setattr(update, "detect_install_method", lambda *a, **k: "editable")
+    monkeypatch.setattr(setup.ClaudeIntegration, "detect", lambda self: True)
+    monkeypatch.setattr(CodexIntegration, "detect", lambda self: False)
 
     def boom(*a, **k):
         raise RuntimeError("disk full")
