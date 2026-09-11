@@ -121,11 +121,13 @@ See the [integration guide and capability matrix](https://github.com/fotodevelop
 for repair, upgrade, uninstall, runtime diagnostics and limitations.
 
 Fresh Claude → Codex handoff and the installed pickup skill were exercised on
-an isolated database without passing the previous transcript. A small measured
-comparison used more input tokens for DCT than for an equivalent compact context
-file (58,271 versus 36,340, with different cache hits). DCT's demonstrated benefit
-here is recovering structured work state; this test does not establish token
-savings. See the [acceptance evidence and benchmark method](https://github.com/fotodeveloper/dct/blob/main/docs/codex-acceptance.md).
+an isolated database without passing the previous transcript. A controlled
+nine-session comparison measured median main-model input of 24,926 tokens for
+one DCT pickup tool versus 23,006 for exactly the same response bytes read from a
+file, an increase of approximately 8.35%. All trials returned the correct answer;
+cache behavior varied, and separate guardian work means these main-task figures
+are not complete billing totals. DCT's demonstrated benefit here is recovering
+structured work state, not token savings. See the [acceptance evidence](https://github.com/fotodeveloper/dct/blob/main/docs/codex-acceptance.md) and [controlled benchmark results](https://github.com/fotodeveloper/dct/blob/main/docs/benchmark-codex.md#controlled-results).
 
 ### Other MCP clients (Cursor, Windsurf, Zed)
 

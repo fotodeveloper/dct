@@ -22,7 +22,24 @@ The first harness prompt prohibited shell reads, so that attempt did not exercis
 the skill file; the targeted follow-up explicitly allowed those reads and passed.
 No blanket permission-bypass flags were used.
 
-## Bounded context microbenchmark
+## Controlled context benchmark
+
+The [controlled benchmark](benchmark-codex.md#controlled-results) supersedes the
+exploratory token comparison below as the current measurement. Nine isolated
+sessions compared exactly the same MCP response bytes through File, File with MCP
+registered, and MCP retrieval. All nine trials were valid and each main task used
+two model steps. Median main-model input was 24,926 tokens for MCP versus 23,006
+for File, an increase of 1,920 tokens (approximately 8.35%). The median paired
+registration difference was +1,538 input tokens and the median paired invocation
+difference was +382.
+
+Cache hits varied across repeats, so those measurements are not labeled cold or
+warm. Guardian approval work occurred separately in the three MCP trials and is
+tabulated separately in the benchmark report; it is excluded from the primary
+task metric, which is therefore not a complete billing total. The experiment
+used one exposed DCT tool and cannot characterize the full 55-tool catalog.
+
+## Earlier exploratory context microbenchmark
 
 Two fresh Codex CLI runs received the same identification task against the same
 fixture. One exposed only `pickup_work` and made one read with
@@ -35,6 +52,14 @@ microbenchmark, not the default 55-tool DCT experience.
 |---|---:|---:|---:|---:|---:|
 | One DCT pickup tool | 58,271 | 40,832 | 17,439 | 137 | 1 MCP |
 | Equivalent compact context file | 36,340 | 29,312 | 7,028 | 95 | 1 shell read |
+
+These were ephemeral exploratory runs retained as historical evidence: per-step
+usage and the full actual prompt were not retained. Only CODEX_HOME was isolated;
+personal home-level skill metadata remained a possible confounder. The exact
+cause of the 21,931-input-token
+gap cannot be recovered from this evidence or inferred from the later controlled
+run. See the [controlled benchmark results](benchmark-codex.md#controlled-results)
+for the current measurement.
 
 These observed results do not demonstrate token savings: the DCT run used more
 input tokens for this small fixture. Prompt/schema overhead and unequal cache
