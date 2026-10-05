@@ -240,8 +240,8 @@ def test_apply_performs_and_verifies_every_effect(engine, proj):
                                                   "index", "tag", "push", "complete"]
     record = assert_released(engine, repo, candidate, [a])
     assert record["proof"] == {str(a): {"commits": [candidate], "merge_commit": None,
-                                        "pr": None, "source": None, "ambiguous": False,
-                                        "associations": []}}
+                                        "pr": None, "pr_source": None, "source": None,
+                                        "ambiguous": False, "associations": []}}
     assert sync_runs(log) == ["1.1.0"]
     json.dumps(out)  # JSON-native
 

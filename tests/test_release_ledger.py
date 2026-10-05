@@ -403,7 +403,8 @@ def test_proof_is_stored_in_canonical_form(proj):
     rec = release_entries(proj, "proj-a", "1.1.0", entry_ids=[a, b], proof=proof)["release"]
     assert rec["proof"] == {
         str(a): {"commits": sorted([CAND, COMMIT]), "merge_commit": None, "pr": None},
-        str(b): {"commits": [OTHER], "merge_commit": CAND, "pr": 17},
+        # K-116 H7: a supplied PR number is stored as the caller's declaration.
+        str(b): {"commits": [OTHER], "merge_commit": CAND, "pr": 17, "pr_source": "client"},
     }
 
 

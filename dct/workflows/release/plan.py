@@ -6,13 +6,23 @@ release tool performs the effects.
 
 build_plan(engine, project, ...) answers, for the release candidate (the
 full HEAD of a STRICTLY verified checkout, K-52):
+  - who performs it (K-119): the project's executor and, for an
+    unfinished record, the record's stored executor, progress owner and
+    consent — ONE read (core.releases.release_routing), so a dialog routes
+    from this single result;
   - range (K-71, K-83): from the graph-nearest release tag that is an
     ancestor of the candidate — see resolve_range for the exact rule — or,
-    without one, the approximate `--since` window;
+    without one, the approximate `--since` window; the ancestry graph is
+    streamed and read in full or REFUSED past ANCESTRY_MAX_COMMITS (K-116
+    H8 — never a cut graph);
   - proof per commit (proof.py rules), reverts with the merge mainline
-    their message names (K-68, K-82 — revert_scopes), squash signals and
+    their message names (K-68, K-82 — revert_scopes; a revert is FULL only
+    when its change equals the inverse of the reverted one in the ONE
+    representation of change_between, which keeps blob identity, file type
+    and mode where git prints no textual patch — K-105), squash signals and
     the collective attestation proposals (K-69), provenance from ONE
-    recognition per proving commit (K-70, K-89);
+    recognition per proving commit (K-70, K-89) — a recognised PR number is
+    marked `pr_source: "git"`, a heuristic one is never a `pr` (K-116 H7);
   - classification of every unreleased entry: proven | unproven with a
     reason; foreign citations; the index state (K-50, read part); the
     version-file contract (K-73);
@@ -35,7 +45,9 @@ import hashlib
 import json
 import os
 import re
+import sys
 from collections import deque
+from collections.abc import Iterator
 from datetime import UTC, date, datetime, timedelta
 
 import sqlalchemy as sa
@@ -43,7 +55,7 @@ import sqlalchemy as sa
 from dct.core import gitinfo
 from dct.core.changelog import entry_state_digest, list_entries, normalize_worktree
 from dct.core.projects import get_project
-from dct.core.releases import get_release, get_version_files, validate_proof
+from dct.core.releases import get_version_files, release_routing, validate_proof
 from dct.core.version import (
     bump,
     normalize_version,
@@ -64,13 +76,17 @@ from dct.workflows.release.proof import (
     suffix_pr,
 )
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 PLAN_KEYS = (
-    "schema_version", "project", "kind", "version", "checkout", "unfinished_release",
-    "range", "entries", "foreign_citations", "reverts", "squash_commits",
-    "attestation_groups", "proof", "index", "version_files", "warnings",
+    "schema_version", "project", "kind", "version", "checkout", "executor",
+    "unfinished_release", "range", "entries", "foreign_citations", "reverts",
+    "squash_commits", "attestation_groups", "proof", "index", "version_files", "warnings",
     "resume", "snapshot", "snapshot_digest",
 )
+# K-116 H8 — the most commits the range resolution reads from the ancestry
+# graph of a candidate (read_ancestry). Past it the plan REFUSES; it never
+# works on a cut graph. Documented in docs/release-workflow.md.
+ANCESTRY_MAX_COMMITS = 1_000_000
 CANDIDATE_KEYS = (
     "schema_version", "project", "checkout", "range", "confirmed", "uncertain",
     "other_branch", "already_proven", "staged_files", "warnings",
@@ -146,20 +162,44 @@ def release_tags(cwd: str, candidate: str) -> list[dict]:
     return sorted(tags, key=lambda t: t["name"])
 
 
+def read_ancestry(cwd: str, candidate: str) -> Iterator[tuple[str, list[str]]]:
+    """(commit, [its parents]) for EVERY commit reachable from `candidate` —
+    `git rev-list --parents <candidate>`, STREAMED (K-116 H8;
+    gitinfo.git_read_lines is the process layer: its timeout applies, and a
+    failed read raises GitReadError). The graph is read in full or not at
+    all: more than ANCESTRY_MAX_COMMITS commits raises GitReadError — a
+    REFUSAL, never a graph cut at the cap (distances computed on a prefix
+    could name the wrong range base)."""
+    lines = gitinfo.git_read_lines(cwd, "rev-list", "--parents", candidate, "--")
+    try:
+        for count, line in enumerate(lines, 1):
+            if count > ANCESTRY_MAX_COMMITS:
+                raise gitinfo.GitReadError(
+                    f"the history of {candidate} in {cwd} holds more than "
+                    f"{ANCESTRY_MAX_COMMITS} commits — the release plan reads the ancestry "
+                    f"graph in full to find the nearest release tag and refuses past that "
+                    f"cap instead of computing a range on part of it")
+            shas = line.split()
+            if shas:
+                yield shas[0], shas[1:]
+    finally:
+        lines.close()
+
+
 def ancestor_distances(cwd: str, candidate: str, targets: set[str]) -> dict[str, int]:
     """The minimum number of PARENT EDGES from `candidate` to each commit of
     `targets` that is an ancestor of it (or the candidate itself, 0) — a
-    breadth-first search over `git rev-list --parents <candidate>` (K-83).
+    breadth-first search over the full ancestry graph (read_ancestry: read
+    with a cap that refuses, K-116 H8) (K-83).
     Not `rev-list --count TAG..candidate`: in a history with merges that
-    counts commits, not the graph distance."""
+    counts commits, not the graph distance. No target → no read."""
     if not targets:
         return {}
-    _, out = gitinfo.git_read(cwd, "rev-list", "--parents", candidate, "--")
-    parents: dict[str, list[str]] = {}
-    for line in out.splitlines():
-        shas = line.split()
-        if shas:
-            parents[shas[0]] = shas[1:]
+    parents: dict[str, tuple[str, ...]] = {}
+    for sha, above in read_ancestry(cwd, candidate):
+        # One str object per commit id (each id appears as a key and as a
+        # parent of its children) — the map is the plan's largest structure.
+        parents[sys.intern(sha)] = tuple(sys.intern(parent) for parent in above)
     found: dict[str, int] = {}
     seen = {candidate}
     queue = deque([(candidate, 0)])
@@ -286,15 +326,42 @@ def introduced_by(cwd: str, merge: Commit, parent: str | None = None) -> list[st
     return [sha for sha in out.split() if sha != merge.sha]
 
 
-def _change(cwd: str, old: str, new: str) -> str:
-    """The change from tree-ish `old` to `new` without positions or blob
-    ids (`git diff-tree -p -U0`, `index` and `@@` lines dropped) — equal for
-    a revert and the inverse of what it reverts even when later commits
-    moved the lines."""
+_DIFF_SECTION = "diff --git "
+
+
+def change_between(cwd: str, old: str, new: str) -> tuple[tuple[str, ...], ...]:
+    """The change from tree-ish `old` to `new` — the ONE representation the
+    revert comparison uses (K-82, K-105): one tuple of lines per changed
+    path, from `git diff-tree -p -U0 --no-renames --full-index` (a rename is
+    a deletion plus an addition).
+
+    Every section keeps git's header lines — the path, `new file mode` /
+    `deleted file mode` (the file TYPE is in the mode: regular, executable,
+    symlink, gitlink) and `old mode` / `new mode`.
+    - A section WITH a textual patch: the removed and added lines are the
+      identity of the change; the `@@` positions and the `index` line are
+      dropped, so a revert equals the inverse of what it reverts even when
+      later commits moved the lines or touched the file elsewhere (the blob
+      ids legitimately differ then).
+    - A section WITHOUT a textual patch (binary content, an empty file, a
+      change git cannot print): the `index <old>..<new> [mode]` line is
+      KEPT with the full input and output blob ids — two `Binary files …
+      differ` lines are never the same change by themselves.
+    """
     _, out = gitinfo.git_read(cwd, "diff-tree", "-p", "-U0", "--no-renames", "--no-color",
                               "--full-index", old, new, "--")
-    return "\n".join(line for line in out.splitlines()
-                     if not line.startswith(("index ", "@@")))
+    sections: list[list[str]] = []
+    for line in out.splitlines():
+        if line.startswith(_DIFF_SECTION) or not sections:
+            sections.append([])
+        sections[-1].append(line)
+    change = []
+    for section in sections:
+        textual = any(line.startswith("@@") for line in section)
+        change.append(tuple(
+            line for line in section
+            if not line.startswith("@@") and not (textual and line.startswith("index "))))
+    return tuple(change)
 
 
 def revert_scopes(cwd: str, commits: list[Commit]) -> dict[str, dict]:
@@ -311,9 +378,13 @@ def revert_scopes(cwd: str, commits: list[Commit]) -> dict[str, dict]:
       the revert removes, never a fixed parent 1. Without a usable mainline
       every commit M brought in relative to ANY parent is affected (which
       side was reverted is unknown).
-    - The revert must be FULL: its own change equals the inverse of the
-      reverted one (T → T's parent, or M → P); else reason 'partial' (a
-      conflict resolved differently, an edited revert).
+    - The revert must be FULL — every revert, an ordinary one included
+      (K-116 H6): its own change equals the inverse of the reverted one (T →
+      T's parent, or M → P) in the representation of change_between (K-105:
+      blob identity, type and mode kept where git prints no textual patch);
+      else reason 'partial' (a conflict resolved differently, an edited
+      revert, a binary file reverted to another blob). A revert of a ROOT
+      commit has nothing to be compared with: 'partial' too.
     A revert that is not confirmed neutralizes nothing; its affected
     entries get no automatic proof (reason 'revert_unconfirmed')."""
     shas = [c.sha for c in commits]
@@ -347,7 +418,7 @@ def revert_scopes(cwd: str, commits: list[Commit]) -> dict[str, dict]:
             scope["reason"] = "partial"  # a root commit: no parent to compare with
         if inverse_of is not None:
             full = len(commit.parents) == 1 and \
-                _change(cwd, commit.parents[0], commit.sha) == _change(cwd, target.sha, inverse_of)
+                change_between(cwd, commit.parents[0], commit.sha) == change_between(cwd, target.sha, inverse_of)
             scope["confirmed"] = full
             scope["reason"] = None if full else "partial"
         scope["affected"] = sorted(set(scope["affected"]))
@@ -528,15 +599,18 @@ def _artifacts(project: dict, checkout: dict, version_files: list[str] | None) -
 
 
 def _provenance(proving: list[str], by_sha: dict[str, Commit], merged_by: dict[str, str]) -> dict:
-    """{commits, merge_commit, pr, source, ambiguous, associations} of a
-    proven entry (K-70, K-89). Per proving commit ONE recognition: a proving
-    commit that is itself a real merge names ITSELF (`own_merge`); else the
-    first-parent merge that brought it in (`introducing_merge`). The PR is
-    the `Merge pull request #N` subject of THAT merge — never borrowed from
-    another commit. A `… (#N)` subject suffix may be an issue number: it is
-    listed as an uncertain association (`subject_suffix`, certain False),
-    never the entry's `pr` (K-95 C4). Several different merge associations
-    → `ambiguous`, merge_commit / pr null — never one picked."""
+    """{commits, merge_commit, pr, pr_source, source, ambiguous,
+    associations} of a proven entry (K-70, K-89). Per proving commit ONE
+    recognition: a proving commit that is itself a real merge names ITSELF
+    (`own_merge`); else the first-parent merge that brought it in
+    (`introducing_merge`). The PR is the `Merge pull request #N` subject of
+    THAT merge — never borrowed from another commit; `pr_source` is then
+    'git' (K-116 H7: recognised in the repository — the plan never emits
+    'client', a declaration only a caller can make), else null. A `… (#N)`
+    subject suffix may be an issue number: it is listed as an uncertain
+    association (`subject_suffix`, certain False), never the entry's `pr`
+    (K-95 C4). Several different merge associations → `ambiguous`,
+    merge_commit / pr null — never one picked."""
     associations: list[dict] = []
 
     def add(item: dict) -> None:
@@ -564,6 +638,7 @@ def _provenance(proving: list[str], by_sha: dict[str, Commit], merged_by: dict[s
         "commits": list(proving),
         "merge_commit": chosen["merge_commit"] if chosen else None,
         "pr": chosen["pr"] if chosen else None,
+        "pr_source": "git" if chosen and chosen["pr"] is not None else None,
         "source": chosen["source"] if chosen else None,
         "ambiguous": len(distinct) > 1,
         "associations": associations,
@@ -738,12 +813,18 @@ def build_plan(
     already verified (verify_release_checkout, its `head` = THE candidate)
     — the plan then never reads HEAD again. A resume plan (an unfinished
     record exists, K-95 C5) shows the record in `resume` and computes no
-    range / proof on today's HEAD (`snapshot` null).
+    range / proof on today's HEAD (`snapshot` null). `executor` (K-119):
+    {project, record} of core.releases.release_routing — the project's
+    setting and, for that unfinished record, ITS stored executor, progress
+    owner and consent, read together with `unfinished_release`.
 
     Raises ValueError (unknown project, bad version / bump),
     gitinfo.NotACheckoutError / CheckoutVerificationError (the checkout
     cannot be CONFIRMED — K-52, never a fallback to the main checkout) and
-    gitinfo.GitReadError (a history read failed — never a partial plan).
+    gitinfo.GitReadError (a history read failed, timed out, or the ancestry
+    graph exceeds ANCESTRY_MAX_COMMITS — never a partial plan); ValueError
+    also when one entry has more than core.releases.ASSOCIATIONS_MAX
+    associations (K-116 H8: refused, never cut).
     """
     project = get_project(engine, project_slug)
     if project is None:
@@ -753,7 +834,9 @@ def build_plan(
     current = project.get("current_version")
     target = _target_version(current, version, bump_type)
     warnings: list[str] = []
-    unfinished = get_release(engine, project_slug)
+    # K-119: the project's executor and the unfinished record (with ITS
+    # stored executor / progress owner / consent) — one read, one result.
+    routing, unfinished = release_routing(engine, project_slug)
     kind = "resume" if unfinished else "release"
     if unfinished and target and not same_version(target, unfinished["version"]):
         warnings.append(
@@ -771,6 +854,7 @@ def build_plan(
         schema_version=SCHEMA_VERSION, project=project_slug, kind=kind,
         version={"current": current, "target": target,
                  "bump": None if version else bump_type},
+        executor=routing,
         unfinished_release=_jsonable(unfinished), foreign_citations=[], reverts=[],
         squash_commits=[], attestation_groups=[], proof={}, warnings=warnings,
         version_files=_jsonable(get_version_files(engine, project_slug)),
@@ -912,7 +996,7 @@ def build_plan(
         foreign_citations=_foreign_citations(engine, _project_id(engine, project_slug), cited),
         squash_commits=[{k: v for k, v in s.items() if k != "message"} for s in squashes],
         attestation_groups=groups,
-        proof=validate_proof(proof_map) or {},
+        proof=validate_proof(proof_map, pr_source="git") or {},
         index=index_state(root, index_artifacts),
     )
     plan["range"]["commit_count"] = len(commits)

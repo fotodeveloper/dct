@@ -2735,6 +2735,9 @@ def _apply(engine, project_slug, located, *, version, bump_type, entry_ids, no_e
             engine, project_slug, target, entry_ids=ids,
             candidate_sha=checkout["head"] if checkout else None,
             checkout_root=checkout["repo_root"] if checkout else None, proof=proof,
+            # K-116 H7: the approved snapshot's PR numbers were recognised in
+            # the repository by the plan — never a client declaration.
+            pr_source="git",
             # K-94 B1: _locate verified the checkout strictly — None means the
             # project is CONFIRMED outside git (a detection error refuses).
             release_mode=run.mode,

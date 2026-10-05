@@ -336,7 +336,14 @@ def _entry_id(raw) -> int:
 PROOF_SOURCES = ("own_merge", "introducing_merge")
 ASSOCIATION_SOURCES = (*PROOF_SOURCES, "subject_suffix")
 ASSOCIATIONS_MAX = 50
-_PROOF_KEYS = frozenset({"commits", "merge_commit", "pr", "source", "ambiguous", "associations"})
+# K-116 H7 — where a proof's `pr` number comes from: "git" = the release
+# plan recognised it in the repository (the `Merge pull request #N` subject
+# of the entry's merge); "client" = the caller DECLARED it (an attestation —
+# no git read and no hosting query backs it). The WRITER states it, never
+# the map: see validate_proof.
+PR_SOURCES = ("git", "client")
+_PROOF_KEYS = frozenset({"commits", "merge_commit", "pr", "pr_source", "source", "ambiguous",
+                         "associations"})
 
 
 def _pr_number(value, field: str) -> int | None:
@@ -360,13 +367,16 @@ def _associations(raw, entry: int) -> list[dict]:
             raise ValueError(f"{where}.source must be one of {', '.join(ASSOCIATION_SOURCES)}")
         if not isinstance(item["certain"], bool):
             raise TypeError(f"{where}.certain must be true or false")
+        if item["source"] == "subject_suffix" and item["certain"]:
+            raise ValueError(f"{where}: a subject_suffix number is a heuristic (it may be an "
+                             f"issue reference) — it is never certain")
         out.append({"merge_commit": validate_sha(item["merge_commit"], f"{where}.merge_commit"),
                     "pr": _pr_number(item["pr"], f"{where}.pr"),
                     "source": item["source"], "certain": item["certain"]})
     return out
 
 
-def validate_proof(proof: Mapping | None) -> dict | None:
+def validate_proof(proof: Mapping | None, pr_source: str = "client") -> dict | None:
     """The proof map (K-70, K-89) in its canonical form, or None for None / {}.
 
     Input: {entry id (int or digit string): <proof>} where <proof> is either
@@ -378,16 +388,39 @@ def validate_proof(proof: Mapping | None) -> dict | None:
     pair comes from that ONE recognition), "ambiguous" (bool — several
     different merge associations: merge_commit and pr must then be null)
     and "associations" ([{merge_commit, pr, source ('own_merge' |
-    'introducing_merge' | 'subject_suffix'), certain (bool)}], at most
-    ASSOCIATIONS_MAX — every recognition, a `(#N)` subject suffix listed as
-    uncertain, never as `pr`). Stored as {"<id>": {"commits": [sorted,
-    deduplicated, lowercased], "merge_commit": ..., "pr": ...[, the optional
-    keys given]}}. Any other shape — or a contradiction (ambiguous with a
+    'introducing_merge' | 'subject_suffix'), certain (bool; never true for
+    'subject_suffix')}], at most ASSOCIATIONS_MAX — a longer list REFUSES,
+    it is never cut; every recognition, a `(#N)` subject suffix listed as
+    uncertain, never as `pr`).
+
+    K-116 H7 — `pr_source` (PR_SOURCES) is the origin of EVERY `pr` number
+    of this map, stated by the WRITER, not by the map: 'client' (default —
+    every caller that does not read the repository itself: MCP
+    release_changelog, a direct core call) = a declared number, a client
+    attestation; 'git' (the release plan and the effects layer that stamps
+    its approved snapshot) = recognised in the repository. Each object with
+    a `pr` is stored with "pr_source": <that value>:
+      - 'client': whatever "pr_source" the map states is REPLACED (a map
+        copied from `dct release plan` still arrives through a surface that
+        verified nothing);
+      - 'git': the object must carry the recognition the number comes from
+        — "source" own_merge / introducing_merge with its merge_commit — and
+        must not state "pr_source": "client"; ValueError otherwise. A
+        heuristic `(#N)` suffix can therefore never be stored as a
+        recognised PR.
+    An object without a `pr` has no origin: a non-null "pr_source" there
+    raises ValueError; a null one is kept as given.
+
+    Stored as {"<id>": {"commits": [sorted, deduplicated, lowercased],
+    "merge_commit": ..., "pr": ...[, "pr_source", the optional keys
+    given]}}. Any other shape — or a contradiction (ambiguous with a
     merge_commit / pr, a source without a merge_commit) — raises ValueError.
     Entries without a commit proof (e.g. attested) are simply absent from
     the map. A non-object map / proof value / association, a non-list
     `associations`, a non-bool `ambiguous` / `certain` or a bool key raises
     TypeError."""
+    if pr_source not in PR_SOURCES:
+        raise ValueError(f"pr_source must be one of {', '.join(PR_SOURCES)}, got {pr_source!r}")
     if proof is None:
         return None
     if not isinstance(proof, Mapping):
@@ -434,6 +467,22 @@ def validate_proof(proof: Mapping | None) -> dict | None:
             item["ambiguous"] = raw["ambiguous"]
         if "associations" in raw:
             item["associations"] = _associations(raw["associations"], entry)
+        stated = raw.get("pr_source")
+        if stated is not None and stated not in PR_SOURCES:
+            raise ValueError(f"proof[{entry}].pr_source must be one of "
+                             f"{', '.join(PR_SOURCES)} or null")
+        if item["pr"] is None:
+            if stated is not None:
+                raise ValueError(f"proof[{entry}].pr_source names an origin but pr is null")
+            if "pr_source" in raw:
+                item["pr_source"] = None
+        else:
+            if pr_source == "git" and (stated == "client" or item.get("source") is None):
+                raise ValueError(
+                    f"proof[{entry}].pr_source: a PR number recognised in git comes from "
+                    f"the entry's merge (source own_merge / introducing_merge with its "
+                    f"merge_commit), never from a client declaration or a heuristic")
+            item["pr_source"] = pr_source
         out[str(entry)] = item
     if not out:
         return None
@@ -445,12 +494,25 @@ def proof_pr(proof: Mapping | None, entry_id: int) -> int | None:
     """The PR number the changelog may render for `entry_id` (K-90): the
     stored map's `pr` when it is set and the map does not mark the entry
     ambiguous — never a heuristic number (the plan never stores one as
-    `pr`, K-95 C4)."""
+    `pr`, K-95 C4). Its origin (recognised in git, or a client attestation)
+    is `pr_source` of the same object — see proof_pr_origins."""
     item = (proof or {}).get(str(entry_id))
     if not isinstance(item, Mapping) or item.get("ambiguous"):
         return None
     pr = item.get("pr")
     return pr if isinstance(pr, int) and not isinstance(pr, bool) and pr > 0 else None
+
+
+def proof_pr_origins(proof: Mapping | None) -> dict[int, dict]:
+    """entry id → {"pr", "pr_source" ('git' | 'client' | None = a map stored
+    before the origin was recorded)} for every entry whose
+    stored proof names a `pr` (K-116 H7) — what a surface SHOWS next to the
+    number, so a declared PR is never read as one recognised in git."""
+    out = {}
+    for key, item in (proof or {}).items():
+        if isinstance(item, Mapping) and item.get("pr") is not None:
+            out[int(key)] = {"pr": item["pr"], "pr_source": item.get("pr_source")}
+    return dict(sorted(out.items()))
 
 
 def check_proof_scope(proof: dict | None, entry_ids: Iterable[int]) -> None:
@@ -1252,18 +1314,48 @@ def get_release(engine: sa.Engine, project_slug: str, version: str | None = None
     if version:
         version = normalize_version(version)
     with engine.begin() as conn:
+        return _read_release(conn, resolve_project_id(conn, project_slug), version)
+
+
+def _read_release(conn: sa.Connection, pid: int, version: str | None) -> dict | None:
+    """get_release on the caller's connection (`version` already normalized)."""
+    row = find_record(conn, pid, version) if version else _latest_unfinished(conn, pid)
+    if row is None:
+        return None
+    record = record_to_dict(row)
+    same = find_records(conn, pid, row.version)
+    if len(same) > 1:
+        record["duplicates"] = describe_duplicates(same)
+    return record
+
+
+def release_routing(engine: sa.Engine, project_slug: str) -> tuple[dict, dict | None]:
+    """(routing, unfinished record) — who performs a release of the project,
+    read in ONE transaction so a dialog routes from a single result (K-119,
+    K-111). Read-only.
+
+    routing = {"project": the project's CURRENT release_executor ('dct' |
+    'own') — it decides only a NEW release; "record": None, or for the
+    unfinished record (get_release without a version — returned as the
+    second element) {"version", "status", "executor" (the value STORED on
+    the record, immutable; null on a record older than the field, which
+    counts as 'dct'), "progress_owner" ('dct' = stamped by `dct release
+    apply`, only `dct release resume` / `abandon` continue it | 'ledger' =
+    advanced through the ledger path by whoever performs its effects —
+    progress_owner), "consent" (bool: the record carries the owner's
+    consent)}}. An unfinished release is routed by its RECORD, never by
+    today's project setting."""
+    with engine.begin() as conn:
         pid = resolve_project_id(conn, project_slug)
-        if version:
-            row = find_record(conn, pid, version)
-        else:
-            row = _latest_unfinished(conn, pid)
-        if row is None:
-            return None
-        record = record_to_dict(row)
-        same = find_records(conn, pid, row.version)
-        if len(same) > 1:
-            record["duplicates"] = describe_duplicates(same)
-        return record
+        record = _read_release(conn, pid, None)
+        routing = {"project": project_release_settings(conn, pid)["executor"], "record": None}
+    if record is not None:
+        routing["record"] = {
+            "version": record["version"], "status": record["status"],
+            "executor": record["executor"], "progress_owner": progress_owner(record),
+            "consent": record["consent"] is not None,
+        }
+    return routing, record
 
 
 def _latest_unfinished(conn: sa.Connection, pid: int):

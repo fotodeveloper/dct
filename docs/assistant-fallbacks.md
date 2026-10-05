@@ -146,8 +146,9 @@ the `/release` skill's, one for one (MCP where a tool suffices — the
 corrections; the CLI where the effects need it):
 
 0. **Probe and plan** — `dct release plan --json`. A missing / older CLI
-   (unknown subcommand or flag) → STOP and say the CLI must be installed or
-   upgraded (and the MCP server restarted). Exit 1 → show the reason, STOP.
+   (unknown subcommand or flag, or a plan whose `schema_version` lower than 3
+   shows it has no `executor` key) → STOP and say the CLI must be installed
+   or upgraded (and the MCP server restarted). Exit 1 → show the reason, STOP.
 1. **Executor** (K-85) — `dct project release-executor <plan.project>`.
    `own` → dct performs none of its effects (`prepare` / `apply` / `resume`
    refuse — `details.executor`): show the plan (step 4) as the shared proof,

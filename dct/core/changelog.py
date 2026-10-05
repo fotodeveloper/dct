@@ -585,6 +585,7 @@ def release_entries(
     manifest: Mapping | None = None,
     consume_proposal: bool = False,
     expected_executor: str | None = None,
+    pr_source: str = "client",
 ) -> dict:
     """Stamp changelog entries with a version, set the project's current_version
     and write the durable release record (K-41) — ONE transaction.
@@ -620,6 +621,13 @@ def release_entries(
     SHAs] or {commits, merge_commit, pr}} — shape checked before any read
     (core.releases.validate_proof); every entry it names must be in the
     resolved set (else ValueError); stored in the NEW record only.
+    `pr_source` (K-116 H7; 'client' default | 'git'): the origin of every
+    `pr` number in `proof`, stored beside it — 'client' = the caller
+    DECLARES the number (an attestation; whatever the map itself states is
+    replaced), 'git' = the caller recognised it in the repository (the
+    effects layer stamping the plan's approved snapshot; each number must
+    carry its merge recognition, else ValueError). A re-run compares the
+    map INCLUDING that origin.
     K-94 / K-85 / K-76 / K-90 / K-97 ledger fields of the NEW record, all
     validated before any read (core.releases.validate_*): `release_mode`
     ('git' | 'without_git' — the mode the caller VERIFIED; None = not
@@ -722,7 +730,7 @@ def release_entries(
     if version:
         version = normalize_version(version)
     sha = release_records.validate_candidate_sha(candidate_sha)
-    proof_map = release_records.validate_proof(proof)
+    proof_map = release_records.validate_proof(proof, pr_source)
     given = {
         "proof": proof_map,
         "release_mode": release_records.validate_release_mode(release_mode),

@@ -414,16 +414,16 @@ def test_real_pg_serialization_failure_in_a_release_is_refused_without_writes(
     eid = add_entry(eng, "proj-c", "added", "x")["id"]
     url = eng.url.render_as_string(hide_password=False)
     outsider = get_engine(url)
-    find = release_records.find_record
+    find = release_records.unique_record  # the record lookup of every ledger WRITE
 
-    def find_then_outsider_writes(conn, pid, version):
-        row = find(conn, pid, version)       # the snapshot is established
+    def find_then_outsider_writes(conn, pid, slug, version):
+        row = find(conn, pid, slug, version)  # the snapshot is established
         with outsider.begin() as other:
             other.execute(projects.update().where(projects.c.id == pid)
                           .values(description="changed by a non-participant"))
         return row
 
-    monkeypatch.setattr(release_records, "find_record", find_then_outsider_writes)
+    monkeypatch.setattr(release_records, "unique_record", find_then_outsider_writes)
     try:
         with pytest.raises(SerializationConflict):
             release_entries(eng, "proj-c", "1.1.0")

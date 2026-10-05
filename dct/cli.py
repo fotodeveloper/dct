@@ -1414,6 +1414,8 @@ def cmd_release_reconstruct(args):
 
 
 def _print_release_record(record: dict) -> None:
+    from dct.core.releases import proof_pr_origins
+
     ids = ", ".join(f"#{i}" for i in record["entry_ids"]) or "(none — version only)"
     print(f"Release {record['version']}: {record['status']} (mode: {record['mode']})")
     print(f"  entries:       {ids}")
@@ -1435,6 +1437,12 @@ def _print_release_record(record: dict) -> None:
     proof = record["proof"] or {}
     print(f"  proof:         {len(proof)} of {len(record['entry_ids'])} entries"
           if proof else "  proof:         -")
+    # K-116 H7: a PR number is shown WITH its origin — a client's declaration
+    # is never presented as one recognised in git.
+    origins = {"git": "recognised in git (the entry's merge)", "client": "client attestation"}
+    for entry_id, ref in proof_pr_origins(proof).items():
+        print(f"    #{entry_id}: PR #{ref['pr']} — "
+              f"{origins.get(ref['pr_source'], 'origin not recorded')}")
     print(f"  created:       {_fmt_date(record['created_at'])}")
     print(f"  updated:       {_fmt_date(record['updated_at'])}")
     if record["completed_at"]:
@@ -1570,9 +1578,16 @@ def cmd_release_plan(args):
     version = plan["version"]
     print(f"Release plan for {plan['project']} ({plan['kind']}): "
           f"{version['current'] or '-'} → {version['target'] or '(no target version given)'}")
+    routing = plan["executor"]
+    print(f"  executor: {routing['project']} (the project's setting — it decides a NEW release)")
     if plan["unfinished_release"]:
         rec = plan["unfinished_release"]
         print(f"  unfinished release {rec['version']}: {rec['status']} — resume or abandon it")
+        owned = routing["record"]
+        # K-119: an unfinished release is routed by its RECORD.
+        print(f"    recorded executor: {owned['executor'] or 'dct (not recorded)'}; progress "
+              f"recorded by: {owned['progress_owner']}; consent: "
+              f"{'recorded' if owned['consent'] else 'none'}")
     checkout = plan["checkout"]
     resume = plan["resume"]
     if not checkout["git"]:

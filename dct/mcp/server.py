@@ -1232,12 +1232,22 @@ def release_changelog(
             "pr": <int> | null}} — plus, as `dct release plan` emits them,
             the optional "source" ("own_merge" | "introducing_merge" | null),
             "ambiguous" (bool; true → merge_commit and pr must be null) and
-            "associations" ([{merge_commit, pr, source, certain}]). `pr` is
+            "associations" ([{merge_commit, pr, source, certain}] — at most
+            50, a longer list is an error, never cut; a "subject_suffix"
+            one is never certain). `pr` is
             the PR linked to the entry — the changelog renders it as `(#N)`
             when the project's changelog_pr_refs was on at stamp time — never
             a heuristic `(#N)` subject suffix; every named entry must be in
-            the release set. Stored in a NEW record only and immutable: a re-run
-            returning an existing record with a DIFFERENT map — or with a
+            the release set. A `pr` given HERE is YOUR declaration (a client
+            attestation — this server reads no repository and asks no
+            hosting service): it is stored and shown as "pr_source":
+            "client", whatever "pr_source" the map states (also a map copied
+            from `dct release plan`, which marks its own recognitions
+            "git"); only `dct release apply` records "git". "pr_source"
+            with a null `pr`, or a value other than "git" / "client", is an
+            error. Stored in a NEW record only and immutable: a re-run
+            returning an existing record with a DIFFERENT map (origin
+            included) — or with a
             map when the record has none — is an error, the identical map
             is the no-op. Entries without a commit proof are simply absent.
             Null/omitted (default) = none.
@@ -1376,7 +1386,9 @@ def get_release(project: str = "", version: str = "") -> dict:
         checkout_root (absolute path or null), release_commit_sha (the
         verified release commit, or null before 'committed'), manifest
         (object of the verified artifacts with content hashes, or null),
-        proof (object entry id → {commits, merge_commit, pr[, source,
+        proof (object entry id → {commits, merge_commit, pr[, pr_source
+        ("git" = the release plan recognised the PR in the repository |
+        "client" = a caller declared it; present when pr is set), source,
         ambiguous, associations]}, or null),
         status, created_at, updated_at, completed_at, abandoned_at (ISO
         datetimes or null), abandon_reason (text or null), release_mode

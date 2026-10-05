@@ -30,9 +30,11 @@ mentions a revert is not one. A revert of a MERGE (K-82) neutralizes the
 commits the merge brought in relative to the mainline parent its message
 names (`…, reversing changes made to <P>.` — P must be exactly one real
 parent of the merge); a missing, edited or contradicting mainline, or a
-partial revert (its change is not the exact inverse of the reverted one),
-leaves the touched entries 'unconfirmed' — no automatic proof, never a
-guess (plan.revert_scopes verifies this in git).
+partial revert (its change is not the exact inverse of the reverted one —
+compared with blob identity, file type and mode where git prints no textual
+patch, K-105: a binary file "reverted" to another blob is partial), leaves
+the touched entries 'unconfirmed' — no automatic proof, never a guess
+(plan.revert_scopes verifies this in git, for EVERY revert — K-116 H6).
 """
 
 from __future__ import annotations

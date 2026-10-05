@@ -23,11 +23,25 @@ messages), `dct/workflows/release/plan.py` (git + database reads) and
 `dct/workflows/release/effects.py` (the effects layer). The
 rules in prose: [assistant-fallbacks.md](assistant-fallbacks.md#changelog-proof-trailers-and-range-shared-by-commit-and-release).
 
-Both documents carry `schema_version` (currently `2` — version 2 added
-`resume`, `snapshot`, `snapshot_digest`, the graph-nearest range base, the
-merge-revert mainline and the per-recognition provenance; a `(#N)` subject
-suffix is no longer a `pr`); it moves when the meaning of a key changes. The top-level keys below are pinned by
-`tests/test_release_plan.py::test_json_documents_keep_their_top_level_keys`.
+Both documents carry `schema_version` (currently `3`; ONE constant,
+`plan.SCHEMA_VERSION`, for the plan and the candidates) — it moves when the
+meaning of a key changes:
+
+- version 2 added `resume`, `snapshot`, `snapshot_digest`, the graph-nearest
+  range base, the merge-revert mainline and the per-recognition provenance;
+  a `(#N)` subject suffix is no longer a `pr`;
+- version 3 added `executor` (the project's executor and, for an unfinished
+  record, the record's stored executor, progress owner and consent — K-119),
+  `pr_source` on every proof object (K-116 H7), the revert comparison that
+  keeps blob identity (K-105) and the ancestry cap that refuses (K-116 H8).
+
+A client that needs a key checks `schema_version` first (a plan with
+`schema_version` lower than 3 has no `executor`). The effects layer's result
+document has its OWN `effects.SCHEMA_VERSION` ([JSON](#json---json-every-subcommand)).
+The top-level keys and the `schema_version` cell of each table below are
+pinned against the module that emits the document by
+`tests/test_release_plan.py::test_json_documents_keep_their_top_level_keys`
+and `tests/test_release_round4_proof.py::test_documented_schema_table_matches_its_module`.
 Datetimes are ISO 8601 strings (UTC when stored naive). Paths in `index`
 are relative to the repository root.
 
@@ -39,7 +53,9 @@ commit; anything not confirmed exits 1 — never a fallback to the main
 checkout. A project whose registered path is CONFIRMED outside git gets a
 plan without a range (its entries: reason `no_git`); a project without a
 registered path gets reason `no_path` — the absence of a repository is not
-confirmed (K-95 C1), and `apply` refuses it.
+confirmed (K-95 C1, K-116 H1: a missing path is never a confirmed `no_git`),
+its plan has no snapshot, and `prepare`, `apply` and the `clog release`
+alias refuse it.
 
 `--entries` / `--no-entries` choose the selection the **snapshot** binds
 (default: every proven id — plus, outside git, every entry). The snapshot is
@@ -48,11 +64,12 @@ what the owner approves: `dct release prepare` and `apply` require its `snapshot
 
 | key | content |
 | --- | --- |
-| `schema_version` | `1` |
+| `schema_version` | `3` |
 | `project` | slug |
 | `kind` | `"release"`, or `"resume"` when an unfinished release record exists (then `resume` is set and nothing is computed on today's HEAD) |
 | `version` | `{current, target, bump}` — `target` from `--version` (normalized) or the bump; for a resume without a version, the record's version |
 | `checkout` | `{git: true, repo_root, project_root, candidate_sha, head (full HEAD), branch (null on a detached HEAD), detached, matches_record?}` or `{git: false, reason: "no_path" \| "not_a_repository", project_root}`; `candidate_sha` = HEAD for a release, the RECORDED candidate for a resume (K-95 C5); `matches_record` (resume only) = `{candidate_sha, checkout_root}` booleans against the record |
+| `executor` | `{project, record}` (K-119, `core.releases.release_routing` — read together with `unfinished_release`, so a dialog routes from this ONE result): `project` = the project's CURRENT `release_executor` (`"dct"` \| `"own"`) — it decides only a NEW release; `record` = `null`, or for the unfinished record `{version, status, executor (the value STORED on the record, immutable; null on a record older than the field — counts as `dct`), progress_owner (`"dct"` = stamped by `dct release apply`: only `dct release resume` / `abandon` continue it \| `"ledger"` = its effects are performed and reported by whoever stamped it — an `own` record, or one stamped outside `apply`), consent (bool — the record carries the owner's consent)}`. A resume is routed by `record`, never by `project` ([Executor](#executor-k-85)) |
 | `unfinished_release` | the unfinished release record (`core.releases.RECORD_FIELDS`) or `null` |
 | `range` | see below; `null` without git |
 | `entries` | `{proven: [...], unproven: [...]}` — every unreleased entry of the project, by id |
@@ -60,12 +77,12 @@ what the owner approves: `dct release prepare` and `apply` require its `snapshot
 | `reverts` | `[{sha, target, target_sha, status: "in_range" \| "outside_range" \| "ambiguous" \| "unconfirmed", mainline, reason, effective, affected}]` — see [Reverts](#reverts-k-68-k-82) |
 | `squash_commits` | `[{sha, subject, signals, pr, lost_ids, proves}]` — `signals` ⊆ `pr_suffix`, `local_squash`, `indented_trailers` |
 | `attestation_groups` | `[{branch, entry_ids, squash_commits, signals, proposal}]` — ONE proposed collective attestation per source branch; `signals` ⊆ `indented_trailer`, `branch_named`, `branch_commits_absent` |
-| `proof` | the proof map the release record stores: `{"<id>": {commits, merge_commit, pr, source, ambiguous, associations}}` (`core.releases.validate_proof`; provenance below) |
+| `proof` | the proof map the release record stores: `{"<id>": {commits, merge_commit, pr, pr_source, source, ambiguous, associations}}` (`core.releases.validate_proof`; provenance below). More than `core.releases.ASSOCIATIONS_MAX` (50) associations of one entry REFUSE the plan (exit 1) — the list is never cut (K-116 H8) |
 | `index` | `{clean, staged, unstaged, untracked, conflicted, release_artifacts: [{path, role: "changelog" \| "version_file", staged, unstaged, untracked, conflicted}]}` — `clean` ignores untracked files; `staged` = the index differs from HEAD; `null` without git |
 | `version_files` | the project's version-file contract `{version_files (null = to be learned at the first release), confirmed_at, history}` |
 | `warnings` | human-readable strings (range to confirm, approximate range, revert outside the range or unconfirmed, unfinished release, HEAD not the recorded candidate, selection holding unproven ids, no git) |
 | `resume` | `null`, or for a resume plan (K-95 C5) the RECORDED release: `{version, status, candidate_sha, checkout_root, release_mode, entry_ids, proof, release_commit_sha, manifest, effects: {stamped, files_written, committed, tagged, pushed, completed} (booleans by status), head (today's HEAD, separately), head_is_candidate, new_unreleased (entries added since — NOT part of the record)}`. A resume plan has `range: null`, empty `entries` and `proof`, `snapshot: null` — an approved release is never recomputed on today's HEAD |
-| `snapshot` | the IMMUTABLE approved context (K-80): `{project, version, current_version, git, repo_root, checkout_root, project_root, candidate_sha (full), range: {base_tag, base_sha, approximate, since, revs}, selected_ids, proof (the map of the selected ids), entries: {"<id>": state digest}}` — `entries` covers EVERY unreleased entry the plan saw (`core.changelog.entry_state_digest` over id, category, entry, component, version); `null` for a resume plan and for a project without a path |
+| `snapshot` | the IMMUTABLE approved context (K-80): `{project, version, current_version, git, repo_root, checkout_root, project_root, candidate_sha (full), range: {base_tag, base_sha, approximate, since, revs}, selected_ids, proof (the map of the selected ids), entries: {"<id>": state digest}}` — `entries` covers EVERY unreleased entry the plan saw (`core.changelog.entry_state_digest` over id, category, entry, component, version), so ANY change of the unreleased set after the plan — also a new entry outside the selection — is another snapshot and needs a new plan (K-116 H3); `null` for a resume plan and for a project without a path |
 | `snapshot_digest` | SHA-256 (hex) of the snapshot's canonical JSON (sorted keys, compact separators, UTF-8) — what `dct release apply --plan-digest` takes |
 
 **`range`**: `{candidate_sha, base_tag, base_sha, base_version,
@@ -77,12 +94,22 @@ since, revs, display, below_scan, commit_count}`.
   tagged commit (`base_distance`; a breadth-first search over `git rev-list
   --parents`, never `rev-list --count TAG..HEAD`, which counts commits, and
   never the highest version). Annotated tags count at their commit. Ties at
-  that distance — one deterministic choice: the exact `v<current_version>`,
-  then a name of the current version in another spelling, then a
-  `v`-prefixed name, then the lowest name; every other tag at the same
-  distance is listed in `alternatives` (`[{name, sha, version,
-  distance}]`). Versions are only compared (the never-rewind order), never
-  used to rank the base. Tags whose name is not a version are ignored.
+  that distance (K-116 H5) — one deterministic choice: the exact
+  `v<current_version>`, then a name of the current version in another
+  spelling, then a `v`-prefixed name, then the lowest name; the choice never
+  hides the tie: every other tag at the same distance is listed in
+  `alternatives` (`[{name, sha, version, distance}]`), named in a warning
+  and printed by the text plan (`equally near: …`). Versions are only
+  compared (the never-rewind order), never used to rank the base. Tags
+  whose name is not a version are ignored.
+- **The ancestry read is bounded, never cut** (K-116 H8,
+  `plan.read_ancestry`): the graph is STREAMED from git (one line per
+  commit, `gitinfo.git_read_lines` — the process layer; its timeout is
+  `gitinfo.GIT_READ_TIMEOUT_SECONDS`, 60 s) and read in full or not at all.
+  A history of more than `plan.ANCESTRY_MAX_COMMITS` (1 000 000) commits, a
+  failed read or a timeout REFUSES the plan (exit 1, `GitReadError`) —
+  distances computed on a prefix of the graph could name the wrong base. A
+  repository without an ancestor release tag is not read at all.
 - `expected_tag`: `{name: "v<current_version>", exists, ancestor}` (null
   without a current version). `confirm_required` is true when the base is
   not the current version's tag, or when another tag on a DIFFERENT commit
@@ -107,12 +134,16 @@ provenance; still classified by proof). Plus:
   first-parent merge that brought it in (`"introducing_merge"`);
   `merge_commit` + `pr` come from that same recognition (`pr` = the merge's
   `Merge pull request #N` subject, else null — never borrowed from another
-  commit). `associations` lists every recognition `{merge_commit, pr,
+  commit). `pr_source` (K-116 H7) is the ORIGIN of `pr`: the plan emits
+  `"git"` (recognised in the repository) with a `pr`, else null — never
+  `"client"`, which only a caller's declaration gets
+  ([origin of a PR number](#origin-of-a-pr-number-k-116-h7)).
+  `associations` lists every recognition `{merge_commit, pr,
   source, certain}`, including a `… (#N)` subject suffix as `source:
   "subject_suffix", certain: false` (it may be an issue number — never the
-  entry's `pr`, K-95 C4). Several DIFFERENT merge associations →
-  `ambiguous: true`, `merge_commit` / `pr` / `source` null — never one
-  picked;
+  entry's `pr`, never certain, K-95 C4). Several DIFFERENT merge
+  associations → `ambiguous: true`, `merge_commit` / `pr` / `pr_source` /
+  `source` null — never one picked;
 - unproven: `reason` ∈ `no_trailer` (no proof in the range nor in the
   bounded below scan), `reverted` (+ `commits`, `reverted_by`),
   `revert_unconfirmed` (+ `commits`, `reverted_by`: an unconfirmed revert
@@ -129,14 +160,40 @@ from git's message (`This reverts commit <M>, reversing changes made to
 neutralized commits are M plus `rev-list M ^P` — what that revert removed
 (`-m 1` and `-m 2` differ), never a fixed parent 1. The revert must be FULL:
 its own change equals the inverse of M → P (or, for an ordinary commit T,
-of T → its parent), compared without line positions. Otherwise the report
+of T → its parent) — for EVERY revert, an ordinary one included (K-116 H6).
+Otherwise the report
 is `status: "unconfirmed"` with `reason` ∈ `no_mainline` (missing or edited
 message), `mainline_not_a_parent`, `mainline_ambiguous`,
 `mainline_on_non_merge`, `partial` (a conflict resolved differently, an
-edited revert): nothing is neutralized automatically and every entry the
+edited revert, or a revert of a ROOT commit — nothing to compare with):
+nothing is neutralized automatically and every entry the
 revert may touch (without a usable mainline: what M brought in relative to
-ANY parent) gets `revert_unconfirmed` — never a guess. A plain first-parent
+ANY parent) gets `revert_unconfirmed` — no automatic proof, never a guess;
+the owner confirms it (attest) or corrects the history. A plain first-parent
 merge without a revert is unchanged.
+
+**What "the same change" means** (K-105, `plan.change_between` — the ONE
+representation, used for every revert by the plan and by `clog
+candidates`): per changed path (`git diff-tree -p -U0 --no-renames
+--full-index`; a rename is a deletion plus an addition) git's header lines —
+the path, `new file mode` / `deleted file mode` (the file TYPE is in the
+mode: regular, executable, symlink, gitlink) and `old mode` / `new mode` —
+plus the identity of the content:
+
+- a path WITH a textual patch: its removed and added lines. Positions (`@@`)
+  and the `index` line are dropped, so a clean revert still equals the
+  inverse of what it reverts when later commits moved the lines or touched
+  the file elsewhere (the blob ids legitimately differ then);
+- a path WITHOUT a textual patch (binary content, an empty file — whatever
+  git prints no lines for): the `index <old>..<new>` line with the FULL
+  input and output blob ids. Two `Binary files … differ` lines are never
+  the same change by themselves.
+
+So B0 → B1, its full revert, then a revert of that revert resolved to B2
+leaves the entry WITHOUT automatic proof (the last revert is `partial`: the
+entry's change did not come back) until a commit brings B1 back; a correct
+full binary revert — also of an added, deleted or renamed binary file, or of
+a mode-only change — is still confirmed.
 
 **Squash heuristic and its limits.** A non-merge commit of the range looks
 like a squash when its subject ends `(#N)`, its message starts with git's
@@ -191,7 +248,7 @@ Best-effort location (read-only; for `/commit`, K-53).
 
 | key | content |
 | --- | --- |
-| `schema_version` | `1` |
+| `schema_version` | `3` |
 | `project` | slug |
 | `checkout` | `{git: true, toplevel, branch, head, detached}` or `{git: false}` |
 | `range` | the `range` object of the plan for target HEAD, or null |
@@ -258,7 +315,10 @@ a project with an existing release process BEFORE it uses this workflow:
 NEW record at its stamp (`releases.executor`, immutable) — the RECORD decides
 from then on; a later change of the project setting never takes over an
 unfinished release (in either direction). dct never runs a command stored in
-the database.
+the database. `dct release plan --json` reports both in ONE result
+(`executor`: the project's setting, and for an unfinished record its stored
+executor, progress owner and consent — K-119), so a dialog routes a new
+release by `executor.project` and a resume by `executor.record`.
 
 **The stamp binds the expected executor** (K-106): the approval is for a
 release performed by ONE executor. `release_entries(expected_executor=…)`
@@ -753,7 +813,7 @@ and a refusal writes nothing.
 | `status` | the state machine below | forward only |
 | `release_commit_sha` | the verified release commit | set once, from `committed` on |
 | `manifest` | JSON object of the verified artifacts (e.g. `changelog`, `version_files`, `tree`, `untracked_baseline`) | write-once per key; the MERGED manifest ≤ 64 KiB |
-| `proof` | `{"<entry id>": {commits, merge_commit, pr}}` (K-70) | written with the stamp; a re-run passing a different map is refused (K-94 B2) |
+| `proof` | `{"<entry id>": {commits, merge_commit, pr[, pr_source, source, ambiguous, associations]}}` (K-70, K-89); `pr_source` = `git` \| `client`, stored with every `pr` ([origin](#origin-of-a-pr-number-k-116-h7)) | written with the stamp; a re-run passing a different map (the origin included) is refused (K-94 B2) |
 | `consent` | what the owner approved (K-97 F4): `{version, entry_ids, candidate_sha, proposal_sha256, render, push_target: {remote, url, branch, tag} \| null[, executor: "dct" \| "own"]}` (`push_target: null` = the EXPLICIT local release: `--no-push`, or outside git; `executor` (K-106) = who the owner approved to perform it — present on consents written since the field) — what a resume EXECUTES: its version, entries and candidate must be the record's, its push target is the only one pushed to (its remote must still have that push URL) | write-once |
 | `proposal` | the approved version-file proposal (K-76): `{paths, base_blobs: {path: blob \| null}, expected_blobs: {path: blob}, script: {identity, sha256} \| null, candidate_sha, version, plan_digest, release_mode, changelog: {path, base_blob, base_sha256} \| null}` (the last four: the release context it is bound to; blob ids are git blob ids, or SHA-256 of the content in dct's release blob store for `without_git`); `consent.proposal_sha256` = `proposal_digest(proposal)` (SHA-256 of its canonical JSON). Written by the stamp that consumed the project's PENDING proposal | write-once |
 | `render` | the changelog render settings of THIS release (K-90): `{"pr_refs": bool}` — defaults to the project's `changelog_pr_refs` at stamp time, so a later preference change cannot alter the expected hashes | write-once |
@@ -812,10 +872,34 @@ prepare` (`core.releases.set_pending_proposal` / `get_pending_proposal`),
 replaced by a new prepare, consumed and cleared by the stamp that names its
 digest (`release_entries(consume_proposal=True)`).
 
+<a id="origin-of-a-pr-number-k-116-h7"></a>**Origin of a PR number**
+(K-116 H7). Every stored `pr` carries `pr_source` — set by the WRITER, never
+taken from the map (`core.releases.validate_proof(proof, pr_source)`):
+
+- `git` — recognised in the repository by the release plan (the `Merge pull
+  request #N` subject of the entry's own / introducing merge) and stamped
+  by `dct release apply` from the approved snapshot. Such an object must
+  carry that recognition (`source` + `merge_commit`), so a heuristic number
+  can never be stored as recognised.
+- `client` — DECLARED by the caller: a client attestation. Every `pr` that
+  arrives through MCP `release_changelog` (or a direct core call) is stored
+  this way, whatever `pr_source` the supplied map states — also a map
+  copied from `dct release plan`: the server read no repository and asks no
+  hosting service. No lookup is required for it; it is simply never
+  presented as git's recognition.
+
+The plan's heuristics — a `(#N)` subject suffix (`associations[].source:
+"subject_suffix"`, never certain) and `squash_commits[].pr` — are never a
+`pr`, hence have no `pr_source` and are never rendered. The origin is shown
+wherever the number is: in the record (`get_release`, `release status
+--json`) and in `dct release status` (`#12: PR #7 — client attestation` /
+`recognised in git (the entry's merge)`; `origin not recorded` for a map
+stored before the field).
+
 **PR references in the changelog** (K-90, opt-in): with `changelog_pr_refs`
 on at stamp time the record's `render` is `{"pr_refs": true}` and every
 entry of THAT release whose stored proof has an unambiguous `pr`
-(`core.releases.proof_pr`: set and not `ambiguous`) renders as `- <entry>
+(`core.releases.proof_pr`: set and not `ambiguous`; either origin) renders as `- <entry>
 [(<component>)] (#N)` — N is the pull request linked to the entry in this
 repository, never a dct item or changelog id, never a heuristic subject
 number (the plan never stores one as `pr`). ONE renderer
@@ -951,7 +1035,9 @@ tags or publishes REPLACES ONLY layer 3. It keeps the proof and the ledger:
    proof={<id>: proof[<id>], …}, expected_executor="own")` with an explicit
    version and an explicit `entry_ids` list (`[]` = version-only);
    `expected_executor` (K-106) makes the stamp refuse when the project's
-   setting is no longer `own`. It writes the release record
+   setting is no longer `own`. A `pr` in the map is stored as the tool's
+   declaration (`pr_source: "client"`, also when copied from the plan —
+   [origin](#origin-of-a-pr-number-k-116-h7)). It writes the release record
    (`stamped`); a repeat with the same set is a no-op, a different set for
    a recorded V is refused.
 3. **Own effects, verified by the tool** — the tool performs its effects and

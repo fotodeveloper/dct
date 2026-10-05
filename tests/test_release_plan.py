@@ -87,8 +87,8 @@ def test_merge_commit_proves_with_merge_and_pr_provenance(engine, repo):
     assert row["commits"] == [proving]
     assert row["merge_commit"] == merge and row["pr"] == 7
     assert plan["proof"] == {str(e1): {
-        "commits": [proving], "merge_commit": merge, "pr": 7, "source": "introducing_merge",
-        "ambiguous": False, "associations": [
+        "commits": [proving], "merge_commit": merge, "pr": 7, "pr_source": "git",
+        "source": "introducing_merge", "ambiguous": False, "associations": [
             {"merge_commit": merge, "pr": 7, "source": "introducing_merge", "certain": True}]}}
     assert plan["range"]["base_tag"] == "v1.0.0" and not plan["range"]["confirm_required"]
 
@@ -481,9 +481,9 @@ def test_candidates_on_a_detached_head_confirm_nothing(engine, worktree_setup):
 # ── JSON schema stability ────────────────────────────────────────────────────
 
 PINNED_PLAN_KEYS = [
-    "schema_version", "project", "kind", "version", "checkout", "unfinished_release",
-    "range", "entries", "foreign_citations", "reverts", "squash_commits",
-    "attestation_groups", "proof", "index", "version_files", "warnings",
+    "schema_version", "project", "kind", "version", "checkout", "executor",
+    "unfinished_release", "range", "entries", "foreign_citations", "reverts",
+    "squash_commits", "attestation_groups", "proof", "index", "version_files", "warnings",
     "resume", "snapshot", "snapshot_digest",
 ]
 PINNED_CANDIDATE_KEYS = [
@@ -498,7 +498,8 @@ def test_json_documents_keep_their_top_level_keys(cli_engine, repo, monkeypatch,
     monkeypatch.chdir(repo)
     run_cli(monkeypatch, ["release", "plan", "-P", "proj-r", "--patch", "--json"])
     plan = json.loads(capsys.readouterr().out)
-    assert list(plan) == PINNED_PLAN_KEYS and plan["schema_version"] == 2
+    assert list(plan) == PINNED_PLAN_KEYS and plan["schema_version"] == 3
+    assert set(plan["executor"]) == {"project", "record"}
     assert plan["version"] == {"current": "1.0.0", "target": "1.0.1", "bump": "patch"}
     assert set(plan["entries"]) == {"proven", "unproven"}
     assert set(plan["range"]) == {
@@ -510,7 +511,8 @@ def test_json_documents_keep_their_top_level_keys(cli_engine, repo, monkeypatch,
         "project_root", "candidate_sha", "range", "selected_ids", "proof", "entries"}
     assert len(plan["snapshot_digest"]) == 64 and plan["resume"] is None
     run_cli(monkeypatch, ["clog", "candidates", "-P", "proj-r", "--json"])
-    assert list(json.loads(capsys.readouterr().out)) == PINNED_CANDIDATE_KEYS
+    candidates = json.loads(capsys.readouterr().out)
+    assert list(candidates) == PINNED_CANDIDATE_KEYS and candidates["schema_version"] == 3
 
 
 def test_release_plan_cli_refuses_outside_a_checkout(cli_engine, repo, monkeypatch, tmp_path, capsys):

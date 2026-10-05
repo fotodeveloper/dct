@@ -20,6 +20,9 @@ STRICT (raises instead of guessing — the mutating release path only, K-52):
     read-only history reads of the proof layer (`--no-optional-locks`,
     bounded timeout); any failure raises GitReadError, never a partial
     answer.
+  - git_read_lines(cwd, *args) — the same read STREAMED line by line, for
+    output that grows with the history (K-116 H8); a failure or a timeout
+    raises GitReadError, an early close stops git.
 WRITER (the release effects layer only, dct.workflows.release.effects):
   - git_write(cwd, *args, index_file=None, network=False) — keeps the
     caller's identity / config-location variables (WRITE_ENV_PASSTHROUGH;
@@ -36,6 +39,9 @@ import os
 import re
 import shutil
 import subprocess
+import tempfile
+import threading
+from collections.abc import Iterator
 
 GIT_TIMEOUT_SECONDS = 2
 
@@ -248,6 +254,19 @@ def resolve_checkout(
 # ── strict resolver (K-52) ───────────────────────────────────────────────────
 
 
+def _git_env(
+    keep_env: frozenset[str] = frozenset(), extra_env: dict[str, str] | None = None,
+) -> dict[str, str]:
+    """The environment of every strict git process: GIT_* variables dropped
+    (except the names in `keep_env`), LANGUAGE dropped, `extra_env` added,
+    the C locale forced so git's messages can be matched."""
+    env = {key: value for key, value in os.environ.items()
+           if (not key.startswith("GIT_") or key in keep_env) and key != "LANGUAGE"}
+    env.update(extra_env or {})
+    env["LC_ALL"] = "C"
+    return env
+
+
 def _strict_git(
     cwd: str, *args: str, timeout: float = GIT_TIMEOUT_SECONDS,
     error: type[CheckoutVerificationError] = CheckoutVerificationError,
@@ -267,10 +286,7 @@ def _strict_git(
     git = shutil.which("git")
     if not git:
         raise error("git is not on PATH — the checkout cannot be verified")
-    env = {key: value for key, value in os.environ.items()
-           if (not key.startswith("GIT_") or key in keep_env) and key != "LANGUAGE"}
-    env.update(extra_env or {})
-    env["LC_ALL"] = "C"
+    env = _git_env(keep_env, extra_env)
     text = {} if binary else {"encoding": "utf-8", "errors": decode_errors}
     try:
         return subprocess.run(
@@ -409,6 +425,69 @@ def git_read(
         detail = (result.stderr or "").strip() or f"exit code {result.returncode}"
         raise GitReadError(f"`git {' '.join(args)}` failed in {os.fspath(cwd)}: {detail}")
     return result.returncode, result.stdout
+
+
+# How much of a failed streamed read's stderr is quoted in its error.
+_STREAM_STDERR_MAX_BYTES = 8192
+
+
+def git_read_lines(
+    cwd: str | os.PathLike[str], *args: str, timeout: float = GIT_READ_TIMEOUT_SECONDS,
+) -> Iterator[str]:
+    """The stdout LINES of a READ-ONLY `git --no-optional-locks -C <cwd>
+    <args>`, STREAMED (K-116 H8) — for output whose size grows with the
+    history (`rev-list --parents`), which git_read would hold in memory
+    whole. Same environment and decoding as git_read (GIT_* stripped, C
+    locale, undecodable bytes → U+FFFD); lines come without their newline.
+
+    Never a silently partial result: the generator finishes normally ONLY
+    after git exited 0. A non-zero exit, git missing, or `timeout` seconds
+    since the start (the process is killed at the deadline) raises
+    GitReadError — after the lines already yielded, so a caller must not
+    use them when the iteration raised. A consumer that stops early
+    (`close()`, e.g. to refuse past its own cap) kills the process; nothing
+    is left running. The ONE process seam of the streamed readers."""
+    cwd = os.fspath(cwd)
+    git = shutil.which("git")
+    if not git:
+        raise GitReadError("git is not on PATH — the checkout cannot be verified")
+    command = " ".join(args)
+    with tempfile.TemporaryFile() as stderr:
+        try:
+            proc = subprocess.Popen(
+                [git, "--no-optional-locks", "-C", cwd, *args], env=_git_env(),
+                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=stderr,
+            )
+        except (OSError, subprocess.SubprocessError, ValueError) as exc:
+            raise GitReadError(f"could not run git in {cwd}: {exc}") from exc
+        expired = threading.Event()
+
+        def stop() -> None:
+            expired.set()
+            proc.kill()
+
+        timer = threading.Timer(timeout, stop)
+        timer.daemon = True
+        timer.start()
+        try:
+            assert proc.stdout is not None
+            for raw in proc.stdout:
+                yield raw.decode("utf-8", "replace").rstrip("\n")
+            code = proc.wait()
+            if expired.is_set():
+                raise GitReadError(f"`git {command}` timed out after {timeout}s in {cwd}")
+            if code != 0:
+                stderr.seek(0)
+                detail = stderr.read(_STREAM_STDERR_MAX_BYTES).decode("utf-8", "replace").strip()
+                raise GitReadError(
+                    f"`git {command}` failed in {cwd}: {detail or f'exit code {code}'}")
+        finally:
+            timer.cancel()
+            if proc.poll() is None:
+                proc.kill()
+            if proc.stdout is not None:
+                proc.stdout.close()
+            proc.wait()
 
 
 def git_is_ancestor(cwd: str | os.PathLike[str], ancestor: str, descendant: str) -> bool:
