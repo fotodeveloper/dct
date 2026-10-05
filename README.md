@@ -302,6 +302,8 @@ dct release apply --patch --entries 12,15 --plan-digest <digest> --proposal-dige
 dct release resume                    # Finish an interrupted release (verifies every effect; the stored consent, no new approval)
 dct release abandon --version 1.1 --reason "broken build" --confirm
 dct release reconstruct --version 1.0 --confirm       # Record a release made before release records
+dct release takeover --version 1.0 --no-push          # Preview: hand a record without consent to dct (then --takeover-digest <d> --confirm, resume)
+dct release version-files                             # Show the version-file contract (--set a,b | --none, --confirm)
 
 # Projects
 dct project add myproj /path/to/myproj --name "My Project"    # Version auto-detected

@@ -70,8 +70,12 @@ dct/core/changelog.py    — Changelog entries CRUD + release stamping (the stam
 dct/core/releases.py     — Release ledger (K-41/K-60/K-61): records written with
                            the stamp, one state machine (TRANSITIONS; advance,
                            abandon), immutable candidate, write-once release
-                           commit / manifest / proof, legacy reconstruction,
-                           the project's version-file contract (K-73); the
+                           commit / manifest / proof, legacy reconstruction
+                           (its verification scope recorded, K-110), the
+                           controlled takeover of a record without consent
+                           (take_over_release, K-119 M3 — the only way a
+                           record becomes dct's after its stamp), the
+                           project's version-file contract (K-73); the
                            verified release_mode, executor and write-once
                            consent / proposal / render; K-115: tag_proof /
                            push_proof (a status is never proof), mutual
@@ -119,7 +123,8 @@ dct/workflows/release/   — Release workflow (K-72): proof layer, read-only —
                            proof.py (trailer / revert / squash rules),
                            plan.py (`dct release plan`, `dct clog candidates`);
                            effects layer — effects.py (`dct release attest /
-                           prepare / apply / resume / abandon / reconstruct`,
+                           prepare / apply / resume / abandon / reconstruct /
+                           takeover / version-files`,
                            alias `clog release`: the version sync runs once,
                            isolated, in prepare; commits through the repo's
                            hooks, tag, push; every effect verified before

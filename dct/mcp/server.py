@@ -1297,7 +1297,11 @@ def release_changelog(
     performs and verifies them and reports each with advance_release, or
     the record is ended with abandon_release. dct's own effects (changelog
     file, version files, release commit, tag, push) start from `dct release
-    plan` / `prepare` / `apply`, never from this tool.
+    plan` / `prepare` / `apply`, never from this tool. A record stamped
+    here whose release commit already EXISTS can be handed to dct by the
+    owner with the local `dct release takeover --version V` (K-119 M3: its
+    verified artifacts become the consent — no re-stamp; `dct release
+    resume` then performs only the missing effects).
 
     Returns: {"project", "version" (requested, normalized), "current_version"
         (after the call), "mode":
@@ -1398,7 +1402,10 @@ def get_release(project: str = "", version: str = "") -> dict:
         effects, copied from the project's release_executor at stamp time,
         immutable; null on older records), consent (object — what the owner
         approved: {version, entry_ids, candidate_sha, proposal_sha256,
-        render, push_target} — or null), proposal (object — the approved
+        render, push_target} plus, when recorded, executor and takeover
+        ({release_commit_sha, tree, artifacts_sha256} — the release was
+        handed to dct with `dct release takeover`, from those verified
+        artifacts) — or null), proposal (object — the approved
         version-file proposal {paths, base_blobs, expected_blobs, script,
         candidate_sha, version, plan_digest, release_mode, changelog} — or
         null), render (object — this release's
@@ -1457,9 +1464,9 @@ def advance_release(
     or git: the caller reports what IT verified. This is the ledger path of
     a project's OWN release tool and of records stamped outside `dct
     release apply` (release_changelog): a release dct executes — executor
-    "dct" AND a recorded consent (stamped by `dct release apply`) — is
-    refused here; `dct release resume` records its progress after
-    verifying each effect (K-85).
+    "dct" AND a recorded consent (stamped by `dct release apply`, or taken
+    over with `dct release takeover`) — is refused here; `dct release
+    resume` records its progress after verifying each effect (K-85).
 
     Call it after each release step is DONE and verified (also when a resumed
     run finds the effect already present): files_written after the changelog
@@ -1582,7 +1589,8 @@ def abandon_release(
     DIFFERENT reason is an error — the first reason stays.
 
     NOT for a release dct's effects layer executes (executor "dct" AND a
-    recorded consent — stamped by `dct release apply`): this server does
+    recorded consent — stamped by `dct release apply`, or taken over with
+    `dct release takeover`): this server does
     not know the checkout and cannot take that release's operation lock, so
     an abandon from here could not stop a running `dct release apply` /
     `resume`. Such a record is REFUSED — abandon it locally, in the

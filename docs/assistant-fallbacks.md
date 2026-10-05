@@ -275,8 +275,10 @@ entry set, proof, effect state) and, separately, today's HEAD
 apply`), is NOT finished by dct — `resume` refuses it: say who finishes it
 (the project's own tool, or the owner through the ledger path after
 verifying each effect — [executor](release-workflow.md#executor-k-85);
-never this dialog) or abandon it; a record without an approved proposal is
-refused at `stamped` and can only be abandoned. Otherwise the owner
+never this dialog), offer the takeover when its `executor` is `dct` and its
+release commit exists (the last row of the Legacy path table below: dct
+records the consent from the verified artifacts, then `resume` performs
+only the missing effects), or abandon it. Otherwise the owner
 chooses: finish → `dct release resume --json` (no new approval: it executes
 the consent stored at apply — version, entries, candidate, proposal, push
 target — while the scope is unchanged, refuses what lies outside it
@@ -290,14 +292,20 @@ stop.
 
 **Legacy path** — `dct release reconstruct --version V --json` shows the
 evidence (outcome `preview`: the resolved `version` — the stored spelling,
-the request only in `requested_version` — the `candidates`, the `status`
-the evidence reaches: `completed` with a tag, `committed` without one);
-only after the owner confirms, the same command with `--confirm` records it
-(no re-stamp). A `committed` reconstruction stays unfinished: dct's resume
-does not continue it — the owner tags / pushes and records that through
-the ledger path ([executor](release-workflow.md#executor-k-85); never this
-dialog), or abandons it. Refused = contradicting or ambiguous evidence:
-report it; never reconstruct by hand.
+the request only in `requested_version` — the `candidates`, the
+`verification` scope and `contract`, the `status` the evidence reaches:
+`completed` with a tag, `committed` without one); only after the owner
+confirms, the same command with `--confirm` records it (no re-stamp).
+Refused = contradicting or ambiguous evidence: report it; never reconstruct
+by hand. The CLI steps for each refusal and for finishing:
+
+| situation | CLI step |
+| --- | --- |
+| several verified candidates, no tag (`details.candidates`) | the owner picks one: `dct release reconstruct --version V --release-commit <sha> [--confirm] --json` |
+| the release commit changed older changelog history (`details.history`: the diff) | show the diff; nothing is recorded and there is no flag that waives it |
+| outside git, the contract is unknown (`details.contract.state: "unknown"`) | `dct release version-files --json` (show), then with the owner's answer `dct release version-files --set <a,b> --confirm --json` or `dct release version-files --none --confirm --json`; then reconstruct again |
+| the project's executor is `own` (`details.executor: "own"`) | its tool supplies the evidence: `dct release reconstruct --version V --evidence <file.json> [--confirm] --json` — never composed by this dialog |
+| the record ends at `committed` (`details.finish`) | `dct release takeover --version V (--push-remote R [--push-branch B] [--push-url U] \| --no-push) --json` (preview: `details.consent`, `details.missing_effects`, `details.takeover_digest`); after the owner approves exactly that: the same command with `--takeover-digest <digest> --confirm --json`; then `dct release resume --json`. Or the ledger path of whoever performs the missing effects ([executor](release-workflow.md#executor-k-85); never this dialog) |
 
 ## `/commit` fallback
 

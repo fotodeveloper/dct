@@ -1162,6 +1162,17 @@ def _run_effects(action: str, project_slug: str, as_json: bool, call) -> dict:
     else:
         for step in failure["steps"]:
             print(f"  {step['step']}: {step['result']}")
+        # K-109: a release commit that changed older changelog history is
+        # SHOWN — the diff of what it changed besides its own section.
+        for item in failure["details"].get("history") or []:
+            total = item.get("diff_lines", len(item["diff"]))
+            print(f"  changelog history changed by {item['commit']} ({total} diff line(s), "
+                  f"sha256 {item['diff_sha256']}):", file=sys.stderr)
+            for line in item["diff"]:
+                print(f"    {line}", file=sys.stderr)
+            if total > len(item["diff"]):
+                print(f"    … {total - len(item['diff'])} more line(s) — see --json",
+                      file=sys.stderr)
     print(f"✗ {message}", file=sys.stderr)
     sys.exit(code)
 
@@ -1402,16 +1413,46 @@ def cmd_release_abandon(args):
           f"current_version stay; release the work under a new version")
 
 
+def _print_scope(scope: dict) -> None:
+    """The recorded scope of a reconstruction (K-110), one line per fact."""
+    if scope.get("adapter") == "own":
+        print(f"  verified (own adapter): artifacts {scope['artifacts']}, commit "
+              f"{'yes' if scope['commit'] else 'no'}, tag {'yes' if scope['tag'] else 'no'}")
+    else:
+        contract = scope["contract"]
+        shown = "UNKNOWN (never confirmed)" if contract is None else (
+            "confirmed: none" if not contract else "confirmed: " + ", ".join(contract))
+        print(f"  contract:       {shown}")
+        print(f"  verified:       changelog {scope['changelog']}, history {scope['history']}, "
+              f"version files {scope['version_files']}, commit "
+              f"{'yes' if scope['commit'] else 'no'}, tag {'yes' if scope['tag'] else 'no'}")
+    if scope["limited"]:
+        print("  scope:          LIMITED — no changelog section and no version file verified")
+
+
 def cmd_release_reconstruct(args):
-    """`dct release reconstruct --version V [--confirm]` (K-60, legacy releases)."""
+    """`dct release reconstruct --version V [--release-commit SHA |
+    --evidence FILE] [--confirm]` (K-60, legacy releases; K-109, K-110,
+    K-119: the own adapter takes --evidence)."""
     from dct.workflows.release.effects import reconstruct
 
     # The preview (no --confirm) writes nothing — it reads through the
     # read-only engine (K-84); only --confirm bootstraps.
     engine = _get_engine() if args.confirm else _get_readonly_engine()
     project_slug = args.project or _detect_project(engine)
-    out = _run_effects("reconstruct", project_slug, args.json, lambda: reconstruct(
-        engine, project_slug, args.version, confirm=args.confirm))
+
+    def call():
+        supplied = None
+        if args.evidence:
+            try:
+                with open(args.evidence, encoding="utf-8") as fh:
+                    supplied = _json_arg("--evidence", fh.read())
+            except OSError as exc:
+                raise ValueError(f"--evidence: cannot read {args.evidence}: {exc}") from None
+        return reconstruct(engine, project_slug, args.version, confirm=args.confirm,
+                           release_commit=args.release_commit or None, evidence=supplied)
+
+    out = _run_effects("reconstruct", project_slug, args.json, call)
     if args.json:
         return
     evidence = out["details"]["evidence"]
@@ -1424,12 +1465,116 @@ def cmd_release_reconstruct(args):
     if manifest.get("changelog"):
         print(f"  changelog:      {manifest['changelog']['path']} "
               f"({manifest['changelog']['section_date']})")
-    print(f"  version files:  {', '.join(f['path'] for f in manifest['version_files']) or '-'}")
+    files = manifest.get("version_files", manifest.get("artifacts") or [])
+    print(f"  {'artifacts' if 'artifacts' in manifest else 'version files'}:  "
+          f"{', '.join(f['path'] for f in files) or '-'}")
+    _print_scope(evidence["verification"])
+    for other in evidence.get("candidates") or []:
+        if other["commit"] != evidence["release_commit_sha"]:
+            print(f"  other candidate: {other['commit']} — "
+                  f"{'verified (not used)' if other['verified'] else other['reason']}")
+    print(f"  stage proven:   {evidence['status']}")
+    # M9: the executor is an assignment made NOW, never historical provenance.
+    print(f"  responsibility: {out['details']['executor']['assigned']} — the executor "
+          f"ASSIGNED to the record for its further handling (the project's current setting), "
+          f"not who made the release")
+    for warning in out["warnings"]:
+        print(f"  ⚠ {warning}", file=sys.stderr)
     if out["outcome"] == "preview":
         print("  (preview — nothing written; re-run with --confirm to record it)")
     else:
         print(f"✓ Release {out['version']} recorded as {out['release']['status']} "
               f"(mode: reconstructed)")
+    for way in out["details"]["finish"]:
+        print(f"  to finish ({way['way']}): {way['command']}")
+        print(f"      {way['what']}")
+
+
+def cmd_release_takeover(args):
+    """`dct release takeover --version V [push flags | --no-push]
+    [--takeover-digest D --confirm]` (K-119 M3, K-117 J4) — dct takes over
+    an existing record without a consent from its VERIFIED artifacts."""
+    from dct.workflows.release.effects import takeover
+
+    engine = _get_engine() if args.confirm else _get_readonly_engine()
+    project_slug = args.project or _detect_project(engine)
+    out = _run_effects("takeover", project_slug, args.json, lambda: takeover(
+        engine, project_slug, args.version, confirm=args.confirm,
+        takeover_digest=args.takeover_digest or None, push_remote=args.push_remote,
+        push_branch=args.push_branch, push_url=args.push_url, no_push=args.no_push))
+    if args.json:
+        return
+    details = out["details"]
+    consent, taken = details["consent"], details["consent"]["takeover"]
+    print(f"Takeover of release {out['version']} (record: {details['record_status']}):")
+    print(f"  entries:        {', '.join(f'#{i}' for i in consent['entry_ids']) or '(none)'}")
+    print(f"  candidate:      {consent['candidate_sha']}")
+    print(f"  release commit: {taken['release_commit_sha']} (tree {taken['tree']})")
+    print(f"  artifacts:      sha256 {taken['artifacts_sha256']} — "
+          f"{', '.join(details['proposal']['paths']) or 'no version files'}")
+    tag = details["evidence"]["tag_proof"]
+    print(f"  tag:            {tag['name'] + ' (exists, verified)' if tag else 'missing'}")
+    target = consent["push_target"]
+    print(f"  push target:    {target['remote']} {target['branch']} ({target['url']}), tag "
+          f"{target['tag']}" if target else "  push target:    none (--no-push: finished locally)")
+    print(f"  proven stage:   {details['stage']}; record after the takeover: "
+          f"{details['status_after']}")
+    print(f"  still missing:  {', '.join(details['missing_effects']) or 'nothing'} "
+          f"(performed by `dct release resume`)")
+    print("  responsibility: dct — assigned by this takeover, not who made the release")
+    if out["outcome"] == "preview":
+        print("  (preview — nothing written: no bump, no re-stamp, no recorded value changes)")
+        print(f"  next: dct release takeover --version {out['version']} … --takeover-digest "
+              f"{details['takeover_digest']} --confirm   (same push flags)")
+    else:
+        print(f"✓ Release {out['version']} taken over by dct — next: dct release resume")
+    _print_effects(out)
+
+
+def cmd_release_version_files(args):
+    """`dct release version-files [--set PATHS | --none] [--confirm]`
+    (K-110) — show / confirm the project's version-file contract."""
+    from dct.workflows.release.effects import version_files_contract
+
+    writes = args.confirm and (args.set is not None or args.none)
+    engine = _get_engine() if writes else _get_readonly_engine()
+    project_slug = args.project or _detect_project(engine)
+    paths = None
+    if args.none:
+        paths = []
+    elif args.set is not None:
+        paths = [part.strip() for part in args.set.split(",") if part.strip()]
+        if not paths:
+            print("✗ --set needs at least one path (use --none for a project without "
+                  "version files)", file=sys.stderr)
+            sys.exit(1)
+    if args.confirm and paths is None:
+        print("✗ --confirm needs --set <paths> or --none", file=sys.stderr)
+        sys.exit(1)
+    out = _run_effects("version-files", project_slug, args.json, lambda: version_files_contract(
+        engine, project_slug, paths=paths, confirm=args.confirm))
+    if args.json:
+        return
+    contract = out["details"]["contract"]
+
+    def shown(files):
+        return "UNKNOWN (never confirmed)" if files is None else (
+            "none (confirmed: the project has no version files)" if not files
+            else ", ".join(files))
+
+    print(f"Version-file contract of {project_slug}: {shown(contract['version_files'])}"
+          + (f" — confirmed {contract['confirmed_at']}" if contract["confirmed_at"] else ""))
+    if out["outcome"] == "preview":
+        print(f"  proposed:       {shown(out['details']['proposed'])}"
+              f"{'' if out['details']['change'] else ' (no change)'}")
+        print("  (preview — nothing written; re-run with --confirm to confirm it)")
+    elif out["outcome"] == "confirmed":
+        print("✓ Contract confirmed")
+    elif out["outcome"] == "noop":
+        print("✓ Contract unchanged (already confirmed)")
+    elif out["outcome"] == "none":
+        print("  confirm it: dct release version-files --set <path>[,<path>…] --confirm   or   "
+              "dct release version-files --none --confirm")
 
 
 def _print_release_record(record: dict) -> None:
@@ -2898,7 +3043,7 @@ def build_parser() -> argparse.ArgumentParser:
     # attest / prepare / apply / resume / abandon / reconstruct = layer 3 (effects)
     p_release = sub.add_parser(
         "release", help="Release workflow: plan (read-only), attest, prepare, apply, resume, "
-                        "abandon, reconstruct, status")
+                        "abandon, reconstruct, takeover, version-files, status")
     p_release_sub = p_release.add_subparsers(dest="release_command")
     p_rel_plan = p_release_sub.add_parser(
         "plan", help="Show the release plan of the current checkout — no side effects")
@@ -3011,8 +3156,10 @@ def build_parser() -> argparse.ArgumentParser:
         "The push goes to the URL approved at apply (it must still be a push URL of its "
         "remote; URLs added since receive nothing). "
         "A record stamped outside `dct release apply` (MCP release_changelog, an own tool, a "
-        "partial reconstruction) is refused: finish it with `dct clog release-advance` after "
-        "verifying its effects yourself, or abandon it.")
+        "partial reconstruction) is refused: hand it to dct with `dct release takeover` (its "
+        "verified artifacts become the consent; resume then performs only the missing "
+        "effects), finish it with `dct clog release-advance` after verifying its effects "
+        "yourself, or abandon it.")
 
     p_rel_abandon = p_release_sub.add_parser(
         "abandon", help="End an unfinished release as abandoned (all effects stay)")
@@ -3030,14 +3177,80 @@ def build_parser() -> argparse.ArgumentParser:
     p_rel_recon.add_argument("--version", required=True, help="The release (X.Y or X.Y.Z)")
     p_rel_recon.add_argument("--confirm", action="store_true",
                              help="Write the record (without: show the evidence only)")
+    p_rel_recon_how = p_rel_recon.add_mutually_exclusive_group()
+    p_rel_recon_how.add_argument(
+        "--release-commit",
+        help="Choose ONE of several verified release commits (no tag; the refusal lists them)")
+    p_rel_recon_how.add_argument(
+        "--evidence",
+        help="For a project whose release executor is 'own': a JSON file with the evidence "
+             "its tool supplies — {release_commit_sha, candidate_sha, status (committed | "
+             "tagged | completed), tag, artifacts: [{path, sha256}]}")
     p_rel_recon.add_argument("--project", "-P")
     p_rel_recon.add_argument("--json", action="store_true", help="Stable JSON document")
     p_rel_recon.epilog = (
         "The version spelling is resolved first (the stored one: a request for 1.1.0 of a "
         "release stored as 1.1 records 1.1). Commits titled `release: v<V>` are candidates, "
         "each verified (one parent, the version-file contract, the changelog section, the "
-        "version fields); a tag of V → completed, a single verified release commit without a "
-        "tag → committed. Any contradiction is refused; nothing is re-stamped.")
+        "version fields, and the WHOLE older changelog history against the parent: a release "
+        "commit that removed or edited an older section — also a typo fix — is shown as a "
+        "diff and never verified); a tag of V → completed, a single verified release commit "
+        "without a tag → committed (the output names how to finish it: `dct release "
+        "takeover`, or the ledger path), several → all listed, choose with --release-commit. "
+        "The version-file contract is shown as UNKNOWN or confirmed; outside git an unknown "
+        "one refuses — confirm it with `dct release version-files`. A project whose release "
+        "executor is 'own' is not parsed by these rules: pass --evidence (its tool's own "
+        "format; dct verifies the commit, the candidate, each artifact's hash at the commit "
+        "and the tag). Any contradiction is refused; nothing is re-stamped and nothing in "
+        "the repository is modified. The executor shown is assigned to the record now — it "
+        "is not who made the release.")
+
+    p_rel_take = p_release_sub.add_parser(
+        "takeover", help="Hand an existing release record without a consent to dct, from its "
+                         "verified artifacts (then `resume` performs only the missing effects)")
+    p_rel_take.add_argument("--version", required=True, help="The release (X.Y or X.Y.Z)")
+    _add_push_flags(p_rel_take)
+    p_rel_take.add_argument(
+        "--takeover-digest",
+        help="Required with --confirm: the takeover_digest the preview printed")
+    p_rel_take.add_argument("--confirm", action="store_true",
+                            help="Record the takeover (without: show what would be recorded)")
+    p_rel_take.add_argument("--project", "-P")
+    p_rel_take.add_argument("--json", action="store_true", help="Stable JSON document")
+    p_rel_take.epilog = (
+        "For a record dct did not stamp with the owner's consent — a reconstruction that "
+        "ended at 'committed', a record stamped through MCP release_changelog, an older "
+        "record — whose release commit EXISTS. dct verifies the artifacts again (the release "
+        "commit, its single parent, the changelog section and the older history, the version "
+        "files) and compares them with the record; then it shows the consent it would record "
+        "(version, entries, candidate, release commit, tree, artifact hashes, the push target "
+        "or --no-push) and its takeover_digest. With --takeover-digest D --confirm it records "
+        "the consent and the proposal derived from those artifacts. No new bump, no re-stamp, "
+        "no file, commit, tag or push, and nothing recorded is changed; afterwards `dct "
+        "release resume` performs only what is missing (the tag, the push). Refused for an "
+        "'own' record, a record that already has a consent, a terminal record, and when no "
+        "release commit verifies or the artifacts contradict the record — the ledger path "
+        "(`dct clog release-advance`) stays. " + RELEASE_LOCK_EPILOG)
+
+    p_rel_vf = p_release_sub.add_parser(
+        "version-files", help="Show / confirm the project's version-file contract (which "
+                              "files every release changes)")
+    p_rel_vf_set = p_rel_vf.add_mutually_exclusive_group()
+    p_rel_vf_set.add_argument("--set", metavar="PATHS",
+                              help="Comma-separated repo-relative paths to confirm")
+    p_rel_vf_set.add_argument("--none", action="store_true",
+                              help="Confirm that the project has NO version files")
+    p_rel_vf.add_argument("--confirm", action="store_true",
+                          help="Write the contract (without: show the proposal only)")
+    p_rel_vf.add_argument("--project", "-P")
+    p_rel_vf.add_argument("--json", action="store_true", help="Stable JSON document")
+    p_rel_vf.epilog = (
+        "Without flags: shows the contract — UNKNOWN (never confirmed) is not the same as a "
+        "confirmed empty one. --set / --none without --confirm show the proposal; with "
+        "--confirm the contract is stored (the earlier one goes to its history). A release "
+        "made with `dct release prepare` / `apply` learns the contract from its approved "
+        "proposal — this command is for a project that needs one without such a release (a "
+        "reconstruction outside git refuses an unknown contract). " + RELEASE_LOCK_EPILOG)
 
     # _task-mirror (internal: worker for hooks/dct-task-mirror.sh)
     p_tm = sub.add_parser(
@@ -3326,6 +3539,8 @@ RELEASE_COMMAND_MAP = {
     "resume": cmd_release_resume,
     "abandon": cmd_release_abandon,
     "reconstruct": cmd_release_reconstruct,
+    "takeover": cmd_release_takeover,
+    "version-files": cmd_release_version_files,
 }
 
 CONFIG_COMMAND_MAP = {

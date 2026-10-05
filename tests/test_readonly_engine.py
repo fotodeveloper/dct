@@ -41,6 +41,10 @@ READ_ONLY_COMMANDS = [
     ["release", "status", "--project", "proj-a", "--version", "1.0.0"],
     ["clog", "release-status", "--project", "proj-a"],
     ["release", "reconstruct", "--project", "proj-a", "--version", "1.0.0"],
+    # R8d: the previews of the takeover and of the version-file contract.
+    ["release", "takeover", "--project", "proj-a", "--version", "1.0.0", "--no-push"],
+    ["release", "version-files", "--project", "proj-a"],
+    ["release", "version-files", "--project", "proj-a", "--none"],
 ]
 
 
@@ -116,17 +120,20 @@ def test_older_schema_is_refused_and_left_unchanged(tmp_path, args):
     assert not Path(f"{db_path}-journal").exists()
 
 
-@pytest.mark.parametrize("args", [
-    ["release", "status", "--project", "proj-a"],
-    ["clog", "release-status", "--project", "proj-a", "--version", "1.0.0"],
-], ids=lambda a: " ".join(a[:2]))
-def test_current_schema_reads_and_changes_nothing(tmp_path, args):
+@pytest.mark.parametrize("args, shown", [
+    (["release", "status", "--project", "proj-a"], "No "),
+    (["clog", "release-status", "--project", "proj-a", "--version", "1.0.0"], "No "),
+    # K-110: showing the contract, and a proposal for it, writes nothing.
+    (["release", "version-files", "--project", "proj-a"], "UNKNOWN"),
+    (["release", "version-files", "--project", "proj-a", "--none"], "preview"),
+], ids=lambda a: " ".join(a[:2]) if isinstance(a, list) else a)
+def test_current_schema_reads_and_changes_nothing(tmp_path, args, shown):
     db_path = tmp_path / "current.db"
     _rollback_journal_db(db_path)
     before = _state(db_path)
     out = _cli(db_path, args, tmp_path)
     assert out.returncode == 0, out.stdout + out.stderr
-    assert "No " in out.stdout
+    assert shown in out.stdout
     assert _state(db_path) == before
 
 

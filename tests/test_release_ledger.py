@@ -701,9 +701,16 @@ def test_reconstruction_refuses_every_inconsistency_without_writes(legacy, case)
 
 def test_reconstruction_without_git(legacy):
     engine, ids = legacy
+    # K-110: without git the manifest carries the scope of the verification
+    # (the CONFIRMED contract) — `version_files` alone is not evidence.
+    scoped = {**MANIFEST, "verification": {"contract": ["pyproject.toml"]}}
+    with pytest.raises(ValueError, match="verification"):
+        _reconstruct(engine, ids, candidate_sha=None, release_commit_sha=None,
+                     without_git=True)
     rec = _reconstruct(engine, ids, candidate_sha=None, release_commit_sha=None,
-                       without_git=True)
+                       without_git=True, manifest=scoped)
     assert rec["candidate_sha"] is None and rec["status"] == "completed"
+    assert rec["manifest"]["verification"] == {"contract": ["pyproject.toml"]}
 
 
 def test_reconstruction_uses_the_stored_spelling(proj):

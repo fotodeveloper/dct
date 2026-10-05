@@ -74,6 +74,21 @@ historical provenance, G8). It is ADVANCED by the release workflow
 (advance_release) after it verified each effect. get_release reads it back,
 also "the latest unfinished release" so an interrupted /release can resume.
 
+A record WITHOUT a consent (a reconstruction that ended before
+'completed', a stamp through MCP release_changelog, an older record) is
+never executed by dct automatically. It keeps the ledger path, and it can
+be TAKEN OVER (take_over_release, K-119 M3 / K-117 J4): the owner's consent
+— naming what was verified, `consent.takeover` — and the proposal derived
+from the verified artifacts are recorded in one transaction, write-once,
+without a re-stamp. That is the ONLY way a record becomes one dct executes
+after its stamp: advance_release refuses a first consent on a 'dct' record.
+
+A reconstruction records the SCOPE of its verification
+(manifest["verification"], K-110): the version-file contract as it was —
+null = UNKNOWN, a list = confirmed, [] = confirmed "no version files" — is
+never merged; without git a recorded scope with a confirmed contract is
+required (`version_files: []` alone is not evidence of a release).
+
 The ledger only stores and cross-checks what the workflow reports; it never
 reads files or git (the local workflow does — K-51/K-72).
 
@@ -551,7 +566,8 @@ def progress_owner(record: Mapping) -> str:
     """Who executes the release of `record` (K-85, the RECORD decides —
     never today's project setting): 'dct' when its executor is 'dct' (NULL
     on records older than the field counts as 'dct') AND it carries the
-    owner's consent (it was stamped by `dct release apply`); else 'ledger' —
+    owner's consent (it was stamped by `dct release apply`, or handed to
+    dct by take_over_release — K-119 M3); else 'ledger' —
     an 'own' record, or one stamped outside the effects layer (MCP
     release_changelog, older records, a partial reconstruction): its
     effects are performed and verified by whoever reports them through the
@@ -770,9 +786,14 @@ def proposal_digest(proposal: Mapping) -> str:
 
 CONSENT_KEYS = frozenset({
     "candidate_sha", "entry_ids", "version", "proposal_sha256", "render", "push_target",
-    "executor",
+    "executor", "takeover",
 })
 PUSH_TARGET_KEYS = frozenset({"remote", "url", "branch", "tag"})
+# K-119 M3: what a TAKEOVER consent names as verified besides the consent's
+# own version / entry set / candidate / push target (take_over_release).
+TAKEOVER_KEYS = frozenset({"release_commit_sha", "tree", "artifacts_sha256"})
+# The manifest keys that describe the release's artifacts (artifacts_digest).
+ARTIFACT_KEYS = ("tree", "changelog", "version_files")
 
 
 def _push_target(target, field: str) -> dict | None:
@@ -881,7 +902,10 @@ def check_record_consistency(state: Mapping) -> None:
       are recorded; `executor` (when the consent names one) = the record's
       (null counts as 'dct'); `proposal_sha256` = proposal_digest of the
       RECORDED proposal — a digest without a proposal, or a proposal with a
-      consent that names none, is a contradiction;
+      consent that names none, is a contradiction; `takeover` (K-119 M3,
+      when the consent carries one) names the record's release commit, the
+      manifest's tree and artifacts_digest of the recorded manifest
+      (`state["manifest"]`);
     - proposal ↔ record: its `version`, `candidate_sha` and `release_mode`
       (each when bound) are the record's;
     - tag_proof: only on a record with git; its `commit` is the record's
@@ -925,6 +949,19 @@ def check_record_consistency(state: Mapping) -> None:
             raise refuse("consent.proposal_sha256 does not name the recorded proposal")
         if digest is None and proposal is not None:
             raise refuse("consent.proposal_sha256 is null but a proposal is recorded")
+        taken = consent.get("takeover")
+        if taken is not None:
+            manifest = state.get("manifest") or {}
+            if taken["release_commit_sha"] != commit:
+                raise refuse(f"consent.takeover names the release commit "
+                             f"{taken['release_commit_sha']}, the record's release commit is "
+                             f"{commit}")
+            if taken["tree"] != manifest.get("tree"):
+                raise refuse(f"consent.takeover.tree {taken['tree']} is not the manifest's "
+                             f"tree {manifest.get('tree')}")
+            if taken["artifacts_sha256"] != artifacts_digest(manifest):
+                raise refuse("consent.takeover.artifacts_sha256 does not name the recorded "
+                             "artifacts (manifest tree / changelog / version_files)")
     if proposal is not None:
         if proposal.get("version") is not None and not same_version(proposal["version"], version):
             raise refuse(f"proposal.version {proposal['version']} is not the record's version")
@@ -993,6 +1030,31 @@ def check_proof_requirements(state: Mapping, status: str) -> None:
         )
 
 
+def artifacts_digest(manifest: Mapping | None) -> str:
+    """SHA-256 of the canonical JSON of the manifest's ARTIFACT keys
+    (ARTIFACT_KEYS: `tree`, `changelog`, `version_files` — those present) —
+    what a takeover consent names as the verified artifact hashes
+    (consent.takeover.artifacts_sha256). Other manifest keys (the untracked
+    baseline, the verification scope) are not artifacts."""
+    import hashlib
+
+    artifacts = {key: (manifest or {})[key] for key in ARTIFACT_KEYS if key in (manifest or {})}
+    return hashlib.sha256(_canonical(artifacts).encode("utf-8")).hexdigest()
+
+
+def _takeover(value) -> dict:
+    _object(value, "consent.takeover", set(TAKEOVER_KEYS), set(TAKEOVER_KEYS))
+    digest = _digest(value["artifacts_sha256"], "consent.takeover.artifacts_sha256")
+    if digest is None:
+        raise ValueError("consent.takeover.artifacts_sha256 must be a hex SHA-256")
+    return {
+        "release_commit_sha": _full_sha(value["release_commit_sha"],
+                                        "consent.takeover.release_commit_sha"),
+        "tree": _full_sha(value["tree"], "consent.takeover.tree"),
+        "artifacts_sha256": digest,
+    }
+
+
 def validate_consent(consent: Mapping | None) -> dict | None:
     """What the owner approved for this release (K-97 F4) in canonical form,
     or None — so a resume can tell whether the scope changed.
@@ -1005,8 +1067,13 @@ def validate_consent(consent: Mapping | None) -> dict | None:
     'own', K-106 — who the owner approved to perform the release; the stamp
     compares it with the project's setting in its transaction; the key is
     kept only when given, so consents recorded before it compare
-    unchanged). ≤ CONSENT_MAX_BYTES of canonical JSON. ValueError /
-    TypeError otherwise."""
+    unchanged) and the OPTIONAL "takeover" (K-119 M3, kept only when given —
+    the consent of take_over_release: what was VERIFIED when the owner
+    handed an existing release to dct, {"release_commit_sha": the verified
+    release commit, "tree": its tree, "artifacts_sha256": artifacts_digest
+    of the verified manifest} — all three required, FULL ids).
+    ≤ CONSENT_MAX_BYTES of canonical JSON. ValueError / TypeError
+    otherwise."""
     if consent is None:
         return None
     _object(consent, "consent", set(CONSENT_KEYS), {"version", "entry_ids"})
@@ -1025,6 +1092,8 @@ def validate_consent(consent: Mapping | None) -> dict | None:
     }
     if consent.get("executor") is not None:
         out["executor"] = validate_executor(consent["executor"])
+    if consent.get("takeover") is not None:
+        out["takeover"] = _takeover(consent["takeover"])
     ensure_json_fits(out, "consent", CONSENT_MAX_BYTES)
     return out
 
@@ -1217,6 +1286,7 @@ def insert_record(
         "release_commit_sha": release_commit_sha, "release_mode": release_mode,
         "executor": settings["executor"], "consent": consent, "proposal": proposal,
         "render": render, "tag_proof": tag_proof, "push_proof": push_proof,
+        "manifest": manifest,
     }
     check_record_consistency(state)
     check_proof_requirements(state, status)
@@ -1482,15 +1552,162 @@ def advance_release(
       a repeat of the current status; a record is never extended or shrunk
       to fit, and no progress is recorded on an inconsistent one.
 
+    - K-119 M3 / the open point of K-106: a FIRST consent on a record whose
+      executor is 'dct' would hand the release to dct's effects layer
+      (progress_owner) — that is the controlled TAKEOVER, not a progress
+      write: refused here for every actor (take_over_release, `dct release
+      takeover`). A consent on an 'own' record, and the stored consent
+      again, are accepted as before.
+
     Returns {"release": <record>, "updated": bool} — `updated` False when
     nothing changed (idempotent repeat).
     """
-    _validate_status(status)
-    if status == ABANDONED:
+    return _record_progress(
+        engine, project_slug, version, status, release_commit_sha=release_commit_sha,
+        manifest=manifest, release_mode=release_mode, consent=consent, proposal=proposal,
+        render=render, actor=actor, tag_proof=tag_proof, push_proof=push_proof)
+
+
+def check_takeover(row, consent: Mapping | None) -> bool:
+    """K-119 M3 / K-117 J4 — may THIS record be taken over by dct with
+    `consent` (validated)? True when the record already carries exactly this
+    consent (an idempotent repeat), False when the takeover is to be
+    written; ValueError otherwise: a terminal record, an 'own' record (its
+    tool finishes it through the ledger), a consent that does not name what
+    was verified (`takeover`) or does not approve dct as the executor, or a
+    record that already has a DIFFERENT consent (immutable)."""
+    version = row.version
+    if row.status in TERMINAL_STATUSES:
         raise ValueError(
-            "advance_release never abandons a release — use abandon_release "
-            "(explicit confirmation and a reason)."
+            f"Release {version} is '{row.status}' — a terminal status; there is nothing to "
+            f"take over; nothing written."
         )
+    if (row.executor or DEFAULT_EXECUTOR) != "dct":
+        raise ValueError(
+            f"Release {version} is executed by the project's own release tool (executor "
+            f"'{row.executor}', recorded at its stamp) — dct never takes it over; its tool "
+            f"finishes it through the ledger path (advance_release); nothing written."
+        )
+    if consent is None or consent.get("takeover") is None:
+        raise ValueError(
+            "a takeover needs the owner's consent naming what was VERIFIED (consent.takeover: "
+            "release_commit_sha, tree, artifacts_sha256); nothing written."
+        )
+    if consent.get("executor") != "dct":
+        raise ValueError(
+            "a takeover consent approves dct as the executor (consent.executor 'dct'); "
+            "nothing written."
+        )
+    stored = _load_json(row.consent)
+    if stored is None:
+        return False
+    if _canonical(stored) == _canonical(consent):
+        return True
+    raise ValueError(
+        f"Release {version} already carries a consent (dct executes it) — it is immutable "
+        f"and differs from the given one; `dct release resume` continues it; nothing written."
+    )
+
+
+def take_over_release(
+    engine: sa.Engine,
+    project_slug: str,
+    version: str,
+    *,
+    consent: Mapping,
+    release_commit_sha: str,
+    manifest: Mapping,
+    candidate_sha: str | None = None,
+    checkout_root: str | None = None,
+    proposal: Mapping | None = None,
+    confirm: bool = False,
+) -> dict:
+    """The controlled TAKEOVER of an existing release by dct (K-119 M3,
+    K-117 J4) — ledger part only: the missing consent / proposal of a
+    record that has none (a reconstruction that ended at 'committed', a
+    record stamped through MCP release_changelog, an older record) are
+    supplied FROM VERIFIED ARTIFACTS, so that `dct release resume` may
+    perform the effects that are still missing. No new bump, no re-stamp
+    (no entry and no current_version is touched) and no recorded value is
+    changed: every field is write-once — filled when absent, confirmed when
+    equal, refused when different. The local workflow gathers and verifies
+    the evidence (effects.takeover); this function cross-checks it against
+    the record and the database.
+
+    Requires `confirm=True`. In ONE transaction (project write lock), every
+    check before the single UPDATE:
+    - the record: live, unique (K-115 G6), not terminal, executor 'dct'
+      (an 'own' record is never taken over), no consent yet — the SAME
+      consent again is a no-op (`updated` False), a different one refused
+      (check_takeover);
+    - `consent` (validate_consent): executor 'dct' and `takeover`
+      {release_commit_sha, tree, artifacts_sha256} — what was verified;
+      with the record's version, EXACT entry set and candidate, its
+      push_target (or null = an explicit local release), and
+      proposal_sha256 = proposal_digest of `proposal` (the record's
+      proposal when it already has one);
+    - `release_commit_sha` (required) and `manifest` (required, the
+      verified artifacts — merged write-once per key) as in
+      advance_release; `candidate_sha` / `checkout_root` FILL a record that
+      has none (stamped without them) and must equal recorded ones;
+      release_mode is recorded as 'git' (a record without git is never
+      taken over);
+    - the status moves to 'committed' when the record is below it (where
+      the verified evidence starts); a record at 'committed' / 'tagged' /
+      'pushed' keeps its status and its proofs;
+    - the full entry set (check_entry_set), the mutual consistency of the
+      post-state (check_record_consistency — also consent.takeover against
+      the release commit and the manifest) and the proofs its status needs.
+
+    Returns {"release": <record>, "updated": bool}. ValueError / TypeError
+    otherwise; nothing written."""
+    if confirm is not True:
+        raise ValueError(
+            "take_over_release needs explicit confirmation (confirm=True): dct becomes the "
+            "executor of the release; nothing written."
+        )
+    if release_commit_sha is None or manifest is None:
+        raise ValueError(
+            "a takeover needs the verified release commit and the manifest of its artifacts; "
+            "nothing written."
+        )
+    return _record_progress(
+        engine, project_slug, version, None, release_commit_sha=release_commit_sha,
+        manifest=manifest, release_mode="git", consent=consent, proposal=proposal,
+        render=None, actor="dct", tag_proof=None, push_proof=None,
+        takeover={"candidate_sha": validate_sha(candidate_sha, "candidate_sha"),
+                  "checkout_root": checkout_root})
+
+
+def _record_progress(
+    engine: sa.Engine,
+    project_slug: str,
+    version: str,
+    status: str | None,
+    *,
+    release_commit_sha: str | None,
+    manifest: Mapping | None,
+    release_mode: str | None,
+    consent: Mapping | None,
+    proposal: Mapping | None,
+    render: Mapping | None,
+    actor: str,
+    tag_proof: Mapping | None,
+    push_proof: Mapping | None,
+    takeover: Mapping | None = None,
+) -> dict:
+    """The ONE write of advance_release and take_over_release (`takeover`:
+    {candidate_sha, checkout_root} — then `status` is None and derived from
+    the record). See both docstrings."""
+    from dct.core.changelog import normalize_worktree
+
+    if takeover is None:
+        _validate_status(status)
+        if status == ABANDONED:
+            raise ValueError(
+                "advance_release never abandons a release — use abandon_release "
+                "(explicit confirmation and a reason)."
+            )
     version = normalize_version(version)
     sha = validate_sha(release_commit_sha, "release_commit_sha")
     incoming = validate_manifest(manifest)
@@ -1505,9 +1722,27 @@ def advance_release(
         "push_proof": validate_push_proof(push_proof),
     }
     validate_actor(actor)
+    if takeover is not None:
+        root = normalize_worktree(takeover["checkout_root"])
+        ensure_fits(releases, {"checkout_root": root})
     with project_transaction(engine, project_slug, write=True) as (conn, pid):
         row = _require_record(conn, pid, project_slug, version)
-        check_progress_actor(row, actor)
+        if takeover is None:
+            check_progress_actor(row, actor)
+            if (once["consent"] is not None and row.consent is None
+                    and (row.executor or DEFAULT_EXECUTOR) == "dct"):
+                raise ValueError(
+                    f"Release {row.version}: a first consent would make dct the executor "
+                    f"of a release it did not stamp — that is the controlled takeover "
+                    f"(take_over_release; `dct release takeover --version {row.version}`), "
+                    f"never a progress write; nothing written."
+                )
+        else:
+            if check_takeover(row, once["consent"]):
+                return {"release": record_to_dict(row), "updated": False}
+            # Where the verified evidence starts; a record further along
+            # keeps its status (and its proofs).
+            status = row.status if _rank(row.status) >= _COMMITTED else "committed"
         # K-102: the FULL entry set, in THIS transaction — also for a retry
         # of the current status: no progress on a record whose version other
         # entries carry (or lost), and the record is never extended to fit.
@@ -1517,6 +1752,23 @@ def advance_release(
         values: dict = {}
         if moves:
             values["status"] = status
+        candidate = row.candidate_sha
+        if takeover is not None:
+            # Fill-once: a record stamped without its candidate / checkout
+            # gets the verified ones; recorded ones are never replaced.
+            for field, given in (("candidate_sha", takeover["candidate_sha"]),
+                                 ("checkout_root", root)):
+                stored = getattr(row, field)
+                if given is None or stored == given:
+                    continue
+                if stored is not None:
+                    raise ValueError(
+                        f"{field} of release {row.version} is recorded as {stored} — the "
+                        f"verified {given} contradicts it; a takeover changes nothing that "
+                        f"is recorded; nothing written."
+                    )
+                values[field] = given
+            candidate = values.get("candidate_sha", candidate)
 
         for field, given in once.items():
             stored = getattr(row, field)
@@ -1538,7 +1790,7 @@ def advance_release(
                     f"later, not at '{final}'; nothing written."
                 )
             values["release_commit_sha"] = commit = sha
-        check_mode_consistency(mode, row.candidate_sha, commit, final)
+        check_mode_consistency(mode, candidate, commit, final)
         if mode != WITHOUT_GIT and commit is None and _rank(final) >= _COMMITTED and (
                 moves or "release_mode" in values):
             raise ValueError(
@@ -1580,8 +1832,8 @@ def advance_release(
         # for a repeat (a contradiction seeded outside the API blocks progress).
         state = {
             "version": row.version, "entry_ids": json.loads(row.entry_ids),
-            "candidate_sha": row.candidate_sha, "release_commit_sha": commit,
-            "release_mode": mode, "executor": row.executor,
+            "candidate_sha": candidate, "release_commit_sha": commit,
+            "release_mode": mode, "executor": row.executor, "manifest": merged,
             **{field: json.loads(values[field]) if field in values
                else _load_json(getattr(row, field))
                for field in ("consent", "proposal", "render", "tag_proof", "push_proof")},
@@ -1741,6 +1993,13 @@ def reconstruct_release(
       'completed' needs no push proof (its push scope is not recorded).
     - K-115 G6: several live records of the version → refused (the ledger
       is ambiguous), as is any existing record.
+    - K-110 — `manifest["verification"]` is the recorded SCOPE of the
+      verification (a JSON object the workflow writes; TypeError for any
+      other type). `without_git=True` REQUIRES it, with `contract` a list:
+      the project's CONFIRMED version-file contract ([] = confirmed "no
+      version files"). A null / absent contract is UNKNOWN and refused —
+      without a commit or a tag, `version_files: []` alone never proves
+      that a release exists.
 
     The record gets mode 'reconstructed' (its provenance — the original
     stamp mode is unknown), release_mode 'git' / 'without_git' (from
@@ -1818,6 +2077,24 @@ def reconstruct_release(
         raise ValueError(
             f"status '{status}' needs the manifest of the verified artifacts; nothing written."
         )
+    # K-110: the SCOPE of the verification is part of the evidence.
+    scope = (recorded_manifest or {}).get("verification")
+    if scope is not None and not isinstance(scope, Mapping):
+        raise TypeError("manifest.verification must be a JSON object (the scope of the "
+                        "verification)")
+    if without_git:
+        if scope is None:
+            raise ValueError(
+                "a reconstruction without git records the scope of its verification "
+                "(manifest.verification) — without a commit or a tag, `version_files: []` "
+                "alone is not evidence that a release exists; nothing written."
+            )
+        if not isinstance(scope.get("contract"), list):
+            raise ValueError(
+                "manifest.verification.contract is null or absent — the version-file "
+                "contract is unknown; an unknown contract is not a confirmed \"no version "
+                "files\" ([]): confirm the contract first; nothing written."
+            )
 
     with project_transaction(engine, project_slug, write=True) as (conn, pid):
         if unique_record(conn, pid, project_slug, version) is not None:
@@ -2052,3 +2329,4 @@ def clear_pending_proposal(conn: sa.Connection, pid: int) -> None:
     """Drop the pending proposal on the caller's connection (the stamp that
     consumed it)."""
     conn.execute(projects.update().where(projects.c.id == pid).values(release_proposal=None))
+

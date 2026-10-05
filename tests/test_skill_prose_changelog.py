@@ -188,7 +188,8 @@ def test_every_named_workflow_command_and_flag_exists_in_the_cli(text):
 def test_release_skill_and_fallback_drive_the_same_workflow_commands():
     """K-72: the skill and the authoritative fallback describe ONE dialog over
     the same commands — every effects / proof subcommand of the CLI."""
-    effects = {"plan", "attest", "prepare", "apply", "resume", "abandon", "reconstruct", "status"}
+    effects = {"plan", "attest", "prepare", "apply", "resume", "abandon", "reconstruct", "status",
+               "takeover", "version-files"}
     assert effects <= set(_cli()["release"])
     for text in (_skill("release"), _release_fallback()):
         named = {sub for group, sub, _ in _commands(text) if group == "release"}

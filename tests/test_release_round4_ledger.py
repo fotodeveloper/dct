@@ -845,13 +845,14 @@ def test_reconstruction_without_git_takes_no_tag_proof(proj):
     with proj.begin() as conn:
         conn.execute(changelog_entries.update().where(changelog_entries.c.id == a)
                      .values(version="1.0.0"))
+    scoped = {**MANIFEST, "verification": {"contract": []}}    # K-110: the recorded scope
     with pytest.raises(ValueError, match="without git"):
         reconstruct_release(proj, SLUG, "1.0.0", entry_ids=[a], candidate_sha=None,
-                            release_commit_sha=None, manifest=MANIFEST, status="completed",
+                            release_commit_sha=None, manifest=scoped, status="completed",
                             confirm=True, without_git=True,
                             tag_proof={**TAG, "name": "v1.0.0"})
     record = reconstruct_release(proj, SLUG, "1.0.0", entry_ids=[a], candidate_sha=None,
-                                 release_commit_sha=None, manifest=MANIFEST,
+                                 release_commit_sha=None, manifest=scoped,
                                  status="completed", confirm=True, without_git=True)
     assert record["status"] == "completed" and record["tag_proof"] is None
 
@@ -1147,8 +1148,11 @@ def test_a_consistent_record_is_accepted_and_names_its_proposal(proj):
 
 
 def test_a_consent_written_later_must_fit_the_record_too(proj):
-    """advance_release fills a write-once field — the SAME mutual check."""
+    """advance_release fills a write-once field — the SAME mutual check. (On
+    an 'own' record: a first consent on a 'dct' record is the takeover,
+    never a progress write — K-119 M3, tests/test_release_round4_reconstruct.py.)"""
     a = _add(proj, "A")
+    set_release_executor(proj, SLUG, "own")
     release_entries(proj, SLUG, "1.1.0", entry_ids=[a], candidate_sha=CAND)
     before = _snapshot(proj)
     with pytest.raises(ValueError, match="consent.entry_ids"):

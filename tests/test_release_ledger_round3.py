@@ -336,7 +336,8 @@ PROPOSAL = {
 }
 
 
-def test_proposal_and_consent_are_canonical_and_write_once(stamped):
+def test_proposal_and_consent_are_canonical_and_write_once(proj):
+    stamped = proj
     proposal = validate_proposal(PROPOSAL)
     assert proposal["paths"] == ["dct/__init__.py", "pyproject.toml"]
     assert proposal["expected_blobs"]["pyproject.toml"] == "b" * 40
@@ -350,9 +351,11 @@ def test_proposal_and_consent_are_canonical_and_write_once(stamped):
     # K-115 G5: what is STORED must describe the record (a version-only
     # release rendered without PR references) — the consent above does not.
     consent = {**consent, "entry_ids": [], "render": {"pr_refs": False}}
-    out = advance_release(stamped, "proj-a", "1.1.0", "stamped",
-                          proposal=PROPOSAL, consent=consent)
-    rec = out["release"]
+    # Recorded by the STAMP, as `dct release apply` does — a first consent
+    # written later would hand the record to dct: that is the takeover
+    # (K-119 M3, tests/test_release_round4_reconstruct.py), not advance.
+    rec = release_entries(stamped, "proj-a", "1.1.0", entry_ids=[], candidate_sha=CAND,
+                          proposal=PROPOSAL, consent=consent)["release"]
     assert rec["proposal"] == proposal and rec["consent"]["proposal_sha256"] == digest
     # With its consent the record is one dct executes: the effects actor.
     again = advance_release(stamped, "proj-a", "1.1.0", "stamped",
