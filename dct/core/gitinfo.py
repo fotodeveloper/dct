@@ -29,6 +29,25 @@ WRITER (the release effects layer only, dct.workflows.release.effects):
     with `network` also the transport ones), may target a temporary index;
     any failure raises GitWriteError.
 
+PROCESSES (K-108, K-113): every STRICT command and both release-layer
+helpers run through the supervised runner (dct.core.procs) — git in its own
+process group (hooks, filters, transports and whatever they start end with
+it: on a timeout, an interruption or an error the whole group is stopped
+and reaped before the error is raised), stdin closed, no terminal, output
+drained into bounded memory. What a command PRINTS is one of two things:
+  - DATA the caller acts on (refs, object ids, history, diffs, blobs — also
+    the proof layer's and the push verification's input): read WHOLE, or
+    the command is an error once stdout exceeds GIT_OUTPUT_MAX_BYTES
+    (64 MiB) — never a cut result; git_read_lines streams line by line
+    instead (any size; one line over GIT_LINE_MAX_BYTES is an error);
+  - DIAGNOSTIC text (stderr of every command; stdout of git_write(...,
+    diagnostic=True) — `git commit` / `git push`, i.e. hook and transport
+    chatter): the first and the last GIT_DIAGNOSTIC_MAX_BYTES / 2 bytes,
+    the rest counted and dropped.
+The best-effort readers at the top (_git: 2 s location probes for changelog
+detection and hooks) are not part of the release workflow and keep
+subprocess.run.
+
 The Codex hook bridge (autoscan ownership bound to the current worktree) uses
 git_toplevel alone — exactly one git process, no branch read.
 """
@@ -39,11 +58,19 @@ import os
 import re
 import shutil
 import subprocess
-import tempfile
-import threading
 from collections.abc import Iterator
+from dataclasses import dataclass
+
+from dct.core import procs
 
 GIT_TIMEOUT_SECONDS = 2
+# stdout that is DATA is read whole up to this size — past it the command is
+# an error (never a cut result). Streamed reads have no total limit, only
+# one per line.
+GIT_OUTPUT_MAX_BYTES = 64 * 1024 * 1024
+GIT_LINE_MAX_BYTES = 1024 * 1024
+# DIAGNOSTIC text kept per stream: half from the start, half from the end.
+GIT_DIAGNOSTIC_MAX_BYTES = 65536
 
 # A full object id: SHA-1 (40) or SHA-256 (64) lowercase hex.
 _FULL_SHA_RE = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", re.ASCII)
@@ -267,6 +294,20 @@ def _git_env(
     return env
 
 
+@dataclass(frozen=True)
+class GitResult:
+    """A finished strict git command: its exit code, stdout (text, or bytes
+    with `binary`) and stderr (bounded diagnostic text)."""
+
+    returncode: int
+    stdout: str | bytes
+    stderr: str
+
+
+def _diagnostic() -> procs.Capture:
+    return procs.bounded(GIT_DIAGNOSTIC_MAX_BYTES // 2, GIT_DIAGNOSTIC_MAX_BYTES // 2)
+
+
 def _strict_git(
     cwd: str, *args: str, timeout: float = GIT_TIMEOUT_SECONDS,
     error: type[CheckoutVerificationError] = CheckoutVerificationError,
@@ -275,31 +316,50 @@ def _strict_git(
     keep_env: frozenset[str] = frozenset(),
     extra_env: dict[str, str] | None = None,
     binary: bool = False,
-) -> subprocess.CompletedProcess:
-    """`git <global_args> -C <cwd> <args>` with its exit code and stderr, or
+    diagnostic: bool = False,
+) -> GitResult:
+    """`git <global_args> -C <cwd> <args>` through the supervised runner
+    (dct.core.procs.run — module docstring, PROCESSES) → its GitResult, or
     `error` (a CheckoutVerificationError) when git is missing, cannot be
-    started or times out. GIT_* variables are dropped (see _git) — except
-    the names in `keep_env` — then `extra_env` is added, and the C locale is
-    forced so git's messages can be matched. `decode_errors` is the
-    stdout/stderr decoding policy (an undecodable byte under "strict" is
-    reported as `error`); `binary` returns stdout / stderr as raw bytes."""
+    started, times out (the whole process group is stopped first), or
+    prints more DATA than GIT_OUTPUT_MAX_BYTES. GIT_* variables are dropped
+    (see _git) — except the names in `keep_env` — then `extra_env` is
+    added, and the C locale is forced so git's messages can be matched.
+    `decode_errors` is the stdout decoding policy (an undecodable byte
+    under "strict" is reported as `error`); `binary` returns stdout as raw
+    bytes; `diagnostic` marks stdout as diagnostic text (bounded, the
+    middle dropped) instead of data. stderr is always bounded text."""
     git = shutil.which("git")
     if not git:
         raise error("git is not on PATH — the checkout cannot be verified")
-    env = _git_env(keep_env, extra_env)
-    text = {} if binary else {"encoding": "utf-8", "errors": decode_errors}
+    limit = GIT_OUTPUT_MAX_BYTES
     try:
-        return subprocess.run(
-            [git, *global_args, "-C", cwd, *args],
-            env=env, capture_output=True, timeout=timeout, check=False,
-            # Never interactive: no git command dct runs reads stdin, and a
-            # hook / credential helper must not wait on the caller's terminal.
-            stdin=subprocess.DEVNULL, **text,
-        )
-    except subprocess.TimeoutExpired as exc:
-        raise error(f"git timed out after {timeout}s in {cwd}") from exc
-    except (OSError, subprocess.SubprocessError, ValueError) as exc:
+        # stdin closed, no terminal: no git command dct runs reads stdin, and
+        # a hook / credential helper must not wait on the caller's terminal.
+        done = procs.run(
+            [git, *global_args, "-C", cwd, *args], env=_git_env(keep_env, extra_env),
+            timeout=timeout, stdout=_diagnostic() if diagnostic else procs.complete(limit),
+            stderr=_diagnostic())
+    except procs.TimedOut as exc:
+        raise error(f"git timed out after {timeout}s in {cwd} (stopped with its whole "
+                    f"process group)") from exc
+    except procs.OutputLimitExceeded as exc:
+        raise error(
+            f"`git {' '.join(args)}` in {cwd} printed more than the limit of {limit} bytes "
+            f"(GIT_OUTPUT_MAX_BYTES) — its output is data that is never used cut; "
+            f"refused") from exc
+    except procs.ProcessError as exc:
         raise error(f"could not run git in {cwd}: {exc}") from exc
+    try:
+        if binary:
+            stdout: str | bytes = done.stdout.data
+        elif diagnostic:
+            stdout = done.stdout.text(decode_errors)
+        else:
+            stdout = done.stdout.data.decode("utf-8", decode_errors)
+    except ValueError as exc:
+        raise error(f"could not run git in {cwd}: {exc}") from exc
+    return GitResult(done.returncode, stdout, done.stderr.text())
 
 
 def _git_entry_on_path(path: str) -> str | None:
@@ -411,9 +471,10 @@ def git_read(
     """(exit code, stdout) of a READ-ONLY `git --no-optional-locks -C <cwd>
     <args>` (no shell, GIT_* stripped, C locale). An exit code outside
     `ok_codes`, git missing, or a timeout raises GitReadError with git's
-    stderr. stdout is returned verbatim (NUL / control separators kept;
-    bytes that are not UTF-8 — a legacy-encoded commit message — become
-    U+FFFD instead of failing the read).
+    stderr. stdout is returned verbatim and WHOLE (NUL / control separators
+    kept; bytes that are not UTF-8 — a legacy-encoded commit message —
+    become U+FFFD instead of failing the read); output over
+    GIT_OUTPUT_MAX_BYTES is a GitReadError, never a cut result (K-113).
     Callers pass only read commands — this helper never writes, and
     `--no-optional-locks` keeps git from refreshing the index on the way (a
     plain `git status` may rewrite it to update its stat cache)."""
@@ -441,53 +502,36 @@ def git_read_lines(
     locale, undecodable bytes → U+FFFD); lines come without their newline.
 
     Never a silently partial result: the generator finishes normally ONLY
-    after git exited 0. A non-zero exit, git missing, or `timeout` seconds
-    since the start (the process is killed at the deadline) raises
+    after git exited 0. A non-zero exit, git missing, `timeout` seconds
+    since the start, or one line longer than GIT_LINE_MAX_BYTES raises
     GitReadError — after the lines already yielded, so a caller must not
     use them when the iteration raised. A consumer that stops early
-    (`close()`, e.g. to refuse past its own cap) kills the process; nothing
-    is left running. The ONE process seam of the streamed readers."""
+    (`close()`, e.g. to refuse past its own cap) stops git. In every case
+    git's whole process group is stopped and reaped (dct.core.procs.
+    stream_lines — the ONE process seam of the streamed readers)."""
     cwd = os.fspath(cwd)
     git = shutil.which("git")
     if not git:
         raise GitReadError("git is not on PATH — the checkout cannot be verified")
     command = " ".join(args)
-    with tempfile.TemporaryFile() as stderr:
-        try:
-            proc = subprocess.Popen(
-                [git, "--no-optional-locks", "-C", cwd, *args], env=_git_env(),
-                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=stderr,
-            )
-        except (OSError, subprocess.SubprocessError, ValueError) as exc:
-            raise GitReadError(f"could not run git in {cwd}: {exc}") from exc
-        expired = threading.Event()
-
-        def stop() -> None:
-            expired.set()
-            proc.kill()
-
-        timer = threading.Timer(timeout, stop)
-        timer.daemon = True
-        timer.start()
-        try:
-            assert proc.stdout is not None
-            for raw in proc.stdout:
-                yield raw.decode("utf-8", "replace").rstrip("\n")
-            code = proc.wait()
-            if expired.is_set():
-                raise GitReadError(f"`git {command}` timed out after {timeout}s in {cwd}")
-            if code != 0:
-                stderr.seek(0)
-                detail = stderr.read(_STREAM_STDERR_MAX_BYTES).decode("utf-8", "replace").strip()
-                raise GitReadError(
-                    f"`git {command}` failed in {cwd}: {detail or f'exit code {code}'}")
-        finally:
-            timer.cancel()
-            if proc.poll() is None:
-                proc.kill()
-            if proc.stdout is not None:
-                proc.stdout.close()
-            proc.wait()
+    lines = procs.stream_lines(
+        [git, "--no-optional-locks", "-C", cwd, *args], env=_git_env(), timeout=timeout,
+        max_line_bytes=GIT_LINE_MAX_BYTES, stderr=procs.bounded(_STREAM_STDERR_MAX_BYTES))
+    try:
+        for raw in lines:
+            yield raw.decode("utf-8", "replace")
+    except procs.TimedOut as exc:
+        raise GitReadError(f"`git {command}` timed out after {timeout}s in {cwd}") from exc
+    except procs.Failed as exc:
+        raise GitReadError(f"`git {command}` failed in {cwd}: {exc}") from exc
+    except procs.OutputLimitExceeded as exc:
+        raise GitReadError(
+            f"`git {command}` in {cwd} printed a line over the limit of {exc.limit} bytes "
+            f"(GIT_LINE_MAX_BYTES) — refused, nothing of its output is used") from exc
+    except procs.ProcessError as exc:
+        raise GitReadError(f"could not run git in {cwd}: {exc}") from exc
+    finally:
+        lines.close()
 
 
 def git_is_ancestor(cwd: str | os.PathLike[str], ancestor: str, descendant: str) -> bool:
@@ -514,8 +558,8 @@ def git_read_blob(cwd: str | os.PathLike[str], commit: str, path: str) -> bytes 
                          timeout=GIT_READ_TIMEOUT_SECONDS,
                          global_args=("--no-optional-locks",), binary=True)
     if result.returncode != 0:
-        detail = result.stderr.decode("utf-8", "replace").strip()
-        raise GitReadError(f"`git cat-file blob {parts[2]}` failed in {cwd}: {detail}")
+        raise GitReadError(
+            f"`git cat-file blob {parts[2]}` failed in {cwd}: {result.stderr.strip()}")
     return result.stdout
 
 
@@ -530,8 +574,7 @@ def git_cat_blob(cwd: str | os.PathLike[str], blob: str, *, path: str | None = N
     result = _strict_git(cwd, *args, error=GitReadError, timeout=GIT_READ_TIMEOUT_SECONDS,
                          global_args=("--no-optional-locks",), binary=True)
     if result.returncode != 0:
-        detail = result.stderr.decode("utf-8", "replace").strip()
-        raise GitReadError(f"`git {' '.join(args)}` failed in {cwd}: {detail}")
+        raise GitReadError(f"`git {' '.join(args)}` failed in {cwd}: {result.stderr.strip()}")
     return result.stdout
 
 
@@ -566,17 +609,25 @@ class GitWriteError(CheckoutVerificationError):
 def git_write(
     cwd: str | os.PathLike[str], *args: str,
     ok_codes: tuple[int, ...] = (0,), timeout: float = GIT_READ_TIMEOUT_SECONDS,
-    index_file: str | None = None, network: bool = False,
+    index_file: str | None = None, network: bool = False, diagnostic: bool = False,
 ) -> tuple[int, str]:
     """(exit code, stdout) of a git command that MAY write (`git -C <cwd>
-    <args>`, no shell, C locale, stdin closed) — the release effects layer
-    only (dct.workflows.release.effects). GIT_* variables are dropped except
-    WRITE_ENV_PASSTHROUGH (+ NETWORK_ENV_PASSTHROUGH and
+    <args>`, no shell, C locale, stdin closed, no terminal) — the release
+    effects layer only (dct.workflows.release.effects). GIT_* variables are
+    dropped except WRITE_ENV_PASSTHROUGH (+ NETWORK_ENV_PASSTHROUGH and
     GIT_TERMINAL_PROMPT=0 with `network`); `index_file` sets GIT_INDEX_FILE
     (a TEMPORARY index — the user's index is never touched through it; a
     `git commit` exports it to the repository's hooks). An exit code outside
     `ok_codes`, git missing, or a timeout raises GitWriteError with git's
-    stderr."""
+    stderr (bounded: its start and its end).
+
+    Supervised (K-108 / K-118 L10): hooks, filters and transports git
+    starts are in its process group — a timeout or an interruption stops
+    them all before GitWriteError / the interruption is raised. stdout is
+    DATA by default (whole, or GitWriteError past GIT_OUTPUT_MAX_BYTES —
+    `ls-remote`, `hash-object`, `write-tree`); `diagnostic=True` is for
+    commands whose stdout only carries hook / transport chatter (`commit`,
+    `push`): bounded, never an error for its size (K-113)."""
     extra = {"GIT_INDEX_FILE": index_file} if index_file else {}
     keep = WRITE_ENV_PASSTHROUGH
     if network:
@@ -585,6 +636,7 @@ def git_write(
     result = _strict_git(
         os.fspath(cwd), *args, timeout=timeout, error=GitWriteError,
         decode_errors="replace", keep_env=keep, extra_env=extra or None,
+        diagnostic=diagnostic,
     )
     if result.returncode not in ok_codes:
         detail = (result.stderr or "").strip() or f"exit code {result.returncode}"

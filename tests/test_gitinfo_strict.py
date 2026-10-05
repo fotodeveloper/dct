@@ -14,7 +14,6 @@ every failure to None (pinned in test_gitinfo.py).
 
 import os
 import shutil
-import subprocess
 import sys
 from pathlib import Path
 
@@ -102,12 +101,9 @@ def test_git_missing_is_an_error_not_a_non_repository(tmp_path, monkeypatch):
 def test_timeout_is_an_error(tmp_path, monkeypatch):
     plain = tmp_path / "plain"
     plain.mkdir()
-    _use_git(monkeypatch, "/usr/bin/git")
-
-    def _timeout(*args, **kwargs):
-        raise subprocess.TimeoutExpired(cmd=args[0], timeout=gitinfo.GIT_TIMEOUT_SECONDS)
-
-    monkeypatch.setattr(gitinfo.subprocess, "run", _timeout)
+    # A REAL git that never answers (K-108: the strict commands run through
+    # the supervised runner — it is stopped at GIT_TIMEOUT_SECONDS).
+    _use_git(monkeypatch, _fake_git(tmp_path, "exec sleep 60"))
     with pytest.raises(CheckoutVerificationError, match="timed out"):
         verify_release_checkout(str(plain), cwd=str(plain))
 

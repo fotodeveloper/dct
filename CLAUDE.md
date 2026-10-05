@@ -91,6 +91,11 @@ dct/core/gitinfo.py      — Git readers (toplevel / branch / common dir) +
                            (repo root vs project root), best-effort; the
                            STRICT verify_release_checkout (confirmed repo /
                            confirmed non-repo / error) gates the CLI release
+dct/core/procs.py        — Supervised process runner (K-108/K-113): own process
+                           group, TERM→KILL + reap on timeout / interruption /
+                           exception, bounded or complete-or-refuse capture,
+                           streamed lines; used by every strict git command
+                           and the release workflow's sync script
 dct/core/records.py      — Shared STRICT project-row id validator
 dct/core/checkpoints.py  — Item checkpoint helpers
 dct/core/ids.py          — ULID generation

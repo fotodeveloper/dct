@@ -18,6 +18,19 @@ reconstruct --confirm and the old ledger commands (`clog release-advance` =
 record_progress, `clog release-abandon` = abandon — K-96 D10). A second one
 refuses at once; editors and other git processes are never blocked by it.
 
+PROCESSES (K-108, K-113, K-118 L10): the version-sync script and every git
+command — so every hook, filter and push transport git starts — run through
+the ONE supervised runner (dct.core.procs, via run_sync_script and
+dct.core.gitinfo): each in its own process group, stopped and REAPED as a
+whole on a timeout, on an interruption (Ctrl-C, SIGTERM, SIGHUP — turned
+into exceptions while the operation lock is held) and on any error, BEFORE
+the temporary worktree is removed and the lock released; output is drained
+into bounded memory, and git output that is data (refs, history, blobs,
+`ls-remote`) is read whole or refused, never cut. A dct that was KILLED
+leaves its running process groups in the lock's record — the next mutating
+command refuses while one of them lives (_operation, oplock's ownership
+model).
+
 The EXECUTOR is explicit (K-85): the project's release_executor ('dct' |
 'own') is copied onto each record at its stamp, and the RECORD decides from
 then on (a later project-setting change never takes over an unfinished
@@ -153,18 +166,15 @@ import hashlib
 import os
 import re
 import shutil
-import signal
 import stat
-import subprocess
 import tempfile
-import time
 from collections.abc import Callable, Iterable, Iterator
 from datetime import UTC, datetime
 
 import sqlalchemy as sa
 
 from dct import paths as dct_paths
-from dct.core import gitinfo
+from dct.core import gitinfo, procs
 from dct.core import releases as ledger
 from dct.core.changelog import (
     list_entries,
@@ -237,11 +247,12 @@ VERSION_ONLY_LINE = "- Version-only release — no changelog entries."
 ATTEST_SUBJECT = "chore: attest changelog entries"
 RELEASE_SUBJECT = "release: v{version}"
 
-# The version-sync script (prepare, K-96 D9): wall-clock limit, the grace a
-# stopped process group gets between SIGTERM and SIGKILL, and the cap of the
-# captured output (stdout + stderr; the rest is counted and dropped).
+# The version-sync script (prepare, K-96 D9): wall-clock limit and the cap of
+# the captured output (stdout + stderr, ONE stream; the first bytes are kept,
+# the rest is counted and dropped while it is drained — K-113). A stopped
+# process group gets dct.core.procs.TERM_GRACE_SECONDS between SIGTERM and
+# SIGKILL, like every supervised process (K-108).
 SYNC_TIMEOUT_SECONDS = 300
-SYNC_KILL_GRACE_SECONDS = 3
 SYNC_OUTPUT_MAX_BYTES = 65536
 SYNC_TIMEOUT_EXIT = 124  # the exit code of a timed-out sync (as timeout(1))
 # Creating / staging the temporary worktree of prepare (a checkout of the
@@ -253,6 +264,8 @@ COPY_MAX_FILES = 20000
 COPY_MAX_BYTES = 256 * 1024 * 1024
 # `git commit` runs the repository's hooks (a pre-commit test suite …) and
 # `git push` the remote side's — both may take far longer than a git read.
+# Past it git is stopped WITH its whole process group: the hook, the
+# transport and everything they started (K-118 L10).
 HOOK_GIT_TIMEOUT_SECONDS = 900
 
 _MARKER_RE = re.compile(r"^## \[([^\]\r\n]*)\]")
@@ -575,7 +588,8 @@ def _hook_commit(run_refuse: Callable[..., ReleaseRefused], repo: str, tree: str
         gitinfo.git_write(repo, "read-tree", tree, index_file=index)
         try:
             gitinfo.git_write(repo, "commit", "--quiet", "--allow-empty", "-m", message,
-                              index_file=index, timeout=HOOK_GIT_TIMEOUT_SECONDS)
+                              index_file=index, timeout=HOOK_GIT_TIMEOUT_SECONDS,
+                              diagnostic=True)
         except gitinfo.GitWriteError as exc:
             head = _rev(repo, "HEAD^{commit}")
             moved = "unchanged" if head == parent else f"now {head} (moved by another process)"
@@ -867,13 +881,20 @@ def _lock_file(project: dict, checkout: dict | None) -> str:
 def _operation(project: dict, checkout: dict | None, action: str) -> Iterator[None]:
     """Hold the project operation lock for one MUTATING command (K-96 D7) —
     taken before its pre-checks / stamp, released when it returns; another
-    holder → ReleaseRefused at once (nothing done, nothing waits)."""
+    holder → ReleaseRefused at once (nothing done, nothing waits). The lock
+    is also the scope of the SUPERVISED operation (K-108, oplock's
+    ownership model): SIGINT / SIGTERM / SIGHUP end the command as
+    exceptions, every process it starts is reaped before the lock is
+    released, and process groups a KILLED dct left running refuse the next
+    command (`details.process_groups`) instead of running beside it."""
     with contextlib.ExitStack() as stack:
         try:
             stack.enter_context(oplock.operation_lock(_lock_file(project, checkout), action))
         except oplock.OperationLocked as exc:
-            raise ReleaseRefused(str(exc), details={"lock": exc.path,
-                                                    "holder": exc.holder}) from None
+            details = {"lock": exc.path, "holder": exc.holder}
+            if isinstance(exc, oplock.LeftoverProcesses):
+                details["process_groups"] = exc.groups
+            raise ReleaseRefused(str(exc), details=details) from None
         yield
 
 
@@ -1234,78 +1255,39 @@ def _sync_env() -> dict[str, str]:
             if not key.startswith("GIT_") or key in gitinfo.WRITE_ENV_PASSTHROUGH}
 
 
-def _group_alive(pgid: int) -> bool:
-    try:
-        os.killpg(pgid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    return True
-
-
-def _stop_group(proc: subprocess.Popen) -> bool:
-    """Stop the script's whole process group (it runs in its own session):
-    SIGTERM, then SIGKILL after SYNC_KILL_GRACE_SECONDS; the script itself
-    is reaped. Returns True when something had to be stopped. Without
-    process groups (Windows) only the script is killed."""
-    if not hasattr(os, "killpg"):
-        stopped = proc.poll() is None
-        if stopped:
-            proc.kill()
-        proc.wait()
-        return stopped
-    pgid = proc.pid
-    stopped = False
-    for sig in (signal.SIGTERM, signal.SIGKILL):
-        if proc.poll() is not None and not _group_alive(pgid):
-            break
-        stopped = True
-        with contextlib.suppress(ProcessLookupError, PermissionError):
-            os.killpg(pgid, sig)
-        deadline = time.monotonic() + SYNC_KILL_GRACE_SECONDS
-        while time.monotonic() < deadline:
-            if proc.poll() is not None and not _group_alive(pgid):
-                break
-            time.sleep(0.02)
-    proc.wait()
-    return stopped
-
-
 def run_sync_script(script: str, version: str, cwd: str) -> dict:
-    """Run `bash <script> <version>` in `cwd` — its own session / process
-    group, stdin closed, stdout + stderr captured into ONE temporary file.
-    At most SYNC_TIMEOUT_SECONDS of wall clock; on timeout, and after a
-    normal exit for anything it left running, the whole group is stopped
-    (_stop_group) BEFORE this returns. Returns {exit_code (None on
-    timeout), timed_out, output (the first SYNC_OUTPUT_MAX_BYTES, UTF-8
-    with replacement), output_bytes (total), output_dropped_bytes,
-    stopped_processes, duration_seconds}."""
-    started = time.monotonic()
-    with tempfile.TemporaryFile() as out:
-        try:
-            proc = subprocess.Popen(
-                ["bash", script, version], cwd=cwd, stdin=subprocess.DEVNULL, stdout=out,
-                stderr=subprocess.STDOUT, env=_sync_env(), start_new_session=True)
-        except OSError as exc:
-            raise ReleaseRefused(f"the version-sync script cannot be started: {exc}") from None
-        timed_out = False
-        try:
-            proc.wait(timeout=SYNC_TIMEOUT_SECONDS)
-        except subprocess.TimeoutExpired:
-            timed_out = True
-        stopped = _stop_group(proc)
-        total = out.seek(0, os.SEEK_END)
-        out.seek(0)
-        head = out.read(SYNC_OUTPUT_MAX_BYTES)
+    """Run `bash <script> <version>` in `cwd` through the supervised runner
+    (dct.core.procs.run, K-108): its own session / process group, stdin
+    closed, stdout + stderr drained as ONE stream into bounded memory
+    (K-113 — never a file). At most SYNC_TIMEOUT_SECONDS of wall clock; on
+    a timeout, on an interruption of dct, and after a normal exit for
+    anything the script left running, the whole group is stopped and
+    reaped BEFORE this returns or raises. Returns {exit_code (None on
+    timeout), timed_out, output (the first SYNC_OUTPUT_MAX_BYTES, cut on a
+    character boundary, UTF-8 with replacement), output_bytes (total),
+    output_dropped_bytes, stopped_processes, duration_seconds}. A group
+    that cannot be confirmed dead is refused (it may still write)."""
+    timed_out = False
+    try:
+        done = procs.run(["bash", script, version], cwd=cwd, env=_sync_env(),
+                         timeout=SYNC_TIMEOUT_SECONDS, merge_stderr=True,
+                         stdout=procs.bounded(SYNC_OUTPUT_MAX_BYTES))
+    except procs.TimedOut as exc:
+        done, timed_out = exc.result, True
+    except procs.StartFailed as exc:
+        raise ReleaseRefused(f"the version-sync script cannot be started: {exc}") from None
+    except procs.GroupSurvived as exc:
+        raise ReleaseRefused(
+            f"the version-sync script could not be stopped: {exc} — its isolated copy is "
+            f"left in place; nothing prepared.", details={"process_group": exc.pgid}) from None
     return {
-        "exit_code": None if timed_out else proc.returncode,
+        "exit_code": None if timed_out else done.returncode,
         "timed_out": timed_out,
-        "output": head.decode("utf-8", "replace"),
-        "output_bytes": total,
-        "output_dropped_bytes": total - len(head),
-        "stopped_processes": stopped,
-        "duration_seconds": round(time.monotonic() - started, 3),
+        "output": done.stdout.head.decode("utf-8", "replace"),
+        "output_bytes": done.stdout.total,
+        "output_dropped_bytes": done.stdout.dropped,
+        "stopped_processes": done.stopped,
+        "duration_seconds": round(done.duration, 3),
     }
 
 
@@ -1444,25 +1426,44 @@ def _walk(root: str) -> dict[str, tuple]:
 
 
 @contextlib.contextmanager
+def _scratch_dir() -> Iterator[str]:
+    """A temporary directory for the isolated sync, removed afterwards —
+    unless a process group of this operation could not be confirmed dead
+    (procs.survivors, K-108): then it stays, with whatever still writes
+    into it."""
+    tmp = os.path.realpath(tempfile.mkdtemp(prefix="dct-release-prepare-"))
+    try:
+        yield tmp
+    finally:
+        if not procs.survivors():
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
+@contextlib.contextmanager
 def _isolated_worktree(repo: str, candidate: str) -> Iterator[str]:
     """A temporary linked worktree DETACHED at `candidate`, outside the
     user's checkout (under tempfile); the repository's hooks are disabled
     for this internal checkout (core.hooksPath = an empty directory — no
     post-checkout hook runs). Removed afterwards (`git worktree remove
-    --force` + `git worktree prune`), also on failure."""
-    tmp = os.path.realpath(tempfile.mkdtemp(prefix="dct-release-prepare-"))
-    wt, hooks = os.path.join(tmp, "worktree"), os.path.join(tmp, "no-hooks")
-    os.mkdir(hooks)
-    try:
-        gitinfo.git_write(repo, "-c", f"core.hooksPath={hooks}", "worktree", "add", "--detach",
-                          "--quiet", wt, candidate, timeout=PREPARE_GIT_TIMEOUT_SECONDS)
-        yield wt
-    finally:
-        with contextlib.suppress(gitinfo.CheckoutVerificationError):
-            gitinfo.git_write(repo, "worktree", "remove", "--force", "--force", wt)
-        with contextlib.suppress(gitinfo.CheckoutVerificationError):
-            gitinfo.git_write(repo, "worktree", "prune")
-        shutil.rmtree(tmp, ignore_errors=True)
+    --force` + `git worktree prune`), also on failure and on an
+    interruption — by then the supervised runner has reaped every process
+    that ran in it (K-108). Only when a process group could NOT be
+    confirmed dead (procs.survivors) is it left in place: nothing is
+    removed under a process that may still write there."""
+    with _scratch_dir() as tmp:
+        wt, hooks = os.path.join(tmp, "worktree"), os.path.join(tmp, "no-hooks")
+        os.mkdir(hooks)
+        try:
+            gitinfo.git_write(repo, "-c", f"core.hooksPath={hooks}", "worktree", "add",
+                              "--detach", "--quiet", wt, candidate,
+                              timeout=PREPARE_GIT_TIMEOUT_SECONDS)
+            yield wt
+        finally:
+            if not procs.survivors():
+                with contextlib.suppress(gitinfo.CheckoutVerificationError):
+                    gitinfo.git_write(repo, "worktree", "remove", "--force", "--force", wt)
+                with contextlib.suppress(gitinfo.CheckoutVerificationError):
+                    gitinfo.git_write(repo, "worktree", "prune")
 
 
 def _worktree_changes(wt: str, candidate: str) -> dict[str, tuple[str, str, str]]:
@@ -1588,8 +1589,8 @@ def _prepare_plain(run: _Run, version: str, script: tuple[str, bytes] | None) ->
         raise run.refuse(f"special files under the project directory ({', '.join(others[:5])}) "
                          f"— it cannot be copied for an isolated sync; nothing prepared.")
     files = {}
-    with tempfile.TemporaryDirectory(prefix="dct-release-prepare-") as tmp:
-        copy = os.path.join(os.path.realpath(tmp), "project")
+    with _scratch_dir() as tmp:
+        copy = os.path.join(tmp, "project")
         shutil.copytree(root, copy, symlinks=True)
         sync = run_sync_script(os.path.join(copy, *script[0].split("/")), version, copy)
         after = _walk(root)
@@ -2174,7 +2175,8 @@ def _step_push(run: _Run) -> None:
             gitinfo.git_write(run.repo, "push", "--atomic", target["remote"],
                               f"{commit}:refs/heads/{target['branch']}",
                               f"{commit}:refs/tags/{target['tag']}",
-                              network=True, timeout=HOOK_GIT_TIMEOUT_SECONDS)
+                              network=True, timeout=HOOK_GIT_TIMEOUT_SECONDS,
+                              diagnostic=True)
         except gitinfo.GitWriteError as exc:
             raise run.refuse(
                 f"the push of {run.version} to {target['remote']} ({target['branch']}, "

@@ -283,7 +283,100 @@ deleted. A second mutating command refuses AT ONCE (no waiting) with the
 holder's pid / action / start time (`details.lock`, `details.holder`). It
 is not git's `index.lock`: editors and other git processes are never
 blocked; no SQL transaction is held around the effects. Read-only commands
-(`plan`, `status`, the `reconstruct` preview) take no lock.
+(`plan`, `status`, the `reconstruct` preview) take no lock. The lock is
+also the scope of the supervised operation — next section.
+
+### Process supervision and the lock's ownership (K-108, K-113, K-118 L10)
+
+ONE runner (`dct/core/procs.py`: `run`, `stream_lines`) starts every
+external process of the release workflow: the version-sync script of
+`prepare` and every git command of the proof and the effects layer
+(`dct.core.gitinfo`: `git_read`, `git_read_lines`, `git_read_blob`,
+`git_cat_blob`, `git_write`, the strict checkout verification) — so also
+the repository's hooks, filters and the push transport, which git starts.
+
+**The process group.** Each process runs in its own session, as the leader
+of its own process group, with stdin closed and no controlling terminal:
+its children and grandchildren are in that group, the terminal's Ctrl-C
+reaches only dct, and nothing can prompt (a hook, a credential helper or an
+ssh key that needs a passphrase FAILS instead of waiting — use an agent, a
+credential helper or askpass). The runner owns the end of the group:
+
+- after a normal exit, whatever the command left running in its group is
+  stopped before the call returns;
+- on a timeout, an interruption of dct or any error in dct, the whole group
+  is stopped FIRST — SIGTERM, `procs.TERM_GRACE_SECONDS` (3 s), then
+  SIGKILL — and the runner waits until the group is gone (the leader
+  reaped, no member left). Only then is the temporary worktree removed and
+  the operation lock released: no process of a release writes into a
+  worktree that is being removed, or after the lock is free;
+- a group that cannot be confirmed gone (`procs.KILL_CONFIRM_SECONDS`, 5 s
+  after SIGKILL — a member no signal of this user reaches) is REPORTED
+  (`details.process_group` for the sync script, the git error otherwise):
+  the isolated worktree / copy is then left in place, and the group stays
+  in the lock's record (below).
+
+**Signals.** While a mutating command holds the operation lock, SIGINT
+(Ctrl-C), SIGTERM and SIGHUP on the main thread are turned into exceptions
+(KeyboardInterrupt / `procs.Interrupted`), so the command unwinds: the
+group is reaped, temporary resources removed, the lock released. The
+handlers are temporary — restored when the command ends, where a received
+SIGTERM / SIGHUP is delivered again to the original disposition (dct still
+dies from the signal, after the cleanup). A signal the caller ignores
+(`nohup`) stays ignored. While the runner starts or stops a process a
+signal is deferred until the group is reaped. Off the main thread Python
+delivers no signals, so nothing is installed there (an embedding
+application keeps its own handlers); timeouts and errors are supervised on
+every thread. SIGKILL of dct cannot be handled by any handler.
+
+**Who owns the protection** (the lock file's holder record). The record is
+`{pid, action, host, started_at, spawning, groups}`: `groups` lists the
+process groups the runner started and has not yet CONFIRMED gone,
+`spawning` is true between "about to start a process" and "its group is
+recorded"; each update is one fixed-size write. A clean release empties
+the file. When dct is killed (SIGKILL, a crash, a power loss) the kernel
+drops the flock while a group may run on — the record stays, and the NEXT
+mutating command, after taking the flock and before writing its own
+record, refuses (`details.process_groups`, `details.holder`,
+`details.lock`; the record is left untouched) while a recorded group still
+has a live process. It also refuses when it cannot tell: `spawning` was
+true (dct died between starting a process and recording its group), the
+record is of another host, or it cannot be read — the message then says
+how to clear it (check for leftover processes, then empty the lock file:
+`: > <lock>`). A record whose groups are all gone is replaced silently.
+The lock's file descriptor is deliberately NOT inherited by the processes:
+an inherited descriptor proves nothing (the holder's own unlock releases
+the shared lock, a descendant may close it) and would hand the lock to
+every daemon a hook or a transport leaves behind.
+
+Limits, stated plainly: a process that LEAVES its group (`setsid`, a
+daemon: gpg-agent, an ssh ControlMaster, git's background gc) is neither
+stopped nor waited for nor recorded; a recorded group id that the system
+reused for an unrelated process after a hard death refuses until that
+process ends or the owner empties the lock file; without process groups
+(Windows) only the started process itself is stopped and nothing is
+recorded.
+
+**Output** is drained continuously from stdout AND stderr at once (a
+process is never blocked on a full pipe, however much it prints) into
+bounded memory — never into a temporary file:
+
+| what is printed | call sites | how it is kept |
+| --- | --- | --- |
+| DIAGNOSTIC text | the sync script (stdout + stderr as one stream); stderr of every git command; stdout of `git commit` and `git push` (hook and transport chatter) | sync: the first `effects.SYNC_OUTPUT_MAX_BYTES` (64 KiB); git: the first and the last `gitinfo.GIT_DIAGNOSTIC_MAX_BYTES / 2` (32 KiB each) per stream. The rest is counted and dropped (`output_dropped_bytes`; `[… N bytes of output dropped …]` in a git error); a character split by the cut is dropped whole, never shown as U+FFFD |
+| DATA the workflow acts on — also the proof layer's input and the push verification | stdout of every other git command: `rev-parse`, `log`, `diff`, `diff-tree`, `ls-tree`, `ls-files`, `status`, `for-each-ref`, `cat-file` (blobs), `hash-object`, `write-tree`, `config`, `remote get-url`, `ls-remote` | read WHOLE up to `gitinfo.GIT_OUTPUT_MAX_BYTES` (64 MiB); past it the command is an ERROR (the plan / the step is refused) — never a cut result presented as complete |
+| DATA that grows with the history | `rev-list --parents` of the plan (`gitinfo.git_read_lines`) | streamed line by line, any size (the plan's own cap: `ANCESTRY_MAX_COMMITS`); complete only after git exited 0; one line over `gitinfo.GIT_LINE_MAX_BYTES` (1 MiB) is an error |
+
+What an interruption or a timeout leaves behind:
+
+| event | state |
+| --- | --- |
+| Ctrl-C / SIGTERM / SIGHUP during `prepare` (the sync script running) | the script and everything it started are gone; the temporary worktree is removed and pruned; no proposal stored, nothing stamped; the lock is free |
+| the sync script exceeds `SYNC_TIMEOUT_SECONDS` | the same, reported as `failed` with exit code 124 |
+| Ctrl-C / SIGTERM / SIGHUP or `HOOK_GIT_TIMEOUT_SECONDS` during `git commit` (a hook running) | git, the hook and its children are gone; no commit; the record stays `files_written` — `resume` |
+| the same during `git push` | git, the pre-push hook and the transport are gone; the record stays `tagged`; whether the remote received anything is re-read by `resume`, which retries only the push (already there → verified) |
+| dct killed with SIGKILL (or a crash) during any of these | no cleanup ran: a temporary worktree of `prepare` stays registered (`git worktree list`; remove it with `git worktree remove --force <path>` once nothing runs in it), the process group may still run — the next mutating command refuses while it does (above) |
+
 
 ### Commands
 
@@ -383,16 +476,21 @@ An explicit EFFECTS stage before the stamp — not part of the read-only plan:
    candidate, under the system temp directory (outside the checkout; the
    repository's hooks are disabled for this internal checkout via
    `core.hooksPath`), `bash <script> <V>` with cwd = the project root
-   inside it, its own process group, stdin closed, GIT_* location
-   variables dropped. Timeout `effects.SYNC_TIMEOUT_SECONDS` (300 s): the
-   whole process group is stopped (SIGTERM, SIGKILL after
-   `SYNC_KILL_GRACE_SECONDS`) before the command returns — also anything
-   the script left running after a normal exit. Captured stdout + stderr:
-   the first `SYNC_OUTPUT_MAX_BYTES` (64 KiB), the rest counted
+   inside it, its own process group, stdin closed, no terminal, GIT_*
+   location variables dropped — through the supervised runner
+   ([Process supervision](#process-supervision-and-the-locks-ownership-k-108-k-113-k-118-l10)).
+   Timeout `effects.SYNC_TIMEOUT_SECONDS` (300 s): the whole process group
+   is stopped (SIGTERM, SIGKILL after `procs.TERM_GRACE_SECONDS`) and
+   reaped before the command returns — also on Ctrl-C / SIGTERM / SIGHUP,
+   and anything the script left running after a normal exit. stdout +
+   stderr are drained as one stream into memory (never a file): the first
+   `SYNC_OUTPUT_MAX_BYTES` (64 KiB) kept, the rest counted
    (`output_dropped_bytes`). A non-zero exit → outcome `failed` with the
    script's exit code (124 on timeout); nothing stamped, no proposal. The
    worktree is removed (`git worktree remove --force` + `git worktree
-   prune`) in every case. A script that needs untracked or ignored files
+   prune`) in every case but one: a process group that could not be
+   confirmed gone keeps it (nothing is removed under a process that may
+   still write there). A script that needs untracked or ignored files
    of the real checkout (a local venv, …) fails there — reported as such,
    never retried in place.
 4. **The checkout is verified unchanged** — HEAD, every ref, the index,
@@ -586,7 +684,12 @@ apply as git applies them. The commit is built from a TEMPORARY index
 (`GIT_INDEX_FILE`, which git exports to the hooks) holding exactly the
 approved tree, so a hook checks what is committed and the user's index is
 not touched while it runs. Timeout `effects.HOOK_GIT_TIMEOUT_SECONDS`
-(900 s), stdin closed.
+(900 s), stdin closed, no terminal. git runs under the supervised runner
+([Process supervision](#process-supervision-and-the-locks-ownership-k-108-k-113-k-118-l10)):
+a hook that exceeds the timeout — or is running when dct is interrupted —
+is stopped together with everything it started (K-118 L10), and the same
+holds for `git push`, its pre-push hook and its transport. Hook output is
+kept bounded (its start and its end) in the refusal's `git_error`.
 
 - A hook that REFUSES (or a lost HEAD race, a signing failure): `git
   commit` fails, no commit is created by dct, HEAD is reported (unchanged,
@@ -755,7 +858,7 @@ One shape, `effects.RESULT_KEYS` (pinned by
 | `release` | the record (`core.releases.RECORD_FIELDS`) or null |
 | `steps` | `[{step, result, …}]` — step ∈ `sync`, `proposal` (prepare, and the `clog release` alias), `stamp`, `changelog`, `version_files`, `files`, `commit`, `index` (the real index after the commit), `tag`, `push` (`remote`, `branch`, `tag`; `skipped` with `reason` without a push target), `complete`, `attest`; result ∈ `done`, `verified`, `skipped`, `adopted`, `approved`, `conflict` (the last step of a conflict response) |
 | `warnings` | human-readable strings |
-| `details` | prepare: see [Prepare](#prepare-dct-release-prepare-k-76), plus `push_target` (what apply would push to by default — the upstream — or null, read-only); apply: `{requested_version, previous_version, bump, entry_ids, mode, released, current_version, push_target}`; attest: `{previous_head, head, entry_ids}`; abandon: `{updated}`; reconstruct: `{evidence: {version (authoritative), requested_version, spellings, entry_ids, candidate_sha, release_commit_sha, tag, tag_proof ({name, object, commit, annotated} \| null), checkout_root, manifest, status, without_git, candidates}}` (`status` = `completed` \| `committed`; `candidates` (git) = `[{commit, verified, reason}]`); advance: `{updated, previous_status}`; conflict: [Conflicts](#conflicts-k-88); refused / failed: the reason (`error`) plus the refusal's data (e.g. `staged`, `unproven`, `proposal` / `proposal_sha256` / `contract` (the alias), `mismatch`, `checkout_changed`, `foreign`, `foreign_paths`, `foreign_content`, `foreign_staged`, `changed`, `path`, `sync`, `exit_code`; the git effects: `git_error`, `commit`, `head`, `tree`, `parents`, `subject`, `expected_tree`, `index_lock`, `push_target`, `remote_tags`, `remote_branch`, `outside_consent`; the operation lock: `lock`, `holder`; the executor: `executor`, `consent`) |
+| `details` | prepare: see [Prepare](#prepare-dct-release-prepare-k-76), plus `push_target` (what apply would push to by default — the upstream — or null, read-only); apply: `{requested_version, previous_version, bump, entry_ids, mode, released, current_version, push_target}`; attest: `{previous_head, head, entry_ids}`; abandon: `{updated}`; reconstruct: `{evidence: {version (authoritative), requested_version, spellings, entry_ids, candidate_sha, release_commit_sha, tag, tag_proof ({name, object, commit, annotated} \| null), checkout_root, manifest, status, without_git, candidates}}` (`status` = `completed` \| `committed`; `candidates` (git) = `[{commit, verified, reason}]`); advance: `{updated, previous_status}`; conflict: [Conflicts](#conflicts-k-88); refused / failed: the reason (`error`) plus the refusal's data (e.g. `staged`, `unproven`, `proposal` / `proposal_sha256` / `contract` (the alias), `mismatch`, `checkout_changed`, `foreign`, `foreign_paths`, `foreign_content`, `foreign_staged`, `changed`, `path`, `sync`, `exit_code`; the git effects: `git_error`, `commit`, `head`, `tree`, `parents`, `subject`, `expected_tree`, `index_lock`, `push_target`, `remote_tags`, `remote_branch`, `outside_consent`; the operation lock: `lock`, `holder`, `process_groups` (groups a killed dct left running — or `[]` when that cannot be verified), `process_group` (a sync script's group that could not be stopped); the executor: `executor`, `consent`) |
 
 Exit codes: 0 success (also `noop`), 1 refused, the script's own code when
 the version sync fails in prepare (124 on timeout), 75 for a conflict
