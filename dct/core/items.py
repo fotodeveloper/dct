@@ -199,15 +199,20 @@ def create_item(
     tags: list[str] | None = None,
     *,
     force_tags: bool = False,
+    short_title: str | None = None,
 ) -> dict:
     """Create an item. `tags` is list[str] (CSV splitting stays at the CLI
     boundary, #31); names are normalized and registered in the global tag
     dictionary. A name the similarity guard refuses rolls the WHOLE call back —
     no orphan item, no dictionary row. `force_tags=True` bypasses that guard
-    for machine callers (not exposed over MCP)."""
+    for machine callers (not exposed over MCP). `short_title` (#817) is the
+    item's 2-4 word label: "" is stored as NULL, a value longer than the
+    column (50) raises ValueError — refused, never truncated."""
     _validate_title(title)
+    short_title = short_title or None
     ensure_fits(items, {
         "component": component, "source_file": source_file, "source_lines": source_lines,
+        "short_title": short_title,
     })
     _validate_enum(item_type, VALID_TYPES, "item_type")
     _validate_enum(priority, VALID_PRIORITIES, "priority")
@@ -221,6 +226,7 @@ def create_item(
                 project_id=project_id,
                 item_type=item_type,
                 title=title,
+                short_title=short_title,
                 description=description,
                 priority=priority,
                 status=status,
@@ -360,7 +366,7 @@ def update_item(engine: sa.Engine, item_id: int, **kwargs) -> dict | None:
     tags = kwargs.pop("tags", None)
     force_tags = kwargs.pop("force_tags", False)
 
-    allowed = {"title", "description", "priority", "status", "component", "source_file", "source_lines", "resolution", "item_type"}
+    allowed = {"title", "short_title", "description", "priority", "status", "component", "source_file", "source_lines", "resolution", "item_type"}
     values = {}
     for k, v in kwargs.items():
         if k not in allowed or v is None:
@@ -373,7 +379,9 @@ def update_item(engine: sa.Engine, item_id: int, **kwargs) -> dict | None:
             _validate_enum(v, VALID_TYPES, "item_type")
         elif k == "title":
             _validate_title(v)
-        if v == "" and k in {"component", "source_file", "source_lines", "resolution", "description"}:
+        if v == "" and k in {
+            "component", "source_file", "source_lines", "resolution", "description", "short_title",
+        }:
             v = None
         values[k] = v
 

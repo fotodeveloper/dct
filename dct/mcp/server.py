@@ -20,11 +20,10 @@ from mcp.server import MCPServer
 from dct.core.engine import bootstrap_engine
 
 # ONE preview implementation for the whole product (K-35, #413): the MCP list
-# views and the snapshot share dct.workflows.session._preview, so the
-# documented "200-char preview" means the same ceiling everywhere — 200 chars
-# INCLUDING the trailing ellipsis. (mcp → workflows is the sanctioned import
-# direction; workflows never imports the server.)
-from dct.workflows.session import _preview
+# views and the snapshot share dct.core.text._preview (re-exported by
+# dct.workflows.session), so the documented "200-char preview" means the same
+# ceiling everywhere — 200 chars INCLUDING the trailing ellipsis.
+from dct.core.text import _preview
 
 _INSTRUCTIONS = (
         "Deterministic Context Tracker — cross-project work tracking.\n\n"
@@ -40,7 +39,8 @@ _INSTRUCTIONS = (
         "- list_* return {cols:[...], rows:[[...]]}: cols names the fields once, rows are\n"
         "  value arrays in that order (short fields first, long free-text last). Legends —\n"
         "  item: id, item_type, priority, status, in_current_sprint, cp=[done,total],\n"
-        "  component, tags (list[str]), created_at, title, description; changelog: id, version,\n"
+        "  component, tags (list[str]), created_at, short_title (2-4 word label, may be\n"
+        "  null), title — list_items(view='full') appends description; changelog: id, version,\n"
         "  category, component, related_item_id, created_at, released_at, entry;\n"
         "  checkpoint: id, status, sort_order, text; handoff: id, scope, created_by,\n"
         "  created_at, consumed_at, prompt (200-char preview). format='markdown' (lossy)\n"
@@ -311,10 +311,14 @@ def _format_list(rows: list[dict], cols: list[str], format: str):
 
 
 # Column sets — short/fixed-width fields first, long free-text last.
-ITEM_COLS_DEFAULT = [
+# list_items defaults to the BRIEF view (#817): descriptions dominate the
+# payload of a large project's backlog, so they are opt-in via view='full'.
+ITEM_COLS_BRIEF = [
     "id", "item_type", "priority", "status", "in_current_sprint",
-    "cp", "component", "tags", "created_at", "title", "description",
+    "cp", "component", "tags", "created_at", "short_title", "title",
 ]
+ITEM_COLS_FULL = ITEM_COLS_BRIEF + ["description"]
+ITEM_VIEWS = {"brief": ITEM_COLS_BRIEF, "full": ITEM_COLS_FULL}
 CHANGELOG_COLS = [
     "id", "version", "category", "component", "related_item_id",
     "created_at", "released_at", "entry",
@@ -374,6 +378,7 @@ def create_item(
     item_type: str,
     title: str,
     project: str = "",
+    short_title: str = "",
     description: str = "",
     priority: str = "P2",
     component: str = "",
@@ -399,6 +404,10 @@ def create_item(
         title: Short title — hard limit 500 chars (≤ 80 recommended);
             longer titles are refused, never truncated.
         project: Project slug. Empty = auto-detect from CWD.
+        short_title: 2-4 word English noun phrase naming what the item is
+            about (e.g. 'Windows hook paths'); ≤ 50 chars, refused not
+            truncated; always pass it.
+            Shown next to the item number in every list and snapshot.
         description: Prose context (no checkbox lists — use add_checkpoint instead).
         priority: P1 (blocker) / P2 (important, default) / P3 (backlog) / future.
         component: Component or module name (≤ 100 chars).
@@ -410,17 +419,22 @@ def create_item(
             REFUSED and the whole call rolls back (no orphan item) — reuse the
             suggested name, or register yours first with add_tag(force=true).
 
-    Returns: slim ack {id, project, item_type, priority, status, title} —
-        `project` is the resolved slug (auto-detect safety echo). NOT the full
+    Returns: slim ack {id, project, item_type, priority, status, title,
+        short_title} — `project` is the resolved slug (auto-detect safety echo);
+        `short_title` echoes the STORED label (null when none was passed) — a
+        missing key means the server predates the field and ignored it. NOT the full
         item dict (no description/tags echo); call get_item for the rest.
         {"error": "..."} on invalid enum, markup, a refused tag name, an
         over-long field (refused, never truncated), or an unresolvable project.
     """
-    if (err := _reject_toolcall_markup(title=title, description=description, tags=tags)):
+    if (err := _reject_toolcall_markup(
+        title=title, short_title=short_title, description=description, tags=tags
+    )):
         return err
     from dct.core.items import create_item as _create
 
     kwargs: dict = {}
+    if short_title: kwargs["short_title"] = short_title
     if description: kwargs["description"] = description
     if component: kwargs["component"] = component
     if source_file: kwargs["source_file"] = source_file
@@ -434,6 +448,7 @@ def create_item(
         return {
             "id": d["id"], "project": project_slug, "item_type": d["item_type"],
             "priority": d["priority"], "status": d["status"], "title": d["title"],
+            "short_title": d["short_title"],
         }
     except Exception as e:
         return {"error": str(e)}
@@ -451,11 +466,19 @@ def list_items(
     tag: str = "",
     limit: int = 50,
     format: str = "structured",
+    view: str = "brief",
 ):
     """List tracked items in compact {cols,rows} form.
 
     Each row carries a `cp` field with [done, total] checkpoint progress
-    computed in a single SQL query (no N+1), and a `tags` list[str] (name-ASC).
+    computed in a single SQL query (no N+1), a `tags` list[str] (name-ASC) and
+    `short_title` (the item's 2-4 word label, may be null).
+
+    VIEWS — default 'brief' because descriptions dominate the payload of a
+    large project's backlog; call get_item(id) or view='full' for them:
+      - 'brief' (default): id, item_type, priority, status, in_current_sprint,
+        cp, component, tags, created_at, short_title, title.
+      - 'full': the brief columns + description.
 
     Args:
         project: slug; empty = CWD auto-detect, unregistered CWD = cross-project
@@ -465,7 +488,8 @@ def list_items(
         priority: P1 / P2 / P3 / future.
         component: Filter by component name.
         in_current_sprint: '' (any, default), 'true' (only sprint), 'false' (non-sprint).
-        search: Substring in title + description.
+        search: Substring in title + description — matched server-side in
+            EVERY view, so a brief row may match on a description it omits.
         tag: ONE tag name (normalized — trimmed, lowercased); keeps only items
             carrying it. The dictionary is CLOSED: an unknown name returns
             {"error": ...} naming the closest known tags (up to 3, plus a count
@@ -475,13 +499,19 @@ def list_items(
             project-scoped). Use list_tags to see what exists.
         limit: Max rows (default 50). 0 = no limit.
         format: 'structured' (default, {cols,rows}), 'markdown', 'dict'.
+        view: 'brief' (default) | 'full' — see VIEWS. With format='dict',
+            'brief' projects each dict onto the brief columns; 'full' returns
+            the full item dicts (project_id, source_*, resolution, timestamps…).
 
     Returns: {"cols": [...], "rows": [[...]]} by default, list[dict] for
         format="dict", or markdown str for format="markdown".
-        {"error": "..."} on an unknown tag.
+        {"error": "..."} on an unknown tag or an unknown view.
     """
     from dct.core.items import list_items as _list
 
+    cols = ITEM_VIEWS.get(view)
+    if cols is None:
+        return {"error": f"Unknown view {view!r} — valid: {', '.join(ITEM_VIEWS)}"}
     kwargs: dict = {"limit": limit}
     detected = _resolve_project(project, required=False)
     if detected: kwargs["project_slug"] = detected
@@ -497,7 +527,9 @@ def list_items(
 
     try:
         rows = _list(_get_engine(), **kwargs)
-        return _format_list(rows, ITEM_COLS_DEFAULT, format)
+        if format == "dict" and view == "brief":
+            rows = [{c: r.get(c) for c in cols} for r in rows]
+        return _format_list(rows, cols, format)
     except Exception as e:
         return {"error": str(e)}
 
@@ -523,6 +555,7 @@ def get_item(item_id: int) -> dict:
 def update_item(
     item_id: int,
     title: str = "",
+    short_title: str = "",
     status: str = "",
     priority: str = "",
     component: str = "",
@@ -544,6 +577,10 @@ def update_item(
         item_id: Target item.
         title: New title (non-empty, ≤ 500 chars — ≤ 80 recommended; blank or
             '__clear__' is refused).
+        short_title: 2-4 word English noun phrase naming what the item is
+            about (e.g. 'Windows hook paths'); ≤ 50 chars, refused not
+            truncated; always pass it.
+            '__clear__' nulls it.
         status: open / in_progress / resolved / wont_fix.
         priority: P1 / P2 / P3 / future.
         component: Component or module name (≤ 100 chars).
@@ -560,14 +597,16 @@ def update_item(
             the tag is resolved.
 
     Clearing a field — pass literal '__clear__' to null a NULLABLE field
-    (component, resolution, description). NOT for title/status/priority: all
+    (short_title, component, resolution, description). NOT for title/status/priority: all
     three are refused (title cannot be empty; status/priority fail enum
     validation). Tags use
     their own convention above ([], not '__clear__').
 
     Returns: slim POST-state ack {id, item_type, status, priority, title,
-        component, in_current_sprint, resolved_at, progress} — scalars reflect
-        the row AFTER the update (a '__clear__'ed component shows null here);
+        short_title, component, in_current_sprint, resolved_at, progress} —
+        scalars reflect the row AFTER the update (a '__clear__'ed component
+        shows null here; a missing short_title key means the server predates
+        the field and ignored it);
         progress is {done, pending, active}. NOT the full item dict (no
         notes/checkpoints/tags/description echo) — call get_item to read the
         resulting tag list back. {"error": "..."} on unknown id, a refused tag
@@ -575,15 +614,17 @@ def update_item(
         markup.
     """
     if (err := _reject_toolcall_markup(
-        title=title, description=description, resolution=resolution, tags=tags
+        title=title, short_title=short_title, description=description,
+        resolution=resolution, tags=tags,
     )):
         return err
     from dct.core.items import update_item as _update
 
     kwargs: dict = {}
     for field, value in [
-        ("title", title), ("status", status), ("priority", priority),
-        ("component", component), ("resolution", resolution), ("description", description),
+        ("title", title), ("short_title", short_title), ("status", status),
+        ("priority", priority), ("component", component),
+        ("resolution", resolution), ("description", description),
     ]:
         if value == "__clear__":
             kwargs[field] = ""
@@ -601,7 +642,8 @@ def update_item(
         return {
             "id": result["id"], "item_type": result["item_type"],
             "status": result["status"], "priority": result["priority"],
-            "title": result["title"], "component": result["component"],
+            "title": result["title"], "short_title": result["short_title"],
+            "component": result["component"],
             "in_current_sprint": result["in_current_sprint"],
             "resolved_at": result["resolved_at"],
             "progress": _slim_progress(result["progress"]),
@@ -1196,7 +1238,9 @@ def review_sprint(project: str = "", since: str = "last_release") -> dict:
         unconsumed_handoffs, summary. in_sprint / stale_in_progress /
         unconsumed_handoffs are {cols, rows} tables; recent_activity is a dict
         {items_changed: {cols,rows}, checkpoints_completed: int,
-        changelog_added: int}; summary is a scalar dict. NOTE the two sprint
+        changelog_added: int}; summary is a scalar dict. Every item table
+        (in_sprint, items_changed, stale_in_progress) carries a `short_title`
+        column (the item's label, may be null) before `title`. NOTE the two sprint
         numbers measure different sets: `in_sprint` lists only the OPEN members
         (current work) while `summary.sprint_size` / `sprint_completion` count
         ALL members including terminal ones (resolved work stays linked as the
@@ -1455,7 +1499,11 @@ def get_context_snapshot(
         stale_in_progress}, handoff {latest (FULL prompt), others (200-char
         previews), pending_count}, gates / decisions ({cols,rows}),
         recent_changes {items_changed, checkpoints_completed, changelog_added}.
-        COUNTING: an item in TWO active sprints counts once per sprint in
+        LABELS: rows that ARE an item (sprint.items, sprint.stale_in_progress,
+        recent_changes.items_changed) carry `short_title` (may be null); rows
+        that REFERENCE an item (gates, sprint.checkpoints) carry
+        `item_short_title` = the item's short_title, else its title compacted
+        to 50 chars (never null for a titled item). COUNTING: an item in TWO active sprints counts once per sprint in
         active_sprints[].size/done, but only ONCE (DISTINCT) in
         summary.sprint_size — the per-sprint sizes are not expected to sum to
         it. CAPS: sprint.items (100), sprint.checkpoints (500),
@@ -1884,6 +1932,7 @@ def promote_section_to_item(
     item_type: str,
     priority: str = "P2",
     title: str = "",
+    short_title: str = "",
 ) -> dict:
     """Convert a plan_section into a standalone items row with back-link.
 
@@ -1896,6 +1945,9 @@ def promote_section_to_item(
         item_type: issue | todo | feature | idea | improvement (required).
         priority: P1 | P2 | P3 | future (default P2).
         title: Override item title. Empty → use the section heading.
+        short_title: 2-4 word English noun phrase naming what the item is
+            about (e.g. 'Windows hook paths'); ≤ 50 chars, refused not
+            truncated; always pass it. Empty = no label.
 
     Returns: slim ack {id, item_type, priority, status, title} (the new item) —
         NOT the full item dict (no description echo). {"error": "..."} on failure.
@@ -1905,7 +1957,7 @@ def promote_section_to_item(
         d = _promote(
             _get_engine(), section_id,
             item_type=item_type, priority=priority,
-            title=title or None,
+            title=title or None, short_title=short_title or None,
         )
         return {"id": d["id"], "item_type": d["item_type"], "priority": d["priority"], "status": d["status"], "title": d["title"]}
     except Exception as e:
@@ -1918,6 +1970,7 @@ def promote_checkpoint_to_item(
     item_type: str,
     priority: str = "P2",
     title: str = "",
+    short_title: str = "",
 ) -> dict:
     """Convert a plan_checkpoint into a standalone items row with back-link.
 
@@ -1930,6 +1983,9 @@ def promote_checkpoint_to_item(
         priority: P1 | P2 | P3 | future (default P2).
         title: Override item title. Empty → use the checkpoint text
             (truncated to 500 chars).
+        short_title: 2-4 word English noun phrase naming what the item is
+            about (e.g. 'Windows hook paths'); ≤ 50 chars, refused not
+            truncated; always pass it. Empty = no label.
 
     Returns: slim ack {id, item_type, priority, status, title} (the new item) —
         NOT the full item dict (no description echo). {"error": "..."} on failure.
@@ -1939,7 +1995,7 @@ def promote_checkpoint_to_item(
         d = _promote(
             _get_engine(), checkpoint_id,
             item_type=item_type, priority=priority,
-            title=title or None,
+            title=title or None, short_title=short_title or None,
         )
         return {"id": d["id"], "item_type": d["item_type"], "priority": d["priority"], "status": d["status"], "title": d["title"]}
     except Exception as e:
@@ -2171,14 +2227,14 @@ def list_items_in_sprint(sprint_id: int, include_removed: bool = False, format: 
         include_removed: False (default) -> only active members; True also
             includes soft-removed links (the sprint's historical membership).
         format: 'structured' (default) -> {cols, rows} with cols = [id,
-            item_type, priority, status, title]; 'dict' -> list of full item
-            dicts.
+            item_type, priority, status, short_title, title] (short_title may
+            be null); 'dict' -> list of full item dicts.
     """
     from dct.core.sprints import list_items_in_sprint as _list
     rows = _list(_get_engine(), sprint_id=sprint_id, include_removed=include_removed)
     if format == "dict":
         return rows
-    cols = ["id", "item_type", "priority", "status", "title"]
+    cols = ["id", "item_type", "priority", "status", "short_title", "title"]
     return {"cols": cols, "rows": [[r[c] for c in cols] for r in rows]}
 
 

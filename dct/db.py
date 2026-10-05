@@ -82,6 +82,10 @@ items = sa.Table(
     sa.Column("project_id", sa.Integer, sa.ForeignKey("projects.id"), nullable=False),
     sa.Column("item_type", sa.String(20), nullable=False),
     sa.Column("title", sa.String(500), nullable=False),
+    # #817: 2-4 word label shown next to the item number wherever an item is
+    # listed or referenced. Nullable — rows that reference an item fall back
+    # to a compacted title (dct.core.text.item_label).
+    sa.Column("short_title", sa.String(50)),
     sa.Column("description", sa.Text),
     sa.Column("priority", sa.String(10), nullable=False, server_default="P2"),
     sa.Column("status", sa.String(20), nullable=False, server_default="open"),
@@ -524,6 +528,49 @@ def create_tables(engine: sa.Engine) -> None:
     _apply_schema_updates(engine)
 
 
+def _column_exists(engine: sa.Engine, table: str, column: str) -> bool:
+    """Fresh inspector read (never a cached one): does `table.column` exist?"""
+    return column in {c["name"] for c in sa.inspect(engine).get_columns(table)}
+
+
+def _add_column_if_missing(
+    engine: sa.Engine, table: str, column: str, ddl_type: str
+) -> bool:
+    """Add `table.column` of `ddl_type` unless it exists; duplicate-safe (K-25).
+
+    Two processes bootstrapping at once (a hook and the MCP server) must not
+    crash each other on the same ADD COLUMN:
+    - PostgreSQL: `ADD COLUMN IF NOT EXISTS`, inside a transaction that first
+      sets `lock_timeout` so a stuck lock fails fast instead of hanging every
+      hook behind the ACCESS EXCLUSIVE lock the ALTER needs.
+    - SQLite: inspector check, then ALTER; a "duplicate column" error is
+      treated as success once a re-check confirms the column now exists (the
+      other process won the race).
+
+    `table`, `column` and `ddl_type` are code constants, never user input.
+    Returns True when DDL was issued (on PostgreSQL: whenever the inspector saw
+    the column missing), False when the column was already there.
+    """
+    if _column_exists(engine, table, column):
+        return False
+    if engine.dialect.name == "postgresql":
+        with engine.begin() as conn:
+            conn.execute(sa.text("SET LOCAL lock_timeout = '5s'"))
+            conn.execute(sa.text(
+                f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {column} {ddl_type}"
+            ))
+        return True
+    try:
+        with engine.begin() as conn:
+            conn.execute(sa.text(f"ALTER TABLE {table} ADD COLUMN {column} {ddl_type}"))
+    except sa.exc.OperationalError as exc:
+        if "duplicate column" not in str(exc).lower() or not _column_exists(
+            engine, table, column
+        ):
+            raise
+    return True
+
+
 def _apply_schema_updates(engine: sa.Engine) -> None:
     """Idempotent schema updates for existing DBs (lightweight migration runner).
 
@@ -546,6 +593,11 @@ def _apply_schema_updates(engine: sa.Engine) -> None:
         return
 
     col_names = {c["name"] for c in inspector.get_columns("items")}
+
+    # #817: items.short_title (nullable label, no backfill). Duplicate-safe
+    # helper — two processes may bootstrap the same old database at once.
+    if "short_title" not in col_names:
+        _add_column_if_missing(engine, "items", "short_title", "VARCHAR(50)")
 
     # #222: opt-in changelog enforcement. Add projects.manages_changelog and,
     # on first add, backfill — a project KEEPS enforcement only if it already

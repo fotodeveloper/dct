@@ -4,6 +4,7 @@ from datetime import UTC, datetime
 
 import sqlalchemy as sa
 
+from dct.core.text import item_label
 from dct.db import item_checkpoints, items, row_to_dict
 
 VALID_STATUSES = {"pending", "done", "rejected"}
@@ -128,13 +129,27 @@ def _sprint_checkpoints_base(project_id: int, *columns: sa.ColumnElement) -> sa.
     )
 
 
+def _with_item_label(mapping, *, title_key: str, keep_title: bool = True) -> dict:
+    """Row dict for a row that REFERENCES an item: the raw short_title and
+    title columns become `item_short_title` via the one rule
+    (dct.core.text.item_label); the title stays under `title_key` only when
+    `keep_title`."""
+    d = dict(mapping)
+    short_title = d.pop("short_title", None)
+    title = d[title_key] if keep_title else d.pop(title_key)
+    d["item_short_title"] = item_label(short_title, title)
+    return d
+
+
 def _query_sprint_pending_gates(conn: sa.Connection, project_id: int) -> list[dict]:
     """Pending gate checkpoints on items in ANY active sprint of the project —
     the project-wide companion to list_pending_gates (which stays per-item as
     resolve_item's guard). One grouped query, no N+1. Ordered P1-first, then
     checkpoint sort_order, id tie-break.
 
-    Row shape: {item_id, checkpoint_id, kind, priority, item_title, text}.
+    Row shape: {item_id, checkpoint_id, kind, priority, item_short_title,
+    item_title, text} — item_short_title is dct.core.text.item_label (the
+    item's short_title, else its title compacted to 50 chars).
     """
     from dct.core.items import _priority_order_expr  # local: items imports checkpoints
 
@@ -145,6 +160,7 @@ def _query_sprint_pending_gates(conn: sa.Connection, project_id: int) -> list[di
             item_checkpoints.c.id.label("checkpoint_id"),
             item_checkpoints.c.kind,
             items.c.priority,
+            items.c.short_title,
             items.c.title.label("item_title"),
             item_checkpoints.c.text,
         )
@@ -154,7 +170,7 @@ def _query_sprint_pending_gates(conn: sa.Connection, project_id: int) -> list[di
         )
         .order_by(_priority_order_expr(), item_checkpoints.c.sort_order, item_checkpoints.c.id)
     ).fetchall()
-    return [dict(r._mapping) for r in rows]
+    return [_with_item_label(r._mapping, title_key="item_title") for r in rows]
 
 
 def _query_sprint_item_checkpoints(conn: sa.Connection, project_id: int) -> list[dict]:
@@ -163,7 +179,8 @@ def _query_sprint_item_checkpoints(conn: sa.Connection, project_id: int) -> list
     step straight from here, #413 K-9). Rejected checkpoints are hidden (same
     rule as list_checkpoints' default). Ordered item_id, sort_order, id.
 
-    Row shape: {item_id, id, status, kind, sort_order, text}.
+    Row shape: {item_id, id, status, kind, sort_order, item_short_title, text}
+    — item_short_title is dct.core.text.item_label of the owning item.
     """
     rows = conn.execute(
         _sprint_checkpoints_base(
@@ -173,12 +190,17 @@ def _query_sprint_item_checkpoints(conn: sa.Connection, project_id: int) -> list
             item_checkpoints.c.status,
             item_checkpoints.c.kind,
             item_checkpoints.c.sort_order,
+            items.c.short_title,
+            items.c.title.label("item_title"),
             item_checkpoints.c.text,
         )
         .where(item_checkpoints.c.status != "rejected")
         .order_by(item_checkpoints.c.item_id, item_checkpoints.c.sort_order, item_checkpoints.c.id)
     ).fetchall()
-    return [dict(r._mapping) for r in rows]
+    return [
+        _with_item_label(r._mapping, title_key="item_title", keep_title=False)
+        for r in rows
+    ]
 
 
 def list_sprint_pending_gates(engine: sa.Engine, project_slug: str) -> list[dict]:

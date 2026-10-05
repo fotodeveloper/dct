@@ -303,6 +303,7 @@ def _query_sprint_items_with_cp(conn: sa.Connection, project_id: int) -> list[di
             "priority": m["priority"],
             "status": m["status"],
             "cp": [int(m["cp_done"] or 0), int(m["cp_total"] or 0)],
+            "short_title": m["short_title"],
             "title": m["title"],
         })
     return out
@@ -347,7 +348,7 @@ def _query_stale_in_progress(
     """in_progress items untouched for `days` — updated_at ISO-formatted."""
     stale_anchor = datetime.now(UTC) - timedelta(days=days)
     stale_rows = conn.execute(
-        sa.select(items.c.id, items.c.title, items.c.updated_at)
+        sa.select(items.c.id, items.c.short_title, items.c.title, items.c.updated_at)
         .where(
             items.c.project_id == project_id,
             items.c.status == "in_progress",
@@ -360,6 +361,7 @@ def _query_stale_in_progress(
         {
             "id": r._mapping["id"],
             "updated_at": r._mapping["updated_at"].isoformat() if r._mapping["updated_at"] else None,
+            "short_title": r._mapping["short_title"],
             "title": r._mapping["title"],
         }
         for r in stale_rows
@@ -403,19 +405,19 @@ def get_sprint_review(
         "since_anchor": since_label,
         "in_sprint": _to_cols_rows(
             in_sprint_rows,
-            ["id", "priority", "status", "cp", "title"],
+            ["id", "priority", "status", "cp", "short_title", "title"],
         ),
         "recent_activity": {
             "items_changed": _to_cols_rows(
                 changed_rows,
-                ["id", "status", "updated_at", "title"],
+                ["id", "status", "updated_at", "short_title", "title"],
             ),
             "checkpoints_completed": checkpoints_done,
             "changelog_added": changelog_added,
         },
         "stale_in_progress": _to_cols_rows(
             stale,
-            ["id", "updated_at", "title"],
+            ["id", "updated_at", "short_title", "title"],
         ),
         "unconsumed_handoffs": _to_cols_rows(
             [
@@ -475,6 +477,7 @@ def _query_items_with_cp(
             "priority": m["priority"],
             "status": m["status"],
             "cp": [int(m["cp_done"] or 0), int(m["cp_total"] or 0)],
+            "short_title": m["short_title"],
             "title": m["title"],
         })
     return out
@@ -488,7 +491,9 @@ def _query_items_simple(
     """Recently-changed items, newest first, capped at 20. changed_since=None
     means no cutoff (the K-18 'all time' contract) — the limit still applies."""
     q = (
-        sa.select(items.c.id, items.c.title, items.c.status, items.c.updated_at)
+        sa.select(
+            items.c.id, items.c.short_title, items.c.title, items.c.status, items.c.updated_at,
+        )
         .where(
             items.c.project_id == project_id,
             items.c.deleted_at.is_(None),
@@ -504,6 +509,7 @@ def _query_items_simple(
             "id": r._mapping["id"],
             "status": r._mapping["status"],
             "updated_at": r._mapping["updated_at"].isoformat() if r._mapping["updated_at"] else None,
+            "short_title": r._mapping["short_title"],
             "title": r._mapping["title"],
         }
         for r in rows

@@ -561,6 +561,8 @@ def cmd_add(args):
         kwargs["priority"] = args.priority
     if args.component:
         kwargs["component"] = args.component
+    if args.short_title:
+        kwargs["short_title"] = args.short_title
     if args.tags:
         # Shell passes `--tags "a,b,c"` as a string; core expects list[str].
         # Normalize at the CLI boundary so core stays pure (see #31).
@@ -602,7 +604,7 @@ def cmd_list(args):
         # Unknown tag — the core error carries the known-names suggestion.
         print(f"✗ Error: {e}", file=sys.stderr)
         sys.exit(1)
-    headers = ["#", "Project", "Type", "Pri", "Status", "Title"]
+    headers = ["#", "Project", "Type", "Pri", "Status", "Label", "Title"]
 
     # Build project_id → slug cache
     from dct.core.projects import list_projects
@@ -611,9 +613,13 @@ def cmd_list(args):
     rows = []
     for i in items:
         slug = slug_map.get(i.get("project_id"), "?")
-        rows.append([str(i["id"]), slug, i["item_type"], i["priority"], i["status"], i["title"][:60]])
+        rows.append([
+            str(i["id"]), slug, i["item_type"], i["priority"], i["status"],
+            i.get("short_title") or "", i["title"][:60],
+        ])
 
-    _print_table(headers, rows, max_widths={5: 60})
+    # Label is capped below its 50-char column so the title keeps its room.
+    _print_table(headers, rows, max_widths={5: 30, 6: 60})
 
 
 def cmd_show(args):
@@ -627,6 +633,8 @@ def cmd_show(args):
 
     print(f"#{item['id']}  {item['item_type']}/{item['priority']}  [{item['status']}]")
     print(f"Title:       {item['title']}")
+    if item.get("short_title"):
+        print(f"Short title: {item['short_title']}")
     if item.get("description"):
         print(f"Description: {item['description']}")
     if item.get("component"):
@@ -665,6 +673,10 @@ def cmd_update(args):
         kwargs["component"] = args.component
     if args.resolution:
         kwargs["resolution"] = args.resolution
+    if args.short_title is not None:
+        # `is not None` on purpose: `--short-title ""` clears the label (core
+        # stores "" as NULL), while omitting the flag leaves it untouched.
+        kwargs["short_title"] = args.short_title
     if args.tags is not None:
         # `is not None` on purpose: `--tags ""` is a legal CLEAR (empty list),
         # while omitting the flag leaves the item's tags untouched.
@@ -1926,6 +1938,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_add.add_argument("title")
     p_add.add_argument("--priority", "-p", default="P2")
     p_add.add_argument("--component", "-c")
+    p_add.add_argument("--short-title", "-S",
+                       help="2-4 word label shown next to the item number "
+                            "(≤ 50 chars, refused not truncated)")
     p_add.add_argument("--tags", "-t")
     p_add.add_argument("--description", "-d")
     p_add.add_argument("--source-file", "-f")
@@ -1952,6 +1967,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_update.add_argument("--priority", "-p")
     p_update.add_argument("--component", "-c")
     p_update.add_argument("--resolution")
+    p_update.add_argument("--short-title", default=None,
+                          help="2-4 word label (≤ 50 chars). Omit to leave it "
+                               "unchanged; --short-title \"\" clears it.")
     # No "-t" short alias here on purpose (K-25): "-t" already means --type on
     # `list` and --tags on `add`, so on `update` it would silently tag an item
     # with what the user meant as a type. Long flag only.

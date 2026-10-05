@@ -14,7 +14,7 @@
       {% else %}<span class="pager-end">end &rarr;</span>{% endif %}
     </span>
   </nav>
-  <h1>#{{ item.id }} {{ item.title }}</h1>
+  <h1>#{{ item.id }} {{ item.title }}{% if item.short_title %} <span class="short-title">{{ item.short_title }}</span>{% endif %}</h1>
 
   <div class="meta">
     <span class="badge type">{{ item.item_type }}</span>

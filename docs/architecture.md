@@ -23,7 +23,7 @@ SQLAlchemy Core tables (not the ORM) with a `deleted_at` column for soft deletes
 
 **Core**:
 - `projects` — slug, name, path, current_version, manages_changelog, changelog_path
-- `items` — project_id, type, title, priority, status, component, source_file, source_lines, resolution, tags (**DEPRECATED** — see below). Sprint membership is **not** a column: `in_current_sprint` is derived at read time from `item_sprints` (#216 dropped the legacy boolean).
+- `items` — project_id, type, title, short_title (nullable 50-char label, #817), priority, status, component, source_file, source_lines, resolution, tags (**DEPRECATED** — see below). Sprint membership is **not** a column: `in_current_sprint` is derived at read time from `item_sprints` (#216 dropped the legacy boolean).
 - `item_notes` — item_id, note (append-only)
 - `item_checkpoints` — item_id, text, status, kind, sort_order
 - `changelog_entries` — project_id, version, category, entry, component, source_file, related_item_id
@@ -52,9 +52,10 @@ Full DDL lives in:
 - `migrations/002_sprint_and_handoff.sql`
 - `migrations/003_plans_sprints_decisions.sql`
 - `migrations/004_tags.sql`
+- `migrations/005_items_short_title.sql`
 
 At runtime, the engine applies schema via `metadata.create_all()` plus an idempotent `_apply_schema_updates()` that:
-- adds later columns in place (e.g. `item_checkpoints.kind` for gate checkpoints),
+- adds later columns in place (e.g. `item_checkpoints.kind` for gate checkpoints; new columns go through the duplicate-safe `_add_column_if_missing` — `ADD COLUMN IF NOT EXISTS` under a 5 s `lock_timeout` on PostgreSQL, a re-checked "duplicate column" error on SQLite),
 - handles dialect-specific bool literals (PostgreSQL strict, SQLite permissive), and
 - auto-migrates legacy `items.in_current_sprint=TRUE` flags into the new `item_sprints` table as a per-project "legacy sprint" (then drops the column), and
 - backfills `tags` / `item_tags` from the frozen `items.tags` JSON column (`_backfill_item_tags`): tolerant parse (bad JSON is dropped with a stderr note, never raised), per-item anti-join guard so re-tagged items are never re-seeded, and a one-shot stderr similarity report suggesting `dct tags merge` for near-duplicates — a suggestion, never a block.

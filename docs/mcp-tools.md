@@ -28,10 +28,10 @@ Project registration, rename, version, and changelog-location changes are **CLI-
 
 | Tool | Purpose |
 |---|---|
-| `create_item` | Create a tracked item (issue / todo / feature / idea / improvement). |
-| `list_items` | List tracked items in compact `{cols, rows}` form; `tag=<name>` narrows to items carrying that tag (unknown tag → `{"error": ...}` naming the closest known tags — up to 3, plus a count of the rest and a pointer to `list_tags`). |
+| `create_item` | Create a tracked item (issue / todo / feature / idea / improvement). `short_title` = the item's 2-4 word English label (≤ 50 chars, refused not truncated), shown next to the item number everywhere. |
+| `list_items` | List tracked items in compact `{cols, rows}` form. `view='brief'` (default) = `id, item_type, priority, status, in_current_sprint, cp, component, tags, created_at, short_title, title`; `view='full'` appends `description` (brief is the default because descriptions dominate a large backlog's payload; `search` still matches descriptions in both views; `format='dict'` is projected onto the brief columns only in the brief view; unknown view → `{"error": ...}`). `tag=<name>` narrows to items carrying that tag (unknown tag → `{"error": ...}` naming the closest known tags — up to 3, plus a count of the rest and a pointer to `list_tags`). |
 | `get_item` | Get full item details — fields, notes, checkpoints, progress. |
-| `update_item` | Update one or more mutable fields on an existing item. `tags` is a FULL REPLACE of the item's tag set (omit = unchanged, `[]` = clear). |
+| `update_item` | Update one or more mutable fields on an existing item. `short_title` sets the label (`'__clear__'` nulls it). `tags` is a FULL REPLACE of the item's tag set (omit = unchanged, `[]` = clear). |
 | `resolve_item` | Resolve or close an item (terminal status); auto-clears sprint flag, runs the gate-checkpoint guard. |
 | `add_note` | Append a note to an item (append-only ledger). |
 
@@ -69,7 +69,7 @@ guessing a target — pick one explicitly with `assign_item_to_sprint` /
 |---|---|
 | `set_sprint` | Atomically replace the current sprint's membership with the given ids. |
 | `clear_sprint` | Unflag every item from the current sprint (fresh planning). |
-| `review_sprint` | Session start/end dashboard — in-sprint, recent activity, stale WIP, handoffs. |
+| `review_sprint` | Session start/end dashboard — in-sprint, recent activity, stale WIP, handoffs. Every item table carries `short_title` before `title`. |
 | `add_item_to_current_sprint` | Add ONE item to the current sprint, auto-creating it if needed. |
 | `remove_item_from_current_sprint` | Remove ONE item from the current sprint (no-op if absent). |
 
@@ -82,7 +82,7 @@ guessing a target — pick one explicitly with `assign_item_to_sprint` /
 | `list_sprints` | List a project's sprints, newest first, optionally filtered. |
 | `assign_item_to_sprint` | Link an item to a sprint by explicit id (idempotent). |
 | `remove_item_from_sprint` | Soft-remove the item↔sprint link by explicit id. |
-| `list_items_in_sprint` | List items linked to a sprint, newest assignment first. |
+| `list_items_in_sprint` | List items linked to a sprint, newest assignment first (cols `id, item_type, priority, status, short_title, title`). |
 
 ## Handoffs (6)
 
@@ -111,7 +111,7 @@ a single DB transaction. **Prefer these over chaining the granular tools**:
 
 | Tool | Purpose |
 |---|---|
-| `get_context_snapshot` | One composed read: all active sprints (+ per-sprint completion), open member items with `cp`, their checkpoints, pending gates, live decisions (previewed), recent changes, summary. `include` CSV skips sections (`'none'` = headers only). |
+| `get_context_snapshot` | One composed read: all active sprints (+ per-sprint completion), open member items with `cp`, their checkpoints, pending gates, live decisions (previewed), recent changes, summary. `include` CSV skips sections (`'none'` = headers only). Item rows (`sprint.items`, `sprint.stale_in_progress`, `recent_changes.items_changed`) carry `short_title` (may be null); rows referencing an item (`gates`, `sprint.checkpoints`) carry `item_short_title` = `short_title`, else the title compacted to 50 chars. |
 | `pickup_work` | Snapshot + consume ONE handoff. `consume` enum: `''` auto (consumes only when exactly one candidate matches — several → caller picks and re-calls with `handoff_id`), `'true'`, `'false'` (pure read; contradictory with `handoff_id`). Snapshot reflects the state AFTER the write; the consumed row rides only in `picked_up` (full prompt). `consumed_by` required for auto/true. A parallel session winning the race on a SERVER-selected target degrades to `consumed: false` (no error, snapshot is post-race); an explicit `handoff_id` still errors "not found or already consumed". |
 | `handoff_work` | Sprint membership + handoff in one transaction. Session edges are ADDITIVE by default (ADR #57 — sprints are multi-session): `add_item_ids` / `remove_item_ids` pull items in / cut scope. `item_ids` is the REPLACE mode — `'__keep__'` (default, sprint untouched) / CSV (strict set); `''` or a delimiter-only string ERRORS (emptying a sprint is `clear_sprint`'s job), and replace is mutually exclusive with the additive pair. TERMINAL members (resolved / wont_fix) are the sprint's completion history: immune to replace, and removing one errors. All id lists are strict — unknown/foreign ids abort everything. `sprint` selects among multiple active sprints (id or code; id match takes precedence, an id↔code collision errors); ambiguity errors instead of guessing, and a selector without any membership change errors too. |
 
@@ -129,8 +129,8 @@ interpretation belongs to the consuming skill/assistant).
 | `list_plan_sections` | List sections in a plan, optionally filtered by parent or type. |
 | `complete_plan_checkpoint` | Mark a plan checkpoint as done. Real-time; never batch. |
 | `reject_plan_checkpoint` | Mark a plan checkpoint as rejected (scope change, N/A). |
-| `promote_section_to_item` | Convert a plan section into a standalone item, back-linked. |
-| `promote_checkpoint_to_item` | Convert a plan checkpoint into a standalone item, back-linked. |
+| `promote_section_to_item` | Convert a plan section into a standalone item, back-linked (optional `short_title`). |
+| `promote_checkpoint_to_item` | Convert a plan checkpoint into a standalone item, back-linked (optional `short_title`). |
 | `promote_section_to_sprint` | Materialize a `## Sprint N` plan section as a first-class sprint. |
 | `ingest_plan_file` | Ingest a markdown plan/spec/roadmap/ADR file into dct. |
 
@@ -171,8 +171,8 @@ Write ops return a minimal ack, not the full record. `get_item` / `get_handoff` 
 
 | Tool | Ack shape |
 |---|---|
-| `create_item` | `{id, project, item_type, priority, status, title}` |
-| `update_item` | post-state `{id, item_type, status, priority, title, component, in_current_sprint, resolved_at, progress}` (a `__clear__`ed field shows `null`) |
+| `create_item` | `{id, project, item_type, priority, status, title, short_title}` — `short_title` echoes the stored label (a missing key = a server that predates the field and ignored it) |
+| `update_item` | post-state `{id, item_type, status, priority, title, short_title, component, in_current_sprint, resolved_at, progress}` (a `__clear__`ed field shows `null`) |
 | `resolve_item` | `{id, status, resolved_at, progress}` |
 | `add_note` | `{id, item_id, item_title}` |
 | `add_checkpoint` | `{id, item_id, item_title, kind, status, sort_order}` |

@@ -10,7 +10,7 @@
   {% if current_items %}
   <ul class="item-list">
     {% for it in current_items %}
-    <li><a href="/p/{{ slug }}/items/{{ it.id }}">#{{ it.id }} {{ it.title }}</a></li>
+    <li><a href="/p/{{ slug }}/items/{{ it.id }}">#{{ it.id }} {{ it.title }}</a>{% if it.short_title %} <span class="short-title">{{ it.short_title }}</span>{% endif %}</li>
     {% endfor %}
   </ul>
   {% else %}<p class="empty">Current sprint is empty.</p>{% endif %}

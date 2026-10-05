@@ -147,7 +147,7 @@ def test_get_sprint_review_shape(engine, proj):
     review = get_sprint_review(engine, "dct", since="all")
 
     assert review["project"] == "dct"
-    assert review["in_sprint"]["cols"] == ["id", "priority", "status", "cp", "title"]
+    assert review["in_sprint"]["cols"] == ["id", "priority", "status", "cp", "short_title", "title"]
     assert len(review["in_sprint"]["rows"]) == 1
     row = review["in_sprint"]["rows"][0]
     # cp should be [1, 1]

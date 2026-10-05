@@ -54,6 +54,7 @@ from dct.core.sprint import (
     _query_total_open,
     _to_cols_rows,
 )
+from dct.core.text import PREVIEW_CHARS, _preview  # noqa: F401 — re-exported (K-35)
 from dct.db import project_transaction, session_handoffs
 
 SNAPSHOT_SECTIONS = ("sprint", "handoff", "gates", "decisions", "recent_changes")
@@ -68,23 +69,6 @@ SNAPSHOT_CAPS = {
     "handoff_others": 20,
     "stale_in_progress": 50,
 }
-
-PREVIEW_CHARS = 200
-
-
-def _preview(text: str | None, limit: int = PREVIEW_CHARS) -> str | None:
-    """Compact free text to at most `limit` chars, ELLIPSIS INCLUDED.
-
-    The documented "200-char preview" is a hard ceiling: a string of exactly
-    `limit` chars comes back untouched (no marker), a longer one becomes
-    `limit - 1` chars plus '…' — so len(result) <= limit always. Non-str input
-    (None) passes through. Single implementation, shared by the snapshot
-    (handoff.others, decision summaries) and the MCP list views (K-35).
-    """
-    if not isinstance(text, str):
-        return text
-    return text if len(text) <= limit else text[: limit - 1] + "…"
-
 
 def parse_sections(include: str | list[str] | None) -> list[str] | None:
     """Normalize an `include` argument from ANY surface into the list form the
@@ -204,17 +188,17 @@ def _build_snapshot(
             ],
             "items": _to_cols_rows(
                 _query_sprint_items_with_cp(conn, project_id),
-                ["id", "sprint_id", "priority", "status", "cp", "title"],
+                ["id", "sprint_id", "priority", "status", "cp", "short_title", "title"],
                 cap=SNAPSHOT_CAPS["sprint_items"],
             ),
             "checkpoints": _to_cols_rows(
                 _query_sprint_item_checkpoints(conn, project_id),
-                ["item_id", "id", "status", "kind", "sort_order", "text"],
+                ["item_id", "id", "status", "kind", "sort_order", "item_short_title", "text"],
                 cap=SNAPSHOT_CAPS["sprint_checkpoints"],
             ),
             "stale_in_progress": _to_cols_rows(
                 stale,
-                ["id", "updated_at", "title"],
+                ["id", "updated_at", "short_title", "title"],
                 cap=SNAPSHOT_CAPS["stale_in_progress"],
             ),
         }
@@ -242,7 +226,7 @@ def _build_snapshot(
     if "gates" in sections:
         snap["gates"] = _to_cols_rows(
             gates,
-            ["item_id", "checkpoint_id", "kind", "priority", "item_title", "text"],
+            ["item_id", "checkpoint_id", "kind", "priority", "item_short_title", "item_title", "text"],
             cap=SNAPSHOT_CAPS["gates"],
         )
 
@@ -270,7 +254,7 @@ def _build_snapshot(
         )
         snap["recent_changes"] = {
             "items_changed": _to_cols_rows(
-                changed_rows, ["id", "status", "updated_at", "title"]
+                changed_rows, ["id", "status", "updated_at", "short_title", "title"]
             ),
             "checkpoints_completed": checkpoints_done,
             "changelog_added": changelog_added,
