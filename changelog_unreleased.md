@@ -2,6 +2,7 @@
 
 ## Fixed
 
+- Require an explicit confirmation question in Codex handoff and pickup skills instead of ending with an approval reminder.
 - Reject outer function-call wrappers in MCP free-text fields and tag elements before database access (#427).
 - Refresh unchanged managed skill copies, preserve custom MCP settings and quote hook paths containing spaces.
 - Keep symlinked configuration and instruction files attached to their existing targets.

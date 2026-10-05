@@ -14,8 +14,12 @@ Draft a self-contained prompt stating completed work, pending checkpoints,
 verification results, unresolved gates and decisions, and the exact next action.
 Include enough context for another client with no conversation transcript.
 Show the complete prompt and any context summary as ordinary message text before
-requesting approval. Use a separate turn for substantial drafts, with a supported
-question UI or a plain-text question. Save only the approved version; explicit
+requesting approval. Then actually invoke the available question UI (prefer
+`request_user_input_async`) with choices to save this draft, request changes, or
+skip saving. Do not end the turn with only a statement that approval is needed.
+Keep the question pending until the user answers; a preselected choice or elapsed
+time is not approval. If no question UI is available, ask a direct plain-text
+question. Save only the approved version; explicit
 user-provided text and a request to save it already authorize that text.
 
 Default to keeping sprint membership unchanged. Show and obtain approval for any
