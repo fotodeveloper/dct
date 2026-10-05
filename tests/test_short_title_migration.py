@@ -10,6 +10,8 @@ Runs on both lanes: the `engine` fixture is in-memory SQLite by default and
 the throwaway PostgreSQL database on the PG lane.
 """
 
+import re
+
 import pytest
 import sqlalchemy as sa
 from sqlalchemy import event
@@ -24,6 +26,20 @@ _DDL_PREFIXES = ("ALTER", "CREATE", "DROP")
 
 def _columns(engine) -> set[str]:
     return {c["name"] for c in sa.inspect(engine).get_columns("items")}
+
+
+def _record_dml_touching(engine, column: str) -> list[str]:
+    """Collect every INSERT / UPDATE / DELETE statement that names `column`."""
+    seen: list[str] = []
+    dml = re.compile(r"^\s*(INSERT|UPDATE|DELETE)\b", re.IGNORECASE)
+    name = re.compile(rf"\b{column}\b", re.IGNORECASE)
+
+    def _listener(conn, cursor, statement, parameters, context, executemany):
+        if dml.match(statement) and name.search(statement):
+            seen.append(statement.strip())
+
+    event.listen(engine, "before_cursor_execute", _listener)
+    return seen
 
 
 def _record_ddl(engine) -> list[str]:
@@ -54,10 +70,13 @@ def test_three_bootstraps_from_old_schema_heal_once_then_converge(engine, capsys
     item = create_item(engine, "proj-a", "todo", "A long descriptive title",
                        short_title="Label survives")
 
+    dml = _record_dml_touching(engine, "short_title")
     for n in (2, 3):
         ddl.clear()
+        dml.clear()
         create_tables(engine)
         assert ddl == [], f"bootstrap {n} issued DDL: {ddl}"
+        assert dml == [], f"bootstrap {n} wrote short_title: {dml}"
         out = capsys.readouterr()
         assert out.out == "" and out.err == "", f"bootstrap {n} printed output"
         assert get_item(engine, item["id"])["short_title"] == "Label survives"

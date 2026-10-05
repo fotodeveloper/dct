@@ -5,6 +5,8 @@ database adds the three columns; the second and third issue NO DDL, print
 nothing and keep the data. Runs on both lanes (SQLite default, PG lane).
 """
 
+import re
+
 import sqlalchemy as sa
 from sqlalchemy import event
 
@@ -18,6 +20,20 @@ _DDL_PREFIXES = ("ALTER", "CREATE", "DROP")
 
 def _columns(engine) -> set[str]:
     return {c["name"] for c in sa.inspect(engine).get_columns("changelog_entries")}
+
+
+def _record_dml_touching_new_columns(engine) -> list[str]:
+    """Collect every INSERT / UPDATE / DELETE statement naming a #801 column."""
+    seen: list[str] = []
+    dml = re.compile(r"^\s*(INSERT|UPDATE|DELETE)\b", re.IGNORECASE)
+    names = re.compile(r"\b(branch|worktree|branch_source)\b", re.IGNORECASE)
+
+    def _listener(conn, cursor, statement, parameters, context, executemany):
+        if dml.match(statement) and names.search(statement):
+            seen.append(statement.strip())
+
+    event.listen(engine, "before_cursor_execute", _listener)
+    return seen
 
 
 def _record_ddl(engine) -> list[str]:
@@ -56,10 +72,13 @@ def test_three_bootstraps_from_old_schema_heal_once_then_converge(engine, capsys
     assert row["branch"] is None and row["worktree"] is None and row["branch_source"] is None
 
     new = add_entry(engine, "proj-a", "fixed", "After", branch="feat/x", worktree="/tmp/proj-a")
+    dml = _record_dml_touching_new_columns(engine)
     for n in (2, 3):
         ddl.clear()
+        dml.clear()
         create_tables(engine)
         assert ddl == [], f"bootstrap {n} issued DDL: {ddl}"
+        assert dml == [], f"bootstrap {n} wrote branch metadata: {dml}"
         out = capsys.readouterr()
         assert out.out == "" and out.err == "", f"bootstrap {n} printed output"
         rows = {r["id"]: r for r in list_entries(engine, "proj-a")}
