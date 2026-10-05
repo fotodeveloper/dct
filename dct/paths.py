@@ -117,9 +117,53 @@ def release_lock_dir() -> Path:
 
 
 def sqlite_url(path: PurePath | str) -> str:
+    """The ONE builder of a file-backed SQLite URL (K-99) — every SQLite URL
+    dct writes (the default config, `dct init`, migrate-home) comes from here.
+
+    Rendered by SQLAlchemy's own URL object, never by string concatenation:
+    SQLAlchemy 2.1 percent-decodes the database part of a URL when it parses
+    one and 2.0 does not, so a hand-built "sqlite:///" + path names ANOTHER
+    file on 2.1 as soon as the path holds a '%' (`a%20b.db` → `a b.db`).
+    The rendered URL reads back as the same path on the SQLAlchemy that
+    rendered it (sqlite_database_path / make_url / create_engine); its TEXT
+    may differ between versions (2.1 percent-encodes ':', '#', '?', '%').
+    A path the SQLAlchemy in use cannot express in a URL is REFUSED
+    (ValueError) instead of naming another file: on the 2.0 line a '?' in
+    the path starts the query string (2.1 handles it).
+    """
+    import sqlalchemy as sa
+
     # Honor the caller's flavour instead of re-wrapping: PurePath() re-flavours
     # a PureWindowsPath to PurePosixPath on POSIX hosts, where the drive then
     # survives as a literal "C:\\" segment on 3.11 (3.13+ normalizes it away) —
     # that made the forward-slash guarantee depend on the Python version.
     pure = path if isinstance(path, PurePath) else PurePath(path)
-    return f"sqlite:///{pure.as_posix()}"
+    database = pure.as_posix()
+    url = sa.engine.URL.create("sqlite", database=database).render_as_string(
+        hide_password=False)
+    if sa.engine.make_url(url).database != database:
+        raise ValueError(
+            f"the database path {database!r} cannot be written as a SQLite URL with "
+            f"SQLAlchemy {sa.__version__} (it would name another file) — move the "
+            f"database to a path without '?', or upgrade SQLAlchemy to 2.1+"
+        )
+    return url
+
+
+def sqlite_database_path(url: str) -> str | None:
+    """The ONE parser of a SQLite URL (K-99): the database FILE path exactly
+    as the engine resolves it for the same URL (SQLAlchemy's make_url — the
+    version in use decides about percent-decoding), or None when `url` is
+    not a file-backed SQLite URL (another dialect, an in-memory database,
+    unparseable text). Never slices the "sqlite:///" prefix by hand."""
+    import sqlalchemy as sa
+
+    try:
+        parsed = sa.engine.make_url(url)
+    except sa.exc.ArgumentError:
+        return None
+    if parsed.get_backend_name() != "sqlite":
+        return None
+    if not parsed.database or parsed.database == ":memory:":
+        return None
+    return parsed.database

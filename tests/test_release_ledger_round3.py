@@ -16,7 +16,7 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 import sqlalchemy as sa
-from conftest import run_cli
+from conftest import run_cli, tag_proof_for
 from sqlalchemy import event
 
 from dct.core.changelog import (
@@ -90,6 +90,11 @@ def _reconstruct(engine, version, ids, **kw):
     kwargs = {"entry_ids": ids, "candidate_sha": CAND, "release_commit_sha": COMMIT,
               "manifest": MANIFEST, "status": "completed", "confirm": True}
     kwargs.update(kw)
+    if kwargs["status"] in ("tagged", "completed") and kwargs["release_commit_sha"] \
+            and not kwargs.get("without_git"):
+        # K-115 G4: with git, 'tagged' and later carry the verified tag.
+        kwargs.setdefault("tag_proof", tag_proof_for(kwargs["release_commit_sha"],
+                                                     f"v{version}"))
     return reconstruct_release(engine, "proj-a", version, **kwargs)
 
 
@@ -342,21 +347,26 @@ def test_proposal_and_consent_are_canonical_and_write_once(stamped):
                "push_target": {"remote": "origin", "branch": "main", "tag": "v1.1.0"}}
     assert validate_consent(consent)["entry_ids"] == [1, 3]
     assert validate_consent(consent)["version"] == "1.1.0"
+    # K-115 G5: what is STORED must describe the record (a version-only
+    # release rendered without PR references) — the consent above does not.
+    consent = {**consent, "entry_ids": [], "render": {"pr_refs": False}}
     out = advance_release(stamped, "proj-a", "1.1.0", "stamped",
                           proposal=PROPOSAL, consent=consent)
     rec = out["release"]
     assert rec["proposal"] == proposal and rec["consent"]["proposal_sha256"] == digest
+    # With its consent the record is one dct executes: the effects actor.
     again = advance_release(stamped, "proj-a", "1.1.0", "stamped",
-                            proposal=PROPOSAL, consent=consent)
+                            proposal=PROPOSAL, consent=consent, actor="dct")
     assert again["updated"] is False
     before = _row(stamped)
     changed = {**PROPOSAL, "expected_blobs": {**PROPOSAL["expected_blobs"],
                                               "pyproject.toml": "f" * 40}}
     with pytest.raises(ValueError, match="proposal .*immutable"):
-        advance_release(stamped, "proj-a", "1.1.0", "stamped", proposal=changed)
+        advance_release(stamped, "proj-a", "1.1.0", "stamped", proposal=changed, actor="dct")
     with pytest.raises(ValueError, match="consent .*immutable"):
         advance_release(stamped, "proj-a", "1.1.0", "stamped",
-                        consent={**consent, "entry_ids": [1]})
+                        consent={**consent, "push_target": None, "render": None},
+                        actor="dct")
     assert _row(stamped) == before
 
 

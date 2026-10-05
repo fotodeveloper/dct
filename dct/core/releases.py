@@ -31,15 +31,46 @@ release_commit_sha from 'committed' on (also to reach 'completed').
 Further ledger fields (docs/release-workflow.md, "The release ledger"):
 `executor` ('dct' | 'own', K-85 — copied from the project's
 release_executor at stamp time, immutable: a later project-setting change
-never takes over an unfinished release), `consent` (what the owner approved,
+never takes over an unfinished release; K-106: the stamp compares the
+executor its caller expects with the project's setting in ITS transaction —
+check_expected_executor), `consent` (what the owner approved,
 K-97 F4), `proposal` (the approved version-file proposal, K-76) and `render`
 (the changelog render settings, K-90) — each JSON, validated, write-once.
+
+K-115 — a status is never proof. `tag_proof` (the VERIFIED identity of the
+release tag: name, the object the ref resolves to, the commit it targets,
+annotated or lightweight) and `push_proof` (the verified push target, the
+commit its tag resolved to, its branch tip) are write-once JSON the workflow
+reports and the ledger stamps with `recorded_at` — they describe the state
+at verification time, not a guarantee about later. A record WITH git cannot
+be 'tagged', 'pushed' or 'completed' without its tag proof, nor 'pushed'
+without its push proof, nor 'completed' without the push proof when its
+consent approved a push (check_proof_requirements — every executor, also a
+reconstruction). The explicit other paths: a consent with push_target null
+(a local release) and a 'without_git' record (no tag, no push). A field
+that is absent is never taken as proof (G3): a record older than a field
+gets it with its next progress write or stays unproven — nothing is added
+to old history after the fact.
+
+The fields of ONE record must describe the SAME release
+(check_record_consistency, G5 / G9): consent ↔ record (version, entry set,
+candidate, render, executor, the digest of the RECORDED proposal), proposal
+↔ record (version, candidate, release mode), the proofs ↔ the release commit
+and the consented push target — checked before every write, also a repeat.
+
+Who may write (ACTORS, K-85 / K-119 M5 / M6): every progress write and
+every abandon names its actor and the actor is ALWAYS checked (default
+'ledger' — there is no unchecked actor): a release dct's effects layer
+executes (progress_owner 'dct') is advanced and abandoned only by 'dct' —
+the local commands that hold the repository's operation lock.
 
 The record is INSERTED by changelog.release_entries in the same transaction
 as the stamp (insert_record — never a stamp without a record, never a record
 without a stamp) or, for a release made before records existed, by
 reconstruct_release (no re-stamp: the record is checked against the stamps
-already in the database). It is ADVANCED by the release workflow
+already in the database; its executor is the project's CURRENT setting — an
+explicitly assigned responsibility for the record's further handling, not
+historical provenance, G8). It is ADVANCED by the release workflow
 (advance_release) after it verified each effect. get_release reads it back,
 also "the latest unfinished release" so an interrupted /release can resume.
 
@@ -48,7 +79,16 @@ reads files or git (the local workflow does — K-51/K-72).
 
 At most one LIVE record per (project, version) — compared under the version
 contract (1.5 == 1.5.0), enforced here under the project write lock, with a
-partial unique index as the last guard.
+partial unique index as the last guard. K-115 G6: a ledger that nevertheless
+holds several live records of one SEMANTIC version (older data, raw SQL) is
+AMBIGUOUS — every write refuses (unique_record: advance, abandon, the stamp
+and its re-run, reconstruct, the history import, the pre-effect gate) and
+never picks the first one; diagnostic reads keep working and name the
+duplicates (get_release → `duplicates`).
+
+K-102: the stamp is the ONLY writer of versions — changelog.add_entry
+refuses a version and takes the same project lock; advance_release checks
+the FULL entry set (check_entry_set) in its own transaction on every call.
 
 The project's version-file contract (K-73: which repo files a release must
 change) lives on the project row; get_version_files / set_version_files are
@@ -117,6 +157,8 @@ ACTORS = ("dct", "ledger")
 _SHA_RE = re.compile(r"[0-9a-fA-F]{7,64}", re.ASCII)
 _COMMITTED = RELEASE_FLOW.index("committed")
 _FILES_WRITTEN = RELEASE_FLOW.index("files_written")
+_TAGGED = RELEASE_FLOW.index("tagged")
+_PUSHED = RELEASE_FLOW.index("pushed")
 
 # Size caps for the JSON ledger fields — refused, never truncated (#792).
 # K-92 / K-94 B4: a JSON cap is BYTES of the field's CANONICAL JSON (sorted
@@ -128,6 +170,7 @@ PROOF_MAX_BYTES = 262144
 CONSENT_MAX_BYTES = 65536
 PROPOSAL_MAX_BYTES = 65536
 MANIFEST_KEY_MAX = 64
+TAG_NAME_MAX = 255
 ABANDON_REASON_MAX = 2000
 VERSION_FILES_MAX = 200
 VERSION_FILE_PATH_MAX = 500
@@ -137,9 +180,14 @@ RECORD_FIELDS = (
     "release_commit_sha", "manifest", "proof", "status", "created_at",
     "updated_at", "completed_at", "abandoned_at", "abandon_reason",
     "release_mode", "executor", "consent", "proposal", "render",
+    "tag_proof", "push_proof",
 )
 # JSON-encoded record columns (decoded by record_to_dict).
-_JSON_FIELDS = ("manifest", "proof", "consent", "proposal", "render")
+_JSON_FIELDS = ("manifest", "proof", "consent", "proposal", "render", "tag_proof", "push_proof")
+# The ledger's own stamp inside a stored tag_proof / push_proof: WHEN the
+# proof was recorded (the state it describes is the state at verification
+# time — never a guarantee about later). Never accepted from a caller.
+PROOF_STAMP = "recorded_at"
 
 
 def check_transition(current: str, target: str) -> bool:
@@ -430,7 +478,7 @@ def validate_release_mode(mode: str | None) -> str | None:
 
 def validate_executor(executor: str) -> str:
     """'dct' | 'own' (K-85) → itself; anything else → ValueError."""
-    if executor not in EXECUTORS:
+    if not isinstance(executor, str) or executor not in EXECUTORS:
         raise ValueError(
             f"release executor must be one of {', '.join(EXECUTORS)}, got {executor!r}"
         )
@@ -451,13 +499,20 @@ def progress_owner(record: Mapping) -> str:
     return "dct" if executor == "dct" and get("consent") is not None else "ledger"
 
 
+def validate_actor(actor: str) -> str:
+    """'dct' | 'ledger' (ACTORS) → itself; anything else — None included
+    (K-119 M5: there is no "unchecked" actor) — raises ValueError."""
+    if not isinstance(actor, str) or actor not in ACTORS:
+        raise ValueError(f"actor must be one of {', '.join(ACTORS)}, got {actor!r}")
+    return actor
+
+
 def check_progress_actor(record: Mapping, actor: str) -> None:
     """K-85 / K-96 D10 — refuse a progress write by the wrong actor
     (ACTORS): a release dct executes is advanced only by the effects layer
     (`dct release resume` verifies each effect), any other only through the
     ledger path. ValueError otherwise."""
-    if actor not in ACTORS:
-        raise ValueError(f"actor must be one of {', '.join(ACTORS)}, got {actor!r}")
+    validate_actor(actor)
     get = record.get if isinstance(record, Mapping) else lambda k: getattr(record, k)
     owner = progress_owner(record)
     if actor == owner:
@@ -473,6 +528,28 @@ def check_progress_actor(record: Mapping, actor: str) -> None:
         f"'{get('executor') or DEFAULT_EXECUTOR}', "
         f"{'no recorded consent' if get('consent') is None else 'own tool'}) — dct records "
         f"no progress on it; nothing written."
+    )
+
+
+def check_abandon_actor(record: Mapping, actor: str) -> None:
+    """K-119 M6 — who may END a release as abandoned: a release dct's
+    effects layer executes (progress_owner 'dct') only by the actor 'dct' —
+    the LOCAL `dct release abandon`, which holds the repository's operation
+    lock, so no apply / resume of that release can be running; a caller
+    without that lock (actor 'ledger': MCP abandon_release, a direct core
+    call) is refused. A record the ledger path owns is abandoned by either
+    actor. ValueError otherwise."""
+    validate_actor(actor)
+    if actor == "dct" or progress_owner(record) != "dct":
+        return
+    get = record.get if isinstance(record, Mapping) else lambda k: getattr(record, k)
+    raise ValueError(
+        f"Release {get('version')} is executed by dct's effects layer (stamped by `dct "
+        f"release apply` with the owner's consent) — it is abandoned only by the local "
+        f"command, which holds the release operation lock of its repository (an abandon "
+        f"from here could not stop a running apply / resume): run `dct release abandon "
+        f"--version {get('version')} --reason \"…\" --confirm` in the project's checkout; "
+        f"nothing written."
     )
 
 
@@ -615,8 +692,227 @@ def proposal_digest(proposal: Mapping) -> str:
 
 CONSENT_KEYS = frozenset({
     "candidate_sha", "entry_ids", "version", "proposal_sha256", "render", "push_target",
+    "executor",
 })
 PUSH_TARGET_KEYS = frozenset({"remote", "url", "branch", "tag"})
+
+
+def _push_target(target, field: str) -> dict | None:
+    """A push target {"remote" (required), "url", "branch", "tag"} in
+    canonical form (all four keys, null when not given), or None."""
+    if target is None:
+        return None
+    _object(target, field, set(PUSH_TARGET_KEYS), {"remote"})
+    return {key: _text(target.get(key), f"{field}.{key}", optional=key != "remote")
+            for key in sorted(PUSH_TARGET_KEYS)}
+
+
+TAG_PROOF_KEYS = frozenset({"name", "object", "commit", "annotated"})
+PUSH_PROOF_KEYS = frozenset({"target", "tag_commit", "branch_tip"})
+
+
+def _full_sha(value, field: str) -> str:
+    sha = validate_sha(value, field) if isinstance(value, str) else None
+    if sha is None:
+        raise ValueError(f"{field} must be a hex commit id of 7-64 characters, got {value!r}")
+    return sha
+
+
+def validate_tag_proof(tag: Mapping | None) -> dict | None:
+    """The VERIFIED identity of a release tag (K-115 G4) in canonical form,
+    or None. The caller that verified the repository reports it; the ledger
+    enforces its consistency with the record (check_record_consistency).
+
+    {"name": the tag name as `git tag` lists it (unpadded, no whitespace, at
+    most TAG_NAME_MAX chars, never a `refs/...` path), "object": what
+    `refs/tags/<name>` resolves to (the tag OBJECT of an annotated tag, the
+    commit of a lightweight one), "commit": the commit the tag targets
+    (peeled), "annotated": bool} — all four required, ids hex 7-64 chars
+    (lowercased; report FULL ids — they are compared with the record's
+    release commit). A lightweight tag has object == commit, an annotated
+    one object != commit. Unknown keys (also `recorded_at` — the ledger's
+    own stamp) raise ValueError; a non-object or a non-bool `annotated`
+    raises TypeError."""
+    if tag is None:
+        return None
+    _object(tag, "tag_proof", set(TAG_PROOF_KEYS), set(TAG_PROOF_KEYS))
+    name = tag["name"]
+    if (not isinstance(name, str) or not name or len(name) > TAG_NAME_MAX
+            or name.startswith("refs/") or any(ch.isspace() for ch in name)):
+        raise ValueError(
+            f"tag_proof.name must be the tag name as `git tag` lists it (no `refs/tags/` "
+            f"prefix, no whitespace, at most {TAG_NAME_MAX} chars), got {name!r}"
+        )
+    if not isinstance(tag["annotated"], bool):
+        raise TypeError(f"tag_proof.annotated must be true or false, got {tag['annotated']!r}")
+    out = {"name": name, "object": _full_sha(tag["object"], "tag_proof.object"),
+           "commit": _full_sha(tag["commit"], "tag_proof.commit"),
+           "annotated": tag["annotated"]}
+    if out["annotated"] and out["object"] == out["commit"]:
+        raise ValueError("tag_proof: an annotated tag resolves to its tag OBJECT, never to "
+                         "the commit itself (object == commit)")
+    if not out["annotated"] and out["object"] != out["commit"]:
+        raise ValueError("tag_proof: a lightweight tag resolves to the commit itself "
+                         "(object must equal commit)")
+    return out
+
+
+def validate_push_proof(push: Mapping | None) -> dict | None:
+    """The VERIFIED push of a release (K-115 G4) in canonical form, or None:
+    {"target": {"remote" (required), "url", "branch", "tag" (required)} —
+    the push target that was read back, shaped like consent.push_target,
+    "tag_commit": the commit the target's tag resolved to (required),
+    "branch_tip": the commit the target's branch showed, or null}. Ids hex
+    7-64 chars (lowercased; FULL ids). ValueError / TypeError otherwise."""
+    if push is None:
+        return None
+    _object(push, "push_proof", set(PUSH_PROOF_KEYS), {"target", "tag_commit"})
+    target = _push_target(push["target"], "push_proof.target")
+    if target is None or target["tag"] is None:
+        raise ValueError("push_proof.target needs the remote and the tag that were verified")
+    tip = push.get("branch_tip")
+    return {"target": target,
+            "tag_commit": _full_sha(push["tag_commit"], "push_proof.tag_commit"),
+            "branch_tip": None if tip is None else _full_sha(tip, "push_proof.branch_tip")}
+
+
+def _unstamped(proof: Mapping | None) -> dict | None:
+    """A stored tag_proof / push_proof without the ledger's recorded_at."""
+    if proof is None:
+        return None
+    return {key: value for key, value in proof.items() if key != PROOF_STAMP}
+
+
+def _is_version_tag(name: str, version: str) -> bool:
+    try:
+        return same_version(normalize_version(name), version)
+    except ValueError:
+        return False
+
+
+def check_record_consistency(state: Mapping) -> None:
+    """K-115 G4 / G5 / G9 — the fields of ONE record must describe the SAME
+    release; each JSON being valid alone is not enough. `state` is a record
+    dict (get_release) or the post-state a write is about to store. Checked
+    before every ledger write (insert_record, advance_release — also a
+    repeat of the current status) and by the effects layer before any
+    effect; ValueError naming the first contradiction, nothing repaired:
+
+    - consent ↔ record: the same version (version contract), EXACTLY the
+      record's entry_ids, the same candidate_sha; `render` equal when both
+      are recorded; `executor` (when the consent names one) = the record's
+      (null counts as 'dct'); `proposal_sha256` = proposal_digest of the
+      RECORDED proposal — a digest without a proposal, or a proposal with a
+      consent that names none, is a contradiction;
+    - proposal ↔ record: its `version`, `candidate_sha` and `release_mode`
+      (each when bound) are the record's;
+    - tag_proof: only on a record with git; its `commit` is the record's
+      release_commit_sha; for a release dct executes its `name` is a
+      spelling of the version (an own tool's tag name is its own format);
+    - push_proof: only on a record with git; `tag_commit` is the release
+      commit; with a consent its `target` is EXACTLY consent.push_target —
+      and a consent that approved no push (push_target null) has none.
+    A field that is absent proves nothing and is never treated as a match
+    for a recorded one (G3)."""
+    version = state["version"]
+
+    def refuse(what: str) -> ValueError:
+        return ValueError(
+            f"release {version}: {what} — the record, its consent, proposal, render and "
+            f"proofs must describe the same release; nothing written."
+        )
+
+    consent, proposal, render = state.get("consent"), state.get("proposal"), state.get("render")
+    candidate, commit = state.get("candidate_sha"), state.get("release_commit_sha")
+    mode = state.get("release_mode")
+    if consent is not None:
+        if not same_version(consent["version"], version):
+            raise refuse(f"consent.version {consent['version']} is not the record's version")
+        if sorted(consent["entry_ids"]) != sorted(state["entry_ids"]):
+            raise refuse(f"consent.entry_ids {sorted(consent['entry_ids'])} differ from the "
+                         f"record's {sorted(state['entry_ids'])}")
+        if consent.get("candidate_sha") != candidate:
+            raise refuse(f"consent.candidate_sha {consent.get('candidate_sha')} is not the "
+                         f"record's candidate {candidate}")
+        if consent.get("render") is not None and render is not None \
+                and _canonical(consent["render"]) != _canonical(render):
+            raise refuse(f"consent.render {consent['render']} differs from the record's "
+                         f"render {render}")
+        executor = state.get("executor") or DEFAULT_EXECUTOR
+        if consent.get("executor") is not None and consent["executor"] != executor:
+            raise refuse(f"consent.executor '{consent['executor']}' is not the record's "
+                         f"executor '{executor}'")
+        digest = consent.get("proposal_sha256")
+        if digest is not None and (proposal is None or proposal_digest(proposal) != digest):
+            raise refuse("consent.proposal_sha256 does not name the recorded proposal")
+        if digest is None and proposal is not None:
+            raise refuse("consent.proposal_sha256 is null but a proposal is recorded")
+    if proposal is not None:
+        if proposal.get("version") is not None and not same_version(proposal["version"], version):
+            raise refuse(f"proposal.version {proposal['version']} is not the record's version")
+        if proposal.get("candidate_sha") is not None and proposal["candidate_sha"] != candidate:
+            raise refuse(f"proposal.candidate_sha {proposal['candidate_sha']} is not the "
+                         f"record's candidate {candidate}")
+        if proposal.get("release_mode") is not None and mode is not None \
+                and proposal["release_mode"] != mode:
+            raise refuse(f"proposal.release_mode '{proposal['release_mode']}' is not the "
+                         f"record's release_mode '{mode}'")
+    tag, push = state.get("tag_proof"), state.get("push_proof")
+    if mode == WITHOUT_GIT and (tag is not None or push is not None):
+        raise refuse("a release without git has no tag and no push (tag_proof / push_proof)")
+    if tag is not None:
+        if commit is None or tag["commit"] != commit:
+            raise refuse(f"tag_proof.commit {tag['commit']} is not the release commit {commit}")
+        if progress_owner(state) == "dct" and not _is_version_tag(tag["name"], version):
+            raise refuse(f"tag_proof.name {tag['name']!r} is not a tag of {version}")
+    if push is not None:
+        if commit is None or push["tag_commit"] != commit:
+            raise refuse(f"push_proof.tag_commit {push['tag_commit']} is not the release "
+                         f"commit {commit}")
+        if consent is not None:
+            approved = consent.get("push_target")
+            if approved is None:
+                raise refuse("push_proof contradicts the consent: no push was approved "
+                             "(push_target null — an explicit local release)")
+            if _canonical(push["target"]) != _canonical(approved):
+                raise refuse(f"push_proof.target {push['target']} is not the approved push "
+                             f"target {approved}")
+
+
+def check_proof_requirements(state: Mapping, status: str) -> None:
+    """K-115 G4 — a status is never proof: what a record WITH git must carry
+    to be at `status` (checked on every move into it, at reconstruction
+    too, for every executor). ValueError otherwise.
+
+    - 'tagged' and later ('pushed', 'completed'): `tag_proof`, the verified
+      tag identity targeting the release commit;
+    - 'pushed': `push_proof`;
+    - 'completed' when the recorded scope includes a push
+      (consent.push_target set): `push_proof` for exactly that target.
+    Separate, explicit paths: a consent with push_target null (an explicit
+    local release, `--no-push`) and a record without a consent (its push
+    scope is not recorded) complete from 'tagged' without a push; a
+    'without_git' record has no tag and no push at all."""
+    if state.get("release_mode") == WITHOUT_GIT or status not in RELEASE_FLOW:
+        return
+    version, rank = state["version"], _rank(status)
+    if rank >= _TAGGED and state.get("tag_proof") is None:
+        raise ValueError(
+            f"Release {version} cannot be '{status}' without its tag_proof — the VERIFIED "
+            f"identity of its tag ({{name, object, commit, annotated}}, the commit being the "
+            f"release commit); a status alone is never proof that the tag exists; nothing "
+            f"written."
+        )
+    approved = (state.get("consent") or {}).get("push_target")
+    if state.get("push_proof") is None and (
+            status == "pushed" or (status == "completed" and approved is not None)):
+        why = "its consent approved a push" if approved is not None else \
+            "'pushed' records a verified push"
+        raise ValueError(
+            f"Release {version} cannot be '{status}' without its push_proof ({why}) — the "
+            f"VERIFIED push target ({{target, tag_commit, branch_tip}}); a release without a "
+            f"push completes from 'tagged' (an explicit local release); nothing written."
+        )
 
 
 def validate_consent(consent: Mapping | None) -> dict | None:
@@ -627,8 +923,12 @@ def validate_consent(consent: Mapping | None) -> dict | None:
     sorted, deduplicated), "candidate_sha": sha | null, "proposal_sha256":
     proposal_digest of the approved version-file proposal | null, "render":
     validate_render | null, "push_target": null | {"remote" (required),
-    "url", "branch", "tag"} (strings)}. ≤ CONSENT_MAX_BYTES of canonical
-    JSON. ValueError / TypeError otherwise."""
+    "url", "branch", "tag"} (strings)} plus the OPTIONAL "executor" ('dct' |
+    'own', K-106 — who the owner approved to perform the release; the stamp
+    compares it with the project's setting in its transaction; the key is
+    kept only when given, so consents recorded before it compare
+    unchanged). ≤ CONSENT_MAX_BYTES of canonical JSON. ValueError /
+    TypeError otherwise."""
     if consent is None:
         return None
     _object(consent, "consent", set(CONSENT_KEYS), {"version", "entry_ids"})
@@ -636,11 +936,7 @@ def validate_consent(consent: Mapping | None) -> dict | None:
     if isinstance(raw_ids, (str, bytes)) or not isinstance(raw_ids, (list, tuple)):
         raise TypeError("consent.entry_ids must be a list of entry ids")
     ids = sorted({_entry_id(i) for i in raw_ids})
-    push = consent.get("push_target")
-    if push is not None:
-        _object(push, "consent.push_target", set(PUSH_TARGET_KEYS), {"remote"})
-        push = {key: _text(push.get(key), f"consent.push_target.{key}", optional=key != "remote")
-                for key in sorted(PUSH_TARGET_KEYS)}
+    push = _push_target(consent.get("push_target"), "consent.push_target")
     out = {
         "version": normalize_version(_text(consent["version"], "consent.version", 50)),
         "entry_ids": ids,
@@ -649,6 +945,8 @@ def validate_consent(consent: Mapping | None) -> dict | None:
         "render": validate_render(consent.get("render")),
         "push_target": push,
     }
+    if consent.get("executor") is not None:
+        out["executor"] = validate_executor(consent["executor"])
     ensure_json_fits(out, "consent", CONSENT_MAX_BYTES)
     return out
 
@@ -694,17 +992,54 @@ def record_to_dict(row) -> dict:
     return record
 
 
-def find_record(conn: sa.Connection, project_id: int, version: str):
-    """The LIVE record of `version` (version contract equality), or None."""
-    rows = conn.execute(
+def live_records(conn: sa.Connection, project_id: int) -> list:
+    """Every LIVE release record of the project, oldest id first."""
+    return list(conn.execute(
         sa.select(releases).where(
             releases.c.project_id == project_id, releases.c.deleted_at.is_(None)
         ).order_by(releases.c.id)
-    ).all()
-    for row in rows:
-        if same_version(row.version, version):
-            return row
-    return None
+    ).all())
+
+
+def find_records(conn: sa.Connection, project_id: int, version: str) -> list:
+    """EVERY live record of `version` under the version contract (1.1 ==
+    1.1.0 == v1.1), oldest id first. More than one is an AMBIGUOUS ledger
+    (K-115 G6): the unique index compares the stored text only, and data
+    written before it existed may violate even that."""
+    return [row for row in live_records(conn, project_id) if same_version(row.version, version)]
+
+
+def find_record(conn: sa.Connection, project_id: int, version: str):
+    """The LIVE record of `version` (version contract equality), or None —
+    for READS: with duplicates it returns the oldest one (the caller names
+    the others, see get_release). Writers use unique_record."""
+    rows = find_records(conn, project_id, version)
+    return rows[0] if rows else None
+
+
+def describe_duplicates(rows) -> list[dict]:
+    """[{id, version, status}] of the given record rows (oldest first)."""
+    return [{"id": row.id, "version": row.version, "status": row.status} for row in rows]
+
+
+def unique_record(conn: sa.Connection, project_id: int, project_slug: str, version: str):
+    """The ONE live record of `version`, or None — for every WRITE (advance,
+    abandon, the stamp and its re-run, reconstruct, the history import, the
+    pre-effect gate). K-115 G6: several live records of the same SEMANTIC
+    version make the ledger ambiguous — a write never picks the first one;
+    ValueError naming every duplicate, nothing written."""
+    rows = find_records(conn, project_id, version)
+    if len(rows) > 1:
+        listing = ", ".join(f"#{d['id']} ({d['version']}, {d['status']})"
+                            for d in describe_duplicates(rows))
+        raise ValueError(
+            f"the release ledger of '{project_slug}' holds {len(rows)} live records of the "
+            f"same version: {listing} — a write never picks one of them. Inspect them "
+            f"(`dct release status --version {rows[0].version} --json` lists `duplicates`), "
+            f"soft-delete the wrong row(s) by hand (releases.deleted_at), then run the "
+            f"command again; nothing written."
+        )
+    return rows[0] if rows else None
 
 
 def project_release_settings(conn: sa.Connection, project_id: int) -> dict:
@@ -718,6 +1053,25 @@ def project_release_settings(conn: sa.Connection, project_id: int) -> dict:
         "executor": row.release_executor or DEFAULT_EXECUTOR,
         "render": {"pr_refs": bool(row.changelog_pr_refs)},
     }
+
+
+def check_expected_executor(conn: sa.Connection, project_id: int, project_slug: str,
+                            expected: str | None) -> None:
+    """K-106 — inside the STAMP transaction, before any write: the executor
+    the caller's plan / consent expects (`expected`; None = not bound) must
+    be the project's CURRENT release_executor (read on the stamp's
+    connection, under the project lock set_release_executor also takes).
+    ValueError otherwise — nothing stamped, no record, no contract change."""
+    if expected is None:
+        return
+    current = project_release_settings(conn, project_id)["executor"]
+    if current != expected:
+        raise ValueError(
+            f"the approved release expects the executor '{expected}', but the release "
+            f"executor of '{project_slug}' is now '{current}' — the setting changed since "
+            f"the plan; plan again under the current executor (`dct project "
+            f"release-executor`); nothing released."
+        )
 
 
 def check_mode_consistency(release_mode: str | None, candidate_sha: str | None,
@@ -756,15 +1110,21 @@ def insert_record(
     consent: dict | None = None,
     proposal: dict | None = None,
     render: dict | None = None,
+    tag_proof: dict | None = None,
+    push_proof: dict | None = None,
 ) -> dict:
     """Insert a record on the caller's (stamping) connection.
 
-    Callers have validated every value and checked find_record under the same
-    project write lock; the partial unique index still refuses a duplicate.
+    Callers have validated every value and checked unique_record under the
+    same project write lock; the partial unique index still refuses a duplicate.
     The version must fit the schema (ensure_version_fits — the value actually
     stored, K-87). `executor` is copied from the project's release_executor
     (K-85) — never a parameter. A record inserted as 'completed'
-    (reconstruction) gets completed_at = now.
+    (reconstruction) gets completed_at = now. K-115: the record's fields
+    must agree with EACH OTHER (check_record_consistency) and carry the
+    proofs its status needs (check_proof_requirements; `tag_proof` /
+    `push_proof` — validated — are stamped with recorded_at = now) —
+    ValueError before the INSERT otherwise.
     """
     if mode not in RELEASE_MODES:
         raise ValueError(f"Invalid release mode: '{mode}'")
@@ -773,6 +1133,18 @@ def insert_record(
     ensure_version_fits(version)
     check_mode_consistency(release_mode, candidate_sha, release_commit_sha, status)
     settings = project_release_settings(conn, project_id)
+    _check_proof_timing(tag_proof, push_proof, status)
+    state = {
+        "version": version, "entry_ids": list(entry_ids), "candidate_sha": candidate_sha,
+        "release_commit_sha": release_commit_sha, "release_mode": release_mode,
+        "executor": settings["executor"], "consent": consent, "proposal": proposal,
+        "render": render, "tag_proof": tag_proof, "push_proof": push_proof,
+    }
+    check_record_consistency(state)
+    check_proof_requirements(state, status)
+    stamp = {PROOF_STAMP: now.astimezone(UTC).isoformat()}
+    tag_proof = None if tag_proof is None else {**tag_proof, **stamp}
+    push_proof = None if push_proof is None else {**push_proof, **stamp}
 
     def encoded(value):
         return None if value is None else _canonical(value)
@@ -794,6 +1166,8 @@ def insert_record(
             consent=encoded(consent),
             proposal=encoded(proposal),
             render=encoded(render),
+            tag_proof=encoded(tag_proof),
+            push_proof=encoded(push_proof),
             created_at=now,
             updated_at=now,
             completed_at=now if status == "completed" else None,
@@ -802,8 +1176,26 @@ def insert_record(
     return record_to_dict(row)
 
 
+def _check_proof_timing(tag_proof, push_proof, status: str) -> None:
+    """A tag proof belongs to 'tagged' or later, a push proof to 'pushed' or
+    later — ValueError for a premature one."""
+    rank = _rank(status)
+    if tag_proof is not None and rank < _TAGGED:
+        raise ValueError(
+            f"tag_proof is recorded on the move to 'tagged' or later, not at '{status}'; "
+            f"nothing written."
+        )
+    if push_proof is not None and rank < _PUSHED:
+        raise ValueError(
+            f"push_proof is recorded on the move to 'pushed' or later, not at '{status}'; "
+            f"nothing written."
+        )
+
+
 def _require_record(conn: sa.Connection, pid: int, project_slug: str, version: str):
-    row = find_record(conn, pid, version)
+    """The ONE live record of `version` for a write (unique_record — an
+    ambiguous ledger refuses), ValueError when there is none."""
+    row = unique_record(conn, pid, project_slug, version)
     if row is None:
         raise ValueError(
             f"No release record for version {version} in '{project_slug}' — "
@@ -849,6 +1241,13 @@ def get_release(engine: sa.Engine, project_slug: str, version: str | None = None
     terminal (neither 'completed' nor 'abandoned') — an unfinished release a
     workflow should resume — else None. `version` follows the version
     contract (ValueError "Unsupported version"). Read-only.
+
+    K-115 G6 — a diagnostic read keeps working on an AMBIGUOUS ledger:
+    when several live records hold the same semantic version (1.1 and
+    1.1.0), the oldest one is returned with the extra key `duplicates`
+    ([{id, version, status}] of ALL of them, oldest first). The key is
+    absent on a healthy ledger. Every WRITE refuses such a version
+    (unique_record).
     """
     if version:
         version = normalize_version(version)
@@ -858,7 +1257,13 @@ def get_release(engine: sa.Engine, project_slug: str, version: str | None = None
             row = find_record(conn, pid, version)
         else:
             row = _latest_unfinished(conn, pid)
-        return record_to_dict(row) if row is not None else None
+        if row is None:
+            return None
+        record = record_to_dict(row)
+        same = find_records(conn, pid, row.version)
+        if len(same) > 1:
+            record["duplicates"] = describe_duplicates(same)
+        return record
 
 
 def _latest_unfinished(conn: sa.Connection, pid: int):
@@ -877,8 +1282,10 @@ def verify_release_entry_set(
     """K-94 B3 — the pre-effect gate of a resume / retry: the record of
     `version` (default: the latest unfinished one) whose entry set equals
     EXACTLY the live entries carrying its version. Returns the record;
-    ValueError when there is no such record or the sets differ (check_entry_set
-    — the record is never extended). Read-only: one consistent snapshot."""
+    ValueError when there is no such record, the sets differ (check_entry_set
+    — the record is never extended) or the ledger holds several live
+    records of that version (K-115 G6 — the gate of every effect is a write
+    gate: unique_record). Read-only: one consistent snapshot."""
     if version:
         version = normalize_version(version)
     with project_transaction(engine, project_slug) as (conn, pid):
@@ -886,6 +1293,7 @@ def verify_release_entry_set(
             _latest_unfinished(conn, pid)
         if row is None:
             raise ValueError(f"No unfinished release record in '{project_slug}'.")
+        row = _require_record(conn, pid, project_slug, row.version)
         check_entry_set(conn, pid, row)
         return record_to_dict(row)
 
@@ -905,7 +1313,9 @@ def advance_release(
     consent: Mapping | None = None,
     proposal: Mapping | None = None,
     render: Mapping | None = None,
-    actor: str | None = None,
+    actor: str = "ledger",
+    tag_proof: Mapping | None = None,
+    push_proof: Mapping | None = None,
 ) -> dict:
     """Record verified progress: move the release record of `version` along
     the state machine and/or record the effects the workflow verified.
@@ -940,8 +1350,29 @@ def advance_release(
       reporting its own verified effects); checked against the RECORD
       (check_progress_actor) before anything else, also for a repeat: a
       record dct executes (progress_owner 'dct') accepts only 'dct', every
-      other record only 'ledger'. None = not checked (core callers and
-      tests that drive the ledger directly).
+      other record only 'ledger'. K-119 M5: ALWAYS checked — the default
+      is 'ledger' (a caller that names no actor never advances a release
+      dct executes); any other value, None included, raises ValueError.
+    - `tag_proof` / `push_proof` (K-115 G4, validate_tag_proof /
+      validate_push_proof): the VERIFIED tag identity and push target —
+      write-once, stored with the ledger's `recorded_at` (the state at
+      verification time, not a guarantee about later); the stored value
+      again is a confirmation, a different one raises ValueError; a tag
+      proof is accepted from 'tagged' on, a push proof from 'pushed' on. A
+      status is never proof: unless the record is 'without_git', no move
+      into 'tagged' / 'pushed' / 'completed' succeeds without the tag
+      proof, none into 'pushed' without the push proof, and none into
+      'completed' without the push proof when the consent approved a push
+      (check_proof_requirements) — for every executor.
+    - K-115 G5 / G9: the POST-state must be one consistent release
+      (check_record_consistency: record ↔ consent ↔ proposal ↔ render ↔
+      proofs) — checked on every call, also a repeat.
+    - K-115 G6: several live records of the same semantic version refuse
+      the write (unique_record).
+    - K-102: the record's entry set must equal EXACTLY the live entries
+      carrying its version (check_entry_set, in this transaction) — also for
+      a repeat of the current status; a record is never extended or shrunk
+      to fit, and no progress is recorded on an inconsistent one.
 
     Returns {"release": <record>, "updated": bool} — `updated` False when
     nothing changed (idempotent repeat).
@@ -961,12 +1392,18 @@ def advance_release(
         "proposal": validate_proposal(proposal),
         "render": validate_render(render),
     }
-    if actor is not None and actor not in ACTORS:
-        raise ValueError(f"actor must be one of {', '.join(ACTORS)}, got {actor!r}")
+    proofs = {
+        "tag_proof": validate_tag_proof(tag_proof),
+        "push_proof": validate_push_proof(push_proof),
+    }
+    validate_actor(actor)
     with project_transaction(engine, project_slug, write=True) as (conn, pid):
         row = _require_record(conn, pid, project_slug, version)
-        if actor is not None:
-            check_progress_actor(row, actor)
+        check_progress_actor(row, actor)
+        # K-102: the FULL entry set, in THIS transaction — also for a retry
+        # of the current status: no progress on a record whose version other
+        # entries carry (or lost), and the record is never extended to fit.
+        check_entry_set(conn, pid, row)
         moves = check_transition(row.status, status)
         final = status if moves else row.status
         values: dict = {}
@@ -1013,6 +1450,38 @@ def advance_release(
                 f"of its verified artifacts; nothing written."
             )
 
+        # K-115 G4: the tag / push proofs — write-once, stamped by the ledger.
+        now = datetime.now(UTC)
+        new_proofs = {}
+        for field, given in proofs.items():
+            if given is None:
+                continue
+            stored = _load_json(getattr(row, field))
+            if stored is None:
+                new_proofs[field] = given
+            elif _canonical(_unstamped(stored)) != _canonical(given):
+                raise ValueError(
+                    f"{field} is already recorded with a different value — it is immutable "
+                    f"(it describes what was verified then); nothing written."
+                )
+        _check_proof_timing(new_proofs.get("tag_proof"), new_proofs.get("push_proof"), final)
+        for field, given in new_proofs.items():
+            values[field] = _canonical({**given, PROOF_STAMP: now.isoformat()})
+
+        # K-115 G5 / G9: the POST-state must be one consistent release — also
+        # for a repeat (a contradiction seeded outside the API blocks progress).
+        state = {
+            "version": row.version, "entry_ids": json.loads(row.entry_ids),
+            "candidate_sha": row.candidate_sha, "release_commit_sha": commit,
+            "release_mode": mode, "executor": row.executor,
+            **{field: json.loads(values[field]) if field in values
+               else _load_json(getattr(row, field))
+               for field in ("consent", "proposal", "render", "tag_proof", "push_proof")},
+        }
+        check_record_consistency(state)
+        if moves:
+            check_proof_requirements(state, final)
+
         if not values:
             return {"release": record_to_dict(row), "updated": False}
         if row.status in TERMINAL_STATUSES:
@@ -1020,7 +1489,6 @@ def advance_release(
                 f"Release {row.version} is '{row.status}' — a terminal status; "
                 f"nothing can be recorded on it any more; nothing written."
             )
-        now = datetime.now(UTC)
         values["updated_at"] = now
         if final == "completed" and row.completed_at is None:
             values["completed_at"] = now
@@ -1038,8 +1506,18 @@ def abandon_release(
     reason: str,
     *,
     confirm: bool = False,
+    actor: str = "ledger",
 ) -> dict:
     """End an unfinished release as 'abandoned' (K-60) — ledger only.
+
+    `actor` (ACTORS, K-119 M5/M6 — always checked, default 'ledger'; any
+    other value, None included, raises ValueError): a release dct's effects
+    layer executes (progress_owner 'dct') is abandoned ONLY by 'dct' — the
+    local `dct release abandon` (effects.abandon), which holds the
+    repository's operation lock; 'ledger' (MCP abandon_release, a direct
+    core call — no lock, a running apply / resume could go on) is refused
+    with the local command (check_abandon_actor). A record the ledger path
+    owns is abandoned by either actor.
 
     Requires `confirm=True` and a non-empty `reason` (stripped, at most
     ABANDON_REASON_MAX characters); ValueError otherwise. Allowed from every
@@ -1069,8 +1547,10 @@ def abandon_release(
             f"refused, never truncated"
         )
     version = normalize_version(version)
+    validate_actor(actor)
     with project_transaction(engine, project_slug, write=True) as (conn, pid):
         row = _require_record(conn, pid, project_slug, version)
+        check_abandon_actor(row, actor)
         if row.status == ABANDONED:
             if row.abandon_reason == reason:
                 return {"release": record_to_dict(row), "updated": False}
@@ -1107,6 +1587,8 @@ def reconstruct_release(
     confirm: bool = False,
     checkout_root: str | None = None,
     without_git: bool = False,
+    tag_proof: Mapping | None = None,
+    push_proof: Mapping | None = None,
 ) -> dict:
     """Record a release made BEFORE release records existed (K-60) — without
     re-stamping anything. Ledger part only: the evidence (SHAs, manifest,
@@ -1141,12 +1623,25 @@ def reconstruct_release(
       and 'committed' / 'tagged' / 'pushed' are refused (no git effects
       exist).
     - `checkout_root` (optional, ABSOLUTE, normalize_worktree).
+    - K-115 G4 — the same proof rules as advance_release: with git, a
+      status of 'tagged' or later needs `tag_proof` (validate_tag_proof —
+      the tag the workflow VERIFIED, targeting release_commit_sha), 'pushed'
+      needs `push_proof` (validate_push_proof); both are refused below
+      their status and with without_git=True. Nothing is invented for old
+      history: a release whose tag was not verified is reconstructed at
+      'committed'. A reconstructed record carries no consent, so
+      'completed' needs no push proof (its push scope is not recorded).
+    - K-115 G6: several live records of the version → refused (the ledger
+      is ambiguous), as is any existing record.
 
     The record gets mode 'reconstructed' (its provenance — the original
     stamp mode is unknown), release_mode 'git' / 'without_git' (from
-    without_git), the project's current release executor (K-85), no consent,
-    proposal or render (unknown for a legacy release) and completed_at = now
-    when status is 'completed'. Returns the record.
+    without_git), the project's current release executor (K-85; G8: an
+    explicitly ASSIGNED responsibility for the record's further handling —
+    who may record progress on it or abandon it — NOT provenance: it does
+    not say who made the historical release), no consent, proposal or
+    render (unknown for a legacy release) and completed_at = now when
+    status is 'completed'. Returns the record.
     """
     from dct.core.changelog import (
         _dedupe_ids,
@@ -1174,10 +1669,17 @@ def reconstruct_release(
     candidate = validate_sha(candidate_sha, "candidate_sha")
     commit = validate_sha(release_commit_sha, "release_commit_sha")
     recorded_manifest = validate_manifest(manifest)
+    tag = validate_tag_proof(tag_proof)
+    push = validate_push_proof(push_proof)
     root = normalize_worktree(checkout_root)
     ensure_fits(releases, {"checkout_root": root})
     rank = _rank(status)
     if without_git:
+        if tag is not None or push is not None:
+            raise ValueError(
+                "a release without git has no tag and no push — tag_proof / push_proof "
+                "must be absent; nothing written."
+            )
         if candidate or commit:
             raise ValueError(
                 "without_git=True records a release of a project without git — "
@@ -1210,7 +1712,7 @@ def reconstruct_release(
         )
 
     with project_transaction(engine, project_slug, write=True) as (conn, pid):
-        if find_record(conn, pid, version) is not None:
+        if unique_record(conn, pid, project_slug, version) is not None:
             raise ValueError(
                 f"version {version} of '{project_slug}' already has a release record "
                 f"— nothing to reconstruct; nothing written."
@@ -1249,6 +1751,7 @@ def reconstruct_release(
             candidate_sha=candidate, checkout_root=root, now=datetime.now(UTC),
             status=status, release_commit_sha=commit, manifest=recorded_manifest,
             release_mode=WITHOUT_GIT if without_git else "git",
+            tag_proof=tag, push_proof=push,
         )
 
 

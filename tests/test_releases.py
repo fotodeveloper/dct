@@ -11,6 +11,7 @@ import json
 
 import pytest
 import sqlalchemy as sa
+from conftest import ledger_proofs
 from sqlalchemy import event
 
 from dct.core.changelog import add_entry, list_entries, release_entries
@@ -420,7 +421,7 @@ def test_advance_same_status_is_an_idempotent_noop(released):
 
 
 def test_advance_backwards_is_refused_without_writes(released):
-    advance_release(released, "proj-a", "1.1.0", "tagged", release_commit_sha=SHA2)
+    advance_release(released, "proj-a", "1.1.0", "tagged", **ledger_proofs("tagged", SHA2))
     before = _snapshot(released)
     with pytest.raises(ValueError, match="backwards"):
         advance_release(released, "proj-a", "1.1.0", "committed")
@@ -430,7 +431,7 @@ def test_advance_backwards_is_refused_without_writes(released):
 def test_advance_to_completed_stamps_completed_at_once(released):
     assert get_release(released, "proj-a", "1.1.0")["completed_at"] is None
     first = advance_release(released, "proj-a", "1.1.0", "completed",
-                            release_commit_sha=SHA2)["release"]
+                            **ledger_proofs("completed", SHA2))["release"]
     assert first["completed_at"] is not None
     again = advance_release(released, "proj-a", "1.1.0", "completed")
     assert again["updated"] is False
@@ -495,9 +496,11 @@ def test_get_release_without_version_returns_the_latest_unfinished(proj):
     release_entries(proj, "proj-a", "1.1.0", entry_ids=[])
     release_entries(proj, "proj-a", "1.2.0", entry_ids=[])
     assert get_release(proj, "proj-a")["version"] == "1.2.0"
-    advance_release(proj, "proj-a", "1.2.0", "completed", release_commit_sha="d" * 40)
+    advance_release(proj, "proj-a", "1.2.0", "completed",
+                    **ledger_proofs("completed", "d" * 40, "1.2.0"))
     assert get_release(proj, "proj-a")["version"] == "1.1.0"
-    advance_release(proj, "proj-a", "1.1.0", "completed", release_commit_sha="d" * 40)
+    advance_release(proj, "proj-a", "1.1.0", "completed",
+                    **ledger_proofs("completed", "d" * 40))
     assert get_release(proj, "proj-a") is None
 
 

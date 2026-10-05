@@ -28,7 +28,21 @@ an 'own' record, or one stamped outside apply, is refused, never finished
 without a push). The proof layer, attest (a proof-layer commit), the ledger,
 abandon and reconstruct are shared by both executors. Progress writes carry
 the actor: this module advances as 'dct'; record_progress (the ledger path)
-as 'ledger' (core.releases.check_progress_actor).
+as 'ledger' (core.releases.check_progress_actor — always checked, K-119
+M5). abandon (`dct release abandon`, under the operation lock) is the ONLY
+path that ends a release dct executes (actor 'dct', K-119 M6 — MCP
+abandon_release holds no lock and refuses such a record), so no effect ever
+runs past an abandon. K-106: apply's consent names executor 'dct'; the stamp
+compares it with the project's setting in its transaction, and the fresh
+apply re-reads the record and verifies its scope and executor BEFORE the
+first effect (K-102), exactly like a resume.
+
+K-115 G4 — proofs, not statuses: 'tagged' is recorded WITH the tag identity
+verified in the repository (`tag_proof`: name, object, commit, annotated),
+'pushed' WITH the target as read back from the remote (`push_proof`); a
+record that reached those statuses before the fields existed gets them
+with the next progress write of a resume that re-verified them
+(_Run.verified). The ledger refuses the status without the proof.
 
 Every database write runs through _ledger_write (K-88): a lost
 serialization race (db.is_serialization_failure — SQLSTATE 40001 or
@@ -105,12 +119,16 @@ Stages of one release:
      → refused with the observed commit, never adopted); then the user's
      REAL index follows the commit under git's index.lock protocol, its
      own staging preserved (K-79, _sync_real_index) → 'committed';
-  6. tag `v<V>` (lightweight) at the verified release commit → 'tagged';
+  6. tag `v<V>` (lightweight) at the verified release commit → 'tagged'
+     with its tag_proof (K-115 G4; an existing tag of V at that commit —
+     also an annotated one — is verified and recorded instead);
   7. push (K-97 F2) — `git push --atomic` of the release commit and the tag
-     to the CONSENTED target, verified with `git ls-remote` → 'pushed',
-     then 'completed'; a failed push leaves 'tagged' and resume retries
+     to the CONSENTED target, verified with `git ls-remote` → 'pushed'
+     with its push_proof (K-115 G4), then 'completed'; a failed push leaves
+     'tagged' and resume retries
      only the push. Without a push target (--no-push, outside git) the
-     record goes 'tagged' → 'completed'.
+     record goes 'tagged' → 'completed' (no push proof: the consent's
+     push_target null is the explicit local release).
 
 Reconstruction (gather_evidence, K-86 / K-96 D8): the authoritative
 version spelling is resolved FIRST by the shared legacy resolver
@@ -762,7 +780,8 @@ def _tree_of_blobs(repo: str, candidate: str, blobs: dict[str, str]) -> str:
 
 def _version_tags(repo: str, version: str) -> list[dict]:
     """Tags whose name is the same version as `version` (any spelling):
-    [{name, commit (peeled)}]."""
+    [{name, commit (peeled), object (what the ref resolves to — the tag
+    object of an annotated tag), annotated}]."""
     _, out = gitinfo.git_read(
         repo, "for-each-ref", "--format=%(refname:strip=2)%1f%(objectname)%1f%(*objectname)",
         "refs/tags")
@@ -777,8 +796,22 @@ def _version_tags(repo: str, version: str) -> list[dict]:
                 continue
         except ValueError:
             continue
-        tags.append({"name": name, "commit": (peeled or obj).lower()})
+        tags.append({"name": name, "commit": (peeled or obj).lower(), "object": obj.lower(),
+                     "annotated": bool(peeled)})
     return sorted(tags, key=lambda t: t["name"])
+
+
+def _tag_proof(tags: list[dict], version: str, commit: str) -> dict | None:
+    """The identity of the release tag as VERIFIED in the repository now
+    (K-115 G4 — core.releases.validate_tag_proof): of the tags of the
+    version (`_version_tags`) that target `commit`, `v<version>` when it is
+    one of them, else the first by name; None when no tag targets it."""
+    here = [t for t in tags if t["commit"] == commit]
+    if not here:
+        return None
+    tag = next((t for t in here if t["name"] == f"v{version}"), here[0])
+    return {"name": tag["name"], "object": tag["object"], "commit": tag["commit"],
+            "annotated": tag["annotated"]}
 
 
 # ── location ─────────────────────────────────────────────────────────────────
@@ -858,6 +891,10 @@ class _Run:
         self.steps: list[dict] = []
         self.warnings: list[str] = []
         self.record: dict | None = None
+        # K-115 G4: proofs this run verified for a record that lacks them
+        # (reached 'tagged' / 'pushed' before the fields existed) — written
+        # with the next progress write.
+        self.verified: dict[str, dict] = {}
         self.changelog_rel = self._changelog_rel()
 
     def _changelog_rel(self) -> str | None:
@@ -893,12 +930,16 @@ class _Run:
         """Record verified progress (actor 'dct', K-85); a lost
         serialization race → ReleaseConflict with this run's steps (K-88)."""
         version = self.record["version"]
+        for field, proof in self.verified.items():
+            if self.record.get(field) is None:
+                kwargs.setdefault(field, proof)
         out = _ledger_write(
             self.engine, self.slug, version, _STATUS_STEP.get(status, status),
             lambda: ledger.advance_release(self.engine, self.slug, version, status,
                                            actor="dct", **kwargs),
             status=status, steps=self.steps)
         self.record = out["release"]
+        self.verified.clear()
 
     @property
     def version(self) -> str:
@@ -1939,17 +1980,47 @@ def _step_tag(run: _Run) -> None:
         raise run.refuse(
             f"tag(s) {', '.join(t['name'] for t in elsewhere)} of {run.version} point at "
             f"another commit — nothing tagged.", tags=elsewhere)
-    here = [t["name"] for t in tags]
-    if here:
-        run.step("tag", "verified", tag=here[0] if name not in here else name)
+    proof = _tag_proof(tags, run.version, commit)
+    if proof is not None:
+        run.step("tag", "verified", tag=proof["name"])
     else:
         gitinfo.git_write(run.repo, "tag", name, commit)
-        if _rev(run.repo, f"refs/tags/{name}^{{commit}}") != commit:
+        proof = _tag_proof(_version_tags(run.repo, run.version), run.version, commit)
+        if proof is None or proof["name"] != name:
             raise run.refuse(f"tag {name} does not point at {commit} after creating it")
         run.step("tag", "done", tag=name)
     _point(run.on_point, "after_tag")
-    run.advance("tagged")
+    # K-115 G4: 'tagged' is recorded WITH the identity verified just now.
+    run.advance("tagged", tag_proof=proof)
     _point(run.on_point, "after_tagged")
+
+
+def _check_recorded_tag(run: _Run) -> None:
+    """A record at 'tagged' / 'pushed' on resume: a tag of the version must
+    still target the release commit; the recorded tag_proof (K-115 G4) must
+    still be what the repository shows — and a record that has none (it
+    reached the status before the field existed) gets the identity verified
+    now with its next progress write. A status is never the proof."""
+    commit = run.record["release_commit_sha"]
+    tags = _version_tags(run.repo, run.version)
+    found = _tag_proof(tags, run.version, commit)
+    if found is None:
+        raise run.refuse(f"release {run.version} is recorded as tagged but no tag of "
+                         f"it points at {commit} — nothing done.")
+    recorded = run.record.get("tag_proof")
+    if recorded is None:
+        run.verified["tag_proof"] = found
+    else:
+        now = next((t for t in tags if t["name"] == recorded["name"]), None)
+        if now is None or (now["object"], now["commit"]) != (recorded["object"],
+                                                             recorded["commit"]):
+            raise run.refuse(
+                f"release {run.version}: the recorded tag {recorded['name']} "
+                f"({recorded['object']}) is not what the repository shows now "
+                f"({now['object'] if now else 'no such tag'}) — the tag was moved or "
+                f"deleted after it was verified; nothing done.",
+                tag_proof=recorded, tag_now=now)
+    run.step("tag", "verified")
 
 
 # ── step 7: the push (K-97 F2) ───────────────────────────────────────────────
@@ -2060,6 +2131,14 @@ def _consented_target(run: _Run) -> dict | None:
     return target
 
 
+def _push_proof(refs: dict[str, str], target: dict) -> dict:
+    """What the push target showed when it was read (K-115 G4 —
+    core.releases.validate_push_proof): the approved target, the commit its
+    tag resolved to and its branch tip."""
+    return {"target": target, "tag_commit": refs.get(f"refs/tags/{target['tag']}"),
+            "branch_tip": refs.get(f"refs/heads/{target['branch']}")}
+
+
 def _pushed(run: _Run, refs: dict[str, str], target: dict, commit: str) -> bool:
     """The remote holds the release: its branch is the release commit (or a
     known descendant) and the tag points exactly at it. A tag of V at
@@ -2086,7 +2165,8 @@ def _step_push(run: _Run) -> None:
         return
     commit = run.record["release_commit_sha"]
     where = {"remote": target["remote"], "branch": target["branch"], "tag": target["tag"]}
-    if _pushed(run, _ls_remote(run.repo, target["remote"]), target, commit):
+    refs = _ls_remote(run.repo, target["remote"])
+    if _pushed(run, refs, target, commit):
         run.step("push", "verified", **where)
     else:
         _point(run.on_point, "before_push")
@@ -2101,13 +2181,15 @@ def _step_push(run: _Run) -> None:
                 f"{target['tag']}) failed ({exc}) — the release stays 'tagged' (commit and tag "
                 f"exist locally); fix the cause and run `dct release resume`: it retries ONLY "
                 f"the push.", git_error=str(exc), push_target=target) from None
-        if not _pushed(run, _ls_remote(run.repo, target["remote"]), target, commit):
+        refs = _ls_remote(run.repo, target["remote"])
+        if not _pushed(run, refs, target, commit):
             raise run.refuse(
                 f"after the push, {target['remote']} does not show {target['branch']} and "
                 f"{target['tag']} at {commit} — not recorded as pushed.", push_target=target)
         run.step("push", "done", **where)
         _point(run.on_point, "after_push")
-    run.advance("pushed")
+    # K-115 G4: 'pushed' is recorded WITH the target as verified just now.
+    run.advance("pushed", push_proof=_push_proof(refs, target))
     _point(run.on_point, "after_pushed")
 
 
@@ -2117,12 +2199,14 @@ def _verify_push(run: _Run) -> None:
     if target is None:
         run.step("push", "verified", reason="no push target approved")
         return
-    if not _pushed(run, _ls_remote(run.repo, target["remote"]), target,
-                   run.record["release_commit_sha"]):
+    refs = _ls_remote(run.repo, target["remote"])
+    if not _pushed(run, refs, target, run.record["release_commit_sha"]):
         raise run.refuse(
             f"release {run.version} is recorded as pushed, but {target['remote']} does not "
             f"show {target['branch']} and {target['tag']} at its release commit — nothing "
             f"done.", push_target=target)
+    if run.record.get("push_proof") is None:  # an older record: proven now (K-115 G4)
+        run.verified["push_proof"] = _push_proof(refs, target)
     run.step("push", "verified", remote=target["remote"], branch=target["branch"],
              tag=target["tag"])
 
@@ -2156,11 +2240,7 @@ def _continue(run: _Run, *, fresh: bool) -> None:
         if run.record["status"] == "committed":
             _step_tag(run)
         elif run.record["status"] in ("tagged", "pushed"):
-            commit = run.record["release_commit_sha"]
-            if not any(t["commit"] == commit for t in _version_tags(run.repo, run.version)):
-                raise run.refuse(f"release {run.version} is recorded as tagged but no tag of "
-                                 f"it points at {commit} — nothing done.")
-            run.step("tag", "verified")
+            _check_recorded_tag(run)
         if run.record["status"] == "tagged":
             _step_push(run)
         elif run.record["status"] == "pushed":
@@ -2641,7 +2721,10 @@ def _apply(engine, project_slug, located, *, version, bump_type, entry_ids, no_e
                    "candidate_sha": checkout["head"] if checkout else None,
                    "proposal_sha256": proposal_digest,
                    "render": {"pr_refs": bool(run.project.get("changelog_pr_refs"))},
-                   "push_target": push_to}
+                   "push_target": push_to,
+                   # K-106: the owner approved a release executed by dct —
+                   # the stamp compares it with the project's setting.
+                   "executor": ledger.DEFAULT_EXECUTOR}
     _point(on_point, "before_stamp")
     if checkout and _head(checkout["repo_root"]) != checkout["head"]:
         raise ReleaseRefused(
@@ -2661,6 +2744,9 @@ def _apply(engine, project_slug, located, *, version, bump_type, entry_ids, no_e
             consent=consent, render=consent["render"] if consent else None,
             manifest={"untracked_baseline": sorted(pre_untracked)}
             if consent and checkout else None,
+            # K-106: a NEW record is bound to executor 'dct' by the consent
+            # (compared in the stamp transaction); a re-run of an existing
+            # record passes no consent and stays a no-op for either executor.
             consume_proposal=consent is not None)
 
     try:
@@ -2685,6 +2771,13 @@ def _apply(engine, project_slug, located, *, version, bump_type, entry_ids, no_e
         return _finish("apply", run, "noop", **details)
     run.step("stamp", "done", released=stamped["released"])
     _point(on_point, "after_stamp")
+    # K-102 / K-106: the record is RE-READ and verified like a resumed one
+    # BEFORE the first effect — its full entry set / consent scope (an
+    # entry that joined V since the stamp) and its executor (the second
+    # barrier behind the stamp transaction's expected_executor).
+    _check_record_scope(run)
+    _check_record_executor(run)
+    _check_record_consistency(run)
     _check_record_location(run)
     _continue(run, fresh=True)
     return _finish("apply", run, "completed", **details)
@@ -2718,6 +2811,17 @@ def _check_record_scope(run: _Run) -> None:
                 outside_consent=outside)
 
 
+def _check_record_consistency(run: _Run) -> None:
+    """K-115 G5 / G9 — before any effect: the whole record (consent,
+    proposal, render, tag / push proof) must describe ONE release
+    (core.releases.check_record_consistency); a contradiction is refused,
+    never repaired."""
+    try:
+        ledger.check_record_consistency(run.record)
+    except ValueError as exc:
+        raise run.refuse(f"{str(exc).removesuffix('nothing written.')}nothing done.") from None
+
+
 @_conflict_boundary("resume")
 def resume_release(
     engine: sa.Engine,
@@ -2748,6 +2852,7 @@ def resume_release(
             return _finish("resume", run, "noop")
         _check_record_executor(run)
         _check_record_scope(run)
+        _check_record_consistency(run)
         _check_record_location(run)
         if run.repo and _operation_in_progress(run.repo):
             raise run.refuse("a git operation is in progress — finish or abort it first")
@@ -2760,7 +2865,11 @@ def abandon(engine: sa.Engine, project_slug: str, version: str, reason: str, *,
             confirm: bool = False) -> dict:
     """`dct release abandon` — core abandon_release (K-60): the record ends
     'abandoned', every effect stays. Under the project operation lock
-    (K-96 D7): never while another release command of the repository runs."""
+    (K-96 D7): never while another release command of the repository runs —
+    which is why it abandons as the actor 'dct' (K-119 M6): the ONLY path
+    that ends a release dct's effects layer executes; MCP abandon_release
+    (no lock) refuses such a record and names this command. After it no
+    effect continues: resume finds no unfinished record."""
     project = get_project(engine, project_slug)
     if project is None:
         raise ReleaseRefused(f"Project '{project_slug}' not found")
@@ -2768,8 +2877,10 @@ def abandon(engine: sa.Engine, project_slug: str, version: str, reason: str, *,
         with _operation(project, None, "abandon"):
             out = _ledger_write(
                 engine, project_slug, _normalized_or_none(version), "abandon",
+                # K-119 M6: this path holds the operation lock — the only one
+                # that may end a release dct's effects layer executes.
                 lambda: ledger.abandon_release(engine, project_slug, version, reason,
-                                               confirm=confirm), steps=[])
+                                               confirm=confirm, actor="dct"), steps=[])
     except ValueError as exc:
         raise ReleaseRefused(str(exc)) from None
     record = out["release"]
@@ -2786,14 +2897,19 @@ def _normalized_or_none(version: str | None) -> str | None:
 
 @_conflict_boundary("advance")
 def record_progress(engine: sa.Engine, project_slug: str, version: str, status: str, *,
-                    release_commit_sha: str | None = None) -> dict:
+                    release_commit_sha: str | None = None,
+                    tag_proof: dict | None = None,
+                    push_proof: dict | None = None) -> dict:
     """`dct clog release-advance` (K-96 D10) — the LEDGER path of a release
     dct does not execute (an 'own' record, or one stamped outside `dct
     release apply`): core advance_release with actor 'ledger' (its state
     machine, write-once and B1 rules; a record dct executes is refused —
     `dct release resume` records its progress), under the project operation
     lock like every other mutating release path. The caller reports what
-    IT verified (a status is never proof for dct). Returns result() with
+    IT verified (a status is never proof for dct): `tag_proof` /
+    `push_proof` (K-115 G4, core validate_tag_proof / validate_push_proof)
+    are the identities it verified — required by the ledger for 'tagged' /
+    'pushed' / 'completed' of a record with git. Returns result() with
     outcome 'advanced' or 'noop' and details {updated, previous_status}."""
     project = get_project(engine, project_slug)
     if project is None:
@@ -2805,9 +2921,10 @@ def record_progress(engine: sa.Engine, project_slug: str, version: str, status: 
                 engine, project_slug, _normalized_or_none(version), "advance",
                 lambda: ledger.advance_release(engine, project_slug, version, status,
                                                release_commit_sha=release_commit_sha,
+                                               tag_proof=tag_proof, push_proof=push_proof,
                                                actor="ledger"),
                 status=status, steps=[])
-    except ValueError as exc:
+    except (ValueError, TypeError) as exc:
         raise ReleaseRefused(str(exc)) from None
     record = out["release"]
     return result("advance", project_slug, "advanced" if out["updated"] else "noop",
@@ -3054,9 +3171,11 @@ def gather_evidence(engine: sa.Engine, project_slug: str, version: str, *,
 
     Returns {version (authoritative), requested_version, spellings (the
     equivalence map {stored spelling: [entry ids]}), entry_ids,
-    candidate_sha, release_commit_sha, tag, checkout_root, manifest,
-    status, without_git, candidates ([{commit, verified, reason}], git
-    only)}."""
+    candidate_sha, release_commit_sha, tag, tag_proof (K-115 G4: the
+    verified identity {name, object, commit, annotated} of the tag at the
+    release commit — what the record stores; null without a tag or without
+    git), checkout_root, manifest, status, without_git, candidates
+    ([{commit, verified, reason}], git only)}."""
     requested = normalize_version(version)
     project, checkout, project_root = _locate(engine, project_slug, cwd)
     if ledger.get_release(engine, project_slug, requested) is not None:
@@ -3080,8 +3199,8 @@ def gather_evidence(engine: sa.Engine, project_slug: str, version: str, *,
     contract = ledger.get_version_files(engine, project_slug)["version_files"]
     evidence = {"version": version, "requested_version": requested,
                 "spellings": spelling["spellings"], "entry_ids": ids, "candidate_sha": None,
-                "release_commit_sha": None, "tag": None, "checkout_root": None,
-                "without_git": checkout is None, "status": "completed"}
+                "release_commit_sha": None, "tag": None, "tag_proof": None,
+                "checkout_root": None, "without_git": checkout is None, "status": "completed"}
     if checkout is None:
         if not project_root:
             raise ReleaseRefused("the project has no path — no artifact can be verified")
@@ -3140,11 +3259,13 @@ def gather_evidence(engine: sa.Engine, project_slug: str, version: str, *,
                 details={"candidates": candidates})
         commit, status = next(iter(verified)), "committed"
     found = verified[commit]
+    # K-115 G4: the tag identity as verified now — what 'completed' records
+    # (None without a tag: the evidence then ends at 'committed').
+    tag_proof = _tag_proof(tags, version, commit) if tagged is not None else None
     evidence.update(
         candidate_sha=found["candidate_sha"], release_commit_sha=commit, checkout_root=repo,
         status=status, manifest=found["manifest"], candidates=candidates,
-        tag=None if tagged is None else next(
-            (t["name"] for t in tags if t["name"] == f"v{version}"), tags[0]["name"]))
+        tag=None if tag_proof is None else tag_proof["name"], tag_proof=tag_proof)
     return evidence
 
 
@@ -3175,7 +3296,7 @@ def _reconstruct(engine, project_slug: str, version: str, *, cwd) -> dict:
             candidate_sha=evidence["candidate_sha"],
             release_commit_sha=evidence["release_commit_sha"], manifest=evidence["manifest"],
             status=evidence["status"], confirm=True, checkout_root=evidence["checkout_root"],
-            without_git=evidence["without_git"]), steps=[])
+            without_git=evidence["without_git"], tag_proof=evidence["tag_proof"]), steps=[])
     except ValueError as exc:
         raise ReleaseRefused(str(exc)) from None
     return result("reconstruct", project_slug, "reconstructed", version=record["version"],

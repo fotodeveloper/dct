@@ -16,6 +16,7 @@ import re
 
 import pytest
 import sqlalchemy as sa
+from conftest import ledger_proofs, tag_proof_for
 from sqlalchemy import event
 
 from dct.core.changelog import add_entry, release_entries
@@ -96,7 +97,6 @@ LEGAL = {
     "completed": set(),
     "abandoned": set(),
 }
-_COMMIT_FROM = FLOW.index("committed")
 
 
 def test_the_status_set_is_the_flow_plus_abandoned():
@@ -105,10 +105,9 @@ def test_the_status_set_is_the_flow_plus_abandoned():
 
 def _commit_for(status):
     """K-94 B1: from 'committed' on every record not recorded 'without_git'
-    carries its release commit (the same value again is a confirmation)."""
-    if status in FLOW and FLOW.index(status) >= _COMMIT_FROM:
-        return {"release_commit_sha": COMMIT}
-    return {}
+    carries its release commit (the same value again is a confirmation);
+    K-115 G4: from 'tagged' on its tag proof, 'pushed' its push proof."""
+    return ledger_proofs(status, COMMIT)
 
 
 def _reach(engine, status):
@@ -218,7 +217,8 @@ def test_release_commit_is_set_once(git_release):
         advance_release(git_release, "proj-a", "1.1.0", "tagged", release_commit_sha=OTHER)
     assert _snapshot(git_release) == before
     # Later steps need not repeat it.
-    out = advance_release(git_release, "proj-a", "1.1.0", "tagged")
+    out = advance_release(git_release, "proj-a", "1.1.0", "tagged",
+                          tag_proof=tag_proof_for(COMMIT))
     assert out["release"]["release_commit_sha"] == COMMIT
 
 
@@ -562,7 +562,8 @@ def test_get_unfinished_skips_completed_and_abandoned_but_explicit_reads_show_th
     assert get_release(proj, "proj-a")["version"] == "1.3.0"
     abandon_release(proj, "proj-a", "1.3.0", "skip", confirm=True)
     assert get_release(proj, "proj-a")["version"] == "1.2.0"
-    advance_release(proj, "proj-a", "1.2.0", "completed", release_commit_sha=COMMIT)
+    advance_release(proj, "proj-a", "1.2.0", "completed",
+                    **ledger_proofs("completed", COMMIT, "1.2.0"))
     assert get_release(proj, "proj-a")["version"] == "1.1.0"
     abandon_release(proj, "proj-a", "1.1.0", "skip", confirm=True)
     assert get_release(proj, "proj-a") is None
@@ -588,6 +589,11 @@ def _reconstruct(engine, ids, **overrides):
               "manifest": MANIFEST, "status": "completed", "confirm": True}
     kwargs.update(overrides)
     version = kwargs.pop("version", "1.1.0")
+    if kwargs["status"] in ("tagged", "completed") and not kwargs.get("without_git") \
+            and kwargs["release_commit_sha"]:
+        # K-115 G4: with git, 'tagged' and later carry the verified tag.
+        kwargs.setdefault("tag_proof", tag_proof_for(kwargs["release_commit_sha"],
+                                                     f"v{version}"))
     return reconstruct_release(engine, "proj-a", version, **kwargs)
 
 

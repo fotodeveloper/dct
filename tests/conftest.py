@@ -371,6 +371,36 @@ def approved_proposal_digest(engine, slug: str, cwd, *, plan_digest: str, **kw) 
     return out["details"]["proposal_sha256"]
 
 
+def tag_proof_for(commit: str, name: str = "v1.1.0", *, tag_object: str | None = None) -> dict:
+    """A tag proof as a ledger-path caller reports it (K-115 G4,
+    core.releases.validate_tag_proof): a lightweight tag `name` at `commit`,
+    or an annotated one when `tag_object` is given."""
+    return {"name": name, "object": tag_object or commit, "commit": commit,
+            "annotated": tag_object is not None}
+
+
+def push_proof_for(commit: str, tag: str = "v1.1.0", remote: str = "origin") -> dict:
+    """A push proof as a ledger-path caller reports it (K-115 G4)."""
+    return {"target": {"remote": remote, "tag": tag}, "tag_commit": commit}
+
+
+def ledger_proofs(status: str, commit: str, version: str = "1.1.0") -> dict:
+    """The advance_release / reconstruct_release kwargs a record WITH git
+    needs to be at `status` (K-94 B1 + K-115 G4): the release commit from
+    'committed' on, the tag proof from 'tagged' on, the push proof for
+    'pushed'. {} below 'committed'."""
+    flow = ("stamped", "files_written", "committed", "tagged", "pushed", "completed")
+    rank = flow.index(status) if status in flow else -1
+    out: dict = {}
+    if rank >= flow.index("committed"):
+        out["release_commit_sha"] = commit
+    if rank >= flow.index("tagged"):
+        out["tag_proof"] = tag_proof_for(commit, f"v{version}")
+    if status == "pushed":
+        out["push_proof"] = push_proof_for(commit, f"v{version}")
+    return out
+
+
 def make_git_repo(path, branch: str = "main"):
     """A git repo at `path` on `branch` with one commit; returns the realpath."""
     path.mkdir(parents=True, exist_ok=True)

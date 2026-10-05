@@ -34,7 +34,7 @@ from pathlib import Path
 
 import pytest
 import sqlalchemy as sa
-from conftest import git, run_cli
+from conftest import git, ledger_proofs, run_cli
 from test_release_effects import (
     SLUG,
     Interrupted,
@@ -133,8 +133,13 @@ if status == "files_written":
     advance("committed", release_commit_sha=run("git", "rev-parse", "HEAD").strip())
     status = "committed"
 if status == "committed":
-    run("git", "tag", f"release-{version}")
-    advance("tagged")
+    tag = f"release-{version}"
+    run("git", "tag", tag)
+    # K-115 G4: 'tagged' is reported WITH the tag as the tool verified it.
+    obj = run("git", "rev-parse", f"refs/tags/{tag}").strip()
+    commit = run("git", "rev-parse", f"{tag}^{{commit}}").strip()
+    advance("tagged", tag_proof={"name": tag, "object": obj, "commit": commit,
+                                 "annotated": obj != commit})
     status = "tagged"
 if status == "tagged":
     advance("completed")
@@ -297,7 +302,7 @@ def test_a_record_without_consent_is_never_resumed_by_dct(engine, tmp_path, monk
     a = proven(engine, repo, "feature a")
     release_entries(engine, SLUG, "1.1.0", entry_ids=[a], candidate_sha=git(repo, "rev-parse",
                     "HEAD"), checkout_root=str(repo))
-    for status, kw in (("stamped", {}), ("tagged", {"release_commit_sha": "b" * 40})):
+    for status, kw in (("stamped", {}), ("tagged", ledger_proofs("tagged", "b" * 40))):
         if status != "stamped":
             advance_release(engine, SLUG, "1.1.0", status, actor="ledger", **kw)
         before = world(engine, repo)

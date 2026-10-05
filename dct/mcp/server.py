@@ -1184,6 +1184,7 @@ def release_changelog(
     candidate_sha: str = "",
     checkout_root: str = "",
     proof: dict | None = None,
+    expected_executor: str = "",
 ) -> dict:
     """Stamp changelog entries with a version, set the project's current_version
     to it AND write the durable release record — one locked transaction (a
@@ -1240,6 +1241,14 @@ def release_changelog(
             map when the record has none — is an error, the identical map
             is the no-op. Entries without a commit proof are simply absent.
             Null/omitted (default) = none.
+        expected_executor: "dct" | "own" — the release executor the caller's
+            plan was made for (a project's own tool passes "own"). Compared
+            INSIDE the stamp transaction with the project's CURRENT
+            release_executor (the setter takes the same project lock): a
+            mismatch — the setting changed since the plan — is an error
+            BEFORE any write. For a version that already has a record it is
+            compared with that RECORD's executor (immutable). Empty
+            (default) = not bound.
 
     Release record + re-runs: the call's resolved set is the given ids
     ('selected'), [] ('version_only') or the entries already carrying the
@@ -1297,6 +1306,9 @@ def release_changelog(
         proof, or live entries no longer matching its set; a new record that
         would omit an entry already carrying the version; a malformed proof
         or one naming entries outside the set; an invalid entry id; an
+        expected_executor other than the project's current one (or the
+        record's), or an invalid one; a ledger holding several live records
+        of the version (ambiguous — never picked); an
         invalid candidate_sha; a
         relative or over-long (> 500) checkout_root; tool-call markup in
         candidate_sha / checkout_root; or an unresolvable project. Nothing is
@@ -1304,6 +1316,7 @@ def release_changelog(
     """
     if (err := _reject_toolcall_markup(
         candidate_sha=candidate_sha, checkout_root=checkout_root,
+        expected_executor=expected_executor,
     )):
         return err
     from dct.core.changelog import release_entries
@@ -1317,7 +1330,7 @@ def release_changelog(
             _get_engine(), project_slug, version or None,
             bump_type=None if version else bump_type, entry_ids=entry_ids,
             candidate_sha=candidate_sha or None, checkout_root=checkout_root or None,
-            proof=proof,
+            proof=proof, expected_executor=expected_executor or None,
         )
         return {
             "project": project_slug, **result,
@@ -1377,10 +1390,21 @@ def get_release(project: str = "", version: str = "") -> dict:
         version-file proposal {paths, base_blobs, expected_blobs, script,
         candidate_sha, version, plan_digest, release_mode, changelog} — or
         null), render (object — this release's
-        changelog render settings {"pr_refs": bool} — or null)}} or
+        changelog render settings {"pr_refs": bool} — or null), tag_proof
+        (object — the VERIFIED identity of the release tag {name, object
+        (what the tag ref resolves to), commit (the release commit it
+        targets), annotated, recorded_at} — or null = not proven: no tag
+        yet, or a record from before the field), push_proof (object — the
+        VERIFIED push {target: {remote, url, branch, tag}, tag_commit,
+        branch_tip, recorded_at} — or null); a proof describes the state
+        when it was recorded, not a guarantee about later}} or
         {"release": null} when there is no such record (no record for that
         version, or no unfinished release). A release made before records
-        existed has no record. {"error": "..."} on an unsupported version
+        existed has no record. On an AMBIGUOUS ledger — several live
+        records of the same version (1.1 and 1.1.0) — the oldest one is
+        returned with the extra key "duplicates" ([{id, version, status}]
+        of all of them); the key is absent otherwise, and every write tool
+        refuses such a version. {"error": "..."} on an unsupported version
         format or an unresolvable project.
     """
     if (err := _reject_toolcall_markup(version=version)):
@@ -1413,6 +1437,8 @@ def advance_release(
     project: str = "",
     release_commit_sha: str = "",
     manifest: dict | None = None,
+    tag_proof: dict | None = None,
+    push_proof: dict | None = None,
 ) -> dict:
     """Record verified progress of a release — move its record FORWARD and/or
     record the effects the workflow verified. The server never checks files
@@ -1426,8 +1452,10 @@ def advance_release(
     Call it after each release step is DONE and verified (also when a resumed
     run finds the effect already present): files_written after the changelog
     file and version files are written, committed after the release commit,
-    tagged after the tag, pushed after the verified push, completed at the
-    end. Each field below is a SEPARATE top-level parameter.
+    tagged after the tag (WITH tag_proof), pushed after the verified push
+    (WITH push_proof), completed at the end. A status alone is never proof:
+    a record with git cannot reach tagged / pushed / completed without the
+    tag proof. Each field below is a SEPARATE top-level parameter.
 
     Args:
         version: The release (X.Y or X.Y.Z, leading "v" accepted); it must
@@ -1458,6 +1486,31 @@ def advance_release(
             no null values; the MERGED manifest ≤ 65536 bytes of canonical
             JSON (sorted keys, compact, UTF-8). Null/omitted (default) = not
             passed.
+        tag_proof: JSON object — the identity of the release tag as YOU
+            verified it in the repository: {"name": "<tag name as `git tag`
+            lists it>", "object": "<full sha `git rev-parse
+            refs/tags/<name>` prints>", "commit": "<full sha of `git
+            rev-parse <name>^{commit}`>", "annotated": true|false} — all four
+            required; lightweight → object == commit, annotated → object !=
+            commit. `commit` must be the record's release commit. REQUIRED
+            (now or already recorded) for every move into tagged / pushed /
+            completed unless the record's release_mode is "without_git"
+            (which refuses it). Accepted from 'tagged' on; recorded ONCE
+            (stored with the server's recorded_at) — the same value again
+            is a confirmation, a different one is refused. Null/omitted
+            (default) = not passed.
+        push_proof: JSON object — the push as YOU verified it on the remote:
+            {"target": {"remote": "<name>" (required), "url": "<push url>" |
+            null, "branch": "<branch>" | null, "tag": "<tag name>"
+            (required)}, "tag_commit": "<full sha the remote tag resolves
+            to>" (required), "branch_tip": "<full sha of the remote branch>"
+            | null}. `tag_commit` must be the release commit; when the
+            record carries a consent, `target` must equal its push_target
+            exactly (and a consent that approved no push takes none).
+            REQUIRED for 'pushed'; for 'completed' only when the consent
+            approved a push — a release without a push completes from
+            'tagged'. Accepted from 'pushed' on; recorded ONCE like
+            tag_proof. Null/omitted (default) = not passed.
 
     Returns: slim ack {project, version (normalized), status (after the call),
         updated} — `updated` false when nothing changed (idempotent repeat).
@@ -1467,7 +1520,13 @@ def advance_release(
         release_commit_sha, 'committed'+ without a release commit (or with
         one / a git-only status on a "without_git" record), a
         manifest key recorded with a different value or a malformed
-        manifest, a record dct executes (executor "dct" with a consent —
+        manifest, a missing / premature / changed / malformed tag_proof or
+        push_proof (or one that does not match the release commit or the
+        approved push target), a record whose entry set no longer equals
+        the live entries carrying its version (also for a repeat — never
+        extended to fit), a record whose consent / proposal / render /
+        proofs contradict each other, a ledger holding several live records
+        of the version, a record dct executes (executor "dct" with a consent —
         "… recorded only by `dct release resume` …"), an invalid SHA, an
         unsupported version format, tool-call markup, or an unresolvable
         project. Nothing is written on error.
@@ -1484,7 +1543,7 @@ def advance_release(
         out = core_advance_release(
             _get_engine(), project_slug, version, status,
             release_commit_sha=release_commit_sha or None, manifest=manifest,
-            actor="ledger",
+            tag_proof=tag_proof, push_proof=push_proof, actor="ledger",
         )
         return _release_ack(project_slug, out)
     except Exception as e:
@@ -1510,6 +1569,16 @@ def abandon_release(
     Abandoning again with the SAME reason is a no-op (updated false); a
     DIFFERENT reason is an error — the first reason stays.
 
+    NOT for a release dct's effects layer executes (executor "dct" AND a
+    recorded consent — stamped by `dct release apply`): this server does
+    not know the checkout and cannot take that release's operation lock, so
+    an abandon from here could not stop a running `dct release apply` /
+    `resume`. Such a record is REFUSED — abandon it locally, in the
+    project's checkout: `dct release abandon --version V --reason "…"
+    --confirm` (it holds the lock; afterwards resume finds nothing to
+    continue). Records of the ledger path — a project's own release tool,
+    or stamped by release_changelog — are abandoned here.
+
     Args:
         version: The release (X.Y or X.Y.Z, leading "v" accepted); it must
             have a record.
@@ -1525,8 +1594,11 @@ def abandon_release(
         full record with get_release. {"error": "..."} without confirm, with
         an empty or over-long reason, for an already abandoned record with a
         different reason, a version without a record, a completed release,
-        an unsupported version format, tool-call markup, or an unresolvable
-        project. Nothing is written on error.
+        a release dct's effects layer executes ("… abandoned only by the
+        local command … `dct release abandon` …"), a ledger holding several
+        live records of the version, an unsupported version format,
+        tool-call markup, or an unresolvable project. Nothing is written
+        on error.
     """
     if (err := _reject_toolcall_markup(version=version, reason=reason)):
         return err
@@ -1537,6 +1609,7 @@ def abandon_release(
         assert project_slug is not None
         out = core_abandon_release(
             _get_engine(), project_slug, version, reason, confirm=confirm,
+            actor="ledger",  # K-119 M6: no operation lock here
         )
         return _release_ack(project_slug, out)
     except Exception as e:

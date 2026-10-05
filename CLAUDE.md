@@ -55,19 +55,29 @@ uv run --no-project --with 'mcp' --with sqlalchemy --with 'psycopg[binary]' \
 dct/config.py            — Config loading (platform config dir + legacy
                            ~/.claude fallback + env vars; ADR #52)
 dct/paths.py             — Platform-neutral config/data/cache/state dirs
-                           (XDG on POSIX, platformdirs on Windows)
+                           (XDG on POSIX, platformdirs on Windows); the ONE
+                           SQLite URL builder / parser (sqlite_url,
+                           sqlite_database_path — K-99: never concatenate or
+                           slice "sqlite:///", SQLAlchemy 2.0 and 2.1 parse
+                           the path differently)
 dct/migrate.py           — dct migrate-home (legacy → platform-neutral home)
 dct/db.py                — SQLAlchemy Core tables + engine factory + migrations
 dct/core/projects.py     — Projects CRUD (+ realpath-canonical CWD detection)
 dct/core/items.py        — Items / notes / checkpoints CRUD
-dct/core/changelog.py    — Changelog entries CRUD + release stamping
+dct/core/changelog.py    — Changelog entries CRUD + release stamping (the stamp
+                           is the ONLY writer of versions, K-102: add_entry
+                           refuses one; import_released_entry = old history)
 dct/core/releases.py     — Release ledger (K-41/K-60/K-61): records written with
                            the stamp, one state machine (TRANSITIONS; advance,
                            abandon), immutable candidate, write-once release
                            commit / manifest / proof, legacy reconstruction,
                            the project's version-file contract (K-73); the
                            verified release_mode, executor and write-once
-                           consent / proposal / render (docs/release-workflow.md)
+                           consent / proposal / render; K-115: tag_proof /
+                           push_proof (a status is never proof), mutual
+                           consistency of a record's fields, duplicates of
+                           one version refuse writes; every mutation checks
+                           its actor (docs/release-workflow.md)
 dct/core/sprint.py       — Current-sprint ops; delegates to item_sprints
 dct/core/sprints.py      — First-class sprints (single source of truth)
 dct/core/handoff.py      — Session handoffs (cross-session prompt ledger)

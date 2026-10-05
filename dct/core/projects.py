@@ -267,12 +267,27 @@ def set_release_executor(engine: sa.Engine, slug: str, executor: str) -> dict | 
     effects layer — the default) or 'own' (the project's own release tool).
 
     Copied onto each NEW release record at stamp time (releases.executor);
-    an unfinished release keeps the executor it was stamped with. Returns the
-    updated project row, or None when the slug does not resolve to a live
-    project. ValueError for any other value."""
+    an unfinished release keeps the executor it was stamped with. Written
+    inside project_transaction(write=True) — the SAME project lock as the
+    stamp (K-106): the stamp compares the executor its caller expects with
+    this setting in its own transaction, so a change here either precedes
+    that comparison (the stamp refuses) or waits until the stamp committed
+    (the record keeps what the stamp saw). Returns the updated project row,
+    or None when the slug does not resolve to a live project. ValueError
+    for any other value."""
     from dct.core.releases import validate_executor
+    from dct.db import project_transaction
 
-    return _set_project_value(engine, slug, release_executor=validate_executor(executor))
+    value = validate_executor(executor)
+    if get_project(engine, slug) is None:
+        return None
+    try:
+        with project_transaction(engine, slug, write=True) as (conn, pid):
+            conn.execute(projects.update().where(projects.c.id == pid).values(
+                release_executor=value, updated_at=datetime.now(UTC)))
+    except ValueError:  # the project was deleted between the two reads
+        return None
+    return get_project(engine, slug)
 
 
 def set_changelog_pr_refs(engine: sa.Engine, slug: str, enabled: bool) -> dict | None:

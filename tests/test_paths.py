@@ -145,8 +145,84 @@ def test_sqlite_url_posix():
 
 
 def test_sqlite_url_windows_uses_forward_slashes():
+    """The flavour guarantee: a Windows path keeps its drive and uses forward
+    slashes. Asserted on what SQLAlchemy READS back — the rendered text may
+    percent-encode the drive colon on SQLAlchemy 2.1 (K-99)."""
     url = paths.sqlite_url(PureWindowsPath(r"C:\Users\alice\dct.db"))
-    assert url == "sqlite:///C:/Users/alice/dct.db"
+    assert "\\" not in url
+    assert paths.sqlite_database_path(url) == "C:/Users/alice/dct.db"
+
+
+# --- K-99: SQLite URLs independent of the SQLAlchemy version ---
+# SQLAlchemy 2.1 percent-decodes the database part of a URL, 2.0 does not:
+# a hand-built "sqlite:///" + path names ANOTHER file on 2.1 when the path
+# holds a '%'. sqlite_url / sqlite_database_path are the one builder and the
+# one parser; both go through SQLAlchemy's own URL object.
+
+_AWKWARD_NAMES = [
+    "plain.db",
+    "we#ird%20name.db",   # '#' (URI fragment) and a literal percent escape
+    "a b.db",
+    "100%.db",
+    "q?x=1.db",           # '?' would start the query string
+    "zażółć.db",
+]
+
+
+def _url_or_skip(path):
+    """sqlite_url(path) — or skip when the SQLAlchemy in use cannot express
+    the path ('?' on the 2.0 line); the refusal itself has its own test."""
+    try:
+        return paths.sqlite_url(path)
+    except ValueError:
+        if "?" not in str(path):
+            raise
+        pytest.skip("this SQLAlchemy cannot express '?' in a SQLite URL (refused)")
+
+
+def test_sqlite_url_never_names_another_file(tmp_path):
+    """A path with '?': either it round-trips (SQLAlchemy 2.1) or the builder
+    refuses — it never returns a URL that opens a different file."""
+    import sqlalchemy as sa
+
+    path = tmp_path / "q?x=1.db"
+    try:
+        url = paths.sqlite_url(path)
+    except ValueError as exc:
+        assert "cannot be written as a SQLite URL" in str(exc)
+        return
+    assert sa.engine.make_url(url).database == str(path)
+
+
+@pytest.mark.parametrize("name", _AWKWARD_NAMES)
+def test_sqlite_url_round_trips_through_sqlalchemy(tmp_path, name):
+    import sqlalchemy as sa
+
+    path = tmp_path / name
+    url = _url_or_skip(path)
+    assert sa.engine.make_url(url).database == str(path)
+    assert paths.sqlite_database_path(url) == str(path)
+
+
+@pytest.mark.parametrize("name", _AWKWARD_NAMES)
+def test_engine_from_sqlite_url_opens_exactly_that_file(tmp_path, name):
+    import sqlalchemy as sa
+
+    path = tmp_path / name
+    engine = sa.create_engine(_url_or_skip(path))
+    try:
+        with engine.begin() as conn:
+            conn.execute(sa.text("CREATE TABLE t (x INTEGER)"))
+    finally:
+        engine.dispose()
+    assert [p.name for p in tmp_path.iterdir() if p.name != "home"] == [name]
+
+
+@pytest.mark.parametrize("url", [
+    "sqlite://", "sqlite:///:memory:", "postgresql://localhost:5432/dct", "", "not a url",
+])
+def test_sqlite_database_path_is_none_without_a_file(url):
+    assert paths.sqlite_database_path(url) is None
 
 
 # --- Windows branch delegates to platformdirs (seam test) ---

@@ -1419,7 +1419,17 @@ def _print_release_record(record: dict) -> None:
     print(f"  entries:       {ids}")
     print(f"  candidate sha: {record['candidate_sha'] or '-'}")
     print(f"  release commit: {record['release_commit_sha'] or '-'}")
+    tag, push = record.get("tag_proof"), record.get("push_proof")
+    print(f"  tag proof:     {tag['name']} → {tag['commit']}"
+          f"{' (annotated)' if tag['annotated'] else ''}, recorded {tag['recorded_at']}"
+          if tag else "  tag proof:     -")
+    print(f"  push proof:    {push['target']['remote']} {push['target']['branch'] or '-'} "
+          f"{push['target']['tag']} → {push['tag_commit']}, recorded {push['recorded_at']}"
+          if push else "  push proof:    -")
     print(f"  checkout root: {record['checkout_root'] or '-'}")
+    for dup in record.get("duplicates") or []:
+        print(f"  DUPLICATE:     record #{dup['id']} ({dup['version']}, {dup['status']}) — "
+              f"the ledger is ambiguous; every write of this version is refused")
     manifest = record["manifest"] or {}
     print(f"  manifest:      {', '.join(sorted(manifest)) or '-'}")
     proof = record["proof"] or {}
@@ -1465,6 +1475,17 @@ def cmd_clog_release_status(args):
     _print_release_record(record)
 
 
+def _json_arg(flag: str, raw: str):
+    """Parse a CLI argument that carries JSON; ValueError naming the flag
+    for text that is not JSON (its SHAPE is validated by the core)."""
+    import json
+
+    try:
+        return json.loads(raw)
+    except ValueError as exc:
+        raise ValueError(f"{flag} must be a JSON object: {exc}") from None
+
+
 def cmd_clog_release_advance(args):
     """`dct clog release-advance V STATUS` — the LEDGER path (K-96 D10): an
     adapter of effects.record_progress — core advance_release as the actor
@@ -1473,16 +1494,26 @@ def cmd_clog_release_advance(args):
     project's own tool, a record stamped outside `dct release apply`); a
     release dct executes is refused (`dct release resume` records its
     progress). candidate_sha is immutable — not accepted; the manifest is
-    written by the release workflow. Errors exit 1 (a lost serialization
-    race 75)."""
+    written by the release workflow. --tag-proof / --push-proof (K-115 G4)
+    take the JSON identities the caller verified — the ledger requires them
+    for tagged / pushed / completed of a record with git. Errors exit 1 (a
+    lost serialization race 75)."""
     from dct.workflows.release.effects import record_progress
 
     engine = _get_engine()
     project_slug = args.project or _detect_project(engine)
     as_json = getattr(args, "json", False)
-    out = _run_effects("advance", project_slug, as_json, lambda: record_progress(
-        engine, project_slug, args.version, args.status,
-        release_commit_sha=args.release_commit_sha or None))
+
+    def advance():
+        proofs = {}
+        for name in ("tag_proof", "push_proof"):
+            raw = getattr(args, name, None)
+            if raw:
+                proofs[name] = _json_arg(f"--{name.replace('_', '-')}", raw)
+        return record_progress(engine, project_slug, args.version, args.status,
+                               release_commit_sha=args.release_commit_sha or None, **proofs)
+
+    out = _run_effects("advance", project_slug, as_json, advance)
     if as_json:
         return
     record = out["release"]
@@ -2759,12 +2790,26 @@ def build_parser() -> argparse.ArgumentParser:
         "--release-commit-sha",
         help="The verified release commit — recorded once, from 'committed' on "
              "(the candidate commit is immutable)")
+    p_clog_radv.add_argument(
+        "--tag-proof", metavar="JSON",
+        help="The tag as you verified it: {\"name\", \"object\" (git rev-parse "
+             "refs/tags/<name>), \"commit\" (git rev-parse <name>^{commit}), "
+             "\"annotated\": true|false} — required for tagged / pushed / completed of a "
+             "release with git; recorded once")
+    p_clog_radv.add_argument(
+        "--push-proof", metavar="JSON",
+        help="The push as you verified it: {\"target\": {\"remote\", \"url\", "
+             "\"branch\", \"tag\"}, \"tag_commit\", \"branch_tip\"} — required for "
+             "pushed (and for completed when the release's consent approved a push)")
     p_clog_radv.add_argument("--json", action="store_true", help="Stable JSON document")
     p_clog_radv.epilog = (
         "The ledger path for a release dct does NOT execute — a project's own release tool "
         "(release executor 'own') or a record stamped outside `dct release apply`: report "
-        "only what you verified. A release dct executes is refused (`dct release resume` "
-        "records its progress). Holds the release operation lock of the repository.")
+        "only what you verified. A status is never proof: a release with git reaches tagged "
+        "/ pushed / completed only with --tag-proof (full commit ids; its commit must be the "
+        "release commit), and pushed only with --push-proof. A release dct executes is "
+        "refused (`dct release resume` records its progress). Holds the release operation "
+        "lock of the repository.")
 
     p_clog_rabandon = p_clog_sub.add_parser(
         "release-abandon",

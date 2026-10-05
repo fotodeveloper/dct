@@ -203,6 +203,13 @@ def resolve_branch_fields(
     return {**detected, "branch_source": detected_source}
 
 
+_VERSION_REFUSAL = (
+    "add_entry writes UNRELEASED entries — only the release stamp (release_entries / "
+    "MCP release_changelog) assigns a version; old released history is imported with "
+    "import_released_entry; nothing written."
+)
+
+
 def add_entry(
     engine: sa.Engine,
     project_slug: str,
@@ -217,7 +224,21 @@ def add_entry(
     worktree: str | None = None,
     branch_source: str | None = None,
 ) -> dict:
-    """Insert a changelog entry and return the full row.
+    """Insert an UNRELEASED changelog entry and return the full row.
+
+    `version` (K-102) is kept in the signature only so positional callers
+    keep working: every value other than None — also "" — raises ValueError
+    and nothing is written. The transactional stamp
+    (release_entries) is the ONLY writer of versions: an entry written with
+    a version would join the export of a release whose record never lists
+    it. Old released history (and test fixtures) go through the separate
+    import_released_entry.
+
+    Runs in project_transaction(write=True) — the shared project lock of
+    every composed writer: an entry and a stamp of the same project
+    serialize (an entry committed first is in the snapshot the stamp checks
+    against its approved plan; one arriving during the stamp waits and
+    stays unreleased).
 
     `branch` / `worktree` are stored as given (see resolve_branch_fields for
     the detection rule callers apply first) under decide_branch_fields:
@@ -228,11 +249,21 @@ def add_entry(
     unknown, foreign or soft-deleted id raises ValueError and nothing is
     written. Over-long String(N) values are refused.
     """
+    if version is not None:
+        raise ValueError(_VERSION_REFUSAL)
+    values = _entry_values(category, entry, component, source_file, source_lines,
+                           related_item_id, branch, worktree, branch_source)
+    with project_transaction(engine, project_slug, write=True) as (conn, project_id):
+        return _insert_entry(conn, project_id, values)
+
+
+def _entry_values(category, entry, component, source_file, source_lines, related_item_id,
+                  branch, worktree, branch_source) -> dict:
+    """Validated column values shared by add_entry and import_released_entry."""
     if not entry or not entry.strip():
         raise ValueError("Changelog entry cannot be empty")
     _validate_category(category)
     values = {
-        "version": version,
         "category": category,
         "entry": entry,
         "component": component,
@@ -244,16 +275,88 @@ def add_entry(
         ),
     }
     ensure_fits(changelog_entries, values)
+    return values
 
-    with engine.begin() as conn:
-        project_id = resolve_project_id(conn, project_slug)
-        _validate_related_item(conn, project_id, related_item_id)
-        result = conn.execute(
-            changelog_entries.insert()
-            .values(project_id=project_id, **values)
-            .returning(changelog_entries)
+
+def _insert_entry(conn: sa.Connection, project_id: int, values: dict) -> dict:
+    _validate_related_item(conn, project_id, values["related_item_id"])
+    result = conn.execute(
+        changelog_entries.insert()
+        .values(project_id=project_id, **values)
+        .returning(changelog_entries)
+    )
+    return row_to_dict(result.first())
+
+
+def import_released_entry(
+    engine: sa.Engine,
+    project_slug: str,
+    category: str,
+    entry: str,
+    version: str,
+    *,
+    released_at: datetime | None = None,
+    component: str | None = None,
+    source_file: str | None = None,
+    source_lines: str | None = None,
+    related_item_id: int | None = None,
+    branch: str | None = None,
+    worktree: str | None = None,
+    branch_source: str | None = None,
+) -> dict:
+    """Import ONE entry of an ALREADY RELEASED version — old history from
+    before dct tracked the project, or a test fixture (K-102). The separate,
+    explicitly named path: add_entry never takes a version, and a NEW
+    release is always release_entries (the stamp + its record).
+
+    `version` is REQUIRED — a non-empty, unpadded string, stored AS GIVEN (a
+    legacy spelling such as `v1.1` or `2026-rc` stays what the history
+    says; ensure_fits). Inside project_transaction(write=True), before the
+    INSERT:
+    - the version must have NO live release record (under the version
+      contract: 1.1 == 1.1.0 == v1.1) — a record's entry set is exactly the
+      entries carrying its version and is never extended; ValueError
+      "… has a release record …";
+    - a version that parses under the contract must not be HIGHER than a
+      parseable current_version — it was never released (ValueError).
+    Nothing else changes: current_version stays, no record is written (a
+    record for such history is `dct release reconstruct`). `released_at`
+    defaults to now. The other fields follow add_entry. Returns the row;
+    nothing is written on error.
+    """
+    if not isinstance(version, str) or not version.strip() or version != version.strip():
+        raise ValueError(
+            "import_released_entry needs the released version (a non-empty, unpadded "
+            "string) — an unreleased entry is add_entry; nothing written."
         )
-        return row_to_dict(result.first())
+    values = _entry_values(category, entry, component, source_file, source_lines,
+                           related_item_id, branch, worktree, branch_source)
+    values["version"] = version
+    ensure_fits(changelog_entries, values)
+    values["released_at"] = released_at or datetime.now(UTC)
+    from dct.core import releases as release_records
+
+    with project_transaction(engine, project_slug, write=True) as (conn, project_id):
+        recorded = None
+        if _parses(version):  # a record's version always parses
+            recorded = release_records.unique_record(conn, project_id, project_slug, version)
+        if recorded is not None:
+            raise ValueError(
+                f"version {recorded.version} of '{project_slug}' has a release record "
+                f"({recorded.status}) — its entry set is exactly the stamped one and is "
+                f"never extended by an import; nothing written."
+            )
+        current = conn.execute(
+            sa.select(projects.c.current_version).where(projects.c.id == project_id)
+        ).scalar()
+        if current and _parses(current) and _parses(version) \
+                and compare_versions(version, current) > 0:
+            raise ValueError(
+                f"version {version} is higher than the current version {current} of "
+                f"'{project_slug}' — it was never released, so there is no history to "
+                f"import (a new release is release_entries); nothing written."
+            )
+        return _insert_entry(conn, project_id, values)
 
 
 def _validate_related_item(conn: sa.Connection, project_id: int, item_id: int | None) -> None:
@@ -481,6 +584,7 @@ def release_entries(
     expected_entries: Mapping | None = None,
     manifest: Mapping | None = None,
     consume_proposal: bool = False,
+    expected_executor: str | None = None,
 ) -> dict:
     """Stamp changelog entries with a version, set the project's current_version
     and write the durable release record (K-41) — ONE transaction.
@@ -555,6 +659,16 @@ def release_entries(
     consent digest raises ValueError and NOTHING is written (the earlier
     contract and the pending proposal stay). A no-op (an existing record, a
     historical retry) never needs it.
+    K-106 executor binding: `expected_executor` ('dct' | 'own'; None = not
+    bound) — the executor the caller's plan / consent was approved for; a
+    consent naming its `executor` binds the same way (the two must agree,
+    ValueError before any read otherwise). A NEW record: compared with the
+    project's CURRENT release_executor inside the stamp transaction
+    (core.releases.check_expected_executor — the setter takes the same
+    project lock) and refused on a mismatch BEFORE any write (no entry, no
+    record, no version-file contract, the pending proposal stays). An
+    EXISTING record: compared with the RECORD's executor (immutable; today's
+    project setting is irrelevant) — a different one raises ValueError.
 
     The call's RESOLVED SET: 'selected' → the given ids; 'version_only' → [];
     'all' → the live entries already carrying V plus every unreleased entry.
@@ -617,6 +731,15 @@ def release_entries(
         "render": release_records.validate_render(render),
     }
     initial_manifest = release_records.validate_manifest(manifest)
+    expected_by = None if expected_executor is None else \
+        release_records.validate_executor(expected_executor)
+    consented_by = (given["consent"] or {}).get("executor")
+    if expected_by and consented_by and expected_by != consented_by:
+        raise ValueError(
+            f"expected_executor '{expected_by}' contradicts the consent's executor "
+            f"'{consented_by}'; nothing released."
+        )
+    expected_by = expected_by or consented_by
     approval = (given["consent"] or {}).get("proposal_sha256") if consume_proposal else None
     root = normalize_worktree(checkout_root)
     ensure_fits(release_records.releases, {"checkout_root": root})
@@ -641,7 +764,8 @@ def release_entries(
         assert version is not None
         ensure_version_fits(version)
         is_current = same_version(current, version)
-        record = release_records.find_record(conn, pid, version)
+        # K-115 G6: an ambiguous ledger (several live records of V) refuses.
+        record = release_records.unique_record(conn, pid, project_slug, version)
 
         already: list[int] = []
         branches: set[str | None] = set()
@@ -706,6 +830,14 @@ def release_entries(
                     + "; nothing released."
                 )
             release_records.check_entry_set(conn, pid, record)
+            recorded_by = recorded["executor"] or release_records.DEFAULT_EXECUTOR
+            if expected_by is not None and expected_by != recorded_by:
+                raise ValueError(
+                    f"release {recorded['version']} is recorded with the executor "
+                    f"'{recorded_by}', not '{expected_by}' — a record's executor is "
+                    f"immutable (a later project-setting change never takes it over); "
+                    f"nothing written."
+                )
             for field, value in given.items():
                 if recorded[field] is None and field != "proof":
                     continue  # a record older than the field: nothing to contradict
@@ -727,6 +859,7 @@ def release_entries(
                 )
         release_records.check_proof_scope(proof_map, resolved)
         _check_plan_binding(conn, pid, to_stamp, stampable, expected)
+        release_records.check_expected_executor(conn, pid, project_slug, expected_by)
         if current and compare_versions(version, current) < 0:
             raise ValueError(
                 f"Version {version} is lower than the current version {current} of "
@@ -1089,3 +1222,4 @@ def delete_entry(engine: sa.Engine, project_slug: str, entry_id: int) -> bool:
         if result.rowcount == 0:
             raise _entry_state_error(conn, pid, entry_id)
         return True
+

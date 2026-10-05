@@ -2,7 +2,13 @@
 
 import pytest
 
-from dct.core.changelog import add_entry, count_unreleased, delete_entry, list_entries
+from dct.core.changelog import (
+    add_entry,
+    count_unreleased,
+    delete_entry,
+    import_released_entry,
+    list_entries,
+)
 from dct.core.items import (
     add_note,
     create_item,
@@ -420,7 +426,7 @@ class TestChangelogEdgeCases:
         """If unreleased_only=True, version parameter is silently ignored."""
         create_project(engine, slug="p", name="P")
         add_entry(engine, "p", "added", "Unreleased")
-        add_entry(engine, "p", "added", "Released", version="1.0")
+        import_released_entry(engine, "p", "added", "Released", "1.0")
         # Even with version="1.0", unreleased_only should only return unreleased
         entries = list_entries(engine, "p", version="1.0", unreleased_only=True)
         assert len(entries) == 1

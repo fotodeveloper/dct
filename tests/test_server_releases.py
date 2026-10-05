@@ -5,13 +5,15 @@ get_release, advance_release (release_commit_sha, manifest), abandon_release."""
 import json
 
 import pytest
+from conftest import ledger_proofs
 
 SHA = "0123456789abcdef0123456789abcdef01234567"
 SHA2 = "fedcba9876543210fedcba9876543210fedcba98"
 RECORD_KEYS = {"id", "version", "mode", "entry_ids", "candidate_sha", "checkout_root",
                "release_commit_sha", "manifest", "proof", "status", "created_at",
                "updated_at", "completed_at", "abandoned_at", "abandon_reason",
-               "release_mode", "executor", "consent", "proposal", "render"}
+               "release_mode", "executor", "consent", "proposal", "render",
+               "tag_proof", "push_proof"}
 
 
 @pytest.fixture
@@ -150,7 +152,8 @@ def test_abandon_release_ack_and_record(released):
 
 
 def test_abandon_release_completed_is_an_error(released):
-    released.advance_release("1.1.0", "completed", project="test", release_commit_sha=SHA2)
+    released.advance_release("1.1.0", "completed", project="test",
+                             **ledger_proofs("completed", SHA2))
     out = released.abandon_release("1.1.0", "late", confirm=True, project="test")
     assert "never reclassified" in out["error"]
 
@@ -187,7 +190,8 @@ def test_advance_release_errors(released, version, status, match):
 
 
 def test_advance_release_backwards_is_an_error(released):
-    released.advance_release("1.1.0", "tagged", project="test", release_commit_sha=SHA2)
+    released.advance_release("1.1.0", "tagged", project="test",
+                             **ledger_proofs("tagged", SHA2))
     assert "backwards" in released.advance_release("1.1.0", "committed", project="test")["error"]
     released.advance_release("1.1.0", "completed", project="test")
     assert "terminal" in released.advance_release("1.1.0", "tagged", project="test")["error"]

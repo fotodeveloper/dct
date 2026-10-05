@@ -391,6 +391,11 @@ releases = sa.Table(
     sa.Column("consent", sa.Text),  # JSON object: what the owner approved
     sa.Column("proposal", sa.Text),  # JSON object: the approved version-file proposal
     sa.Column("render", sa.Text),  # JSON object: changelog render settings
+    # K-115 G4: the VERIFIED tag identity {name, object, commit, annotated,
+    # recorded_at} and push {target, tag_commit, branch_tip, recorded_at} —
+    # write-once; NULL = not proven (older record / no tag or push yet).
+    sa.Column("tag_proof", sa.Text),
+    sa.Column("push_proof", sa.Text),
     sa.Column("deleted_at", sa.DateTime),
     *_provenance_columns(),
 )
@@ -522,12 +527,11 @@ def ensure_sqlite_dir(database_url: str) -> None:
     file with a raw OperationalError instead of creating it (#360). No-op for
     non-sqlite dialects and for memory URLs ('sqlite://', 'sqlite:///:memory:').
     """
-    url = sa.engine.make_url(database_url)
-    if url.get_backend_name() != "sqlite":
-        return
-    if not url.database or url.database == ":memory:":
-        return
-    Path(url.database).parent.mkdir(parents=True, exist_ok=True)
+    from dct.paths import sqlite_database_path
+
+    database = sqlite_database_path(database_url)  # the ONE parser (K-99)
+    if database is not None:
+        Path(database).parent.mkdir(parents=True, exist_ok=True)
 
 
 def get_engine(database_url: str) -> sa.Engine:
@@ -590,14 +594,18 @@ def get_readonly_engine(database_url: str) -> sa.Engine:
 
     No DDL runs; pair it with check_schema_ready before reading.
     """
+    from dct.paths import sqlite_database_path
+
     url = sa.engine.make_url(database_url)
     if url.get_backend_name() == "sqlite":
-        if not url.database or url.database == ":memory:":
+        # K-99: the path the NORMAL engine opens for this URL (one parser).
+        database = sqlite_database_path(database_url)
+        if database is None:
             raise SchemaNotReady(
                 "an in-memory SQLite database has no schema — a read-only command "
                 "needs an existing database file"
             )
-        path = Path(url.database).expanduser().absolute()
+        path = Path(database).expanduser().absolute()
         if not path.is_file():
             raise SchemaNotReady(
                 f"the database {path} does not exist — this read-only command never "
@@ -917,7 +925,7 @@ def _add_column_if_missing(
 
 
 # Columns _apply_schema_updates heals onto an existing database (K-60, K-61,
-# K-73, K-85, K-90, K-94, K-76, K-97) — table → [(column, DDL type)].
+# K-73, K-85, K-90, K-94, K-76, K-97, K-115) — table → [(column, DDL type)].
 # TIMESTAMP is portable (SQLite stores the value as SQLAlchemy's DateTime
 # would). `{false}` is the dialect's BOOLEAN false literal (PostgreSQL is
 # strict: FALSE; SQLite: 0) — keep it in sync with the column's
@@ -934,6 +942,8 @@ RELEASE_LEDGER_COLUMNS: dict[str, tuple[tuple[str, str], ...]] = {
         ("consent", "TEXT"),
         ("proposal", "TEXT"),
         ("render", "TEXT"),
+        ("tag_proof", "TEXT"),
+        ("push_proof", "TEXT"),
     ),
     "projects": (
         ("version_files", "TEXT"),

@@ -6,7 +6,7 @@ import shutil
 from pathlib import Path
 
 import pytest
-from conftest import git, git_commit_proving, make_git_repo, run_cli
+from conftest import git, git_commit_proving, ledger_proofs, make_git_repo, run_cli
 
 from dct.core.changelog import add_entry, list_entries, release_entries
 from dct.core.projects import create_project, get_project
@@ -175,7 +175,8 @@ def test_release_rerun_of_a_completed_release_is_a_noop(cli_engine, tmp_path, mo
                    current_version="1.0.0")
     a = add_entry(cli_engine, "proj-v", "added", "a")["id"]
     release_entries(cli_engine, "proj-v", "1.1.0")
-    advance_release(cli_engine, "proj-v", "1.1.0", "completed", release_commit_sha="1234567")
+    advance_release(cli_engine, "proj-v", "1.1.0", "completed",
+                    **ledger_proofs("completed", "1234567"))
     run_cli(monkeypatch, ["clog", "release", "--confirm", "--no-push", "-P", "proj-v", "1.1.0", "--entries", str(a)])
     out = capsys.readouterr().out
     assert "already released" in out and "release record 1.1.0: completed" in out
@@ -187,7 +188,8 @@ def test_release_rerun_with_a_different_set_exits_nonzero(cli_engine, tmp_path, 
     a = add_entry(cli_engine, "proj-v", "added", "a")["id"]
     add_entry(cli_engine, "proj-v", "added", "b")
     release_entries(cli_engine, "proj-v", "1.1.0", entry_ids=[a])
-    advance_release(cli_engine, "proj-v", "1.1.0", "completed", release_commit_sha="1234567")
+    advance_release(cli_engine, "proj-v", "1.1.0", "completed",
+                    **ledger_proofs("completed", "1234567"))
     assert _exit_code(monkeypatch, ["clog", "release", "--confirm", "--no-push", "-P", "proj-v", "1.1.0"]) == 1
     assert "different set" in capsys.readouterr().err
 
@@ -220,7 +222,8 @@ def test_release_status_without_version_shows_the_unfinished_one(recorded, monke
 
 def test_release_status_none_unfinished(recorded, monkeypatch, capsys):
     engine, _ = recorded
-    advance_release(engine, "proj-v", "1.1.0", "completed", release_commit_sha="1234567")
+    advance_release(engine, "proj-v", "1.1.0", "completed",
+                    **ledger_proofs("completed", "1234567"))
     run_cli(monkeypatch, ["clog", "release-status", "-P", "proj-v"])
     assert "No unfinished release" in capsys.readouterr().out
 
@@ -317,7 +320,7 @@ def test_release_abandon_keeps_everything_and_repeat_is_a_noop(recorded, monkeyp
 
 def test_release_advance_backwards_exits_nonzero(recorded, monkeypatch, capsys):
     engine, _ = recorded
-    advance_release(engine, "proj-v", "1.1.0", "tagged", release_commit_sha="1234567")
+    advance_release(engine, "proj-v", "1.1.0", "tagged", **ledger_proofs("tagged", "1234567"))
     assert _exit_code(monkeypatch, ["clog", "release-advance", "1.1.0", "committed",
                                     "-P", "proj-v"]) == 1
     assert "backwards" in capsys.readouterr().err

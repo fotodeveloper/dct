@@ -22,6 +22,7 @@ from pathlib import Path
 import pytest
 import sqlalchemy as sa
 
+from dct import paths
 from dct.core.projects import create_project
 from dct.db import (
     UPGRADE_COMMAND,
@@ -170,7 +171,10 @@ def test_readonly_engine_opens_a_path_with_uri_metacharacters(tmp_path):
     _rollback_journal_db(plain)
     db_path = tmp_path / "we#ird%20name.db"
     plain.rename(db_path)
-    eng = get_readonly_engine(f"sqlite:///{db_path}")
+    # K-99: the URL comes from the ONE builder (paths.sqlite_url), so the
+    # test holds on every supported SQLAlchemy (2.1 percent-decodes the
+    # database part of a URL, 2.0 does not).
+    eng = get_readonly_engine(paths.sqlite_url(db_path))
     try:
         check_schema_ready(eng)
     finally:

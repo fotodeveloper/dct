@@ -241,10 +241,10 @@ K-97 F3) → `apply` → `resume` after an interruption.
 | `dct release prepare [--version V \| --patch \| --minor \| --major] (--entries … \| --no-entries) --plan-digest D [--json]` | the PREPARE stage (K-76, [below](#prepare-dct-release-prepare-k-76)): the version-sync script runs ONCE, isolated, and its result becomes the project's PENDING version-file proposal; outcome `prepared` with `proposal_sha256`. Nothing is stamped. |
 | `dct release apply [--version V \| --patch \| --minor \| --major] (--entries … \| --no-entries) --plan-digest D --proposal-digest P [--push-remote R [--push-branch B] \| --no-push] --confirm` | one release from the APPROVED plan (K-80) and the APPROVED proposal (K-76): `D` = the `snapshot_digest` of `dct release plan`, `P` = the `proposal_sha256` of `dct release prepare`, both with the SAME version and selection — steps 1-7 below. The push target (step 7) is approved with it. A re-run of a recorded / historical release needs no `P` (no-op). |
 | `dct release resume` | finishes the unfinished record (table below). No `--confirm` (K-97 F4): it executes the CONSENT stored at apply — version, entries, candidate, proposal, push target — and refuses whatever lies outside it (then: a new apply, or abandon) |
-| `dct release abandon --version V --reason "…" --confirm` | core `abandon_release`: the record ends `abandoned`; stamps, `current_version` and every effect stay; V stays taken |
+| `dct release abandon --version V --reason "…" --confirm` | core `abandon_release` as the actor `dct`, under the operation lock: the record ends `abandoned`; stamps, `current_version` and every effect stay; V stays taken. The ONLY path that abandons a release dct executes (K-119 M6): MCP `abandon_release` holds no lock and refuses such a record, so no effect runs past an abandon — afterwards `resume` finds no unfinished record |
 | `dct release reconstruct --version V [--confirm]` | a legacy release WITHOUT a record: evidence is gathered read-only and shown; `--confirm` records it (core `reconstruct_release`, no re-stamp) — [Reconstruct](#reconstruct-dct-release-reconstruct-k-60-k-86-k-96-d8) |
 | `dct release status [--version V]` | the record (read-only) |
-| `dct clog release-advance V STATUS [--release-commit-sha S] [--json]` | the LEDGER path (K-96 D10, `effects.record_progress`): core `advance_release` as the actor `ledger` under the operation lock, for a release dct does NOT execute (an `own` record, or one stamped outside `apply`); a release dct executes is refused (`resume` records its progress). Outcome `advanced` / `noop`, details `{updated, previous_status}` |
+| `dct clog release-advance V STATUS [--release-commit-sha S] [--tag-proof JSON] [--push-proof JSON] [--json]` | the LEDGER path (K-96 D10, `effects.record_progress`): core `advance_release` as the actor `ledger` under the operation lock, for a release dct does NOT execute (an `own` record, or one stamped outside `apply`); a release dct executes is refused (`resume` records its progress). `--tag-proof` / `--push-proof` carry what the caller verified ([proofs](#proof-of-the-tag-and-of-the-push-k-115)) — a record with git reaches `tagged` / `pushed` / `completed` only with them. Outcome `advanced` / `noop`, details `{updated, previous_status}` |
 | `dct clog release-abandon V --reason "…" --confirm [--json]` | alias of `dct release abandon` (the same function, the same lock) |
 | `dct clog release [V] [--patch …] [--entries … \| --no-entries] [--proposal-digest P] [--push-remote R [--push-branch B] \| --no-push] --confirm [--json]` | alias of `prepare` + `apply` (the same functions, no rules of its own); `--confirm` is REQUIRED as for apply (K-96 D1 — it commits, tags and pushes; running it is not the confirmation). No `--plan-digest`: the plan is derived inside the call for the candidate it pins, with the same stamp binding. Without `--entries` it releases every unreleased entry — all must be proven. Without `--proposal-digest` it prepares inside the call and proceeds only when the proposal's files EQUAL the confirmed contract; a first release (also an empty contract, D4) or a contract change is refused with the proposal shown (it stays pending) — re-run with `--proposal-digest P`. Refused instead of guessed: unproven entries, a proof range that needs confirmation (`range.confirm_required`). |
 
@@ -260,6 +260,20 @@ from then on; a later change of the project setting never takes over an
 unfinished release (in either direction). dct never runs a command stored in
 the database.
 
+**The stamp binds the expected executor** (K-106): the approval is for a
+release performed by ONE executor. `release_entries(expected_executor=…)`
+(MCP `release_changelog(expected_executor=…)`; `dct release apply` records
+`executor: "dct"` in the consent, which binds the same way) compares it with
+the project's CURRENT setting INSIDE the stamp transaction, and the setter
+(`dct project release-executor`, `core.projects.set_release_executor`) takes
+the same project lock — so a change either precedes that comparison (the
+stamp refuses BEFORE any write: no entry stamped, no record, no version-file
+contract, the pending proposal stays) or waits until the stamp committed
+(the record keeps the executor the stamp saw). As a second barrier the
+fresh `apply` re-reads the record after the stamp and verifies its executor
+and its scope before its first effect, exactly like a resume. A re-run for
+a version that already has a record is compared with that RECORD's executor.
+
 | surface | executor `dct` | executor `own` |
 | --- | --- | --- |
 | `release plan --json`, `clog candidates` (proof layer) | yes | yes — the own tool consumes the same plan, snapshot and proof map |
@@ -267,15 +281,19 @@ the database.
 | `release prepare` / `apply` / the `clog release` alias | yes | REFUSED before any write (`details.executor: "own"`, pointing here) |
 | ledger: MCP `release_changelog`, `get_release`, `advance_release`, `abandon_release` | stamp: use `apply` (an MCP stamp has no consent — below) | yes — the own tool's path |
 | `release resume` | only a record with executor `dct` AND a recorded consent | REFUSED (`details.executor`) |
-| `release abandon`, `clog release-abandon` | yes | yes (ledger only) |
+| `release abandon`, `clog release-abandon` (local, under the operation lock) | yes — the only way to abandon a record dct executes | yes (ledger only) |
+| MCP `abandon_release` (no lock — it never guesses the checkout) | only a record WITHOUT a consent (stamped outside `apply`); a record dct executes is REFUSED and directed to `dct release abandon` (K-119 M6) | yes |
 | `release reconstruct` | yes | yes — it records VERIFIED history and performs no effect; the record gets the project's executor at reconstruction |
 
 **Who records progress** (`core.releases.progress_owner`,
-`advance_release(actor=…)`): a record with executor `dct` (null on older
+`advance_release(actor=…)` / `abandon_release(actor=…)` — the actor is
+ALWAYS checked, K-119 M5: the default is `ledger`, and no value, `None`
+included, skips the check): a record with executor `dct` (null on older
 records counts as `dct`) AND a consent was stamped by `dct release apply` —
-only the effects layer advances it (`resume`, after verifying each effect);
-MCP `advance_release` and `clog release-advance` (actor `ledger`) are
-refused. Every other record — executor `own`, or stamped outside the effects
+only the effects layer advances it (`resume`, after verifying each effect)
+and only the local `dct release abandon` ends it;
+MCP `advance_release` / `abandon_release` and `clog release-advance` (actor
+`ledger`) are refused. Every other record — executor `own`, or stamped outside the effects
 layer (MCP `release_changelog`, older records, a partial reconstruction): no
 approved proposal, no approved push target — is advanced ONLY through the
 ledger path by whoever performed and verified its effects; `dct release
@@ -474,8 +492,9 @@ for a first release (`confirmed` null) and for a changed set — approving
 6. **Tag** — `v<V>`, lightweight (like the repository's existing tags), at
    the verified release commit (tree and parent re-checked). A tag of the
    same version (any spelling) at another commit refuses; one at the
-   release commit is accepted (no second tag for another spelling).
-   `tagged`.
+   release commit is accepted (no second tag for another spelling — also
+   an annotated one the owner created). `tagged` is recorded WITH the tag's
+   verified identity (`tag_proof`, K-115 G4).
 7. **Push** (K-97 F2) — to the CONSENTED push target only (never
    re-derived from today's upstream, K-97 F4): its remote must still have
    the approved push URL (else refused: outside the consent). `git
@@ -485,12 +504,16 @@ for a first release (`confirmed` null) and for a changed set — approving
    again. Else `git push --atomic <remote> <commit>:refs/heads/<branch>
    <commit>:refs/tags/v<V>` (the local `pre-push` and the remote's hooks
    run; `GIT_TERMINAL_PROMPT=0`, the caller's SSH / credential variables
-   kept) and `git ls-remote` again must show both; then `pushed`, then
+   kept) and `git ls-remote` again must show both; then `pushed` — recorded
+   WITH what the remote showed (`push_proof`: the consented target, the
+   commit its tag resolved to, its branch tip; K-115 G4) — then
    `completed`. A failed push (rejected, unreachable, a refusing hook)
    leaves the record `tagged` with the git error (`details.git_error`) —
    `resume` retries ONLY the push: never a new bump, commit or tag. Without
    a push target (`--no-push`, outside git): step `push` is `skipped` and
-   the record goes from `tagged` to `completed`.
+   the record goes from `tagged` to `completed` — the consent's
+   `push_target: null` is the explicit local release; no push proof exists
+   or is needed.
 
 ### Commits and hooks (K-96, K-79)
 
@@ -549,10 +572,15 @@ refused, the lock untouched.
 before anything), then verifies the record's FULL entry
 set (K-94 B3, `core.releases.verify_release_entry_set`: exactly the live
 entries carrying its version — a mismatch refuses before any effect and is
-never repaired by widening the record), that its consent names its
+never repaired by widening the record; a ledger with several live records
+of the version refuses too, K-115 G6), that its consent names its
 proposal, and that the record's version, entries and candidate are the
 consented ones (K-97 F4: resume executes the STORED consent and asks for no
-new approval; anything outside it refuses — a new apply, or abandon); then the
+new approval; anything outside it refuses — a new apply, or abandon), and
+that record, consent, proposal, render and proofs describe ONE release
+(K-115 G5/G9, `check_record_consistency`). A FRESH `apply` runs the same
+three checks on the record it just stamped, re-read from the database,
+before its first effect (K-102 / K-106); then the
 record against the checkout (K-51): the record's `checkout_root` must be
 THIS checkout (another worktree → refused, the record is never re-pinned), a
 git record needs its candidate and checkout, no operation may be in
@@ -563,8 +591,8 @@ progress. Then, by status:
 | `stamped` | the candidate | index: nothing staged or conflicted; unstaged only F and the proposal's files. A record without an approved proposal (stamped outside the effects layer, or before K-76) is refused — the sync is never run after the stamp; abandon it. Otherwise steps 3-4: each artifact classified (baseline → written, approved → kept, else refused with nothing written), the approved blobs written, the full set verified from one read, the manifest recorded |
 | `files_written` | the candidate — or the release commit itself (its only parent is the candidate, its tree is `manifest.tree`, its subject `release: v<V>`), which is adopted (then only the real-index update and `committed`) | every manifest file must still hold its recorded hash (a reverted version file → refused, not overwritten); then step 5 (the commit through the hooks) |
 | `committed` | the release commit or a descendant | the release commit is verified (tree = `manifest.tree`, parent = candidate); step 6 |
-| `tagged` | the release commit or a descendant | the tag must point at the release commit; step 7 — ONLY the push, to the consented target (already on the remote → verified); without a push target `completed` |
-| `pushed` | the release commit or a descendant | the tag as for `tagged`; the remote must still show the branch and the tag (`git ls-remote`, nothing pushed again); `completed` |
+| `tagged` | the release commit or a descendant | a tag of V must point at the release commit and the recorded `tag_proof` must still be what the repository shows (a moved / deleted tag → refused); a record older than the field gets the identity verified NOW with its next progress write; step 7 — ONLY the push, to the consented target (already on the remote → verified); without a push target `completed` |
+| `pushed` | the release commit or a descendant | the tag as for `tagged`; the remote must still show the branch and the tag (`git ls-remote`, nothing pushed again; a record without a `push_proof` gets what was read now); `completed` |
 | `completed` / `abandoned` | — | no unfinished record: outcome `noop`, no side effect |
 
 Interruption points (`effects.INTERRUPTION_POINTS`, the `on_point` hook of
@@ -626,12 +654,15 @@ Evidence, read-only (`effects.gather_evidence`), in this order:
    (any equivalent spelling). `candidates`: `[{commit, verified, reason}]`.
 3. **The stage the evidence reaches**: the tags of V must all point at ONE
    commit (else refused — a contradiction). With a tag: that commit must be
-   a verified candidate → status `completed` (other candidates, e.g. a
+   a verified candidate → status `completed`, recorded WITH the tag's
+   identity as verified now (`evidence.tag_proof` → the record's
+   `tag_proof`, K-115 G4; other candidates, e.g. a
    backport on another branch, are listed, not used). Without a tag:
    exactly one verified candidate → status `committed` — the record ends
    where the evidence ends; dct's `resume` does not continue it (no
    consent: nobody approved a push target) — tag / push it yourself and
-   record that with `dct clog release-advance`, or abandon it. No verified
+   record that with `dct clog release-advance … --tag-proof '{…}'`, or
+   abandon it. No verified
    candidate, or several without a tag → refused. Without a release commit
    nothing is reconstructed (a stamp without its candidate cannot be
    verified).
@@ -639,8 +670,15 @@ Evidence, read-only (`effects.gather_evidence`), in this order:
    found (version field, or a line holding V) → `completed`.
 
 The record: mode `reconstructed`, the resolved version, the status of step
-3, the manifest `{tree, changelog, version_files}`, no consent, proposal or
-render, the project's executor at reconstruction. Any refusal writes nothing.
+3, the manifest `{tree, changelog, version_files}`, the `tag_proof` of a
+`completed` git release, no consent, proposal, render or push proof (nobody
+approved or verified a push through dct — no confirmation is invented for
+old history), the project's executor at reconstruction. That executor (G8)
+is an explicitly ASSIGNED responsibility for the record's further handling
+— who may record progress on it or abandon it — NOT provenance: it does not
+say who made the historical release. Any refusal writes nothing — also
+when the ledger already holds a record of the version, or several (K-115
+G6).
 
 ### JSON (`--json`, every subcommand)
 
@@ -657,7 +695,7 @@ One shape, `effects.RESULT_KEYS` (pinned by
 | `release` | the record (`core.releases.RECORD_FIELDS`) or null |
 | `steps` | `[{step, result, …}]` — step ∈ `sync`, `proposal` (prepare, and the `clog release` alias), `stamp`, `changelog`, `version_files`, `files`, `commit`, `index` (the real index after the commit), `tag`, `push` (`remote`, `branch`, `tag`; `skipped` with `reason` without a push target), `complete`, `attest`; result ∈ `done`, `verified`, `skipped`, `adopted`, `approved`, `conflict` (the last step of a conflict response) |
 | `warnings` | human-readable strings |
-| `details` | prepare: see [Prepare](#prepare-dct-release-prepare-k-76), plus `push_target` (what apply would push to by default — the upstream — or null, read-only); apply: `{requested_version, previous_version, bump, entry_ids, mode, released, current_version, push_target}`; attest: `{previous_head, head, entry_ids}`; abandon: `{updated}`; reconstruct: `{evidence: {version (authoritative), requested_version, spellings, entry_ids, candidate_sha, release_commit_sha, tag, checkout_root, manifest, status, without_git, candidates}}` (`status` = `completed` \| `committed`; `candidates` (git) = `[{commit, verified, reason}]`); advance: `{updated, previous_status}`; conflict: [Conflicts](#conflicts-k-88); refused / failed: the reason (`error`) plus the refusal's data (e.g. `staged`, `unproven`, `proposal` / `proposal_sha256` / `contract` (the alias), `mismatch`, `checkout_changed`, `foreign`, `foreign_paths`, `foreign_content`, `foreign_staged`, `changed`, `path`, `sync`, `exit_code`; the git effects: `git_error`, `commit`, `head`, `tree`, `parents`, `subject`, `expected_tree`, `index_lock`, `push_target`, `remote_tags`, `remote_branch`, `outside_consent`; the operation lock: `lock`, `holder`; the executor: `executor`, `consent`) |
+| `details` | prepare: see [Prepare](#prepare-dct-release-prepare-k-76), plus `push_target` (what apply would push to by default — the upstream — or null, read-only); apply: `{requested_version, previous_version, bump, entry_ids, mode, released, current_version, push_target}`; attest: `{previous_head, head, entry_ids}`; abandon: `{updated}`; reconstruct: `{evidence: {version (authoritative), requested_version, spellings, entry_ids, candidate_sha, release_commit_sha, tag, tag_proof ({name, object, commit, annotated} \| null), checkout_root, manifest, status, without_git, candidates}}` (`status` = `completed` \| `committed`; `candidates` (git) = `[{commit, verified, reason}]`); advance: `{updated, previous_status}`; conflict: [Conflicts](#conflicts-k-88); refused / failed: the reason (`error`) plus the refusal's data (e.g. `staged`, `unproven`, `proposal` / `proposal_sha256` / `contract` (the alias), `mismatch`, `checkout_changed`, `foreign`, `foreign_paths`, `foreign_content`, `foreign_staged`, `changed`, `path`, `sync`, `exit_code`; the git effects: `git_error`, `commit`, `head`, `tree`, `parents`, `subject`, `expected_tree`, `index_lock`, `push_target`, `remote_tags`, `remote_branch`, `outside_consent`; the operation lock: `lock`, `holder`; the executor: `executor`, `consent`) |
 
 Exit codes: 0 success (also `noop`), 1 refused, the script's own code when
 the version sync fails in prepare (124 on timeout), 75 for a conflict
@@ -707,18 +745,20 @@ and a refusal writes nothing.
 | `id`, `created_at`, `updated_at` | row identity and times | — |
 | `version` | the AUTHORITATIVE spelling (normalized) — every artifact uses it | fixed |
 | `mode` | stamp mode: `all`, `selected`, `version_only`, `reconstructed` | fixed |
-| `entry_ids` | the exact entry set (`[]` = version-only); must always equal EXACTLY the live entries carrying the version (K-94 B3 — `verify_release_entry_set` is the pre-effect gate of a resume / retry; a mismatch refuses, the record is never extended or shrunk) | fixed |
+| `entry_ids` | the exact entry set (`[]` = version-only); must always equal EXACTLY the live entries carrying the version (K-94 B3 — `verify_release_entry_set` is the pre-effect gate of a resume / retry AND of a fresh apply; `advance_release` checks it again in its own transaction on EVERY call, also a repeat of the current status, K-102; a mismatch refuses, the record is never extended or shrunk) | fixed |
 | `candidate_sha` | the commit the release was cut from, or null | immutable (K-61) |
 | `checkout_root` | absolute path of the release checkout, or null | fixed |
 | `release_mode` | the VERIFIED release mode (K-94 B1): `git` or `without_git` (a project CONFIRMED outside git); null = recorded before the field existed (unverified) | write-once |
-| `executor` | who performs the effects (K-85): `dct` (the effects layer) or `own` (the project's own tool) — copied from the project's `release_executor` at stamp time (and at reconstruction); null on records older than the field (counts as `dct`). With `consent` it decides who records progress ([Executor](#executor-k-85)) | immutable — a later project-setting change never takes over an unfinished release |
+| `executor` | who performs the effects (K-85): `dct` (the effects layer) or `own` (the project's own tool) — copied from the project's `release_executor` at stamp time, after the stamp compared it with the executor its caller expects (K-106), and at reconstruction (there: an assigned responsibility, not provenance); null on records older than the field (counts as `dct`). With `consent` it decides who records progress and who may abandon ([Executor](#executor-k-85)) | immutable — a later project-setting change never takes over an unfinished release |
 | `status` | the state machine below | forward only |
 | `release_commit_sha` | the verified release commit | set once, from `committed` on |
 | `manifest` | JSON object of the verified artifacts (e.g. `changelog`, `version_files`, `tree`, `untracked_baseline`) | write-once per key; the MERGED manifest ≤ 64 KiB |
 | `proof` | `{"<entry id>": {commits, merge_commit, pr}}` (K-70) | written with the stamp; a re-run passing a different map is refused (K-94 B2) |
-| `consent` | what the owner approved (K-97 F4): `{version, entry_ids, candidate_sha, proposal_sha256, render, push_target: {remote, url, branch, tag} \| null}` (`null` = no push: `--no-push`, outside git, or a record from before the push) — what a resume EXECUTES: its version, entries and candidate must be the record's, its push target is the only one pushed to (its remote must still have that push URL) | write-once |
+| `consent` | what the owner approved (K-97 F4): `{version, entry_ids, candidate_sha, proposal_sha256, render, push_target: {remote, url, branch, tag} \| null[, executor: "dct" \| "own"]}` (`push_target: null` = the EXPLICIT local release: `--no-push`, or outside git; `executor` (K-106) = who the owner approved to perform it — present on consents written since the field) — what a resume EXECUTES: its version, entries and candidate must be the record's, its push target is the only one pushed to (its remote must still have that push URL) | write-once |
 | `proposal` | the approved version-file proposal (K-76): `{paths, base_blobs: {path: blob \| null}, expected_blobs: {path: blob}, script: {identity, sha256} \| null, candidate_sha, version, plan_digest, release_mode, changelog: {path, base_blob, base_sha256} \| null}` (the last four: the release context it is bound to; blob ids are git blob ids, or SHA-256 of the content in dct's release blob store for `without_git`); `consent.proposal_sha256` = `proposal_digest(proposal)` (SHA-256 of its canonical JSON). Written by the stamp that consumed the project's PENDING proposal | write-once |
 | `render` | the changelog render settings of THIS release (K-90): `{"pr_refs": bool}` — defaults to the project's `changelog_pr_refs` at stamp time, so a later preference change cannot alter the expected hashes | write-once |
+| `tag_proof` | the VERIFIED identity of the release tag (K-115 G4): `{name, object (what refs/tags/<name> resolves to — the tag object of an annotated tag), commit (the commit it targets = `release_commit_sha`), annotated, recorded_at}`; null = not proven (no tag yet, a `without_git` release, or a record from before the field) | write-once, from `tagged` on |
+| `push_proof` | the VERIFIED push (K-115 G4): `{target: {remote, url, branch, tag}, tag_commit (= `release_commit_sha`), branch_tip, recorded_at}`; with a consent `target` = `consent.push_target` exactly; null = no push verified (a local release, `without_git`, or a record from before the field) | write-once, from `pushed` on |
 | `completed_at`, `abandoned_at`, `abandon_reason` | terminal stamps; the FIRST abandon reason stays — the same reason again is a no-op, a different one is refused (K-94 B5) | set once |
 
 **State machine** (`core.releases.TRANSITIONS`): `stamped → files_written →
@@ -731,7 +771,11 @@ tag. K-94 B1: a NULL `candidate_sha` never implies "no git". Only a
 `without_git` record completes without a release commit — and only with the
 manifest of its verified artifacts; it never reaches `committed`, `tagged`
 or `pushed` and carries no candidate or release commit. Every other record
-(also `release_mode` null) needs `release_commit_sha` from `committed` on.
+(also `release_mode` null) needs `release_commit_sha` from `committed` on,
+its `tag_proof` from `tagged` on and — for `pushed`, and for `completed`
+when its consent approved a push — its `push_proof` (K-115 G4,
+[below](#proof-of-the-tag-and-of-the-push-k-115)): a status alone is never
+proof.
 
 **Write-once rule** (`check_unchanged`): a field not yet recorded may be
 written once (`advance_release`); the stored value again is a confirmation;
@@ -788,7 +832,89 @@ database read-only (`core.engine.readonly_engine`: SQLite `mode=ro`, no
 journal-mode change, no file or directory created; PostgreSQL READ ONLY
 transactions) and refuse a missing database or an older schema with a
 message naming `dct db upgrade` — the explicit bootstrap every write command
-otherwise runs implicitly.
+otherwise runs implicitly. Caveat (G2): on a SQLite database that is
+ALREADY in WAL mode, SQLite itself may create the `-wal` / `-shm` sidecar
+files next to the database for any reader, also a read-only one; the
+database file's bytes and mtime, its schema and its data stay unchanged
+(that is what the tests compare). The SQLite file path is resolved exactly
+as the normal engine resolves it for the same URL (`dct.paths.sqlite_url` /
+`sqlite_database_path`, K-99 — SQLAlchemy 2.1 percent-decodes the database
+part of a URL, 2.0 does not).
+
+### Proof of the tag and of the push (K-115)
+
+A status is never proof — `tagged` used to be recordable by anyone who
+called `advance_release`, and a git record could jump to `completed` with no
+tag at all. Now the ledger stores WHAT was verified and enforces it
+(`core.releases.check_proof_requirements`, on every move into the status,
+for every executor, and at reconstruction):
+
+| record | `tagged` | `pushed` | `completed` |
+| --- | --- | --- | --- |
+| with git (`release_mode` `git`, or null = unverified) and a consent that approved a push (`push_target` set) | `tag_proof` | `tag_proof` + `push_proof` for exactly that target | `tag_proof` + `push_proof` |
+| with git, consent with `push_target: null` (the explicit local release) | `tag_proof` | refused (no push was approved) | `tag_proof` |
+| with git, no consent (an own tool's record, MCP stamp, reconstruction — its push scope is not recorded) | `tag_proof` | `tag_proof` + `push_proof` (the tool's own target) | `tag_proof` |
+| `without_git` | never | never | the manifest of its verified artifacts; a tag / push proof is REFUSED |
+
+- The LOCAL executor verifies the repository: dct's effects layer reads the
+  tag (`refs/tags/<name>`: the object it resolves to and the commit it
+  peels to) and the remote (`git ls-remote` of the consented target) and
+  passes what it saw; an own tool reports the same through
+  `advance_release(tag_proof=…, push_proof=…)` / `dct clog release-advance
+  --tag-proof … --push-proof …`. The LEDGER only cross-checks: the tag's
+  `commit` and the push's `tag_commit` must be the record's
+  `release_commit_sha`; a lightweight tag has `object == commit`, an
+  annotated one a different `object`; a push `target` must equal the
+  consent's; for a release dct executes the tag `name` must be a spelling
+  of the version (an own tool's tag name is its own format). Report FULL
+  commit ids.
+- A proof describes the state AT VERIFICATION TIME (`recorded_at`, stamped
+  by the ledger) — not a guarantee that nobody deletes or moves the tag
+  later. On resume dct compares the recorded tag with the repository again
+  and refuses a moved or deleted one.
+- A missing field is never treated as proof (G3): a record that reached
+  `tagged` / `pushed` before the fields existed needs the proof for its
+  next move (dct's `resume` re-verifies and supplies it); a record that is
+  already `completed` stays as it is — nothing is added to old history
+  after the fact, and its null proof simply means "not proven".
+
+**One consistent release** (K-115 G5/G9, `core.releases.check_record_consistency`
+— before every ledger write, also a repeat, and before any effect): each
+JSON field being valid alone is not enough. The consent must name the
+record's version (version contract), EXACTLY its `entry_ids`, its
+`candidate_sha`, its `render` (when both are recorded), its `executor`
+(when the consent names one) and — by `proposal_sha256` — the RECORDED
+proposal (a digest without a proposal, or a proposal beside a consent that
+names none, is a contradiction); the proposal's `version`, `candidate_sha`
+and `release_mode` (each when bound) must be the record's; the proofs must
+match the release commit and the consented push target. A contradiction
+that was written outside the API blocks every further progress write —
+nothing is repaired by widening either side.
+
+**An ambiguous ledger refuses writes** (K-115 G6): one live record per
+(project, version) is enforced under the project lock and by a unique
+index on the stored text — data from before the index, or raw SQL, can
+still leave SEVERAL live records of one semantic version (`1.1` and
+`1.1.0`; the bootstrap only warns when the index cannot be created). Then
+every WRITE of that version — `advance_release`, `abandon_release`, the
+stamp and its re-run, `reconstruct_release`, the history import, the
+pre-effect gate of apply / resume — refuses and names the duplicates
+instead of picking the first record. Diagnostic reads keep working:
+`get_release` / `dct release status` return the oldest record plus
+`duplicates` (`[{id, version, status}]` of all of them; the key is absent
+on a healthy ledger). Repair is manual: soft-delete the wrong row(s)
+(`releases.deleted_at`).
+
+**The stamp is the only writer of versions** (K-102): public core
+`changelog.add_entry` refuses every explicit `version` (the parameter
+remains only for positional compatibility) and runs under the same project
+lock as the stamp; old released history and test fixtures use the separate
+`changelog.import_released_entry`, which refuses a version that has a
+release record (any spelling) or that is higher than the current version.
+An entry that nevertheless carries the version of a recorded release (raw
+SQL) makes the record inconsistent: every progress write and every effect
+is refused until it is resolved — the record and its consent are never
+widened to include it.
 
 ## Layers and a project's own release tool
 
@@ -822,8 +948,10 @@ tags or publishes REPLACES ONLY layer 3. It keeps the proof and the ledger:
    entries), so plan and approve again.
 2. **Exact stamp** — `release_changelog(project, version=V, entry_ids=[…],
    candidate_sha=<checkout.candidate_sha>, checkout_root=<checkout.repo_root>,
-   proof={<id>: proof[<id>], …})` with an explicit version and an explicit
-   `entry_ids` list (`[]` = version-only). It writes the release record
+   proof={<id>: proof[<id>], …}, expected_executor="own")` with an explicit
+   version and an explicit `entry_ids` list (`[]` = version-only);
+   `expected_executor` (K-106) makes the stamp refuse when the project's
+   setting is no longer `own`. It writes the release record
    (`stamped`); a repeat with the same set is a no-op, a different set for
    a recorded V is refused.
 3. **Own effects, verified by the tool** — the tool performs its effects and
@@ -833,7 +961,11 @@ tags or publishes REPLACES ONLY layer 3. It keeps the proof and the ledger:
 4. **Progress** — `advance_release(version=V, status=…)` after each verified
    effect, in order `files_written` (optionally with `manifest`) →
    `committed` (with `release_commit_sha`; the candidate stays immutable) →
-   `tagged` → `pushed` (after the verified push) → `completed`. An interrupted release is resumed from
+   `tagged` (with `tag_proof` — the tag as the tool verified it: `{name,
+   object, commit, annotated}`, the commit being the release commit; the
+   tag NAME is the tool's own format) → `pushed` (after the verified push,
+   with `push_proof`) → `completed` ([proofs](#proof-of-the-tag-and-of-the-push-k-115):
+   a tool that does not push completes from `tagged`). An interrupted release is resumed from
    `get_release(project)`, never re-stamped under a new version;
    `abandon_release` ends it explicitly with a reason.
 

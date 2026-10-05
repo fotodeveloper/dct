@@ -78,11 +78,11 @@ class Lost(Exception):
     sqlstate = "40001"
 
 
-find = releases.find_record
+find = releases.unique_record  # the record lookup of every ledger WRITE
 
 
-def find_then_conflict(conn, pid, version):
-    row = find(conn, pid, version)
+def find_then_conflict(conn, pid, slug, version):
+    row = find(conn, pid, slug, version)
     if state["armed"] and not state["fired"]:
         state["fired"] = True
         if MODE == "raise":
@@ -102,7 +102,7 @@ def find_then_conflict(conn, pid, version):
     return row
 
 
-releases.find_record = find_then_conflict
+releases.unique_record = find_then_conflict
 
 if TARGET == "stamp":
     stamp = effects.release_entries
