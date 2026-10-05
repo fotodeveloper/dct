@@ -12,12 +12,23 @@ Zero-argument workflow. Auto-detects project from CWD.
 ## Deferred-tool load (do this first)
 
 `list_projects`, `count_unreleased_changelog`, `list_changelog`,
-`release_changelog`, and `export_changelog` are deferred — load them all with
-ONE ToolSearch call before Step 1:
+`release_changelog`, `export_changelog`, `update_changelog` and
+`delete_changelog` are deferred — load them all with ONE ToolSearch call
+before Step 0:
 
 ```
-ToolSearch("select:mcp__dct__list_projects,mcp__dct__count_unreleased_changelog,mcp__dct__list_changelog,mcp__dct__release_changelog,mcp__dct__export_changelog")
+ToolSearch("select:mcp__dct__list_projects,mcp__dct__count_unreleased_changelog,mcp__dct__list_changelog,mcp__dct__release_changelog,mcp__dct__export_changelog,mcp__dct__update_changelog,mcp__dct__delete_changelog")
 ```
+
+**Capability probe (mandatory, before anything else):** the loaded schema of
+`release_changelog` MUST list an `entry_ids` parameter. If it does not, STOP:
+"The dct MCP server is older than this skill — restart it (or upgrade dct)
+before releasing." An old server silently ignores unknown arguments and would
+stamp EVERY unreleased entry.
+
+The trailer format and the range / proof rules used below are defined ONCE in
+`docs/assistant-fallbacks.md` ("Changelog proof: trailers and range") —
+restated here briefly; on divergence that doc wins.
 
 ## Workflow
 
@@ -42,9 +53,12 @@ Auto-commit procedure (same safety rules as `/commit` — never lose history,
 never leak secrets):
 
 1. **Only genuinely-unsafe state stops the flow.** If a merge / rebase /
-   cherry-pick is in progress (`.git/MERGE_HEAD`, `.git/rebase-merge/`,
-   `.git/CHERRY_PICK_HEAD`), STOP and report — an auto-commit mid-operation is
-   unsafe. This is the ONLY hard stop in Step 0.
+   cherry-pick is in progress, STOP and report — an auto-commit mid-operation
+   is unsafe. This is the ONLY hard stop in Step 0. Probe with
+   `git rev-parse --git-path <marker>` for each of `MERGE_HEAD`,
+   `rebase-merge`, `rebase-apply`, `CHERRY_PICK_HEAD` and test whether the
+   printed path exists — never a literal `.git/...` path (in a linked worktree
+   `.git` is a file, not a directory).
 2. **Stage explicitly — never `git add -A` / `git add .`.** Stage tracked
    modifications and safe untracked files by path. EXCLUDE secrets and junk:
    anything matching `.env*`, `*.pem`, `*.key`, `id_rsa*`, `*.p12`,
@@ -56,47 +70,98 @@ never leak secrets):
    `<type>(<scope>): <description> (v<current_version>)` derived from the staged
    diff, with the `Co-Authored-By` trailer. If the changes span too many concerns
    to summarize, use `chore: commit work in progress before release
-   (v<current_version>)`.
+   (v<current_version>)`. Each WIP commit carries the `Changelog:` trailer
+   selected exactly as `/commit` Step 3b does, against THAT commit's staged
+   diff.
 4. **Commit.** If the pre-commit hook rejects, fix the underlying issue, re-stage,
    and make a NEW commit (never `--amend`, never `--no-verify`).
 5. Re-run `git status --porcelain`; it MUST now be empty (modulo any
-   intentionally-skipped secret/junk files from step 2). Then continue to Step 1.
+   intentionally-skipped secret/junk files from step 2). Then continue to Step 1
+   (which pins the candidate SHA AFTER these commits).
 
-### Step 1: Gather state (ONE parallel message)
+### Step 1: Gather state, pin the candidate, read the proof
 
 After Step 0 leaves the tree clean, gather all state in a single parallel message:
-- `mcp__dct__list_projects()` — match CWD to a registered project → `slug`, `current_version`, `changelog_path`
-- `mcp__dct__count_unreleased_changelog(project)`
-- `mcp__dct__list_changelog(project, unreleased_only=true)`
+- `mcp__dct__list_projects()` — match CWD to a registered project → `slug`, `current_version`, `changelog_path`, `path`
+- `mcp__dct__list_changelog(project, unreleased_only=true)` — ALL unreleased entries (every branch)
 - `git status --porcelain` — confirm the tree is still clean going into the release
+- `git rev-parse HEAD` → pin the candidate `SHA`; `git branch --show-current`; `git rev-parse --show-toplevel`
+
+Then compute the range `R` and read the proof:
+- `CUR` = `current_version`. If `git rev-parse -q --verify "refs/tags/v$CUR"`
+  succeeds AND `git merge-base --is-ancestor "v$CUR" "$SHA"` holds →
+  `R = v$CUR..$SHA`. Otherwise `R = --since=<oldest unreleased entry's
+  created_at minus 1 day> $SHA` — and WARN the user that the boundary is
+  approximate.
+- Proven ids = union of
+  `git log --format='%(trailers:key=Changelog,valueonly,separator=%x2C)' R`
+  and the lines of `git log --format=%B R` matching
+  `^Changelog: [0-9]+(, [0-9]+)*$` exactly (squash merges that keep the
+  original messages; quoted `> Changelog: 12` or bulleted `- Changelog: 12`
+  prose never counts). A squash configured as "PR title and description"
+  drops the commit bodies — those entries show up without proof and need an
+  attestation.
+- Split the unreleased entries into **with proof in range** and **without
+  proof**. An entry whose trailer lies below the previous tag is "without
+  proof in range".
 
 Present the state:
 ```
-Project: myproj (My Project)
+Project: proj-a (My Project)
 Current version: 1.0
+Candidate: abc1234 (feat/x) — range v1.0..abc1234
 Unreleased entries: 5
 
-  [added] New Python parser support
-  [added] Incremental indexing
-  [fixed] Parser crash on empty files
-  [fixed] Memory leak in watcher
-  [changed] Refactored graph schema
+  With proof in range (3):
+    #12 [added] New Python parser support          (feat/x)
+    #13 [added] Incremental indexing               (feat/x)
+    #15 [fixed] Parser crash on empty files        (feat/x)
+  Without proof (2):
+    #16 [fixed] Memory leak in watcher             (feat/x)
+    #17 [changed] Refactored graph schema          (no branch)
 ```
 
-If there are no unreleased entries, inform the user and stop.
+If there are no unreleased entries at all, go straight to Step 2 Question 2
+and the version-only branch of Step 3 (or stop if the user does not want a
+version-only release).
 
-### Step 2: Review entries + bump type (ONE AskUserQuestion, two questions)
+### Step 2: Decide entries without proof + bump type (AskUserQuestion)
 
-Ask both pre-stamp decisions in a SINGLE `AskUserQuestion` call. This is the
-pre-stamp safety net — once Step 4 stamps, reverting requires manual SQL.
+This is the pre-stamp safety net — once Step 4 stamps, reverting requires
+manual SQL. Ask the decisions in as few `AskUserQuestion` calls as the
+question limit allows (the bump question rides in the first call).
 
-**Question 1 — entries review:**
-- question: "Ready to release, or review entries first?"
+**Question 1 — one per entry WITHOUT proof** (entries with a null branch
+included — they get a decision too, never an assumption):
+- question: `"#<id> [<category>] <entry> — no Changelog trailer in range. What now?"`
 - options:
-  - `"Go ahead — entries look correct"`
-  - `"Amend one entry"` → follow-up free-text `AskUserQuestion` for id + new text; call `mcp__dct__add_changelog` for the replacement, mark the old one via `/clog` amend flow; re-show the list
-  - `"Drop one entry"` → follow-up free-text `AskUserQuestion` for id; soft-delete (or flag for post-release removal); re-show the list
-  - `"Cancel release"` → stop
+  - `"Attest — the change is in the candidate"` → the owner confirms the
+    change is in `SHA`; collect every attested id, then create ONE empty
+    attestation commit on the candidate branch (the ONLY way to add proof
+    after the fact):
+    ```bash
+    git commit --allow-empty -m "$(cat <<'EOF'
+    chore: attest changelog entries
+
+    Changelog: 16, 17
+    Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
+    EOF
+    )"
+    ```
+  - `"Correct it"` → follow-up free-text question for the fix;
+    `mcp__dct__update_changelog(entry_id, entry=..., branch=..., ...)`
+    (replaces the old Amend flow); re-scan and ask again for this entry.
+  - `"Withdraw it"` → `mcp__dct__delete_changelog(entry_id)` (soft delete;
+    replaces the old Drop flow).
+  - `"Leave unreleased"` → the entry stays for a later release (typical for
+    another branch's work that is not in the candidate).
+
+There is NO "include without proof" option. A free-text "cancel" answer stops
+the release. A proven entry's text may still be fixed with `update_changelog`
+before Step 4 if the user asks.
+
+**After every commit this skill creates (WIP in Step 0, attestation here):**
+re-pin `SHA=$(git rev-parse HEAD)` and re-run the Step 1 scan before moving on.
 
 **Question 2 — bump type.** The bump type MUST be an `AskUserQuestion` option —
 do NOT substitute a plain-text prompt, and do NOT infer it from the user's
@@ -110,23 +175,43 @@ number. Compute the next version from `current_version` (vX.Y.Z):
   - `"major — v<(X+1).0.0> (breaking changes)"`
   - `"explicit version — I'll type one"` → follow-up free-text AskUserQuestion
 
-If either "Amend"/"Drop"/"Cancel" was chosen, resolve that first (re-showing the
-list) before honoring the bump-type answer.
+Compute the release version `V` ONCE from this answer. Every later step — and
+every retry — uses that same explicit `V`; never re-derive it from a bump.
 
-### Step 3: Confirm
+Resolve all Question 1 decisions (and their re-scans) before Step 3.
+
+### Step 3: Confirm the proven set
 ```
-Release myproj 1.1?
-  5 changelog entries will be stamped
+Release proj-a 1.1?
+  Candidate: def5678 (feat/x)
+  Stamped (proven): #12, #13, #15, #16, #17
+  Left unreleased: —
   Version: 1.0 → 1.1
 ```
 Wait for confirmation.
 
+**Empty proven set** → ask explicitly: "No proven entries. Release version V
+only (no changelog entries)?" If yes, Step 4 passes `entry_ids=[]` and Step 5
+writes a version-only section. Tell the user the side effects: the
+`since=last_release` anchor does not move (no entry gets `released_at`), and a
+full `export_changelog` omits V. If no, stop.
+
 ### Step 4: Stamp version in DB
 
-Call `mcp__dct__release_changelog(project, version=<version>)`. This:
-- Updates all unreleased changelog entries with the new `version`.
-- Updates the project's `current_version` field.
-- After this call, `count_unreleased_changelog(project)` will return 0.
+Call `mcp__dct__release_changelog(project, version=V, entry_ids=[<proven ids>])`
+— ALWAYS an explicit `version` (never `bump_type`) and ALWAYS an explicit
+`entry_ids` list (`[]` for a version-only release). This:
+- Stamps exactly those entries with `V` (STRICT — any invalid id fails the
+  whole call and nothing is written).
+- Updates the project's `current_version` field to `V`.
+- Is a no-op when repeated with the same arguments — a retry after an
+  interrupted run reuses the same `V` and ids.
+
+Check the answer before continuing: `mode` is `"selected"` (or
+`"version_only"` for `[]`), `entry_ids` equals the selection, and `released`
+(plus `already_released` on a retry) accounts for every selected id. STOP and
+report on any mismatch or `{"error": ...}`. Entries left unreleased keep
+counting in `count_unreleased_changelog` — that is expected.
 
 ### Step 5: Append the new version's section to the changelog file
 
@@ -142,8 +227,10 @@ whole file from the DB.
 
 Let `V` = the version just stamped in Step 4 and `F` = the project's changelog
 file. **Resolve `F` via the project's `changelog_path`, do NOT hardcode
-`changelog.md`:** `F = {project.path}/{changelog_path}`, where `changelog_path`
-comes from the Step 1 `list_projects` result (default `changelog.md` when the
+`changelog.md`:** `F = {root}/{changelog_path}`, where `root` = the CURRENT
+checkout's toplevel (`git rev-parse --show-toplevel`) when it lies inside
+`project.path` (e.g. a linked worktree of the project), else `project.path`;
+`changelog_path` comes from the Step 1 `list_projects` result (default `changelog.md` when the
 field is absent — e.g. a not-yet-restarted MCP server). A project that keeps its
 changelog in a subdirectory (e.g. a monorepo with `packages/core/changelog.md`) is then
 handled transparently. Authoritative cross-check, always live:
@@ -153,7 +240,9 @@ handled transparently. Authoritative cross-check, always live:
 **Case A — F does not exist (bootstrap / from-scratch project):**
 Call `mcp__dct__export_changelog(project, include_unreleased=false)` and write
 the full result to F. For a from-scratch project the full render equals the
-incremental one, so this is safe. Then continue to Step 6.
+incremental one, so this is safe. A version-only release is omitted by the
+full export — insert its section (Case B step 1) below the header. Then
+continue to Step 6.
 
 **Case B — F already exists (the normal path):**
 
@@ -162,12 +251,15 @@ incremental one, so this is safe. Then continue to Step 6.
    - If `isinstance(section, dict)` → it is an error: do NOT touch F, report it,
      stop (the DB was already stamped in Step 4, so either fix the export error
      and re-run Step 5, or manually revert the stamped entries).
-   - If `section == ""` → V has no entries (unexpected after Step 4): STOP and
-     report rather than writing an empty section.
+   - If `section == ""` → V has no entries. For a version-only release
+     (Step 3, `entry_ids=[]`) this is expected: use
+     `section = "## [V] - YYYY-MM-DD\n\n- Version-only release — no changelog entries.\n"`
+     (today's date). Otherwise it is unexpected after Step 4: STOP and report
+     rather than writing an empty section.
 2. From the F contents, count its existing version-section markers — **lines that start with** `## [` (`grep -c '^## \['`) — call it `N`. Anchor to line start; an entry body may contain `## [` mid-text and MUST NOT be counted.
 3. **Idempotency guard:** if a **line starting with** `## [V]` already appears in F (anchored — `grep -q '^## \[V\]'`), the section is
    already archived (e.g. a re-run after a partial release). Do NOT write —
-   report "changelog.md already contains [V]" and continue to Step 6.
+   report "the changelog already contains [V]" and continue to Step 6.
 4. Insert `section` directly **below the `# Changelog` header** (keep exactly
    one blank line after the header) so it becomes the TOP version section.
    Every existing section MUST stay byte-for-byte unchanged below it.
@@ -186,7 +278,8 @@ the FILE is the source of truth for shipped history.
 
 ### Step 6: Sync version-bearing files
 
-If `{project.path}/scripts/dct-version-sync.sh` exists, run it:
+If `{root}/scripts/dct-version-sync.sh` exists (`root` as in Step 5), run it
+from `root`:
 ```bash
 bash scripts/dct-version-sync.sh <version>
 ```
@@ -217,17 +310,17 @@ need sync.
 
 ### Step 7: Commit + tag the release (ONE command)
 
-Stage ONLY the artifacts touched by Steps 5 and 6 (`changelog.md` and any files
+Stage ONLY the artifacts touched by Steps 5 and 6 (the changelog file `F` and any files
 modified by `scripts/dct-version-sync.sh` — check `git status --porcelain` after
 Step 6), then commit and tag in a SINGLE command with explicit paths:
 
 ```bash
-git add changelog.md <version-synced-files> && git commit -m "release: v<version>" && git tag v<version>
+git add <F> <version-synced-files> && git commit -m "release: v<version>" && git tag v<version>
 ```
 
 - The commit message is the **literal** `release: v<version>` — no type, no
-  scope, no version suffix. The dct global hook recognizes this prefix and
-  bypasses the changelog-presence check (all entries were just stamped).
+  scope, no version suffix, no `Changelog:` trailer. The dct global hook
+  recognizes this prefix and bypasses the changelog-presence check.
 - The tag is **mandatory** — the `v<version>` prefix is the canonical
   "this commit = this release" marker for `git log`, `git describe`, GitHub, and
   matches npm/PyPI/Cargo release-UI expectations.
@@ -239,7 +332,7 @@ If a tag `v<version>` already exists (rare — usually a failed earlier release)
   - `"Leave tag alone, don't tag this commit"`
   - `"Abort — the existing tag is correct, something is wrong with this release"`
 
-### Step 8b: Push the tag? (AskUserQuestion)
+### Step 8: Push the tag? (AskUserQuestion)
 
 Pushing is a separate, user-confirmed action — never push automatically. Ask via
 `AskUserQuestion`:
@@ -254,22 +347,26 @@ Pushing is a separate, user-confirmed action — never push automatically. Ask v
 
 ### Step 9: Report
 ```
-✓ myproj released as 1.1
-  5 entries stamped
+✓ proj-a released as 1.1
+  5 entries stamped (#12, #13, #15, #16, #17); attested: #16, #17; left unreleased: —
   changelog.md: [1.1] section prepended (older history preserved)
-  Version-synced files: pyproject.toml, myproj/__init__.py
+  Version-synced files: pyproject.toml, proj_a/__init__.py
   Commit: release: v1.1 (abc1234)
   Tag: v1.1 (pushed to origin) | v1.1 (local only — run `git push origin v1.1` to push)
 ```
 
-The Tag line reflects the Step 8b choice: "pushed to origin" if the user chose
+The Tag line reflects the Step 8 choice: "pushed to origin" if the user chose
 "Push now", otherwise "local only" with the push-later reminder.
 
 ## Rules
 - NEVER release without user confirmation.
 - NEVER skip the bump type question, and NEVER substitute a plain-text prompt
-  for it — the bump type MUST be an AskUserQuestion (Step 2b). The pre-stamp
-  structured choice is the last reversible point.
+  for it — the bump type MUST be an AskUserQuestion (Step 2, Question 2). The
+  pre-stamp structured choice is the last reversible point.
+- NEVER call `release_changelog` without `entry_ids` or without an explicit
+  `version`, and NEVER skip the capability probe.
+- NEVER stamp an entry without proof in range — attest, correct, withdraw or
+  leave it (Step 2). Only this skill creates attestation commits.
 - If `current_version` is not set, ask for explicit version instead of bump type.
 - `changelog.md` is an **append-only archive**: /release only PREPENDS the new
   version's section (Step 5 Case B), it does NOT regenerate the whole file.
@@ -285,10 +382,10 @@ The Tag line reflects the Step 8b choice: "pushed to origin" if the user chose
 - The release commit contains ONLY changelog.md + version-synced files — no app
   code. Step 0 guarantees this by auto-committing any WIP as a SEPARATE commit
   first, so the release commit stays a clean revert target.
-- Tag is **mandatory** — every release commit gets a `v<version>` tag (Step 8).
+- Tag is **mandatory** — every release commit gets a `v<version>` tag (Step 7).
   A release without a tag is not a release — it's a commit that happens to bump
   `pyproject.toml`. Tags are the git-native marker for `git describe`,
   `git log --decorate`, GitHub's release UI, and `pip install <pkg>==<version>`.
 - Pushing the tag to remote is NOT automatic — it is a user-confirmed
-  `AskUserQuestion` (Step 8b). When `.github/workflows/publish.yml` exists,
+  `AskUserQuestion` (Step 8). When `.github/workflows/publish.yml` exists,
   "Push now" publishes to PyPI after the test job passes; say so in the option.

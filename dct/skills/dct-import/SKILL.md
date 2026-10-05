@@ -92,6 +92,9 @@ For each selected file, show the proposed table then `AskUserQuestion`:
 
 For each confirmed issue-like or changelog entry (legacy v0.1 path):
 1. Items: `mcp__dct__create_item(...)` — **REMEMBER the returned `id`** per entry.
+   Pass a `short_title` for every item: a 2-4 word English noun phrase naming
+   what it is about (≤ 50 chars, no item number, no project name), derived
+   from the title — even when the title itself stays in its source language.
 2. Parent + sub-tasks: after creating the parent item, loop
    `mcp__dct__add_checkpoint(parent_id, text)` for each sub-task —
    remember each checkpoint id. Mark already-done sub-tasks via

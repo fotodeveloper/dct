@@ -41,6 +41,9 @@ From the conversation context, determine:
 - **project**: Detect from CWD using `mcp__dct__list_projects()` (longest path prefix), or ask if ambiguous
 - **item_type**: Infer from the user's phrasing per the table above
 - **title**: Concise summary (max ~80 chars)
+- **short_title**: Label — a 2-4 word English noun phrase naming what the item
+  is about (≤ 50 chars; no item number, no project name), e.g. "Windows hook
+  paths". Always set it; the server refuses a longer one
 - **priority**: P1 (blocks work / data loss / security), P2 (important — default), P3 (backlog), future (post-v1)
 - **description**: Details, context, steps to reproduce (for issues) — prose, not checkbox lists
 - **component**: Module or subsystem (optional)
@@ -64,6 +67,7 @@ Present the proposed item (short form — no wall of JSON):
 Track this?
   Type:     issue
   Priority: P1
+  Label:    Parser empty-file crash
   Title:    Parser crashes on empty files
   File:     cmd/parse.go:42-58
   Tags:     parser, crash
@@ -77,7 +81,11 @@ skip confirmation.
 
 ### Step 3: Create
 
-Call `mcp__dct__create_item(project, item_type, title, ...)` with all fields.
+Call `mcp__dct__create_item(project, item_type, title, short_title, ...)` with
+all fields.
+Verify the ack echoes `short_title`. If it does not, the MCP server is older
+than this skill — warn the user to restart the MCP server (or upgrade dct)
+and set the label later with `update_item`; do not claim the label was saved.
 **REMEMBER the returned `id`** — needed for any follow-up (add_checkpoint,
 update_item, resolve_item).
 
@@ -93,12 +101,12 @@ checkpoint breakdown.
 ### Step 5: Report
 
 ```
-✓ #42 issue/P1 — Parser crashes on empty files
+✓ #42 issue/P1 [Parser empty-file crash] — Parser crashes on empty files
 ```
 
 For feature/improvement with checkpoints:
 ```
-✓ #43 feature/P2 — Dark mode
+✓ #43 feature/P2 [Dark mode] — Dark mode
   Checkpoints: 5 (ready to track)
 ```
 

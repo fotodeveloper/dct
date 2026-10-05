@@ -41,21 +41,21 @@ Extract from the request:
 - **priority**: `P1`/`P2`/`P3`/`future`, or empty
 - **component**: match exact component name
 - **in_current_sprint**: `"true"` (only sprint), `"false"` (exclude sprint), or empty
-- **search**: free-text, searched in `title` + `description`
+- **search**: free-text, searched in `title` + `description` (server-side — a brief row may match on a description it does not show)
 - **limit**: default 50
 
 ID normalization (from `#42`, `42`, `ITEM-42`, `item-42`, `ITEM_42`, `item_42`, `0042` → `42`): regex `^(#|ITEM-|item-|ITEM_|item_)?0*(\d+)$` — case-insensitive prefix strip, leading-zero strip, cast int. Uniform with /track-update and /track-resolve. If a single ID is given, skip listing and go to `mcp__dct__get_item(id)`.
 
 ### Step 2: Query
 
-Call `mcp__dct__list_items(project, status, item_type, priority, component, in_current_sprint, search, tag, limit, format="structured")`.
+Call `mcp__dct__list_items(project, status, item_type, priority, component, in_current_sprint, search, tag, limit, format="structured")`. `view` defaults to `"brief"` (no `description`); pass `view="full"` only when the task genuinely needs descriptions.
 
 `tag` narrows to items carrying that tag (server-side; the dictionary is global, the listing stays project-scoped). An unknown tag returns `{"error": ...}` naming the closest known tags (up to 3, plus a count of the rest and a pointer to `list_tags`) — surface it, do not silently fall back to an unfiltered list.
 
-Response shape:
+Response shape (brief view):
 ```
-{"cols": ["id","item_type","priority","status","in_current_sprint","cp","component","tags","created_at","title","description"],
- "rows": [[22,"improvement","P2","open",false,[0,0],"server",["mcp"],"2026-04-17","Optimize...","..."]]}
+{"cols": ["id","item_type","priority","status","in_current_sprint","cp","component","tags","created_at","short_title","title"],
+ "rows": [[22,"improvement","P2","open",false,[0,0],"server",["mcp"],"2026-04-17","List payload size","Optimize..."]]}
 ```
 
 ### Step 3: Present — priority grouping
@@ -66,10 +66,10 @@ Render as markdown:
 
 ```
 ## P1 — blocking (2)
-| #   | Type  | Sprint | cp    | Component | Title                         |
-|-----|-------|--------|-------|-----------|-------------------------------|
-| 42  | issue | ●      | 2/3   | parser    | Crash on empty files          |
-| 88  | todo  |        | 0/0   | auth      | Rotate session tokens         |
+| #   | Type  | Sprint | cp    | Component | Label                   | Title                         |
+|-----|-------|--------|-------|-----------|-------------------------|-------------------------------|
+| 42  | issue | ●      | 2/3   | parser    | Parser empty-file crash | Crash on empty files          |
+| 88  | todo  |        | 0/0   | auth      | —                       | Rotate session tokens         |
 
 ## P2 — important (11)
 ...
@@ -78,7 +78,7 @@ Render as markdown:
 ...
 ```
 
-Use `●` for `in_current_sprint=true`, blank for false. Use `cp` as `done/total` string (e.g. `2/5`) from the raw `[2,5]` array.
+Use `●` for `in_current_sprint=true`, blank for false. Use `cp` as `done/total` string (e.g. `2/5`) from the raw `[2,5]` array. Label is `short_title`; render `—` when it is null.
 
 ### Step 4: Hotspots (only if explicitly asked OR >1 hotspot auto-detected)
 
@@ -132,4 +132,4 @@ Showing 13 open items in dct. Use /track-list --include-resolved to show closed.
 - **Default hides resolved** — do not surprise the user with closed items unless they ask.
 - **Prefer subagent for cross-project** when ≥2 projects have ≥20 open items each. Tell the user: "Cross-project aggregation — delegating to subagent".
 - **`cp` column is authoritative** — do not re-query per-item to compute progress (N+1).
-- **Don't show `description` in the table** (it's in cols but too long for a grid row). Keep it available for follow-up `get_item` calls. Render only `title` in the grid.
+- **Descriptions are not in the default listing** (brief view). Fetch them with `get_item(id)` or `view="full"` only when the task needs them; never render `description` in the grid.

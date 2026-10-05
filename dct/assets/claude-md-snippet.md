@@ -54,6 +54,11 @@ Rules of thumb:
 - `idea` = exploratory, not yet decided to build
 - `improvement` = existing thing works but could be better (refactor, UX polish, perf)
 
+Every new item gets a `short_title` label: a 2-4 word English noun phrase
+naming what it is about (≤ 50 chars, no item number, no project name — e.g.
+"Windows hook paths"). The `create_item` ack echoes it; if it does not, the
+MCP server is outdated — restart it.
+
 **MCP tools** — 57 total; most important:
 - `pickup_work`, `handoff_work`, `get_context_snapshot` — composed session-edge ops; prefer them over chaining the granular tools below
 - `list_projects`, `list_items`, `get_item`, `create_item`, `update_item`, `resolve_item`, `add_note`
@@ -82,11 +87,15 @@ Sketch the work breakdown BEFORE starting code.
 → `reject_checkpoint(id)` (ledger-preserving); never delete.
 
 **Committing** — "commit" / "save this" / "commit this"
-→ `/commit` (parallel pre-flight probe, changelog guard, HEREDOC message with `(vX.Y.Z)`).
+→ `/commit` (parallel pre-flight probe, per-branch changelog guard, HEREDOC message with `(vX.Y.Z)`).
+The message ends with a `Changelog: <id>, <id>` trailer (ids ascending, before
+`Co-Authored-By:`) naming the unreleased entries of the CURRENT branch whose
+text matches the staged diff — `/release` stamps only entries proven that way.
+`/clog` records `branch` / `worktree` from the agent's own working directory.
 If pre-commit hook rejects: fix underlying issue, re-stage, **NEW commit** (never `--amend`, never `--no-verify`).
 
 **Releasing** — "release" / "bump version" / "ship it"
-→ `/release` (dirty-tree hard stop → stamp DB → export MD → commit `release: vX.Y.Z`).
+→ `/release` (capability probe → proof by `Changelog:` trailers in range, attest/correct/withdraw/leave the rest → stamp the exact `entry_ids` at an explicit version → append-only export → commit `release: vX.Y.Z` + tag).
 
 **Session end** — "handoff" / "end session" / "wrap up" / "next session"
 → `/handoff` (flag sprint items, optionally write handoff prompt).
@@ -119,11 +128,15 @@ priority, status, title}`; checkpoint ops → `{id, item_id, status, progress}`)
 - `rows` is an array of value arrays in the same order
 - short/fixed-width fields come first, long free text (title, description, entry, prompt) last
 - extract a field by `cols.indexOf("title")` → index into each row
+- `list_items` defaults to `view="brief"` (…, `short_title`, `title` — no
+  `description`); pass `view="full"` or call `get_item(id)` only when the
+  descriptions are needed
 - `list_handoffs` truncates `prompt` to a 200-char preview → `get_handoff(id)` for full text
 
 Opt-in formats on list-views:
 - `format="markdown"` → human-readable table (lossy — no description)
-- `format="dict"` → list of full-key dicts (legacy shape)
+- `format="dict"` → list of dicts (for `list_items` the keys follow `view`:
+  brief columns by default, full item rows with `view="full"`)
 
 ### ID normalization
 
@@ -134,9 +147,10 @@ whitespace-separated batch ids.
 ### Fallback workflows
 
 If a skill name renames or disappears in a future CC version, Claude can
-still drive dct via raw MCP calls. The `Skill fallback workflows` section
-in dct's own repo `CLAUDE.md` has step-by-step prose descriptions for
-`/release`, `/commit`, `/track`, `/clog`, `/track-resolve`.
+still drive dct via raw MCP calls. `docs/assistant-fallbacks.md` in dct's own
+repo has the authoritative step-by-step prose for `/release`, `/commit`,
+`/track`, `/clog`, `/track-resolve` — and the shared `Changelog:` trailer /
+release-range rules.
 
 ### Auto-detect project from CWD
 

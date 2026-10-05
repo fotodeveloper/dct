@@ -17,18 +17,27 @@ From the current work, determine:
 - **entry**: Concise description of the change (English, ~1 sentence)
 - **component**: Module/subsystem (optional)
 - **source_file**: Main file changed (optional)
+- **source_lines**: Line range in that file, e.g. "42-58" (optional)
 - **related_item_id**: If this change resolves a tracked item (optional)
+- **branch** / **worktree**: Read in YOUR current working directory:
+  `git branch --show-current` (empty output = detached HEAD → omit `branch`)
+  and `git rev-parse --show-toplevel`. Always pass them — the MCP server
+  runs in the session start directory, which may be another checkout or
+  worktree, so its own guess can name the wrong branch.
 
 ### Step 2: Confirm
 ```
 Changelog entry:
   [added] New Python parser support (parser)
   File: cmd/parse.go
+  Branch: feat/x (/tmp/proj-a)
 ```
 Wait for confirmation.
 
 ### Step 3: Create
-Call `mcp__dct__add_changelog(project, category, entry, ...)`.
+Call `mcp__dct__add_changelog(project, category, entry, branch, worktree, ...)`.
+The ack echoes `branch` and `branch_source`; if `branch` is missing from the
+ack, the MCP server is older than this skill — tell the user to restart it.
 
 ### Step 4: Report
 ```
