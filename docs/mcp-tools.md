@@ -31,7 +31,7 @@ Project registration, rename, version, and changelog-location changes are **CLI-
 | `create_item` | Create a tracked item (issue / todo / feature / idea / improvement). `short_title` = the item's 2-4 word English label (≤ 50 chars, refused not truncated), shown next to the item number everywhere. |
 | `list_items` | List tracked items in compact `{cols, rows}` form. `view='brief'` (default) = `id, item_type, priority, status, in_current_sprint, cp, component, tags, created_at, short_title, title`; `view='full'` appends `description` (brief is the default because descriptions dominate a large backlog's payload; `search` still matches descriptions in both views; `format='dict'` is projected onto the brief columns only in the brief view; unknown view → `{"error": ...}`). `tag=<name>` narrows to items carrying that tag (unknown tag → `{"error": ...}` naming the closest known tags — up to 3, plus a count of the rest and a pointer to `list_tags`). |
 | `get_item` | Get full item details — fields, notes, checkpoints, progress. |
-| `update_item` | Update one or more mutable fields on an existing item. `short_title` sets the label (`'__clear__'` nulls it). `tags` is a FULL REPLACE of the item's tag set (omit = unchanged, `[]` = clear). |
+| `update_item` | Update one or more mutable fields on an existing item. `short_title` is optional: omit (or blank) keeps the label, a value sets it (stripped, ≤ 50 chars), `'__clear__'` nulls it. `tags` is a FULL REPLACE of the item's tag set (omit = unchanged, `[]` = clear). |
 | `resolve_item` | Resolve or close an item (terminal status); auto-clears sprint flag, runs the gate-checkpoint guard. |
 | `add_note` | Append a note to an item (append-only ledger). |
 
@@ -54,14 +54,20 @@ checkout of the SAME git repository as the project's registered path (same git
 common dir — main checkout or any linked worktree, never a nested foreign repo
 or a submodule); `worktree` is that checkout's toplevel. It does not identify
 the project of a worktree outside the registered path — pass `project`.
+A `server` value is UNCERTAIN — it names the server's own checkout, which does
+not follow the client's `cd` — so `include_unbranched` filters count it like an
+unbranched row, while a plain `branch` filter matches the stored branch exactly.
+Stored worktree paths and the `worktree` filter share one textual normalization
+(absolute only; normpath, no trailing separator; never `realpath` of a client
+path); historical rows are not rewritten.
 
 | Tool | Purpose |
 |---|---|
-| `add_changelog` | Add an unreleased changelog entry (version stays NULL until release); pass `branch` / `worktree`. |
-| `list_changelog` | List changelog entries for a project; optional `branch` / `worktree` / `include_unbranched` filters. |
+| `add_changelog` | Add an unreleased changelog entry (version stays NULL until release); pass `branch` / `worktree` (absolute path, normalized textually — never resolved on the server). `related_item_id` must be a live item of the same project. A server-detected branch (`branch_source='server'`) adds a `warning` to the ack: confirm or correct it with `update_changelog`. |
+| `list_changelog` | List changelog entries for a project; optional `branch` / `worktree` / `include_unbranched` filters. Plain `branch` = exact match on the stored branch (any source); `include_unbranched` adds every uncertain row (branch null or `branch_source='server'`). Rows carry `item_short_title` — the related item's label when it is a live item of the project, else null. |
 | `count_unreleased_changelog` | Count unreleased entries (used by the commit gate); same optional filters. |
 | `release_changelog` | Stamp all unreleased entries, an explicit `entry_ids` set, or none (`[]`, version only) and set `current_version` — idempotent, never rewinds. |
-| `update_changelog` | Amend an unreleased entry (text, category, component, source, related item, branch, worktree). Deferred. |
+| `update_changelog` | Amend an unreleased entry (text, category, component, source, related item, branch, worktree). An omitted branch field is kept, except on a server-detected row, whose unconfirmed other field is cleared; both null → `branch_source` null. Serialized with `release_changelog` on the project lock. Deferred. |
 | `delete_changelog` | Soft-delete an unreleased entry. Deferred. |
 | `export_changelog` | Export changelog as Keep a Changelog markdown. |
 
@@ -187,7 +193,7 @@ Write ops return a minimal ack, not the full record. `get_item` / `get_handoff` 
 | `add_note` | `{id, item_id, item_title}` |
 | `add_checkpoint` | `{id, item_id, item_title, kind, status, sort_order}` |
 | `complete_checkpoint` / `reject_checkpoint` / `reopen_checkpoint` | `{id, item_id, status, progress}` |
-| `add_changelog` | `{id, project, category, component, branch, branch_source}` |
+| `add_changelog` | `{id, project, category, component, branch, branch_source}` (+ `warning` when `branch_source='server'`) |
 | `update_changelog` | `{id, project, updated_fields}` |
 | `delete_changelog` | `{deleted, id}` |
 | `release_changelog` | `{project, version, current_version, mode, entry_ids, released, already_released}` (+ `warning`) |
@@ -201,7 +207,7 @@ Write ops return a minimal ack, not the full record. `get_item` / `get_handoff` 
 | `create_plan` | `{id, ulid, slug, kind, status, title}` |
 | `add_plan_section` | `{id, ulid, heading, depth, section_type, status, sort_order}` |
 | `complete_plan_checkpoint` / `reject_plan_checkpoint` | `{id, plan_section_id, status, sort_order}` |
-| `promote_section_to_item` / `promote_checkpoint_to_item` | `{id, item_type, priority, status, title}` |
+| `promote_section_to_item` / `promote_checkpoint_to_item` | `{id, item_type, priority, status, title, short_title}` — `short_title` echoes the stored label (a missing key = a server that predates the field) |
 | `add_tag` | `{id, name, created}` (`created` is `false` when an existing tag was reused) |
 | `merge_tag` | `{from, into, items_moved}` |
 

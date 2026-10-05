@@ -503,7 +503,8 @@ def test_promote_section_to_item_ack_shape(srv):
     plan = srv.create_plan("plan-2", "Plan", "plan", project="test")
     section = core_add_section(srv._get_engine(), plan_id=plan["id"], heading="Chunk", depth=2)
     out = srv.promote_section_to_item(section["id"], "todo")
-    assert set(out) == {"id", "item_type", "priority", "status", "title"}
+    assert set(out) == {"id", "item_type", "priority", "status", "title", "short_title"}
+    assert out["short_title"] is None  # K-47: the STORED label, also when null
     assert out["item_type"] == "todo"
     assert out["title"] == "Chunk"
     assert "description" not in out
@@ -515,14 +516,15 @@ def test_promote_checkpoint_to_item_ack_shape(srv):
     section = core_add_section(eng, plan_id=plan["id"], heading="S", depth=2)
     cp = add_plan_checkpoint(eng, section["id"], "promote me to an item")
     out = srv.promote_checkpoint_to_item(cp["id"], "todo")
-    assert set(out) == {"id", "item_type", "priority", "status", "title"}
+    assert set(out) == {"id", "item_type", "priority", "status", "title", "short_title"}
+    assert out["short_title"] is None
     assert out["item_type"] == "todo"
     assert "description" not in out
 
 
 def test_promote_tools_pass_short_title_through(srv):
-    """#817: both promotion paths hand short_title to create_item; the acks
-    stay as they were (write acks other than create/update are unchanged)."""
+    """#817: both promotion paths hand short_title to create_item; K-47: the
+    acks echo the STORED (normalized) label."""
     eng = srv._get_engine()
     plan = core_create_plan(eng, "test", slug="p-short", title="P", kind="plan")
     section = core_add_section(eng, plan_id=plan["id"], heading="Section", depth=2)
@@ -531,7 +533,8 @@ def test_promote_tools_pass_short_title_through(srv):
     from_cp = srv.promote_checkpoint_to_item(cp["id"], "todo", short_title="Checkpoint label")
     assert srv.get_item(from_section["id"])["short_title"] == "Section label"
     assert srv.get_item(from_cp["id"])["short_title"] == "Checkpoint label"
-    assert "short_title" not in from_section
+    assert from_section["short_title"] == "Section label"
+    assert from_cp["short_title"] == "Checkpoint label"
 
 
 def test_promote_section_short_title_too_long_refused_no_backlink(srv):

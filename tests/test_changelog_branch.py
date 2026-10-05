@@ -59,12 +59,12 @@ def test_add_entry_without_branch_stores_nulls(proj):
 @pytest.mark.parametrize("field,limit", [("branch", 255), ("worktree", 500)])
 def test_add_entry_refuses_over_long_values_and_writes_nothing(proj, field, limit):
     with pytest.raises(ValueError, match=rf"{field} too long: {limit + 1} chars, max {limit}"):
-        add_entry(proj, "proj-a", "added", "x", **{field: "b" * (limit + 1)})
+        add_entry(proj, "proj-a", "added", "x", **{field: "/" + "b" * limit})
     assert list_entries(proj, "proj-a") == []
 
 
 def test_add_entry_exact_limit_stored_untruncated(proj):
-    e = add_entry(proj, "proj-a", "added", "x", branch="b" * 255, worktree="w" * 500)
+    e = add_entry(proj, "proj-a", "added", "x", branch="b" * 255, worktree="/" + "w" * 499)
     assert len(e["branch"]) == 255 and len(e["worktree"]) == 500
 
 
@@ -295,7 +295,7 @@ def test_all_null_database_unfiltered_output_unchanged(proj):
     assert count_unreleased(proj, "proj-a") == 3
 
 
-def test_related_item_short_title_label(proj):
+def test_related_item_label_is_item_short_title(proj):
     labelled = create_item(proj, "proj-a", "todo", "A very long descriptive title",
                            short_title="Hook paths")
     plain = create_item(proj, "proj-a", "todo", "t" * 80)
@@ -303,9 +303,9 @@ def test_related_item_short_title_label(proj):
     _add(proj, "b", related_item_id=plain["id"])
     _add(proj, "c")
     by_entry = {r["entry"]: r for r in list_entries(proj, "proj-a")}
-    assert by_entry["a"]["related_item_short_title"] == "Hook paths"
-    assert by_entry["b"]["related_item_short_title"] == "t" * 49 + "…"
-    assert by_entry["c"]["related_item_short_title"] is None
+    assert by_entry["a"]["item_short_title"] == "Hook paths"
+    assert by_entry["b"]["item_short_title"] == "t" * 49 + "…"
+    assert by_entry["c"]["item_short_title"] is None
     # The join never leaks helper columns or duplicates rows.
     assert len(by_entry) == 3
     assert not any(k.startswith("_item") for k in by_entry["a"])

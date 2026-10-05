@@ -69,7 +69,7 @@ def test_list_changelog_cols_legend(srv):
     out = srv.list_changelog(project="test")
     assert out["cols"] == [
         "id", "version", "category", "component", "branch", "branch_source",
-        "related_item_id", "related_item_short_title", "created_at", "released_at",
+        "related_item_id", "item_short_title", "created_at", "released_at",
         "worktree", "entry",
     ]
     assert out["cols"] == srv.CHANGELOG_COLS
@@ -80,7 +80,7 @@ def test_list_changelog_row_carries_item_label(srv):
     srv.add_changelog("added", "x", project="test", related_item_id=item["id"])
     out = srv.list_changelog(project="test")
     row = dict(zip(out["cols"], out["rows"][0], strict=True))
-    assert row["related_item_short_title"] == "Label"
+    assert row["item_short_title"] == "Label"
 
 
 def test_list_and_count_branch_filters(srv):

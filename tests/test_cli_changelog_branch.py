@@ -410,3 +410,44 @@ def test_update_is_project_scoped(cli_engine, monkeypatch, capsys):
     theirs = add_entry(cli_engine, "proj-b", "added", "theirs")["id"]
     assert _exit_code(monkeypatch, ["clog", "delete", str(theirs), "-P", "proj-a"]) == 1
     assert _rows(cli_engine, "proj-b")[theirs]["entry"] == "theirs"
+
+
+# ── R1b: related item, worktree path and provenance contracts (K-37, K-42) ───
+
+
+def test_add_foreign_item_id_exits_nonzero_writes_nothing(cli_engine, monkeypatch, capsys):
+    from dct.core.items import create_item
+
+    create_project(cli_engine, slug="proj-b", name="B")
+    foreign = create_item(cli_engine, "proj-b", "todo", "Theirs")["id"]
+    assert _exit_code(monkeypatch, ["clog", "add", "added", "x", "-P", "proj-a",
+                                    "--item-id", str(foreign)]) == 1
+    assert "Unknown item id" in capsys.readouterr().err
+    assert _rows(cli_engine) == {}
+
+
+def test_update_negative_item_id_exits_nonzero(cli_engine, monkeypatch, capsys):
+    eid = add_entry(cli_engine, "proj-a", "added", "x")["id"]
+    assert _exit_code(monkeypatch, ["clog", "update", str(eid), "-P", "proj-a",
+                                    "--item-id", "-3"]) == 1
+    assert "Unknown item id" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("command", ["list", "count"])
+def test_relative_worktree_filter_exits_nonzero(cli_engine, monkeypatch, capsys, command):
+    assert _exit_code(monkeypatch, ["clog", command, "-P", "proj-a", "--worktree", "wt"]) == 1
+    assert "absolute path" in capsys.readouterr().err
+
+
+def test_worktree_filter_matches_a_trailing_slash_spelling(cli_engine, monkeypatch, capsys):
+    add_entry(cli_engine, "proj-a", "added", "x", worktree="/tmp/wt-x")
+    run_cli(monkeypatch, ["clog", "count", "-P", "proj-a", "--worktree", "/tmp/wt-x/"])
+    assert capsys.readouterr().out.strip() == "1"
+
+
+def test_update_branch_of_server_row_drops_the_unconfirmed_worktree(cli_engine, monkeypatch):
+    eid = add_entry(cli_engine, "proj-a", "added", "x", branch="main",
+                    worktree="/tmp/proj-a", branch_source="server")["id"]
+    run_cli(monkeypatch, ["clog", "update", str(eid), "-P", "proj-a", "--branch", "feat/x"])
+    row = _rows(cli_engine)[eid]
+    assert (row["branch"], row["worktree"], row["branch_source"]) == ("feat/x", None, "client")

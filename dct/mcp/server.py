@@ -20,10 +20,11 @@ from mcp.server import MCPServer
 from dct.core.engine import bootstrap_engine
 
 # ONE preview implementation for the whole product (K-35, #413): the MCP list
-# views and the snapshot share dct.core.text._preview (re-exported by
+# views and the snapshot share dct.core.text.preview (re-exported by
 # dct.workflows.session), so the documented "200-char preview" means the same
-# ceiling everywhere — 200 chars INCLUDING the trailing ellipsis.
-from dct.core.text import _preview
+# ceiling everywhere — 200 chars INCLUDING the trailing ellipsis. CLEAR is the
+# one free-text clear sentinel ('__clear__', K-48).
+from dct.core.text import CLEAR, preview
 
 _INSTRUCTIONS = (
         "Deterministic Context Tracker — cross-project work tracking.\n\n"
@@ -42,7 +43,7 @@ _INSTRUCTIONS = (
         "  component, tags (list[str]), created_at, short_title (2-4 word label, may be\n"
         "  null), title — list_items(view='full') appends description; changelog: id, version,\n"
         "  category, component, branch, branch_source, related_item_id,\n"
-        "  related_item_short_title, created_at, released_at, worktree, entry;\n"
+        "  item_short_title, created_at, released_at, worktree, entry;\n"
         "  checkpoint: id, status, sort_order, text; handoff: id, scope, created_by,\n"
         "  created_at, consumed_at, prompt (200-char preview). format='markdown' (lossy)\n"
         "  or 'dict' (full-key dicts) opt in.\n\n"
@@ -322,7 +323,7 @@ ITEM_COLS_FULL = ITEM_COLS_BRIEF + ["description"]
 ITEM_VIEWS = {"brief": ITEM_COLS_BRIEF, "full": ITEM_COLS_FULL}
 CHANGELOG_COLS = [
     "id", "version", "category", "component", "branch", "branch_source",
-    "related_item_id", "related_item_short_title", "created_at", "released_at",
+    "related_item_id", "item_short_title", "created_at", "released_at",
     "worktree", "entry",
 ]
 CHECKPOINT_COLS = ["id", "status", "sort_order", "text"]
@@ -408,7 +409,8 @@ def create_item(
         project: Project slug. Empty = auto-detect from CWD.
         short_title: 2-4 word English noun phrase naming what the item is
             about (e.g. 'Windows hook paths'); ≤ 50 chars, refused not
-            truncated; always pass it.
+            truncated; always pass it. Surrounding whitespace is stripped
+            (blank = no label).
             Shown next to the item number in every list and snapshot.
         description: Prose context (no checkbox lists — use add_checkpoint instead).
         priority: P1 (blocker) / P2 (important, default) / P3 (backlog) / future.
@@ -579,10 +581,10 @@ def update_item(
         item_id: Target item.
         title: New title (non-empty, ≤ 500 chars — ≤ 80 recommended; blank or
             '__clear__' is refused).
-        short_title: 2-4 word English noun phrase naming what the item is
-            about (e.g. 'Windows hook paths'); ≤ 50 chars, refused not
-            truncated; always pass it.
-            '__clear__' nulls it.
+        short_title: Optional new 2-4 word label (≤ 50 chars, refused not
+            truncated; surrounding whitespace is stripped). Omit (or blank) =
+            keep the current label — do NOT re-send one when changing other
+            fields; '__clear__' nulls it.
         status: open / in_progress / resolved / wont_fix.
         priority: P1 / P2 / P3 / future.
         component: Component or module name (≤ 100 chars).
@@ -628,8 +630,18 @@ def update_item(
         ("priority", priority), ("component", component),
         ("resolution", resolution), ("description", description),
     ]:
-        if value == "__clear__":
+        if value == CLEAR:
             kwargs[field] = ""
+        elif field == "short_title" and value and not value.strip():
+            # Whitespace-only is a BLANK value here, i.e. omitted (K-43): it
+            # never clears an existing label — only CLEAR does. The raw value
+            # is still length-checked first (refused, never truncated).
+            from dct.core.limits import ensure_fits
+            from dct.db import items as items_table
+            try:
+                ensure_fits(items_table, {"short_title": value})
+            except ValueError as e:
+                return {"error": str(e)}
         elif value:
             kwargs[field] = value
     # Sentinel (K-16): only an explicit list reaches core — None means "leave
@@ -1001,13 +1013,18 @@ def add_changelog(
         component: Optional area/module tag; appended as " (component)" to the bullet on export.
         source_file: Optional relative path of the file the change touched.
         source_lines: Optional line range (e.g. "42-58").
-        related_item_id: Tracked-item id to link (0 = none).
+        related_item_id: Tracked-item id to link (0 = none) — must be a live
+            item of the SAME project (unknown / another project's / deleted
+            → error, nothing written).
         branch: Git branch the change was made on (`git branch --show-current`),
             ≤ 255 chars. PASS IT: this server's cwd is the directory the session
             STARTED in and does not follow a mid-session `cd` into another
             worktree, so its own detection can name the wrong branch.
         worktree: Toplevel of the checkout the change was made in
-            (`git rev-parse --show-toplevel`), ≤ 500 chars.
+            (`git rev-parse --show-toplevel`), ≤ 500 chars; must be an
+            ABSOLUTE path (relative / `~` → refused). Stored after a purely
+            textual normalization (normpath, no trailing separator) — never
+            resolved against this server's filesystem.
             Either given → both stored as passed (a missing one stays null),
             branch_source='client'; an over-long value is REFUSED, never
             truncated. Neither given → detected from this server's cwd, kept
@@ -1019,9 +1036,14 @@ def add_changelog(
 
     Returns: slim ack {id, project, category, component, branch, branch_source}
         — `project` is the resolved slug; component / branch / branch_source may
-        be null. NOT the entry text echo (nor the full row). {"error": "..."} on
-        failure — empty/whitespace entry, invalid category, literal tool-call
-        markup in a free-text field, an over-long branch/worktree, or an
+        be null. Plus `warning` when branch_source='server': the values are
+        this MCP server's own checkout, not one you confirmed — such a row
+        counts as UNCERTAIN (like an unbranched one) in include_unbranched
+        filters; confirm or correct it with update_changelog(branch=...,
+        worktree=...). NOT the entry text echo (nor the full row).
+        {"error": "..."} on failure — empty/whitespace entry, invalid category,
+        literal tool-call markup in a free-text field, an over-long or
+        relative branch/worktree, an invalid related_item_id, or an
         unresolvable project (explicit slug not found, or empty `project` with
         an unregistered CWD).
     """
@@ -1047,11 +1069,19 @@ def add_changelog(
             use_process_cwd=True, detected_source="server",
         ))
         row = add_entry(engine, project_slug, category, entry, **kwargs)
-        return {
+        ack = {
             "id": row["id"], "project": project_slug, "category": row["category"],
             "component": row["component"], "branch": row["branch"],
             "branch_source": row["branch_source"],
         }
+        if row["branch_source"] == "server":
+            ack["warning"] = (
+                f"branch/worktree were detected from the MCP server's own checkout "
+                f"({row['branch'] or 'detached HEAD'} @ {row['worktree']}), not "
+                f"confirmed by you; the entry counts as uncertain. Confirm or "
+                f"correct it: update_changelog({row['id']}, branch=..., worktree=...)."
+            )
+        return ack
     except Exception as e:
         return {"error": str(e)}
 
@@ -1071,19 +1101,26 @@ def list_changelog(
         project: Slug. Empty = CWD auto-detect.
         unreleased_only: True (default) → only entries without a version; False → all.
         format: 'structured' (default, {cols,rows}) | 'markdown' | 'dict'.
-        branch: Only entries written on this branch. Empty (default) = no branch
-            filter — every entry, exactly as before branch tracking.
-        worktree: Only entries whose worktree equals this path exactly
-            (combinable with branch). Empty = no worktree filter.
-        include_unbranched: With `branch`: also entries whose branch is null
-            (pre-tracking or undetected). Ignored without `branch`.
+        branch: Only entries whose STORED branch equals this exactly, whatever
+            its branch_source. Empty (default) = no branch filter — every
+            entry, exactly as before branch tracking.
+        worktree: Only entries whose worktree equals this ABSOLUTE path after
+            the same normalization as on write (normpath, no trailing
+            separator; relative → error). Combinable with branch. Empty = no
+            worktree filter.
+        include_unbranched: With `branch`: also every UNCERTAIN entry — branch
+            null (pre-tracking or undetected) or branch_source='server' (the
+            server's own checkout, whatever branch it stores); such rows keep
+            their stored branch/worktree/source. Ignored without `branch`.
 
     Returns: {cols, rows} by default — cols = [id, version, category, component,
-        branch, branch_source, related_item_id, related_item_short_title,
-        created_at, released_at, worktree, entry]; related_item_short_title is
-        the related item's short_title (or its title compacted to 50 chars),
-        null when there is no related item. list[dict] for 'dict', markdown str
-        for 'markdown'. {"error": "..."} on an unresolvable project.
+        branch, branch_source, related_item_id, item_short_title, created_at,
+        released_at, worktree, entry]; item_short_title is the related item's
+        short_title (or its title compacted to 50 chars) when it is a live item
+        of this project, else null (no link, or a deleted / foreign historical
+        id — related_item_id is kept as stored). list[dict] for 'dict',
+        markdown str for 'markdown'. {"error": "..."} on an unresolvable
+        project or a relative worktree.
     """
     from dct.core.changelog import list_entries
     try:
@@ -1110,11 +1147,14 @@ def count_unreleased_changelog(
 
     Args:
         project: Slug. Empty = auto-detect from CWD.
-        branch: Count only entries written on this branch. Empty (default) = the
-            whole project, exactly as before branch tracking.
-        worktree: Count only entries of this exact worktree path (combinable).
-        include_unbranched: With `branch`: also count entries whose branch is
-            null. Ignored without `branch`.
+        branch: Count only entries whose STORED branch equals this exactly,
+            whatever its branch_source. Empty (default) = the whole project,
+            exactly as before branch tracking.
+        worktree: Count only entries of this ABSOLUTE worktree path, normalized
+            as on write (relative → error). Combinable.
+        include_unbranched: With `branch`: also count every UNCERTAIN entry —
+            branch null or branch_source='server' (any stored branch). Ignored
+            without `branch`.
 
     Returns: {"count": <int>} on success, {"error": "..."} on failure.
     Typical use: gate before /release (stop if count == 0).
@@ -1199,9 +1239,6 @@ def release_changelog(
         return {"error": str(e)}
 
 
-_CLEAR = "__clear__"
-
-
 @mcp.tool(structured_output=False)
 def update_changelog(
     entry_id: int,
@@ -1223,21 +1260,28 @@ def update_changelog(
     Args:
         entry_id: The entry to change (id from list_changelog / add_changelog).
         project: Slug the entry must belong to. Empty = auto-detect from CWD.
-        entry: New changelog line (cannot be blanked).
+        entry: New changelog line (cannot be blanked; '__clear__' is refused).
         category: added / changed / fixed / removed.
         component: New component; '__clear__' = null.
         source_file: New source path, ≤ 500 chars; '__clear__' = null.
         source_lines: New line range, ≤ 100 chars; '__clear__' = null.
-        related_item_id: New linked item id; 0 (default) = unchanged, -1 = unlink.
+        related_item_id: New linked item id — a live item of the SAME project;
+            0 (default) = unchanged, -1 = unlink; any other negative → error.
         branch: Move the entry to this branch, ≤ 255 chars; '__clear__' = null.
-        worktree: New worktree path, ≤ 500 chars; '__clear__' = null.
-            Setting (or clearing) branch/worktree marks branch_source='client'.
+        worktree: New worktree path — ABSOLUTE, ≤ 500 chars, normalized as on
+            add (relative → error); '__clear__' = null.
+            The branch/worktree you pass are stored with branch_source='client'.
+            A field you omit is kept — EXCEPT on a server-detected entry, whose
+            unconfirmed other field is cleared (pass both to confirm both);
+            both null afterwards → branch_source null.
 
     Returns: slim ack {id, project, updated_fields} — `updated_fields` lists the
         applied field names. {"error": "..."} when no field is given, the entry
         is unknown / another project's / deleted, it is already released, the
-        category is invalid, a value is too long, or a free-text field carries
-        tool-call markup. Nothing is written on error.
+        category is invalid, entry is '__clear__', related_item_id is < -1 or
+        not a live item of the project, a value is too long, the worktree is
+        relative, or a free-text field carries tool-call markup. Nothing is
+        written on error.
     """
     if (err := _reject_toolcall_markup(
         entry=entry, component=component, source_file=source_file,
@@ -1246,6 +1290,13 @@ def update_changelog(
         return err
     from dct.core.changelog import update_entry
 
+    if entry == CLEAR:
+        return {"error": "entry cannot be cleared — pass the new changelog line"}
+    if related_item_id < -1:
+        return {"error": (
+            f"Invalid related_item_id {related_item_id}: 0 = unchanged, "
+            f"-1 = unlink, otherwise a positive item id"
+        )}
     fields: dict = {}
     if entry:
         fields["entry"] = entry
@@ -1256,7 +1307,7 @@ def update_changelog(
         ("source_lines", source_lines), ("branch", branch), ("worktree", worktree),
     ):
         if value:
-            fields[name] = None if value == _CLEAR else value
+            fields[name] = None if value == CLEAR else value
     if related_item_id:
         fields["related_item_id"] = None if related_item_id == -1 else related_item_id
 
@@ -1515,7 +1566,7 @@ def list_handoffs(
         project_slug = _resolve_project(project, required=False)
         rows = _list(_get_engine(), project_slug, unconsumed_only=unconsumed_only)
         for r in rows:
-            r["prompt"] = _preview(r.get("prompt"))
+            r["prompt"] = preview(r.get("prompt"))
         return _format_list(rows, HANDOFF_COLS, format)
     except Exception as e:
         return {"error": str(e)}
@@ -2105,6 +2156,14 @@ def reject_plan_checkpoint(checkpoint_id: int) -> dict:
     return {"id": row["id"], "plan_section_id": row["plan_section_id"], "status": row["status"], "sort_order": row["sort_order"]}
 
 
+def _promote_ack(d: dict) -> dict:
+    """Slim ack shared by both promote-to-item tools (K-47)."""
+    return {
+        "id": d["id"], "item_type": d["item_type"], "priority": d["priority"],
+        "status": d["status"], "title": d["title"], "short_title": d["short_title"],
+    }
+
+
 @mcp.tool(structured_output=False)
 def promote_section_to_item(
     section_id: int,
@@ -2126,11 +2185,20 @@ def promote_section_to_item(
         title: Override item title. Empty → use the section heading.
         short_title: 2-4 word English noun phrase naming what the item is
             about (e.g. 'Windows hook paths'); ≤ 50 chars, refused not
-            truncated; always pass it. Empty = no label.
+            truncated; always pass it. Surrounding whitespace is stripped;
+            empty = no label.
 
-    Returns: slim ack {id, item_type, priority, status, title} (the new item) —
-        NOT the full item dict (no description echo). {"error": "..."} on failure.
+    Returns: slim ack {id, item_type, priority, status, title, short_title}
+        (the new item) — `short_title` echoes the STORED label (null when none);
+        a missing key means the server predates the field and ignored it (an
+        unsupported contract — do not retry the promotion, it would create a
+        second item). NOT the full item dict (no description echo).
+        {"error": "..."} on failure — tool-call markup in title/short_title, an
+        over-long field, an invalid enum, an unknown source; no item and no
+        back-link are written then.
     """
+    if (err := _reject_toolcall_markup(title=title, short_title=short_title)):
+        return err
     from dct.core.plans.crud import promote_section_to_item as _promote
     try:
         d = _promote(
@@ -2138,7 +2206,7 @@ def promote_section_to_item(
             item_type=item_type, priority=priority,
             title=title or None, short_title=short_title or None,
         )
-        return {"id": d["id"], "item_type": d["item_type"], "priority": d["priority"], "status": d["status"], "title": d["title"]}
+        return _promote_ack(d)
     except Exception as e:
         return {"error": str(e)}
 
@@ -2164,11 +2232,20 @@ def promote_checkpoint_to_item(
             (truncated to 500 chars).
         short_title: 2-4 word English noun phrase naming what the item is
             about (e.g. 'Windows hook paths'); ≤ 50 chars, refused not
-            truncated; always pass it. Empty = no label.
+            truncated; always pass it. Surrounding whitespace is stripped;
+            empty = no label.
 
-    Returns: slim ack {id, item_type, priority, status, title} (the new item) —
-        NOT the full item dict (no description echo). {"error": "..."} on failure.
+    Returns: slim ack {id, item_type, priority, status, title, short_title}
+        (the new item) — `short_title` echoes the STORED label (null when none);
+        a missing key means the server predates the field and ignored it (an
+        unsupported contract — do not retry the promotion, it would create a
+        second item). NOT the full item dict (no description echo).
+        {"error": "..."} on failure — tool-call markup in title/short_title, an
+        over-long field, an invalid enum, an unknown source; no item and no
+        back-link are written then.
     """
+    if (err := _reject_toolcall_markup(title=title, short_title=short_title)):
+        return err
     from dct.core.plans.crud import promote_checkpoint_to_item as _promote
     try:
         d = _promote(
@@ -2176,7 +2253,7 @@ def promote_checkpoint_to_item(
             item_type=item_type, priority=priority,
             title=title or None, short_title=short_title or None,
         )
-        return {"id": d["id"], "item_type": d["item_type"], "priority": d["priority"], "status": d["status"], "title": d["title"]}
+        return _promote_ack(d)
     except Exception as e:
         return {"error": str(e)}
 

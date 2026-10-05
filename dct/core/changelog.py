@@ -2,16 +2,27 @@
 
 Branch metadata (#801): every entry may carry the git `branch` / `worktree` it
 was written on and a `branch_source` ('client' | 'server') naming who supplied
-them. `resolve_branch_fields` is the ONE rule deciding those three values for a
-new entry (used by the MCP server and the CLI alike); `release_entries` can
-stamp an explicit set of entry ids instead of every unreleased entry.
+them. `resolve_branch_fields` is the ONE detection rule for a new entry (used
+by the MCP server and the CLI alike), `decide_branch_fields` the ONE
+provenance rule for every write (add and update, K-42) and
+`normalize_worktree` the ONE path contract for stored values and the
+`worktree` filter; `release_entries` can stamp an explicit set of entry ids
+instead of every unreleased entry.
+
+A 'server' source is UNCERTAIN (K-36): it names the MCP server's own
+checkout, not a place the client confirmed. Filters therefore follow one
+explicit contract (see _branch_conditions): a plain `branch` filter matches
+the STORED branch exactly whatever its source, while `include_unbranched`
+treats a server-detected row like an unbranched one.
 """
 
-from collections.abc import Iterable
+import os
+from collections.abc import Iterable, Mapping
 from datetime import UTC, datetime
 
 import sqlalchemy as sa
 
+from dct.core import records
 from dct.core.limits import ensure_fits
 from dct.core.projects import resolve_project_id
 from dct.core.text import item_label
@@ -57,6 +68,65 @@ def _fits(column: str, value: str | None) -> str | None:
     return value
 
 
+def normalize_worktree(path: str | None) -> str | None:
+    """The ONE worktree path contract (K-42) — stored values and the filter.
+
+    None / "" → None. Anything else must be an ABSOLUTE path, else ValueError
+    ("worktree must be an absolute path ..."): a relative (or `~`) path is
+    ambiguous on the server. Normalization is purely textual —
+    os.path.normpath, which also drops a trailing separator (except for the
+    root itself) — with NO filesystem access: a client path may live in
+    another filesystem namespace than this server, so it is never resolved
+    with realpath, never checked for existence. (Values the server detects
+    itself come from gitinfo, already realpath-canonical on this machine.)
+    Historical rows are never rewritten; only new writes and filter
+    arguments pass through here.
+    """
+    if not path:
+        return None
+    if not os.path.isabs(path):
+        raise ValueError(
+            f"worktree must be an absolute path (the checkout toplevel, "
+            f"`git rev-parse --show-toplevel`), got {path!r}"
+        )
+    return os.path.normpath(path)
+
+
+def decide_branch_fields(
+    provided: Mapping[str, str | None],
+    existing: Mapping[str, str | None] | None = None,
+    source: str = "client",
+) -> dict:
+    """The ONE provenance rule for `{branch, worktree, branch_source}` (K-42).
+
+    `provided` holds only the branch / worktree keys the caller ACTUALLY
+    passed (None value = an explicit clear); omitting a key is never a clear.
+    `existing` is the row's current triple (None for a new entry), `source`
+    the provenance to record for the resulting values.
+      - A field not provided keeps its existing value — EXCEPT when the
+        existing row is server-detected: a server value is unconfirmed, so a
+        caller who confirms or changes only ONE field drops the other
+        (cleared to NULL) unless it is provided too. A 'server' triple is
+        never relabelled 'client' without the client supplying it.
+      - Resulting branch and worktree both NULL → branch_source NULL;
+        otherwise `source`.
+    The worktree passes through normalize_worktree (relative → ValueError).
+    Returns all three keys.
+    """
+    if source not in BRANCH_SOURCES:
+        raise ValueError(f"Invalid branch_source: '{source}'. Valid: {', '.join(BRANCH_SOURCES)}")
+    base = {"branch": None, "worktree": None}
+    if existing is not None and existing.get("branch_source") != "server":
+        base = {"branch": existing.get("branch"), "worktree": existing.get("worktree")}
+    result = {**base}
+    if "branch" in provided:
+        result["branch"] = provided["branch"] or None
+    if "worktree" in provided:
+        result["worktree"] = normalize_worktree(provided["worktree"])
+    no_value = result["branch"] is None and result["worktree"] is None
+    return {**result, "branch_source": None if no_value else source}
+
+
 def resolve_branch_fields(
     engine: sa.Engine,
     project_slug: str,
@@ -70,7 +140,9 @@ def resolve_branch_fields(
     """Decide `{branch, worktree, branch_source}` for a NEW entry (#801, C3).
 
     - Explicit `branch` and/or `worktree` from the caller win: stored as given
-      with branch_source='client'; an over-long explicit value is REFUSED
+      (the worktree through normalize_worktree — textual only, a relative
+      path is refused) with branch_source='client'; an over-long explicit
+      value is REFUSED
       (ValueError from ensure_fits, never truncated). A value not given stays
       NULL — explicit values are never mixed with detected ones.
     - Neither given: detect via gitinfo.resolve_checkout(project path, cwd)
@@ -92,7 +164,7 @@ def resolve_branch_fields(
     if detected_source not in BRANCH_SOURCES:
         raise ValueError(f"Invalid branch_source: '{detected_source}'. Valid: {', '.join(BRANCH_SOURCES)}")
     if branch or worktree:
-        values = {"branch": branch or None, "worktree": worktree or None}
+        values = {"branch": branch or None, "worktree": normalize_worktree(worktree)}
         ensure_fits(changelog_entries, values)
         return {**values, "branch_source": "client"}
     context = None
@@ -128,16 +200,17 @@ def add_entry(
     """Insert a changelog entry and return the full row.
 
     `branch` / `worktree` are stored as given (see resolve_branch_fields for
-    the detection rule callers apply first); `branch_source` defaults to
-    'client' when either is set. Over-long String(N) values are refused.
+    the detection rule callers apply first) under decide_branch_fields:
+    the worktree is normalized (normalize_worktree — a relative path is
+    refused), `branch_source` defaults to 'client' and is NULL when both
+    values are NULL. `related_item_id` (None = no link) must be a live item
+    of the SAME project — checked in the insert transaction (K-37); an
+    unknown, foreign or soft-deleted id raises ValueError and nothing is
+    written. Over-long String(N) values are refused.
     """
     if not entry or not entry.strip():
         raise ValueError("Changelog entry cannot be empty")
     _validate_category(category)
-    if branch_source is None and (branch or worktree):
-        branch_source = "client"
-    if branch_source is not None and branch_source not in BRANCH_SOURCES:
-        raise ValueError(f"Invalid branch_source: '{branch_source}'. Valid: {', '.join(BRANCH_SOURCES)}")
     values = {
         "version": version,
         "category": category,
@@ -146,14 +219,15 @@ def add_entry(
         "source_file": source_file,
         "source_lines": source_lines,
         "related_item_id": related_item_id,
-        "branch": branch,
-        "worktree": worktree,
-        "branch_source": branch_source,
+        **decide_branch_fields(
+            {"branch": branch, "worktree": worktree}, source=branch_source or "client"
+        ),
     }
     ensure_fits(changelog_entries, values)
 
     with engine.begin() as conn:
         project_id = resolve_project_id(conn, project_slug)
+        _validate_related_item(conn, project_id, related_item_id)
         result = conn.execute(
             changelog_entries.insert()
             .values(project_id=project_id, **values)
@@ -162,24 +236,46 @@ def add_entry(
         return row_to_dict(result.first())
 
 
+def _validate_related_item(conn: sa.Connection, project_id: int, item_id: int | None) -> None:
+    """K-37: a link must name a live item of this project (None = no link).
+
+    Runs on the writer's connection, so the check and the write share one
+    transaction. Non-positive ids are refused the same way (never sent to the
+    FK as a raw IntegrityError).
+    """
+    if item_id is None:
+        return
+    records.validate_project_rows(
+        conn, items, project_id, [item_id], "item", "nothing written."
+    )
+
+
 def _branch_conditions(
     branch: str | None, worktree: str | None, include_unbranched: bool
 ) -> list:
-    """WHERE fragments of the branch / worktree filters (#801, C4).
+    """WHERE fragments of the branch / worktree filters (#801 C4, K-36, K-42).
 
-    No `branch` → no branch condition at all (include_unbranched is ignored),
-    so unfiltered callers see exactly what they saw before #801. `worktree`
-    is an exact match and combines with either.
+    The ONE filter contract:
+      - No `branch` → no branch condition at all (include_unbranched is
+        ignored), so unfiltered callers see exactly what they saw before #801.
+      - Plain `branch` → the STORED branch equals it exactly, whatever its
+        branch_source (a server-detected 'main' row matches branch='main').
+      - `branch` + include_unbranched → additionally every row whose branch is
+        UNCERTAIN: branch NULL, or branch_source='server' (the MCP server's
+        own checkout, never confirmed by the client) whatever branch it
+        stores. Rows keep their stored branch / worktree / source.
+      - `worktree` → exact match on the stored path after normalize_worktree
+        of the argument (relative → ValueError); combines with either.
     """
     c = changelog_entries.c
     conditions = []
     if branch:
         cond = c.branch == branch
         if include_unbranched:
-            cond = sa.or_(cond, c.branch.is_(None))
+            cond = sa.or_(cond, c.branch.is_(None), c.branch_source == "server")
         conditions.append(cond)
     if worktree:
-        conditions.append(c.worktree == worktree)
+        conditions.append(c.worktree == normalize_worktree(worktree))
     return conditions
 
 
@@ -196,8 +292,10 @@ def list_entries(
     """Live entries of a project, newest first.
 
     `unreleased_only` wins over `version`. Branch filters: see
-    _branch_conditions. Each row also carries `related_item_short_title` —
-    item_label() of the related item, None when there is none.
+    _branch_conditions. Each row also carries `item_short_title` (K-38) —
+    item_label() of the related item when it is a LIVE item of the same
+    project, else None (no link, or a dangling historical id — the stored
+    related_item_id itself is never rewritten).
     """
     with engine.begin() as conn:
         pid = resolve_project_id(conn, project_slug)
@@ -209,7 +307,12 @@ def list_entries(
             )
             .select_from(
                 changelog_entries.outerjoin(
-                    items, items.c.id == changelog_entries.c.related_item_id
+                    items,
+                    sa.and_(
+                        items.c.id == changelog_entries.c.related_item_id,
+                        items.c.project_id == changelog_entries.c.project_id,
+                        items.c.deleted_at.is_(None),
+                    ),
                 )
             )
             .where(changelog_entries.c.project_id == pid, changelog_entries.c.deleted_at.is_(None))
@@ -226,9 +329,7 @@ def list_entries(
             row = row_to_dict(r)
             short_title = row.pop("_item_short_title")
             title = row.pop("_item_title")
-            row["related_item_short_title"] = (
-                item_label(short_title, title) if row["related_item_id"] else None
-            )
+            row["item_short_title"] = item_label(short_title, title)
             rows.append(row)
         return rows
 
@@ -312,7 +413,7 @@ def release_entries(
     (selected ids that already had V)}, plus `warning` in mode 'all' when the
     stamped entries span several branches (NULL counts as its own value).
     """
-    from dct.core.records import validate_project_rows
+    from dct.core import records
 
     if bool(version) == bool(bump_type):
         raise ValueError("Provide exactly one of version or bump_type (patch/minor/major)")
@@ -359,7 +460,7 @@ def release_entries(
             to_stamp, selected = [], []
             nothing_to_do = is_current
         else:
-            validate_project_rows(
+            records.validate_project_rows(
                 conn, changelog_entries, pid, ids, "changelog entry", "nothing released."
             )
             stamped = dict(conn.execute(
@@ -466,16 +567,45 @@ def _entry_state_error(conn: sa.Connection, project_id: int, entry_id: int) -> V
     )
 
 
+def _load_unreleased_entry(conn: sa.Connection, project_id: int, entry_id: int):
+    """The live, unreleased entry of the project under the write lock, or a
+    ValueError naming why not (see _entry_state_error)."""
+    c = changelog_entries.c
+    row = conn.execute(
+        sa.select(c.branch, c.worktree, c.branch_source).where(
+            c.id == entry_id,
+            c.project_id == project_id,
+            c.version.is_(None),
+            c.deleted_at.is_(None),
+        )
+    ).first()
+    if row is None:
+        raise _entry_state_error(conn, project_id, entry_id)
+    return row
+
+
 def update_entry(engine: sa.Engine, project_slug: str, entry_id: int, **fields) -> dict:
     """Amend an UNRELEASED entry of the project in place and return the row.
 
     Accepted fields: entry, category (validated), component, source_file,
     source_lines, related_item_id, branch, worktree. A value of None CLEARS a
-    nullable field (all but entry / category). Setting branch or worktree
-    also sets branch_source='client'. One conditional UPDATE (live,
-    unreleased, this project) — raises ValueError when no field is given, on
-    an empty entry, an invalid category, an over-long value, an unknown /
-    foreign / deleted entry, or an already released one (distinct messages).
+    nullable field (all but entry / category); an omitted field is unchanged.
+    `related_item_id` must be a live item of the same project (K-37; None
+    unlinks). branch / worktree follow decide_branch_fields (K-42): the
+    passed ones are stored with branch_source='client'; a field NOT passed
+    is kept — unless the row was server-detected, whose unconfirmed other
+    field is CLEARED; both NULL afterwards → branch_source NULL. The worktree
+    is normalized (normalize_worktree; relative → refused).
+
+    Runs in project_transaction(write=True) (K-39): on PostgreSQL the
+    project's advisory lock is taken BEFORE the snapshot, so an edit and a
+    release of the same project serialize — an edit committed first is
+    included in the release, an edit arriving after it gets the controlled
+    "already released" refusal (the conditional unreleased-only UPDATE stays
+    as the last guard). Raises ValueError when no field is given, on an
+    empty entry, an invalid category, an over-long value, a relative
+    worktree, a bad related item, an unknown / foreign / deleted entry, or
+    an already released one (distinct messages). Nothing is written on error.
     """
     unknown = set(fields) - _UPDATABLE_FIELDS
     if unknown:
@@ -490,14 +620,19 @@ def update_entry(engine: sa.Engine, project_slug: str, entry_id: int, **fields) 
         raise ValueError("Changelog entry cannot be empty")
     if "category" in values:
         _validate_category(values["category"])
-    if "branch" in values or "worktree" in values:
-        values["branch_source"] = "client"
-    ensure_fits(changelog_entries, values)
-    values["updated_at"] = datetime.now(UTC)
+    branch_given = {k: values.pop(k) for k in ("branch", "worktree") if k in values}
+    if "worktree" in branch_given:
+        branch_given["worktree"] = normalize_worktree(branch_given["worktree"])
+    ensure_fits(changelog_entries, {**values, **branch_given})
 
     c = changelog_entries.c
-    with engine.begin() as conn:
-        pid = resolve_project_id(conn, project_slug)
+    with project_transaction(engine, project_slug, write=True) as (conn, pid):
+        current = _load_unreleased_entry(conn, pid, entry_id)
+        if "related_item_id" in values:
+            _validate_related_item(conn, pid, values["related_item_id"])
+        if branch_given:
+            values.update(decide_branch_fields(branch_given, current._mapping))
+        values["updated_at"] = datetime.now(UTC)
         row = conn.execute(
             changelog_entries.update()
             .where(
@@ -517,14 +652,15 @@ def update_entry(engine: sa.Engine, project_slug: str, entry_id: int, **fields) 
 def delete_entry(engine: sa.Engine, project_slug: str, entry_id: int) -> bool:
     """Soft-delete an UNRELEASED entry of the project; True on success.
 
-    One conditional UPDATE (deleted_at, updated_at). Raises ValueError for an
-    unknown / foreign / already deleted entry and, separately, for a released
-    one — released entries are history.
+    One conditional UPDATE (deleted_at, updated_at) inside
+    project_transaction(write=True), serialized with release exactly like
+    update_entry (K-39). Raises ValueError for an unknown / foreign / already
+    deleted entry and, separately, for a released one — released entries are
+    history.
     """
     now = datetime.now(UTC)
     c = changelog_entries.c
-    with engine.begin() as conn:
-        pid = resolve_project_id(conn, project_slug)
+    with project_transaction(engine, project_slug, write=True) as (conn, pid):
         result = conn.execute(
             changelog_entries.update()
             .where(

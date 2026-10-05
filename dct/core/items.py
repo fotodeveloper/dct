@@ -121,6 +121,20 @@ def _validate_title(title: str) -> str:
     return _validate_title_length(title)
 
 
+def normalize_short_title(short_title: str | None) -> str | None:
+    """The ONE short_title write rule (#817, K-43) — create, update, promote.
+
+    FIRST the raw value is length-checked against items.short_title (> 50
+    chars → ValueError, refused, never truncated — surrounding spaces count),
+    THEN it is stripped; an empty result is NULL. None → None. A caller that
+    omits the field never reaches here, so omission never clears a label.
+    """
+    if short_title is None:
+        return None
+    ensure_fits(items, {"short_title": short_title})
+    return short_title.strip() or None
+
+
 def _has_tag_exists(tag_id: int):
     """Correlated EXISTS: the item carries an ACTIVE link to `tag_id`.
 
@@ -206,13 +220,12 @@ def create_item(
     dictionary. A name the similarity guard refuses rolls the WHOLE call back —
     no orphan item, no dictionary row. `force_tags=True` bypasses that guard
     for machine callers (not exposed over MCP). `short_title` (#817) is the
-    item's 2-4 word label: "" is stored as NULL, a value longer than the
-    column (50) raises ValueError — refused, never truncated."""
+    item's 2-4 word label, normalized by normalize_short_title (length
+    checked on the raw value, then stripped; empty → NULL)."""
     _validate_title(title)
-    short_title = short_title or None
+    short_title = normalize_short_title(short_title)
     ensure_fits(items, {
         "component": component, "source_file": source_file, "source_lines": source_lines,
-        "short_title": short_title,
     })
     _validate_enum(item_type, VALID_TYPES, "item_type")
     _validate_enum(priority, VALID_PRIORITIES, "priority")
@@ -379,8 +392,13 @@ def update_item(engine: sa.Engine, item_id: int, **kwargs) -> dict | None:
             _validate_enum(v, VALID_TYPES, "item_type")
         elif k == "title":
             _validate_title(v)
+        if k == "short_title":
+            # K-43: an explicit value (even all-blank) is normalized; an
+            # empty result clears the label. Omitting the key keeps it.
+            values[k] = normalize_short_title(v)
+            continue
         if v == "" and k in {
-            "component", "source_file", "source_lines", "resolution", "description", "short_title",
+            "component", "source_file", "source_lines", "resolution", "description",
         }:
             v = None
         values[k] = v

@@ -969,10 +969,20 @@ def cmd_clog_add(args):
 
 
 def _branch_filter_kwargs(args) -> dict:
-    """`clog list` / `clog count` branch filters → core keyword arguments."""
+    """`clog list` / `clog count` branch filters → core keyword arguments.
+
+    A relative --worktree is refused here (exit 1, message on stderr) under
+    the same contract core applies (normalize_worktree, K-42)."""
+    from dct.core.changelog import normalize_worktree
+
+    try:
+        worktree = normalize_worktree(args.worktree)
+    except ValueError as e:
+        print(f"✗ Error: {e}", file=sys.stderr)
+        sys.exit(1)
     return {
         "branch": args.branch or None,
-        "worktree": args.worktree or None,
+        "worktree": worktree,
         "include_unbranched": args.include_unbranched,
     }
 
@@ -2155,11 +2165,16 @@ def build_parser() -> argparse.ArgumentParser:
         "--worktree", help="Checkout toplevel of the change (default: detected in CWD)")
 
     def _add_branch_filters(p):
-        p.add_argument("--branch", help="Only entries written on this branch")
-        p.add_argument("--worktree", help="Only entries of this exact worktree path")
+        p.add_argument(
+            "--branch",
+            help="Only entries whose stored branch is exactly this (any branch source)")
+        p.add_argument(
+            "--worktree",
+            help="Only entries of this absolute worktree path (normalized as on write)")
         p.add_argument(
             "--include-unbranched", action="store_true",
-            help="With --branch: also entries with no recorded branch")
+            help="With --branch: also uncertain entries — no recorded branch, or "
+                 "detected by the MCP server (branch_source=server, any branch)")
 
     p_clog_list = p_clog_sub.add_parser("list", help="List changelog entries")
     p_clog_list.add_argument("--project", "-P")

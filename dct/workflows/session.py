@@ -54,7 +54,7 @@ from dct.core.sprint import (
     _query_total_open,
     _to_cols_rows,
 )
-from dct.core.text import PREVIEW_CHARS, _preview  # noqa: F401 — re-exported (K-35)
+from dct.core.text import PREVIEW_CHARS, preview  # noqa: F401 — re-exported (K-35)
 from dct.db import project_transaction, session_handoffs
 
 SNAPSHOT_SECTIONS = ("sprint", "handoff", "gates", "decisions", "recent_changes")
@@ -123,7 +123,7 @@ def _handoff_brief(row: dict) -> dict:
         "scope": row.get("scope"),
         "created_by": row.get("created_by"),
         "created_at": row.get("created_at"),
-        "prompt": _preview(row.get("prompt")),
+        "prompt": preview(row.get("prompt")),
     }
 
 
@@ -241,7 +241,7 @@ def _build_snapshot(
                     "ref_code": d.get("ref_code"),
                     "created_at": d.get("created_at"),
                     "title": d.get("title"),
-                    "decision_preview": _preview(d.get("decision")),
+                    "decision_preview": preview(d.get("decision")),
                 }
                 for d in decisions
             ],

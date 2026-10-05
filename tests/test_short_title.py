@@ -13,7 +13,7 @@ import pytest
 from dct.core.checkpoints import add_checkpoint
 from dct.core.items import create_item, get_item, update_item
 from dct.core.sprints import get_current_sprint, set_current_sprint_items
-from dct.core.text import ITEM_LABEL_CHARS, PREVIEW_CHARS, _preview, item_label
+from dct.core.text import ITEM_LABEL_CHARS, PREVIEW_CHARS, item_label, preview
 from dct.db import items as items_tbl
 from dct.workflows.task_mirror import MIRROR_SHORT_TITLES, mirror_tasks
 
@@ -53,7 +53,7 @@ def test_item_label_never_exceeds_the_column_width(n):
 
 def test_preview_default_budget_unchanged_by_the_move():
     assert PREVIEW_CHARS == 200
-    assert _preview("q" * 201) == "q" * 199 + "…"
+    assert preview("q" * 201) == "q" * 199 + "…"
 
 
 # ── core write path ───────────────────────────────────────────────────────────
@@ -282,3 +282,63 @@ def test_review_sprint_every_item_row_carries_a_label(srv, labelled_project):
     _assert_labelled(review, labelled_project, {
         "in_sprint", "recent_activity.items_changed", "stale_in_progress",
     })
+
+
+# ── K-43: one normalization on every write path ───────────────────────────────
+
+
+@pytest.mark.parametrize("blank", ["", " ", "   ", "\t\n "])
+def test_item_label_whitespace_short_title_falls_back_to_title(blank):
+    """A whitespace-only label stored before K-43 never masks the title."""
+    assert item_label(blank, "Real title") == "Real title"
+
+
+@pytest.mark.parametrize("raw,stored", [
+    ("  Hook paths  ", "Hook paths"),
+    ("   ", None),
+    ("\tLabel\n", "Label"),
+    (" " + "a" * 48 + " ", "a" * 48),  # exactly 50 raw chars fits
+])
+def test_create_normalizes_short_title(engine, proj, raw, stored):
+    item = create_item(engine, "proj-a", "todo", "T", short_title=raw)
+    assert item["short_title"] == stored
+    assert get_item(engine, item["id"])["short_title"] == stored
+
+
+def test_create_51_raw_chars_with_spaces_refused_before_strip(engine, proj):
+    """The limit applies to the RAW input (49 visible chars + 2 spaces):
+    refused, never stripped into a fit, never truncated."""
+    with pytest.raises(ValueError, match=r"short_title too long: 51 chars, max 50"):
+        create_item(engine, "proj-a", "todo", "T", short_title=" " + "a" * 49 + " ")
+
+
+def test_update_normalizes_and_blank_clears_but_omission_keeps(engine, proj):
+    iid = create_item(engine, "proj-a", "todo", "T", short_title="Keep me")["id"]
+    assert update_item(engine, iid, status="in_progress")["short_title"] == "Keep me"
+    assert update_item(engine, iid, short_title="  New label ")["short_title"] == "New label"
+    assert update_item(engine, iid, short_title="   ")["short_title"] is None
+
+
+def test_update_51_raw_chars_with_spaces_refused_row_unchanged(engine, proj):
+    iid = create_item(engine, "proj-a", "todo", "T", short_title="Keep")["id"]
+    with pytest.raises(ValueError, match=r"short_title too long: 51 chars"):
+        update_item(engine, iid, short_title="a" * 49 + "  ")
+    assert get_item(engine, iid)["short_title"] == "Keep"
+
+
+def test_promote_paths_normalize_short_title(engine, proj):
+    from dct.core.plans.crud import (
+        add_plan_checkpoint,
+        add_plan_section,
+        create_plan,
+        promote_checkpoint_to_item,
+        promote_section_to_item,
+    )
+
+    plan = create_plan(engine, "proj-a", slug="p-norm", title="P", kind="plan")
+    section = add_plan_section(engine, plan_id=plan["id"], heading="S", depth=2)
+    cp = add_plan_checkpoint(engine, section["id"], "checkpoint text")
+    from_section = promote_section_to_item(engine, section["id"], "todo", short_title="  Sec  ")
+    from_cp = promote_checkpoint_to_item(engine, cp["id"], "todo", short_title="  ")
+    assert get_item(engine, from_section["id"])["short_title"] == "Sec"
+    assert get_item(engine, from_cp["id"])["short_title"] is None
