@@ -98,23 +98,51 @@ if [ -z "$cached" ]; then
 fi
 
 # Project manages its changelog in dct. Check dct DB for unreleased entries of
-# THIS branch (#801; unbranched entries count too), falling back to the
-# project-wide count when an older dct rejects --branch. Unlike the blocking
-# commit hook, a failing count keeps REMINDING (non-blocking, so erring towards
-# the reminder costs nothing). Never pass an empty --branch.
-branch=$(git branch --show-current 2>/dev/null)
-count=""
-[ -n "$branch" ] && count=$(dct clog count --project "$project" --branch "$branch" --include-unbranched 2>/dev/null)
-case "$count" in ''|*[!0-9]*) count=$(dct clog count --project "$project" 2>/dev/null);; esac
-case "$count" in ''|*[!0-9]*) count=0;; esac
-if [ "$count" -gt 0 ]; then
-  exit 0
+# THIS branch (#801; unbranched and server-detected entries count too, K-36),
+# falling back to the project-wide count when an older dct rejects --branch.
+# The count logic and the guidance live in the shared lib (K-48). Unlike the
+# blocking commit hook, THIS hook's failure policy is to keep REMINDING: a
+# missing lib or a failing count yields the generic reminder (non-blocking,
+# so erring towards the reminder costs nothing).
+#
+# Locate the lib next to this script's REAL path (a symlinked install points
+# into the package) or next to the invoked path (a copied install carries a
+# copy). Portable symlink walk: plain `readlink`, no GNU `-f`.
+_dirof() { case "$1" in */*) printf '%s' "${1%/*}" ;; *) printf . ;; esac; }
+_self=${BASH_SOURCE[0]}
+_hops=0
+while [ -L "$_self" ] && [ "$_hops" -lt 40 ]; do
+  _link=$(readlink "$_self") || break
+  case "$_link" in /*) _self=$_link ;; *) _self=$(_dirof "$_self")/$_link ;; esac
+  _hops=$((_hops + 1))
+done
+_lib=""
+for _dir in "$(_dirof "$_self")" "$(_dirof "${BASH_SOURCE[0]}")"; do
+  if [ -f "$_dir/dct-changelog-count.lib.sh" ]; then
+    _lib=$_dir/dct-changelog-count.lib.sh
+    break
+  fi
+done
+guidance=""
+if [ -n "$_lib" ] && . "$_lib"; then
+  dct_changelog_count "$project"
+  case "$DCT_CL_COUNT" in
+    ''|*[!0-9]*) ;;                        # broken count → remind generically
+    *)
+      [ "$DCT_CL_COUNT" -gt 0 ] && exit 0
+      guidance=$(dct_changelog_guidance)
+      ;;
+  esac
 fi
 
 # Reminder (non-blocking — always exit 0)
 file_count=$(echo "$app_files" | wc -l | tr -d ' ')
 echo ""
 echo "📝 Reminder: ${file_count} app file(s) changed in ${project}/ but no changelog entry found."
-echo "   Use /clog to add an entry."
+if [ -n "$guidance" ]; then
+  echo "   $guidance"
+else
+  echo "   Use /clog to add an entry."
+fi
 echo ""
 exit 0

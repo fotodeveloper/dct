@@ -66,6 +66,12 @@ HOOK_WIRING = [
      "matcher": "TodoWrite|TaskCreate", "timeout": None},
 ]
 
+# Shared bash libraries the hooks source (K-48) — NOT hooks, never wired into
+# settings.json. Installed next to the hooks under the SAME name: a symlinked
+# hook finds the lib beside its real path in the package anyway, but a COPIED
+# hook (no symlink privilege) only finds the copy installed beside it.
+HOOK_LIBS = ["dct-changelog-count.lib.sh"]
+
 def discover_skills() -> list[str]:
     """Skill directories shipped inside the package (each holds a SKILL.md).
 
@@ -142,6 +148,8 @@ def install_hook(config: Config | None = None) -> bool:
     - dct-plan-autoscan.sh (PostToolUse, v0.2.0) — re-scans plan-like MD files
       in the background after edit/write, injecting ULIDs and updating DB state
     - dct-task-mirror.sh (PostToolUse) — mirrors Claude Code tasks into dct
+    plus the shared libs in ``HOOK_LIBS`` (same name, not wired — sourced by
+    the two changelog hooks; a copied hook needs its copied lib).
 
     Each hook is independently optional: a source missing from the dct repo (old
     checkout) is skipped silently. An existing pre-#224 regular-file copy is
@@ -162,6 +170,7 @@ def install_hook(config: Config | None = None) -> bool:
         ("check-changelog-on-stop.sh", "dct-check-changelog-on-stop.sh"),
         ("dct-plan-autoscan.sh", "dct-plan-autoscan.sh"),
         ("dct-task-mirror.sh", "dct-task-mirror.sh"),
+        *((name, name) for name in HOOK_LIBS),
     ]:
         src = HOOKS_DIR / src_name
         dst = CLAUDE_HOOKS_DIR / dst_name
@@ -466,11 +475,11 @@ class ClaudeIntegration(ClientIntegration):
         rows.append({"check": "instructions", "status": "ok" if block_valid else "error",
                      "message": "DCT managed instruction block" if block_valid else "Missing or malformed DCT instruction block"})
         missing_hooks = []
-        for spec in HOOK_WIRING:
-            path = CLAUDE_HOOKS_DIR / spec["script"]
-            source = HOOKS_DIR / spec["script"]
+        for script in [spec["script"] for spec in HOOK_WIRING] + HOOK_LIBS:
+            path = CLAUDE_HOOKS_DIR / script
+            source = HOOKS_DIR / script
             if not source.is_file():
-                source = HOOKS_DIR / spec["script"].removeprefix("dct-")
+                source = HOOKS_DIR / script.removeprefix("dct-")
             try:
                 valid = path.read_bytes() == source.read_bytes()
                 if path.is_symlink():
@@ -478,7 +487,7 @@ class ClaudeIntegration(ClientIntegration):
             except OSError:
                 valid = False
             if not valid:
-                missing_hooks.append(spec["script"])
+                missing_hooks.append(script)
         rows.append({"check": "hook_assets", "status": "error" if missing_hooks else "ok",
                      "message": "Missing or outdated hook files: " + ", ".join(missing_hooks)
                      if missing_hooks else "Current packaged hook files present"})

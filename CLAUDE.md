@@ -139,7 +139,11 @@ operation. The five rules — full versions with code samples in
 4. Exit codes carry meaning: `0` pass-through, `2` block with structured reason.
 5. Strip `-m "message"` content before inspecting commit flags.
 
-Reference implementation: `dct/hooks/check-changelog.sh`.
+Reference implementation: `dct/hooks/check-changelog.sh`. Logic shared by
+several hooks lives in a sourced `dct/hooks/*.lib.sh` (never wired; installed
+beside the hooks — `HOOK_LIBS` in `dct/integrations/claude.py`), while each
+hook keeps its own failure policy; commands a hook prints for pasting quote
+every interpolated argument with `printf %q`.
 
 ## MCP tool conventions
 
