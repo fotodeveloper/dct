@@ -12,14 +12,15 @@ description: >-
 # /release — ONE workflow over `dct release`
 
 The release is EXECUTED by the local workflow — `dct release plan / attest /
-prepare / apply / resume / abandon / reconstruct / status`, all with `--json`
-(schemas, order of effects, refusals: `docs/release-workflow.md`; code:
-`dct/workflows/release/`). This skill runs the DIALOG from the first plan to
-the pushed tag in ONE workflow: it shows what the workflow reports, asks the
-owner, passes the owner's decisions back as flags — and, when the owner
-agrees, commits the work in progress itself (Step 3) without leaving this
-workflow. The authoritative step list is the `/release` fallback of
-`docs/assistant-fallbacks.md`; this skill follows it step for step.
+prepare / apply / resume / abandon / reconstruct / takeover / version-files /
+status`, all with `--json` (schemas, order of effects, refusals:
+`docs/release-workflow.md`; code: `dct/workflows/release/`). This skill runs
+the DIALOG from the first plan to the pushed tag in ONE workflow: it shows
+what the workflow reports, asks the owner, passes the owner's decisions back
+as flags — and, when the owner agrees, commits the work in progress itself
+(Step 3) without leaving this workflow. The authoritative step list is the
+`/release` fallback of `docs/assistant-fallbacks.md`; this skill follows it
+step for step.
 
 The workflow performs and verifies every release effect and records the
 progress in the release record itself. This skill therefore:
@@ -29,12 +30,14 @@ progress in the release record itself. This skill therefore:
   `resume`); the only commit it makes is the owner's work in progress
   (Step 3), with the `/commit` procedure;
 - never calls `advance_release` and never stamps through `release_changelog`
-  — the ledger is written by the workflow;
+  — the ledger is written by the workflow; an entry added or corrected during
+  the dialog never takes a version (the stamp of `apply` is the only writer
+  of versions);
 - does not run a push of its own: the push of the release commit and the tag
   is a step of `apply` / `resume`, to the push target the owner approved
   (Step 8);
-- never resets, stashes or cleans the owner's work, never uses the
-  `clog release … --confirm` alias (it uses `apply`, like the fallback).
+- never resets, stashes or cleans the owner's work, and does not use the
+  `clog release` alias (it uses `apply`, like the fallback).
 
 Run every command in the CURRENT checkout (your shell's working directory),
 never in the MCP server's directory. Add `-P <slug>` only when the project is
@@ -67,31 +70,55 @@ Load the two MCP tools the dialog may need for corrections with ONE call:
 ToolSearch("select:mcp__dct__update_changelog,mcp__dct__delete_changelog")
 ```
 
-### Step 1: Executor (K-85)
+### Step 1: Route — from this ONE plan result (K-111, K-119)
 
-Run `dct project release-executor <plan.project>` (read-only without a
-value).
+The plan carries everything the routing needs, read in one transaction:
+`kind`, `unfinished_release` and `executor` — `executor.project` (the
+project's release-executor setting TODAY) and `executor.record` (`null`, or
+for the unfinished record its `version`, `status`, stored `executor`,
+`progress_owner` and `consent`). Decide from this ONE result. Run no other
+command to find out who releases: a second read at a later moment can
+disagree with the plan.
 
-- `own` → the project's OWN release tool performs the effects: dct's
-  `prepare` / `apply` / `resume` refuse it before any write
-  (`details.executor`). Show the plan (Step 4) as the shared proof, say that
-  this project releases through its own integration
-  (`docs/release-workflow.md#integrating-a-projects-own-release-tool`) and
-  STOP. Never run a command stored anywhere in its place.
-- `dct` → continue.
+FIRST: is there an unfinished release (`kind == "resume"` —
+`unfinished_release` is the record)? Then it is routed by what the RECORD
+stores, whatever the setting says today — a release dct stamped stays dct's
+after the project switched to its own tool, and the other way round.
+`executor.project` applies ONLY to a NEW release. Never ask the owner again
+merely because the setting for future releases changed; one line saying so
+is enough.
 
-### Step 2: Unfinished release, legacy release
+| the plan shows (the FIRST matching row routes) | who finishes it | path |
+| --- | --- | --- |
+| `kind == "resume"` and `executor.record.progress_owner == "dct"` | dct, on the consent STORED on the record | **Resume path** → `dct release resume` at once when the owner asked to continue (no second question) |
+| `kind == "resume"` and `executor.record.executor == "own"` | the project's own release tool | **Resume path** → hand over: its tool finishes it through the ledger path; dct runs nothing and takes nothing over |
+| `kind == "resume"` and `executor.record.consent == false` | nobody automatically — a `dct` record stamped outside `apply` | **Resume path** → offer `dct release takeover` (a NEW consent the owner approves) or the ledger path |
+| `kind == "release"` and `executor.project == "own"` | the project's own release tool | show the plan (Step 4) as the shared proof, hand over and STOP |
+| `kind == "release"` and `executor.project == "dct"` | dct | Step 2 |
 
-- `kind == "resume"` (`unfinished_release` is a record) → an earlier release
-  did not finish. Follow the **Resume path** below — never start a new
-  version on top of it.
-- `version.current` set → `dct release status --version <current> --json`.
-  Outcome `none` means the current version was released before release
-  records existed. Offer the **Legacy path** below (recommended: it records
-  the old release from evidence, without re-stamping), or continuing without
-  it, or stopping.
+- **A new release of an `own` project** — the project's OWN release tool
+  performs the effects: dct's `prepare` / `apply` / `resume` refuse it
+  before any write (`details.executor`). Show the plan (Step 4) as the
+  shared proof, say that this project releases through its own integration
+  (`docs/release-workflow.md#integrating-a-projects-own-release-tool`: its
+  tool stamps through the ledger with `expected_executor="own"` and reports
+  each verified effect, the tag with its `tag_proof`) and STOP. Never run a
+  command stored anywhere in its place. A release its tool made before
+  release records existed is recorded by the **Legacy path** (the
+  `--evidence` row), when the owner asks for it.
+- Every later plan of this dialog (after Step 3, Step 6) is routed by the
+  same table, from THAT result.
 
-### Step 3: Work in progress — committed in this workflow (K-97 F1)
+### Step 2: Legacy release
+
+Only for a new release (`kind == "release"`): `version.current` set →
+`dct release status --version <current> --json`. Outcome `none` means the
+current version was released before release records existed. Offer the
+**Legacy path** below (recommended: it records the old release from
+evidence, without re-stamping), or continuing without it, or stopping.
+Outcome `found` → continue.
+
+### Step 3: Work in progress — committed in this workflow (K-97 F1, K-120)
 
 `prepare` / `apply` refuse unless the index and the work tree are clean
 (`index.clean`, no `conflicted` path, no untracked release artifact) and no
@@ -106,8 +133,13 @@ committed as it is — the owner finishes or aborts it first, then the
 workflow continues here.
 
 On `"Commit the work in progress now"` perform the commit HERE, in this same
-workflow, following the `/commit` procedure (the `commit` skill, Steps 1–8;
-its version-bump redirect to `/release` does not apply — you are in it):
+workflow, following the `/commit` procedure (the `commit` skill, Steps 1–8 —
+the ONE source of the commit commands; its version-bump redirect to
+`/release` does not apply: you are in it). That pointer is an instruction
+for YOU, not a request to the owner: after the owner's consent you commit
+the work in progress yourself, plan again, finish the release and let the
+workflow perform the approved push. Do not tell the owner to commit and come
+back.
 
 1. Show the staging plan (explicit paths, never everything at once; a
    partially staged path stays as it is; never secrets or build output),
@@ -124,12 +156,12 @@ its version-bump redirect to `/release` does not apply — you are in it):
    exactly what is staged — the repository's hooks run; never `--no-verify`,
    never `--amend`. A rejecting hook: fix the cause, re-stage, select the
    trailer again from the new staged diff, create a NEW commit.
-4. Then re-plan: `dct release plan --json` again and continue from Step 2 —
+4. Then re-plan: `dct release plan --json` again and continue from Step 1 —
    the new HEAD is the candidate the later steps pin (Step 7 binds it, Step 8
    and Step 9 refuse any other).
 
 The question never ends or splits the release: after the commit the dialog
-goes on; `"Stop"` ends it with nothing released.
+goes on to the pushed tag; `"Stop"` ends it with nothing released.
 
 ### Step 4: Show the plan (plain text)
 
@@ -140,7 +172,7 @@ Project: proj-a — current 1.0.0
 Candidate: abc1234 (feat/x) — range v1.0.0..abc1234 (12 commits)
 
 Proven (4), by branch / merge:
-  feat/x — merge def5678 (PR #41)
+  feat/x — merge def5678 (PR #41, recognised in git)
     #12 [added] New parser support            proved by 1a2b3c4
     #13 [added] Incremental indexing          proved by 5d6e7f8
   (no branch)
@@ -158,6 +190,11 @@ Version files: pyproject.toml, proj_a/__init__.py (contract)
   `merge_commit` / `pr` (K-70); each shows its proving `commits`. The public
   changelog never carries branch names — this grouping is for the review
   only.
+- A PR number is shown WITH its origin (`pr_source`, K-116): `git` = the
+  plan recognised it in the repository (the entry's own merge); `client` =
+  declared by a client, an attestation nobody looked up — say "declared",
+  never present it as git's recognition. A `(#N)` subject suffix (the squash
+  line above) is a heuristic, not a PR of the entry.
 - Unproven entries (`entries.unproven`) show their `reason` (`no_trailer`,
   `reverted` + the reverting commit, `revert_unconfirmed`, `below_range`,
   `squash_suspected` + the group, `no_git`, `no_path`).
@@ -208,10 +245,12 @@ dct release attest --entries 16,17 --confirm --json
 The workflow creates the empty commit `chore: attest changelog entries`
 whose final paragraph is `Changelog: <ids>` (only ids the plan lists as
 unproven; nothing staged; no release unfinished; the repository's hooks
-run). Outcome `attested` → the candidate changed: run
+run; the commit must prove EXACTLY the approved ids before it is published).
+Outcome `attested` → the candidate changed: run
 `dct release plan --version V --json` again, show what changed and continue
 with Step 7 only when the attested ids are now proven. Outcome `refused` →
-show `details.error` and return to Step 5.
+show `details.error` and return to Step 5 (a hook that changed the id set:
+the `details.approved_ids` row of the table).
 
 ### Step 7: Bind the decision (K-80, H4)
 
@@ -241,7 +280,7 @@ Release proj-a 1.1.0?
   is not the consent). Say the side effects: the `since=last_release`
   anchor does not move, and a full changelog export omits V. No → stop.
 
-### Step 8: Prepare — the version files and the push target (K-76, K-97 F3)
+### Step 8: Prepare — the version files and the push target (K-76, K-97 F3, K-104)
 
 Before anything is stamped: the version-sync script runs ONCE in an
 isolated temporary worktree (outside git: a temporary copy); nothing in the
@@ -262,32 +301,40 @@ Outcome `prepared` → show, as plain text:
   version-file contract; an empty list is a contract too (no version files);
 - `details.sync`: the script's exit code, duration and output
   (`output_dropped_bytes` > 0 → say how many bytes were cut);
-- the push target `details.push_target` — remote, URL, branch, tag `v<V>`
-  (the branch's upstream). `null` (no upstream, see `warnings`) → the owner
-  chooses a remote and a branch (`--push-remote <remote> --push-branch
-  <branch>`) or a local release (`--no-push`); never guess one.
+- the push target `details.push_target` — remote, branch, tag `v<V>` (the
+  branch's upstream) and `details.push_target.url`: the ONE effective push
+  URL — the remote's push address, never its fetch URL; the release is read,
+  pushed and verified exactly there. `null` (the reason is in `warnings`) →
+  the owner decides, never guess: no upstream → `--push-remote <remote>
+  --push-branch <branch>`, or a local release (`--no-push`); a remote with
+  SEVERAL push URLs (listed in `warnings`) → the owner picks ONE with
+  `--push-url <url>` — there is no mirror mode, the other addresses are the
+  owner's to push.
 
-Then ask: `"Release with these files, pushed to <remote>/<branch>"` /
-`"Other push target"` / `"Local release — no push"` / `"Not these files —
+Then ask: `"Release with these files, pushed to <remote>/<branch> (<url>)"`
+/ `"Other push target"` / `"Local release — no push"` / `"Not these files —
 stop"`. Keep `details.proposal_sha256` (`P`). Outcome `failed` → the script
-failed or timed out (exit code 124; `details.sync`): nothing stamped; the
-owner fixes the script, then prepare again. `refused` → the refusal table
-below.
+failed or timed out (exit code 124; `details.sync`, with the environment
+contract it ran under in `details.environment`): nothing stamped; the owner
+fixes the script, then prepare again. `refused` → the refusal table below.
 
 ### Step 9: Apply — only on the owner's yes
 
 ```bash
 dct release apply --version 1.1.0 --entries 12,13,15,16,17 --plan-digest <D> --proposal-digest <P> --confirm --json
 dct release apply --version 1.1.0 --entries 12,13,15,16,17 --plan-digest <D> --proposal-digest <P> --push-remote origin --push-branch main --confirm --json   # another push target
+dct release apply --version 1.1.0 --entries 12,13,15,16,17 --plan-digest <D> --proposal-digest <P> --push-remote origin --push-branch main --push-url <url> --confirm --json   # ONE of several push URLs
 dct release apply --version 1.1.0 --no-entries --plan-digest <D> --proposal-digest <P> --no-push --confirm --json   # version-only, local
 ```
 
 The first form pushes to the upstream shown in Step 8; pass the push flags
 the owner chose, nothing else. The workflow stamps, writes the changelog
 section and the approved version files, makes the `release: v<V>` commit
-through the repository's hooks, updates the real index, tags `v<V>` and
-pushes the commit and the tag atomically (K-97 F2) — each verified and
-recorded. Never pass a digest the owner has not seen.
+through the repository's hooks (on the pinned candidate, published by
+compare-and-swap — needs git 2.36 or newer), updates the real index, tags
+`v<V>` and pushes the commit and the tag atomically to the approved URL
+(K-97 F2, K-104) — each verified and recorded. Never pass a digest the
+owner has not seen.
 
 ### Step 10: Read the result and report
 
@@ -297,87 +344,178 @@ recorded. Never pass a digest the owner has not seen.
   reconstruct` → offer the **Legacy path**.
 - Exit 1, outcome `refused` → show `details.error`, then act by the table
   below. Only the listed `steps` happened. A `release` that is unfinished →
-  the **Resume path**.
+  the **Resume path**: the same operation continues there on the stored
+  consent once the cause is gone.
 - Outcome `conflict` (exit 75) → the conflict row of the table.
+- Show every `warnings` line of a result, also of a successful one — a
+  post-commit hook that failed after the commit was published (the release
+  stands; nothing is repeated), a pin or stored blob that could not be
+  cleaned.
 
 Refusals (the keys are the workflow's own, `dct/workflows/release/effects.py`):
 
 | details | what to tell the owner | next action |
 | --- | --- | --- |
 | `details.error` | every refusal: the reason, verbatim | the row of the other keys |
-| `details.executor`, `details.consent` | the project (`executor: "own"`) or the record (`own`, or `consent: null` — stamped outside `apply`) is not executed by dct | hand over: the project's own tool, or the owner records the verified effects through the ledger path (`docs/release-workflow.md#executor-k-85`) — never this dialog; or abandon |
+| `details.executor`, `details.consent` | the project (`executor: "own"`) or the record (`own`, or `consent: null` — stamped outside `apply`) is not executed by dct | a new release: hand over to the project's own tool (Step 1); a record: the Resume path — the own tool's ledger path, or for a `dct` record the takeover (a NEW consent); this dialog runs nothing in its place |
 | `details.lock`, `details.holder` | another release command holds the repository's operation lock (pid, action, start) | wait until it ends, then run the same command once — never loop |
+| `details.lock`, `details.reason` | `lock: null` — the lock's identity cannot be determined: the project has no registered path (`reason: "no_path"`) or its path cannot be verified (`"unverifiable_path"`); dct never locks on a substitute key | this is not a busy lock: the owner registers or corrects the path (`dct project rename <slug> --path <dir>`), or the command is run where the registered path exists; then the same command once |
+| `details.process_groups`, `details.process_group` | a dct that was killed left processes running (`process_groups`; `[]` = it cannot be verified), or a version-sync script could not be stopped (`process_group`) — the repository may still be written to | never loop and never clear it yourself: show the groups and the hint of `details.error`; the owner decides (ends those processes and clears the lock file as the message says); only then the same command once |
+| `details.git_version`, `details.required_git_version` | git is older than the workflow needs (the hooks are run explicitly) — refused before any effect, never a fallback that skips hooks | the owner upgrades git; then the same command |
 | `details.staged`, `details.unstaged`, `details.conflicted`, `details.untracked`, `details.in_progress` | the tree is not clean, a release artifact is untracked, or a merge / rebase / cherry-pick / revert runs | Step 3 (commit the work in progress here), or the owner finishes the operation; then re-plan |
 | `details.unfinished` | an unfinished release exists | the Resume path |
 | `details.unproven` | a selected id has no proof | Step 5 (attest / correct / withdraw / keep), then Step 7 |
-| `details.approved_digest`, `details.derived_digest` | the context differs from the approved plan (HEAD, an entry added or edited, selection, version, proof) | show the derived `snapshot`; Step 7 again — a new approval |
+| `details.approved_ids`, `details.proven_ids` | attest: a commit hook changed the id set — the commit would prove `proven_ids`, the owner approved `approved_ids` (equality is required); nothing was published | the owner fixes the hook; then Step 6 again |
+| `details.approved_digest`, `details.derived_digest` | the context differs from the approved plan (HEAD, an entry added or edited, selection, version, proof) — or, for a takeover, from the approved preview | show the derived `snapshot`; Step 7 again — a new approval (a takeover: preview again) |
+| `details.proposal_digest`, `details.plan_digest` | a new release was started without an approved version-file proposal (`proposal_digest: null`) — equal paths or a checked version field are no consent to the content | Step 8 (prepare for the plan `plan_digest`), the owner approves the files, then Step 9 with that digest |
 | `details.mismatch`, `details.pending`, `details.approved_script`, `details.missing_blobs` | the approved proposal is void: another candidate / version / plan, a newer prepare, a changed script, pruned blobs | Step 8 again — a new approval |
-| `details.changed` | before the stamp: a proposal file changed since prepare (approval void); on resume: a release artifact differs from the recorded manifest, or a hook changed the work tree after the commit | prepare again (Step 8); on resume the owner restores the files, then resume — or abandon |
-| `details.checkout_changed`, `details.sync`, `details.path` | prepare: the script wrote outside its isolated worktree, failed / timed out, touched the changelog, or broke a version file's contract | STOP; the owner fixes the script, then Step 8 |
-| `details.proposal`, `details.contract` | (the `clog release … --confirm` alias only) a first release or a contract change needs the proposal approved | this dialog uses Step 8 instead |
-| `details.foreign` | a release file differs from both its baseline and the approved content — nothing overwritten | the owner restores or finishes the file, then resume — or abandon |
+| `details.changed` | before the stamp: a proposal file changed since prepare (approval void); on resume: a release artifact differs from the recorded manifest, or a post-commit hook changed the work tree after the commit | prepare again (Step 8); on resume the owner restores the files, then resume |
+| `details.checkout_changed`, `details.sync`, `details.environment`, `details.path` | prepare: the script wrote outside its isolated worktree, failed / timed out (`sync`, with its `environment` contract: it ran isolated, with only the candidate's files — never in the checkout), touched the changelog, or broke a version file's contract | STOP; the owner fixes the script (it must provide what it needs itself, committed), then Step 8 |
+| `details.foreign` | a release file differs from both its baseline and the approved content — nothing overwritten | the owner restores or finishes the file, then resume |
 | `details.foreign_paths`, `details.foreign_content` | the index holds staged changes that are not the release's — left untouched | the owner unstages them, then resume |
-| `details.git_error`, `details.head`, `details.commit`, `details.tree`, `details.expected_tree` | a repository hook refused the release (or attestation) commit (`git_error`, `head`), or changed it (`commit`, `tree` ≠ `expected_tree`) — never adopted | show the hook output; the owner fixes the cause (a changed commit: resets HEAD to the candidate and the artifacts), then resume |
+| `details.git_error`, `details.hook`, `details.head`, `details.expected_parent`, `details.tree`, `details.expected_tree`, `details.changed`, `details.subject`, `details.unpublished_commit`, `details.pinned_ref`, `details.head_ref`, `details.signed` | the release (or attestation) commit was stopped and nothing was published — no ref moved: a hook refused it (`hook`, `git_error`), a hook changed the approved content (`changed`, `tree` ≠ `expected_tree`) or the message outside its contract (`subject`; `unpublished_commit` = an unreferenced object git removes), signing failed (`signed`), or HEAD moved / the branch was switched meanwhile (`head` ≠ `expected_parent`, `pinned_ref` ≠ `head_ref`) | show the hook output; the owner fixes the hook or puts the files back as approved (after a branch switch: switches back), then resume on the same candidate (attest: Step 6 again) — no branch has to be moved back |
+| `details.commit`, `details.parents`, `details.tree`, `details.expected_tree`, `details.candidate` | on resume HEAD is neither the candidate nor the release commit — a commit made by hand, or the leftover of an older run (`commit`, its `parents`, its `tree` against the approved `expected_tree`, the `candidate`); reported exactly: dct touched no ref, no staging and no file, and it never resets | show it. The hint of `details.error` is conditional: IF that commit is the owner's to discard and nothing is based on it, the owner moves the branch back to the candidate, then resume. The owner decides — never this dialog |
 | `details.foreign_staged` | after the release commit: the owner's own staged version of a release file was preserved | the owner unstages or commits it, then resume |
 | `details.index_lock` | another git process holds `index.lock` (never removed by dct) | wait for it, then resume |
-| `details.push_target`, `details.git_error` | no upstream (`push_target: null`) → nothing stamped; a failed push → the record stays `tagged` | choose `--push-remote … --push-branch …` or `--no-push` and apply again; after a failed push fix the cause, then resume — it retries ONLY the push |
-| `details.remote_tags` | the remote already has a tag of V | stop; the owner decides (another version, or the remote's tag) |
+| `details.push_target`, `details.push_urls` | before the stamp, nothing released: no upstream (`push_target: null`), or the remote has several push URLs (`push_urls`) — a release goes to ONE approved address (no mirror mode) | the owner chooses `--push-remote … --push-branch …`, picks ONE of the listed addresses with `--push-url <url>`, or `--no-push`; then apply again. On resume `push_urls` without the approved URL = the remote no longer pushes to the approved address (outside the consent): the owner restores the remote, then resume |
+| `details.url`, `details.rewrite_rule` | a git `insteadOf` / `pushInsteadOf` rule (`rewrite_rule`) would rewrite the approved address `url` on git's command line — dct pushes only to the exact approved URL | the owner removes that rule (or points the remote at the final address); then the same command (after the stamp: resume) |
+| `details.git_error`, `details.push_target` | a failed push → the record stays `tagged` (the commit and the tag exist locally) | fix the cause, then resume — it retries ONLY the push, to the approved URL |
+| `details.remote_tags` | the push destination already has a tag of V | stop; the owner decides (another version, or the remote's tag) |
 | `details.remote_branch` | the remote branch is not contained in the candidate | the owner fetches and integrates it, then re-plan from Step 0 |
-| `details.outside_consent`, `details.url_now` | the record's scope or the push remote's URL left the stored consent | restore the remote, then resume; otherwise abandon |
+| `details.outside_consent` | the record's version, entries or candidate left the stored consent — resume does not cover it | show what differs; the owner restores the recorded scope, then resume. The dialog never widens a consent (Resume path) |
 | `details.recorded` | the record belongs to another checkout | resume in that checkout (`details.recorded`) |
 | `details.conflict`, `details.observed_effects`, `details.record_state` | outcome `conflict`, exit 75: a concurrent database write; the rolled-back write, the effects that DID happen (they stay), the re-read record (`unknown` → check `dct release status`) | never retry on your own; the owner decides: a conflict at the stamp → the same apply again; later → resume |
 
 Report the requested version (`details.requested_version`), the record's
 version (`version` — the authoritative spelling of every artifact) and the
-project's `details.current_version` SEPARATELY (K-55 / K-31), and the push:
+project's `details.current_version` SEPARATELY (K-55 / K-31), and the push —
+remote, branch, tag and the `url` of the `push` step:
 
 ```
 ✓ proj-a released: requested 1.1.0 · record 1.1.0 · current_version 1.1.0
   5 entries stamped (#12, #13, #15, #16, #17); attested: #16, #17; left unreleased: #18
   Steps: stamp done · changelog done · version_files done · commit done · index done · tag done · push done · complete done
-  Pushed: <details.push_target.remote> <branch> + v1.1.0   (or: local release, push skipped)
+  Pushed: <remote> <branch> + v1.1.0 → <url>   (or: local release, push skipped)
 ```
 
 When `.github/workflows/publish.yml` exists in the repository, say that the
 pushed tag publishes the package.
 
-## Resume path (K-97 F4)
+## Resume path (K-97 F4, K-111, K-112)
 
-Show the RECORDED release from the plan's `resume` (`version`, `status`,
-`candidate_sha`, `entry_ids`, `proof`, `effects`, `release_commit_sha`) —
-the resume continues exactly that, it is never recomputed on today's HEAD —
-and, SEPARATELY, today's `resume.head` (`checkout.matches_record`) and the
-entries added since (`resume.new_unreleased`: not part of this release).
+Step 1 routes here (`kind == "resume"`). Show the RECORDED release from the
+plan's `resume` (`version`, `status`, `candidate_sha`, `entry_ids`, `proof`,
+`effects`, `release_commit_sha`) — a resume continues exactly that, it is
+never recomputed on today's HEAD — and, SEPARATELY, today's `resume.head`
+(`checkout.matches_record`), the entries added since
+(`resume.new_unreleased`: not part of this release) and who finishes it
+(`executor.record`). A PR number in the recorded `proof` is shown with its
+origin (`pr_source`: recognised in git, or declared by a client).
 
-A record whose `executor` is `own`, or without a `consent` (stamped outside
-`dct release apply` — MCP `release_changelog`, an own tool, a partial
-reconstruction), is NOT finished by dct: resume refuses it. Say who
-finishes it — the project's own tool, or the owner through the ledger path
-after verifying each effect (`docs/release-workflow.md#executor-k-85`; never
-this dialog) — offer the takeover when its `executor` is `dct` and its
-release commit exists (the last row of the Legacy path table below: dct
-records the consent from the verified artifacts, then `resume` performs
-only the missing effects) — or offer to abandon it.
+### A release dct executes (`progress_owner` is `dct`)
 
-Otherwise ask: `"Finish release v<version>"` / `"Abandon release
-v<version>"` / `"Stop"`.
+The owner approved this release at `apply` (or at a takeover), and that
+consent is stored on the record: version, entries, candidate, proposal, push
+target. It is not asked for a second time.
 
-- **Finish** → `dct release resume --json`. No new approval: it executes the
-  consent stored at apply (version, entries, candidate, proposal, push
-  target) while the scope is unchanged, and refuses what lies outside it
-  (`details.outside_consent`). It checks the record against THIS checkout
-  (another worktree or HEAD → refused; the record is never re-pinned — run
-  it in the record's `checkout_root`), verifies each effect, skips what
-  exists and matches, performs what is missing (a `tagged` record: ONLY the
-  push) and refuses on a contradiction without overwriting. The version sync
-  is never re-run. Read the result as in Step 10.
-- **Abandon** → ask for the owner's reason (free text), and confirm that the
-  record, the stamps, `current_version` and every effect stay and V stays
-  taken (the work is released later under a NEW version). Then:
+- **The owner asked to continue it** ("resume", "finish the release", "go
+  on" after a refusal whose cause is gone) and its scope is unchanged → show
+  the stored state and run, at once and on the stored consent:
 
-```bash
-dct release abandon --version 1.1.0 --reason "<the owner's reason>" --confirm --json
-```
+  ```bash
+  dct release resume --json
+  ```
+
+  No new approval, no menu, no second question — the command takes no
+  confirmation flag because there is nothing left to approve. It checks the
+  record against THIS checkout (another worktree or HEAD → refused; the
+  record is never re-pinned — run it in the record's `checkout_root`),
+  verifies each effect, skips what exists and matches, performs what is
+  missing (a `tagged` record: ONLY the push) and refuses on a contradiction
+  without overwriting. The version sync is never re-run. The release commit,
+  the tag and the push are finished by this one command, inside the same
+  workflow. Read the result as in Step 10.
+- **The request was something else** (a new version, a bare "release" in a
+  session that did not start this one): a record in the database never
+  starts anything by itself. Show the stored state, say that this release
+  is finished first (a new version cannot be stamped over it), and run the
+  resume when the owner says to finish it.
+- **An earlier explicit "stop"**, or a withdrawn consent, stays binding in
+  this conversation: do not resume until the owner says to continue.
+- **A refusal or a conflict is reported, not retried**: one run per request
+  — never loop; run it again only when the owner says the cause is gone
+  (the table of Step 10).
+- **The scope changed** (`details.outside_consent`: the record's version,
+  entries or candidate differ from the consent) → the stored consent does
+  not cover it. Show exactly what differs. A new or wider consent is asked
+  for only then — for that concrete change of scope, never as a routine
+  question — and the dialog never widens a consent by itself: the owner
+  restores the recorded scope (then resume), or decides how the release
+  ends.
+- **Abandon** only on the owner's explicit request or decision, with the
+  owner's reason — it is not a routine option and never the dialog's
+  choice. Confirm that the record, the stamps, `current_version` and every
+  effect stay and V stays taken (the work is released later under a NEW
+  version). Then:
+
+  ```bash
+  dct release abandon --version 1.1.0 --reason "<the owner's reason>" --confirm --json
+  ```
+
+  This local command is the only way to abandon a release dct executes: the
+  MCP tool `abandon_release` refuses such a record (it holds no operation
+  lock, so an effect could run past it — K-119 M6).
+
+### A record nobody finishes automatically (`progress_owner` is `ledger`)
+
+`resume` refuses it at every status (`details.executor`, `details.consent`)
+— do not run it.
+
+- **The record's `executor` is `own`** → the project's own tool finishes it
+  through the ledger path: its stamp carried `expected_executor="own"`, and
+  it reports each effect it verified (the tag with its `tag_proof`, a push
+  with its `push_proof`) —
+  `docs/release-workflow.md#integrating-a-projects-own-release-tool`. Say so
+  and hand over; this dialog performs none of it. An `own` record stays with
+  its tool: dct never offers the takeover for it, whatever the project's
+  setting says today.
+- **The record's `executor` is `dct` (or null) and it has no consent** — it
+  was stamped outside `dct release apply` (the MCP stamp, an older record, a
+  reconstruction that ended at `committed`). Two ways to finish it; the
+  owner chooses:
+
+  1. **The takeover** — dct records the missing consent from the VERIFIED
+     artifacts (no re-stamp, no new bump). This is a NEW consent and needs
+     the owner's explicit approval — "no second question" covers only the
+     unchanged resume above. The push decision is explicit (ask: the remote
+     and branch, ONE address with `--push-url <url>` when the remote has
+     several, or no push). Preview:
+
+     ```bash
+     dct release takeover --version 1.1.0 --push-remote origin --push-branch main --json
+     dct release takeover --version 1.1.0 --no-push --json                # a local release
+     ```
+
+     Outcome `preview` (nothing written): show `details.consent` — version,
+     entries, candidate, release commit, tree, the artifacts digest
+     (`takeover.artifacts_sha256`), the push target or "no push" —
+     `details.stage`, `details.missing_effects` (what resume will still do)
+     and keep `details.takeover_digest` (`T`). Ask: `"Hand release
+     v<version> to dct with exactly this consent"` / `"Not this — stop"`.
+     Only on yes, with the SAME push flags:
+
+     ```bash
+     dct release takeover --version 1.1.0 --push-remote origin --push-branch main --takeover-digest <T> --confirm --json
+     ```
+
+     Outcome `taken_over` — no effect was performed. Then, in the same
+     workflow, `dct release resume --json` performs only the missing
+     effects. Refused (no release commit verifies — a `stamped` record with
+     nothing made; `details.contradictions`; a digest that no longer
+     matches → preview again) → show it; the ledger path stays.
+  2. **The ledger path** — whoever performs the missing effects verifies
+     them and records the progress (`docs/release-workflow.md#executor-k-85`).
+     Never this dialog.
 
 ## Legacy path (a release without a record)
 
@@ -385,44 +523,64 @@ dct release abandon --version 1.1.0 --reason "<the owner's reason>" --confirm --
 dct release reconstruct --version 1.0.0 --json
 ```
 
-Outcome `preview`: show `details.evidence` — its resolved `version` (the
-stored spelling) and the request `requested_version` SEPARATELY, the
-`candidates` (each verified or not, with its reason), the `status` the
-evidence reaches (`completed` with a tag, `committed` without one), entry
-ids, release commit, tag, changelog section, version files — and ask
-`"Record this release"` / `"Stop"`. Only on yes run the same command with
-`--confirm`. Also show `evidence.verification` (the scope that was
-verified; `limited: true` = only the database's stamp, and in git the
-commit, prove the release — say so) and `details.executor` (the executor
-ASSIGNED to the record now — a responsibility, not who made the release).
-Refused → show the reason; the owner decides — never reconstruct by hand,
-never write the record another way. The CLI steps for each refusal and for
-finishing (`details.finish`):
+Outcome `preview` (nothing written): show `details.evidence` —
 
-| situation | CLI step |
+- its resolved `version` (the stored spelling) and the request
+  `requested_version` SEPARATELY;
+- the `candidates` (each verified or not, with its reason and its `history`
+  state), the `status` the evidence reaches (`completed` with a tag,
+  `committed` without one), entry ids, release commit, tag, changelog
+  section, version files;
+- `evidence.verification` — the scope that WAS verified. `limited: true` =
+  no artifact content was verified: only the database's stamp, and in git
+  the commit, prove the release — say so plainly;
+- `evidence.contract` — the version-file contract: `state: "unknown"`
+  (nothing was ever confirmed) is not the same as a `"confirmed"` empty
+  list;
+
+and, beside the evidence, `details.executor` — the executor ASSIGNED to the
+record now: a responsibility for its further handling (`provenance: false`),
+not who made the release — and `details.finish`: the ways to finish a
+release the evidence leaves at `committed`. Ask `"Record this release"` /
+`"Stop"`. Only on yes:
+
+```bash
+dct release reconstruct --version 1.0.0 --confirm --json
+```
+
+Outcome `reconstructed`. Refused → show the reason; the owner decides —
+never reconstruct by hand, never write the record another way. The step for
+each refusal and for finishing:
+
+| situation | step |
 | --- | --- |
-| several verified candidates, no tag (`details.candidates`) | the owner picks one: `dct release reconstruct --version V --release-commit <sha> [--confirm] --json` |
-| the release commit changed older changelog history (`details.history`: the diff) | show the diff; nothing is recorded and there is no flag that waives it |
-| outside git, the contract is unknown (`details.contract.state: "unknown"`) | `dct release version-files --json` (show), then with the owner's answer `dct release version-files --set <a,b> --confirm --json` or `dct release version-files --none --confirm --json`; then reconstruct again |
-| the project's executor is `own` (`details.executor: "own"`) | its tool supplies the evidence: `dct release reconstruct --version V --evidence <file.json> [--confirm] --json` — never composed by this dialog |
-| the record ends at `committed` (`details.finish`) | `dct release takeover --version V (--push-remote R [--push-branch B] [--push-url U] \| --no-push) --json` (preview: `details.consent`, `details.missing_effects`, `details.takeover_digest`); after the owner approves exactly that: the same command with `--takeover-digest <digest> --confirm --json`; then `dct release resume --json`. Or the ledger path of whoever performs the missing effects (`docs/release-workflow.md#executor-k-85`; never this dialog) |
+| several verified candidates, no tag (`details.candidates`) | show them all; dct picks none — the owner picks one: `dct release reconstruct --version V --release-commit <sha> --json`, then the same with `--confirm` |
+| the release commit changed older changelog history (`details.history`) | show the diff (`state`, `diff`, `diff_lines`); nothing is recorded and no flag or waiver exists — also for a typo fix; the release stays without a record |
+| outside git, the contract is unknown (`details.contract`, `state: "unknown"`) | `dct release version-files --json` (outcome `none` = UNKNOWN, `found` = confirmed); ask the owner which files hold the version, or none; with THAT answer `dct release version-files --set <a,b> --confirm --json` or `dct release version-files --none --confirm --json` (outcome `confirmed`); then reconstruct again |
+| the project's executor is `own` (`details.executor: "own"`) | its tool supplies the evidence file: `dct release reconstruct --version V --evidence <file.json> --json`, then the same with `--confirm` — the file comes from the own tool, never composed by this dialog |
+| the record ends at `committed` (`details.finish`) | way `takeover` → the takeover of the **Resume path** above (preview, the owner approves that digest, resume); way `ledger` → whoever performs the missing tag and push records them (`docs/release-workflow.md#executor-k-85`; the only way for an `own` record) |
 
 ## Rules
 
 - NEVER release without the owner's confirmation; the owner decides the
   work-in-progress commit, every attestation, correction, withdrawal, the
   version, version-only, the version files and the push target.
-- ALWAYS run `dct release plan --json` first and read the executor; an
-  unfinished record is resumed or abandoned, never replaced by a new version.
+- ALWAYS run `dct release plan --json` first and route from that ONE result
+  (Step 1): an unfinished record by what it stores, a new release by the
+  project's setting. An unfinished record is resumed or — on the owner's
+  explicit decision — abandoned, never replaced by a new version.
+- An unchanged resume needs no second question; a takeover and a changed
+  scope need a new, explicit consent; a record alone starts nothing.
 - ONE workflow: work in progress is committed inside it (Step 3) on the
-  owner's consent — never send the owner away to commit it.
+  owner's consent, by you — the owner is not sent away for it — and the
+  release goes on to the approved push.
 - NEVER stamp an entry without proof: attest (Step 6), correct, withdraw or
   keep it. Collective attestation is a proposal the owner confirms.
 - ALWAYS pass `--version V` (computed once), `--entries` or, with explicit
   consent, `--no-entries`, the `snapshot_digest` of the plan bound to THAT
   selection, and `--proposal-digest` only after the owner approved the
   prepared files and the push target.
-- NEVER retry a conflict or a lock refusal on your own.
+- NEVER retry a conflict or a refusal on your own, and never loop on a lock.
 - `dct release abandon` only with the owner's reason and explicit
   confirmation.
 - The skill never edits the changelog file, never runs the version sync

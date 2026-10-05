@@ -204,6 +204,7 @@ def test_resume_refuses_when_the_remote_no_longer_pushes_to_the_approved_url(eng
     with pytest.raises(ReleaseRefused, match="consent") as exc:
         resume(engine, repo)
     assert exc.value.details["push_urls"] == [str(swapped)]
+    assert "url_now" not in exc.value.details  # R8c S11: `push_urls` is the whole answer
     assert (refs(swapped), refs(approved)) == before
     assert get_release(engine, SLUG, "1.1.0")["status"] == "tagged"
 

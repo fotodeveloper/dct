@@ -2707,7 +2707,7 @@ def _consented_target(run: _Run) -> dict | None:
             f"address of this repository's remote any more (now "
             f"{', '.join(urls) if urls else 'missing'}) — outside the consent of "
             f"{run.version}: restore the remote, or abandon the release; nothing pushed.",
-            push_target=target, push_urls=urls or [], url_now=urls[0] if urls else None)
+            push_target=target, push_urls=urls or [])
     _check_literal_url(run, target["url"])
     return target
 

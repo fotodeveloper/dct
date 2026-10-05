@@ -287,8 +287,8 @@ dct clog add added "New Python parser support" --project myproj
 dct clog list --project myproj --unreleased
 dct clog count --project myproj       # Used by hooks
 dct clog count --branch feat/x --include-unbranched   # This branch + unbranched/server-detected
-dct clog release 1.1 --project myproj --confirm  # Alias of `dct release prepare` + `apply`: commit, tag, push to the upstream (run from a checkout)
-dct clog release --patch --entries 12,15 --confirm --no-push   # Only these (proven) entries; a local release
+dct clog release 1.1 --project myproj --proposal-digest <p> --confirm  # Alias of `dct release apply` that derives the plan itself (after `dct release prepare`): commit, tag, push to the upstream (run from a checkout)
+dct clog release --patch --entries 12,15 --proposal-digest <p> --confirm --no-push   # Only these (proven) entries; a local release
 dct clog update 12 --branch feat/x    # Amend an unreleased entry
 dct clog delete 12                    # Soft-delete an unreleased entry
 dct clog export --project myproj --output changelog.md

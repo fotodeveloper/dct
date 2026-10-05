@@ -263,8 +263,8 @@ Client entries of other checkouts are not listed.
 
 ## The effects layer
 
-`dct/workflows/release/effects.py` — ONE implementation for the CLI and the
-skills of both clients (they only run the dialog). Every effect is VERIFIED
+`dct/workflows/release/effects.py` — ONE implementation for the CLI and every
+client skill (a skill only runs the dialog). Every effect is VERIFIED
 against reality before the ledger records its progress; a status is never
 taken as proof. The release commit and its tag are pushed to the approved
 push target (K-97 F2). The MCP server never runs this code.
@@ -1504,7 +1504,7 @@ The three layers (K-72) and who may use them:
 | 2 ledger | MCP / core `release_changelog`, `get_release`, `advance_release`, `abandon_release` | the effects layer, or a project's own release tool |
 | 3 effects | `dct release attest / prepare / apply / resume / abandon / reconstruct / takeover / version-files` | the default behind `/release` for projects without their own tool (`reconstruct --evidence` is the own tool's adapter) |
 
-The skills of both clients only run the dialog over layers 1 and 3; the MCP
+A client skill only runs the dialog over layers 1 and 3; the MCP
 process never verifies files (it runs in its own directory, not in the
 release checkout).
 
