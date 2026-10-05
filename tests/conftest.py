@@ -106,6 +106,13 @@ def _live_database_url() -> str:
         return ""
 
 
+# Captured ONCE, at conftest import — structurally BEFORE `_suite_isolation`
+# repoints DCT_DATABASE_URL / DCT_CONFIG_PATH at a throwaway file (#822).
+# Read later, the guard would compare the lane target against the suite's own
+# SQLite file and never recognise the developer's real database.
+LIVE_DATABASE_URL = _live_database_url()
+
+
 def _probe_item_count(url: str) -> int | None:
     """Rows in `items` on the target — None when absent or unreadable.
 
@@ -123,20 +130,59 @@ def _probe_item_count(url: str) -> int | None:
         eng.dispose()
 
 
+def pg_lane_refusal_reason(url: str, item_count: int | None) -> str | None:
+    """`throwaway_refusal_reason` against the import-time LIVE identity."""
+    return throwaway_refusal_reason(url, LIVE_DATABASE_URL, item_count)
+
+
 @pytest.fixture(scope="session")
 def pg_lane_target_guard():
     """Refuse a non-throwaway PG lane target ONCE, before any test runs DDL."""
     if not PG_TEST_URL:
         return
-    reason = throwaway_refusal_reason(
-        PG_TEST_URL, _live_database_url(), _probe_item_count(PG_TEST_URL)
-    )
+    reason = pg_lane_refusal_reason(PG_TEST_URL, _probe_item_count(PG_TEST_URL))
     if reason:
         pytest.exit(
             "DCT_TEST_DATABASE_URL must point at a THROWAWAY database "
             f"({reason}). Each test runs DROP SCHEMA public CASCADE on it.",
             returncode=3,
         )
+
+
+# --- Suite isolation (#822) -------------------------------------------------
+# Hook tests run shell hooks that call the PATH `dct`; with the developer's
+# environment that binary reads their config and migrates their LIVE database
+# with this tree's code. Every subprocess the suite starts must instead see a
+# throwaway SQLite file + config and import THIS tree's `dct` package.
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _suite_isolation(tmp_path_factory):
+    """Point DCT_* at a session tmp dir and put this tree first on PYTHONPATH.
+
+    Tests that exercise config/URL resolution from files or env absence clear
+    these locally with `monkeypatch.delenv(..., raising=False)`.
+    """
+    tmp = tmp_path_factory.mktemp("dct-suite")
+    overrides = {
+        "DCT_DATABASE_URL": f"sqlite:///{tmp / 'suite.db'}",
+        "DCT_CONFIG_PATH": str(tmp / "dct.toml"),
+        "DCT_DATA_DIR": str(tmp / "data"),
+        "PYTHONPATH": os.pathsep.join(
+            p for p in (REPO_ROOT, os.environ.get("PYTHONPATH", "")) if p
+        ),
+    }
+    saved = {key: os.environ.get(key) for key in overrides}
+    os.environ.update(overrides)
+    try:
+        yield tmp
+    finally:
+        for key, value in saved.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
 
 
 @pytest.fixture

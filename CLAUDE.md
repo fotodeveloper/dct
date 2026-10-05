@@ -20,6 +20,8 @@ Deep-dives live in `docs/` and are read on demand — keep this file lean:
 ```bash
 # Development
 .venv/bin/pytest -v                    # Run tests (in-memory SQLite)
+# No env vars needed: conftest's `_suite_isolation` fixture points DCT_* at a
+# throwaway SQLite file + config for the suite AND its subprocesses (#822).
 
 # PG test lane (#426) — the same suite against a real PostgreSQL server.
 # DCT_TEST_DATABASE_URL switches the `engine` fixture; isolation is a per-test

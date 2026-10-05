@@ -9,6 +9,13 @@ from dct import paths
 from dct.config import Config, load_config, save_config
 
 
+@pytest.fixture(autouse=True)
+def _no_env_database_override(monkeypatch):
+    """These tests assert what the FILE says; the suite-wide throwaway
+    DCT_DATABASE_URL (conftest._suite_isolation) would win over it."""
+    monkeypatch.delenv("DCT_DATABASE_URL", raising=False)
+
+
 def test_save_load_roundtrip(tmp_path):
     config_path = tmp_path / "dct.toml"
     original = Config(database_url="postgresql://localhost:5432/dct")
