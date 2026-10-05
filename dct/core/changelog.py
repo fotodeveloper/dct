@@ -398,6 +398,10 @@ def release_entries(
     candidate_sha: str | None = None,
     checkout_root: str | None = None,
     proof: Mapping | None = None,
+    release_mode: str | None = None,
+    consent: Mapping | None = None,
+    proposal: Mapping | None = None,
+    render: Mapping | None = None,
 ) -> dict:
     """Stamp changelog entries with a version, set the project's current_version
     and write the durable release record (K-41) — ONE transaction.
@@ -432,18 +436,35 @@ def release_entries(
     `proof` (K-70, optional): the proof map {entry id: [proving commit
     SHAs] or {commits, merge_commit, pr}} — shape checked before any read
     (core.releases.validate_proof); every entry it names must be in the
-    resolved set (else ValueError); stored in the NEW record only (a re-run
-    returning an existing record ignores it, like candidate_sha).
+    resolved set (else ValueError); stored in the NEW record only.
+    K-94 / K-85 / K-76 / K-90 / K-97 ledger fields of the NEW record, all
+    validated before any read (core.releases.validate_*): `release_mode`
+    ('git' | 'without_git' — the mode the caller VERIFIED; None = not
+    stated, then the record needs a release commit to complete),
+    `consent`, `proposal`, `render` (JSON objects; `render` defaults to the
+    project's changelog_pr_refs setting at stamp time). The record's
+    `executor` is copied from the project's release_executor — never a
+    parameter. K-94 B2: a re-run that returns an EXISTING record compares
+    every given `proof` / `release_mode` / `consent` / `proposal` / `render`
+    with the stored value — identical (or not given) is the no-op, a
+    contradicting one raises ValueError (immutable, never silently
+    ignored; a re-run never fills a field: a given proof for a record
+    without one is refused too). The other four are not compared when the
+    record predates them (stored NULL — nothing to contradict; such a
+    record stays unverified). candidate_sha is not re-checked (K-61: never
+    re-pinned).
 
     The call's RESOLVED SET: 'selected' → the given ids; 'version_only' → [];
     'all' → the live entries already carrying V plus every unreleased entry.
 
     Order of checks: (0) V has a live release record (core.releases): the
-    resolved set equal to the record's → whole-operation no-op that RETURNS
-    the record (resume — also when V is lower than current_version, also for
-    a version-only release; the record is not re-pinned); a different set →
-    ValueError "version V was released with a different set: ..." and
-    nothing is written. Without a record (an unrecorded legacy release, or
+    resolved set equal to the record's AND to the live entries carrying V
+    (K-94 B3, core.releases.check_entry_set) and no contradicting given
+    field (B2) → whole-operation no-op that RETURNS the record (resume —
+    also when V is lower than current_version, also for a version-only
+    release; the record is not re-pinned); a different set → ValueError
+    "version V was released with a different set: ..." (for an abandoned
+    record the message says so — K-94 B5) and nothing is written. Without a record (an unrecorded legacy release, or
     none yet) — K-20: (1) nothing left to stamp → no-op, NO write at all:
     every selected entry already carries V ('selected'); current_version
     already V ('version_only'); nothing unreleased AND V is current_version
@@ -486,6 +507,13 @@ def release_entries(
         version = normalize_version(version)
     sha = release_records.validate_candidate_sha(candidate_sha)
     proof_map = release_records.validate_proof(proof)
+    given = {
+        "proof": proof_map,
+        "release_mode": release_records.validate_release_mode(release_mode),
+        "consent": release_records.validate_consent(consent),
+        "proposal": release_records.validate_proposal(proposal),
+        "render": release_records.validate_render(render),
+    }
     root = normalize_worktree(checkout_root)
     ensure_fits(release_records.releases, {"checkout_root": root})
     ids = None if entry_ids is None else _dedupe_ids(entry_ids)
@@ -561,12 +589,21 @@ def release_entries(
         if record is not None:
             recorded = release_records.record_to_dict(record)
             if set(resolved) != set(recorded["entry_ids"]):
+                abandoned = recorded["status"] == release_records.ABANDONED
                 raise ValueError(
                     f"version {recorded['version']} was released with a different set: "
                     f"recorded {recorded['entry_ids']} ({recorded['mode']}), requested "
-                    f"{resolved} ({mode}) — a released version is history; "
-                    f"nothing released."
+                    f"{resolved} ({mode}) — "
+                    + (f"that release was ABANDONED ({recorded['abandon_reason']}); "
+                       f"release the work under a NEW version"
+                       if abandoned else "a released version is history")
+                    + "; nothing released."
                 )
+            release_records.check_entry_set(conn, pid, record)
+            for field, value in given.items():
+                if recorded[field] is None and field != "proof":
+                    continue  # a record older than the field: nothing to contradict
+                release_records.check_unchanged(field, recorded[field], value, may_fill=False)
             result["release"] = recorded
             return result
         if nothing_to_do:
@@ -613,9 +650,13 @@ def release_entries(
             .where(projects.c.id == pid)
             .values(current_version=version, updated_at=now)
         )
+        if given["render"] is None:
+            given["render"] = release_records.project_release_settings(conn, pid)["render"]
         result["release"] = release_records.insert_record(
             conn, pid, version=version, mode=mode, entry_ids=resolved,
             candidate_sha=sha, checkout_root=root, now=now, proof=proof_map,
+            release_mode=given["release_mode"], consent=given["consent"],
+            proposal=given["proposal"], render=given["render"],
         )
         result["released"] = released
         result["current_version"] = version
@@ -659,6 +700,103 @@ def stored_spellings(conn: sa.Connection, project_id: int, version: str) -> list
         )
     ).scalars()
     return sorted(v for v in stored if same_version(v, version))
+
+
+def _stamp_order(entry: Mapping) -> tuple:
+    """Sort key of the legacy spelling rule: earliest released_at first (a
+    NULL released_at — time unknown — after every known time), then the
+    lowest id. Datetimes compare as naive UTC (SQLite returns naive)."""
+    released = entry.get("released_at")
+    if released is not None and getattr(released, "tzinfo", None) is not None:
+        released = released.astimezone(UTC).replace(tzinfo=None)
+    # (False, t, id) for a known time, (True, None, id) for an unknown one:
+    # the first element differs between the two, so None never meets a time.
+    return (released is None, released, entry["id"])
+
+
+def spelling_rule(record_versions: Iterable[str], entries: Iterable[Mapping]) -> str | None:
+    """The ONE deterministic rule for the authoritative spelling of a version
+    (K-86 / K-93 A3), shared by the export, the reconstruction and the
+    resolver below — pure, no I/O.
+
+    `entries`: the live entries carrying the version ({id, version,
+    released_at}); `record_versions`: versions of live release records.
+    1. a live release record of the version → ITS spelling;
+    2. else the stored spelling of the FIRST-STAMPED entry: earliest
+       released_at (NULL = unknown time, after every known time), ties →
+       the lowest entry id;
+    3. else None (the caller may fall back to current_version).
+    Nothing is rewritten: the other spellings stay as stored."""
+    entries = list(entries)
+    if not entries:
+        return None
+    stored = entries[0]["version"]
+    for candidate in record_versions:
+        if same_version(candidate, stored):
+            return candidate
+    return min(entries, key=_stamp_order)["version"]
+
+
+def resolve_version_spelling(conn: sa.Connection, project_id: int, version: str) -> dict:
+    """The shared legacy-version resolver (K-86 / K-93 A3): which stored
+    spelling is AUTHORITATIVE for `version` (compared under the version
+    contract) and which spellings are equivalent to it.
+
+    Returns {requested (normalized), authoritative (stored spelling, or
+    None when the database knows no such release), source ("record" |
+    "entries" | "current_version" | None), record (the live record's
+    version or None), current_version (the project's current_version when
+    it equals the version, else None), spellings ({stored spelling: [entry
+    ids]} of the live entries carrying it — the equivalence map), equivalent
+    (sorted distinct spellings across record, entries and current_version),
+    several (bool: more than one spelling exists)}.
+
+    Rule (spelling_rule): the record's spelling, else the first-stamped
+    entry's (earliest released_at, NULL last, then lowest id), else
+    current_version. The resolver never picks silently among CONFLICTING
+    artifacts: callers compare files, sections and tags against
+    `equivalent` / `authoritative` and refuse a contradiction. Read-only."""
+    from dct.db import releases
+
+    requested = normalize_version(version)
+    c = changelog_entries.c
+    matching = stored_spellings(conn, project_id, requested)
+    rows = [] if not matching else [dict(r._mapping) for r in conn.execute(
+        sa.select(c.id, c.version, c.released_at).where(
+            c.project_id == project_id, c.version.in_(matching), c.deleted_at.is_(None)
+        ).order_by(c.id)
+    )]
+    record = next((v for v in conn.execute(
+        sa.select(releases.c.version).where(
+            releases.c.project_id == project_id, releases.c.deleted_at.is_(None)
+        ).order_by(releases.c.id)
+    ).scalars() if same_version(v, requested)), None)
+    current = conn.execute(
+        sa.select(projects.c.current_version).where(projects.c.id == project_id)
+    ).scalar()
+    current = current if same_version(current, requested) else None
+    spellings: dict[str, list[int]] = {}
+    for row in rows:
+        spellings.setdefault(row["version"], []).append(row["id"])
+    authoritative = spelling_rule([record] if record else [], rows)
+    source = None
+    if authoritative is not None:
+        source = "record" if record is not None else "entries"
+    elif record is not None:
+        authoritative, source = record, "record"
+    elif current is not None:
+        authoritative, source = current, "current_version"
+    equivalent = sorted({*spellings, *(v for v in (record, current) if v)})
+    return {
+        "requested": requested,
+        "authoritative": authoritative,
+        "source": source,
+        "record": record,
+        "current_version": current,
+        "spellings": {k: spellings[k] for k in sorted(spellings)},
+        "equivalent": equivalent,
+        "several": len(equivalent) > 1,
+    }
 
 
 def _entries_of_version(conn: sa.Connection, project_id: int, version: str) -> list[int]:

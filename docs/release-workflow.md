@@ -247,6 +247,7 @@ no operation may be in progress. Then, by status:
 | `files_written` | the candidate — or the release commit itself (its only parent is the candidate, its tree is `manifest.tree`, its subject `release: v<V>`), which is adopted | every manifest file must still hold its recorded hash (a reverted version file → refused, not overwritten); then step 5 |
 | `committed` | the release commit or a descendant | the release commit is verified (tree = `manifest.tree`, parent = candidate); step 6. The sync is never re-run. |
 | `tagged` | the release commit or a descendant | the tag must point at the release commit; `completed` |
+| `pushed` | the release commit or a descendant | as `tagged` (the push itself is not repeated); `completed` |
 | `completed` / `abandoned` | — | no unfinished record: outcome `noop`, no side effect |
 
 Interruption points (`effects.INTERRUPTION_POINTS`, the `on_point` hook of
@@ -305,6 +306,84 @@ One shape, `effects.RESULT_KEYS` (pinned by
 Exit codes: 0 success (also `noop`), 1 refused, the script's own code when
 the version sync fails, 2 for a usage error.
 
+## The release ledger (record fields)
+
+`dct/core/releases.py` — one record per released version
+(`core.releases.RECORD_FIELDS`; MCP `get_release`, `dct release status
+--json`). The ledger stores and cross-checks what the workflow verified; it
+never reads files or git. Every field is validated before any read or write
+and a refusal writes nothing.
+
+| field | content | mutability |
+| --- | --- | --- |
+| `id`, `created_at`, `updated_at` | row identity and times | — |
+| `version` | the AUTHORITATIVE spelling (normalized) — every artifact uses it | fixed |
+| `mode` | stamp mode: `all`, `selected`, `version_only`, `reconstructed` | fixed |
+| `entry_ids` | the exact entry set (`[]` = version-only); must always equal EXACTLY the live entries carrying the version (K-94 B3 — `verify_release_entry_set` is the pre-effect gate of a resume / retry; a mismatch refuses, the record is never extended or shrunk) | fixed |
+| `candidate_sha` | the commit the release was cut from, or null | immutable (K-61) |
+| `checkout_root` | absolute path of the release checkout, or null | fixed |
+| `release_mode` | the VERIFIED release mode (K-94 B1): `git` or `without_git` (a project CONFIRMED outside git); null = recorded before the field existed (unverified) | write-once |
+| `executor` | who performs the effects (K-85): `dct` (the effects layer) or `own` (the project's own tool) — copied from the project's `release_executor` at stamp time (and at reconstruction); null on records older than the field | immutable — a later project-setting change never takes over an unfinished release |
+| `status` | the state machine below | forward only |
+| `release_commit_sha` | the verified release commit | set once, from `committed` on |
+| `manifest` | JSON object of the verified artifacts (e.g. `changelog`, `version_files`, `tree`, `untracked_baseline`) | write-once per key; the MERGED manifest ≤ 64 KiB |
+| `proof` | `{"<entry id>": {commits, merge_commit, pr}}` (K-70) | written with the stamp; a re-run passing a different map is refused (K-94 B2) |
+| `consent` | what the owner approved (K-97 F4): `{version, entry_ids, candidate_sha, proposal_sha256, render, push_target: {remote, url, branch, tag} \| null}` — a resume compares its own scope with it | write-once |
+| `proposal` | the approved version-file proposal (K-76): `{paths, base_blobs: {path: blob \| null}, expected_blobs: {path: blob}, script: {identity, sha256} \| null, candidate_sha}`; `consent.proposal_sha256` = `proposal_digest(proposal)` (SHA-256 of its canonical JSON) | write-once |
+| `render` | the changelog render settings of THIS release (K-90): `{"pr_refs": bool}` — defaults to the project's `changelog_pr_refs` at stamp time, so a later preference change cannot alter the expected hashes | write-once |
+| `completed_at`, `abandoned_at`, `abandon_reason` | terminal stamps; the FIRST abandon reason stays — the same reason again is a no-op, a different one is refused (K-94 B5) | set once |
+
+**State machine** (`core.releases.TRANSITIONS`): `stamped → files_written →
+committed → tagged → pushed → completed`, forward jumps allowed (the
+workflow verified the intermediate effects), `abandoned` (terminal, only via
+`abandon_release`) from every unfinished status. `pushed` (K-97) = the
+release commit and its tag are on the push target; a failed push leaves the
+record `tagged` and is resumed from there — never a new bump, commit or
+tag. K-94 B1: a NULL `candidate_sha` never implies "no git". Only a
+`without_git` record completes without a release commit — and only with the
+manifest of its verified artifacts; it never reaches `committed`, `tagged`
+or `pushed` and carries no candidate or release commit. Every other record
+(also `release_mode` null) needs `release_commit_sha` from `committed` on.
+
+**Write-once rule** (`check_unchanged`): a field not yet recorded may be
+written once (`advance_release`); the stored value again is a confirmation;
+a DIFFERENT value is refused ("immutable"). A re-run of `release_changelog`
+that returns an existing record never fills a field either: a given
+`proof` must equal the stored map (also refused when the record has none);
+a given `release_mode` / `consent` / `proposal` / `render` must equal the
+stored value — a record that predates the field (null) has nothing to
+contradict and stays as it is.
+
+**Size caps** (refused, never truncated): `manifest` 64 KiB, `proof` 256
+KiB, `consent` and `proposal` 64 KiB — BYTES of the canonical JSON (sorted
+keys, compact separators, UTF-8; `core.releases.json_size`), the manifest
+measured after the merge; `abandon_reason` 2000 characters.
+
+**Legacy spellings** (K-86 / K-93 A3): `changelog.resolve_version_spelling`
+is the ONE resolver of a version stored under several equivalent spellings
+(1.1 / 1.1.0 / v1.1). Rule (`changelog.spelling_rule`, shared by the export
+and the reconstruction): the live record's spelling; else the stored
+spelling of the FIRST-STAMPED entry — earliest `released_at` (null = unknown
+time, after every known time), ties → the lowest entry id; else
+`current_version`. It also returns the equivalence map (`spellings`: stored
+spelling → entry ids, `equivalent`, `several`) — nothing is rewritten, and a
+caller comparing artifacts (file, section, tag) against it refuses a real
+contradiction instead of picking one. The reconstruction stores the
+resolved spelling and checks that FINAL value against the schema's width
+(K-87, `ensure_version_fits`).
+
+**Project settings**: `release_executor` (`dct` default \| `own`; `dct
+project release-executor <slug> own|dct`) and `changelog_pr_refs` (default
+off; `dct project changelog-pr-refs <slug> on|off`).
+
+**Read-only commands** (K-84): `release plan`, `release status` / `clog
+release-status`, `clog candidates` and the `reconstruct` preview open the
+database read-only (`core.engine.readonly_engine`: SQLite `mode=ro`, no
+journal-mode change, no file or directory created; PostgreSQL READ ONLY
+transactions) and refuse a missing database or an older schema with a
+message naming `dct db upgrade` — the explicit bootstrap every write command
+otherwise runs implicitly.
+
 ## Layers and a project's own release tool
 
 The three layers (K-72) and who may use them:
@@ -341,7 +420,7 @@ tags or publishes REPLACES ONLY layer 3. It keeps the proof and the ledger:
 4. **Progress** — `advance_release(version=V, status=…)` after each verified
    effect, in order `files_written` (optionally with `manifest`) →
    `committed` (with `release_commit_sha`; the candidate stays immutable) →
-   `tagged` → `completed`. An interrupted release is resumed from
+   `tagged` → `pushed` (after the verified push) → `completed`. An interrupted release is resumed from
    `get_release(project)`, never re-stamped under a new version;
    `abandon_release` ends it explicitly with a reason.
 

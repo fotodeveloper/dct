@@ -393,7 +393,8 @@ def released(proj):
 
 
 def test_statuses_are_ordered_forward():
-    assert RELEASE_FLOW == ("stamped", "files_written", "committed", "tagged", "completed")
+    assert RELEASE_FLOW == (
+        "stamped", "files_written", "committed", "tagged", "pushed", "completed")
     assert RELEASE_STATUSES == (*RELEASE_FLOW, "abandoned")
 
 
@@ -494,9 +495,9 @@ def test_get_release_without_version_returns_the_latest_unfinished(proj):
     release_entries(proj, "proj-a", "1.1.0", entry_ids=[])
     release_entries(proj, "proj-a", "1.2.0", entry_ids=[])
     assert get_release(proj, "proj-a")["version"] == "1.2.0"
-    advance_release(proj, "proj-a", "1.2.0", "completed")
+    advance_release(proj, "proj-a", "1.2.0", "completed", release_commit_sha="d" * 40)
     assert get_release(proj, "proj-a")["version"] == "1.1.0"
-    advance_release(proj, "proj-a", "1.1.0", "completed")
+    advance_release(proj, "proj-a", "1.1.0", "completed", release_commit_sha="d" * 40)
     assert get_release(proj, "proj-a") is None
 
 

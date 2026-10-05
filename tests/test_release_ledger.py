@@ -82,37 +82,48 @@ def _record_count(engine):
 
 # ── the state machine, pair by pair ──────────────────────────────────────────
 
-FLOW = ["stamped", "files_written", "committed", "tagged", "completed"]
+FLOW = ["stamped", "files_written", "committed", "tagged", "pushed", "completed"]
 
-# Hand-written from K-60: forward along the flow (jumps allowed), abandoned
-# from every NON-terminal status, nothing out of completed / abandoned.
+# Hand-written from K-60 / K-97: forward along the flow (jumps allowed),
+# abandoned from every NON-terminal status, nothing out of completed /
+# abandoned. 'pushed' sits between 'tagged' and 'completed'.
 LEGAL = {
-    "stamped": {"files_written", "committed", "tagged", "completed", "abandoned"},
-    "files_written": {"committed", "tagged", "completed", "abandoned"},
-    "committed": {"tagged", "completed", "abandoned"},
-    "tagged": {"completed", "abandoned"},
+    "stamped": {"files_written", "committed", "tagged", "pushed", "completed", "abandoned"},
+    "files_written": {"committed", "tagged", "pushed", "completed", "abandoned"},
+    "committed": {"tagged", "pushed", "completed", "abandoned"},
+    "tagged": {"pushed", "completed", "abandoned"},
+    "pushed": {"completed", "abandoned"},
     "completed": set(),
     "abandoned": set(),
 }
+_COMMIT_FROM = FLOW.index("committed")
 
 
 def test_the_status_set_is_the_flow_plus_abandoned():
     assert set(RELEASE_STATUSES) == set(LEGAL)
 
 
+def _commit_for(status):
+    """K-94 B1: from 'committed' on every record not recorded 'without_git'
+    carries its release commit (the same value again is a confirmation)."""
+    if status in FLOW and FLOW.index(status) >= _COMMIT_FROM:
+        return {"release_commit_sha": COMMIT}
+    return {}
+
+
 def _reach(engine, status):
-    """A version-only release (no candidate → no release commit needed) at `status`."""
+    """A version-only release at `status` (with its release commit from 'committed' on)."""
     release_entries(engine, "proj-a", "1.1.0", entry_ids=[])
     if status == "abandoned":
         abandon_release(engine, "proj-a", "1.1.0", "test", confirm=True)
     elif status != "stamped":
-        advance_release(engine, "proj-a", "1.1.0", status)
+        advance_release(engine, "proj-a", "1.1.0", status, **_commit_for(status))
 
 
 def _move(engine, target):
     if target == "abandoned":
-        return abandon_release(engine, "proj-a", "1.1.0", "test move", confirm=True)
-    return advance_release(engine, "proj-a", "1.1.0", target)
+        return abandon_release(engine, "proj-a", "1.1.0", "test", confirm=True)
+    return advance_release(engine, "proj-a", "1.1.0", target, **_commit_for(target))
 
 
 @pytest.mark.parametrize("start,target", list(itertools.product(LEGAL, repeat=2)))
@@ -211,13 +222,59 @@ def test_release_commit_is_set_once(git_release):
     assert out["release"]["release_commit_sha"] == COMMIT
 
 
-def test_a_release_without_candidate_may_pass_committed_without_a_commit(proj):
-    """No candidate = no git evidence to pair it with (a confirmed non-git
-    project, or a caller that pinned nothing) — the ledger does not invent
-    a requirement it cannot check."""
+@pytest.mark.parametrize("target", ["committed", "tagged", "pushed", "completed"])
+def test_a_null_candidate_does_not_mean_without_git(proj, target):
+    """K-94 B1: a record without candidate_sha and without a verified
+    release_mode is NOT a no-git release — it needs its release commit from
+    'committed' on, 'completed' included; nothing written on refusal."""
     release_entries(proj, "proj-a", "1.1.0", entry_ids=[])
+    before = _snapshot(proj)
+    with pytest.raises(ValueError, match="without its release commit"):
+        advance_release(proj, "proj-a", "1.1.0", target)
+    assert _snapshot(proj) == before
+
+
+def test_only_a_without_git_release_completes_without_a_commit(proj):
+    """K-94 B1: 'without_git' completes without a commit — but only with the
+    manifest of its verified artifacts, and never through a git-only status."""
+    release_entries(proj, "proj-a", "1.1.0", entry_ids=[], release_mode="without_git")
+    before = _snapshot(proj)
+    for status in ("committed", "tagged", "pushed"):
+        with pytest.raises(ValueError, match="without git"):
+            advance_release(proj, "proj-a", "1.1.0", status)
+    with pytest.raises(ValueError, match="without git"):
+        advance_release(proj, "proj-a", "1.1.0", "completed", release_commit_sha=COMMIT,
+                        manifest={"tree": "none"})
+    with pytest.raises(ValueError, match="manifest"):
+        advance_release(proj, "proj-a", "1.1.0", "completed")
+    assert _snapshot(proj) == before
+    advance_release(proj, "proj-a", "1.1.0", "files_written", manifest={"tree": "none"})
     out = advance_release(proj, "proj-a", "1.1.0", "completed")
-    assert out["release"]["release_commit_sha"] is None
+    rec = out["release"]
+    assert (rec["status"], rec["release_mode"], rec["release_commit_sha"]) == (
+        "completed", "without_git", None)
+
+
+def test_without_git_mode_contradicting_a_candidate_is_refused(proj):
+    before = _snapshot(proj)
+    with pytest.raises(ValueError, match="without git"):
+        release_entries(proj, "proj-a", "1.1.0", entry_ids=[], candidate_sha=CAND,
+                        release_mode="without_git")
+    assert _snapshot(proj) == before
+
+
+def test_release_mode_is_recorded_once_on_a_legacy_record(proj):
+    """A record stamped without a mode (an older caller) may record its
+    verified mode once; a different mode later is refused (immutable)."""
+    release_entries(proj, "proj-a", "1.1.0", entry_ids=[])
+    out = advance_release(proj, "proj-a", "1.1.0", "files_written", release_mode="git")
+    assert out["release"]["release_mode"] == "git"
+    again = advance_release(proj, "proj-a", "1.1.0", "files_written", release_mode="git")
+    assert again["updated"] is False
+    before = _snapshot(proj)
+    with pytest.raises(ValueError, match="release_mode .*immutable"):
+        advance_release(proj, "proj-a", "1.1.0", "files_written", release_mode="without_git")
+    assert _snapshot(proj) == before
 
 
 # ── manifest: write-once per key ─────────────────────────────────────────────
@@ -364,11 +421,30 @@ def test_proof_naming_an_entry_outside_the_set_is_refused_without_writes(proj):
     assert _snapshot(proj) == before
 
 
-def test_proof_is_ignored_by_a_rerun_returning_the_record(proj):
+def test_a_rerun_with_a_contradicting_proof_is_refused(proj):
+    """K-94 B2: the stored proof is immutable — a re-run passing a DIFFERENT
+    proof map is refused (never silently ignored); the identical map, or
+    none, is the no-op returning the record."""
     a = _add(proj, "a")
     first = release_entries(proj, "proj-a", "1.1.0", entry_ids=[a], proof={a: [COMMIT]})
-    again = release_entries(proj, "proj-a", "1.1.0", entry_ids=[a], proof={a: [OTHER]})
-    assert again["release"]["proof"] == first["release"]["proof"]
+    before = _snapshot(proj)
+    with pytest.raises(ValueError, match="proof .*immutable"):
+        release_entries(proj, "proj-a", "1.1.0", entry_ids=[a], proof={a: [OTHER]})
+    assert _snapshot(proj) == before
+    same = release_entries(proj, "proj-a", "1.1.0", entry_ids=[a], proof={str(a): [COMMIT]})
+    assert same["release"] == first["release"]
+    bare = release_entries(proj, "proj-a", "1.1.0", entry_ids=[a])
+    assert bare["release"] == first["release"]
+    assert _snapshot(proj) == before
+
+
+def test_a_rerun_adding_a_proof_to_a_record_without_one_is_refused(proj):
+    a = _add(proj, "a")
+    release_entries(proj, "proj-a", "1.1.0", entry_ids=[a])
+    before = _snapshot(proj)
+    with pytest.raises(ValueError, match="proof .*immutable"):
+        release_entries(proj, "proj-a", "1.1.0", entry_ids=[a], proof={a: [COMMIT]})
+    assert _snapshot(proj) == before
 
 
 @pytest.mark.parametrize("bad", [
@@ -428,11 +504,16 @@ def test_abandon_of_an_unknown_version_is_refused(proj):
 
 
 def test_repeated_abandon_keeps_the_first_reason(git_release):
+    """K-94 B5: the same reason again is the compatible no-op; a DIFFERENT
+    reason is refused with a message naming the recorded one (the first
+    reason and time stay)."""
     first = abandon_release(git_release, "proj-a", "1.1.0", "first", confirm=True)
     before = _snapshot(git_release)
-    again = abandon_release(git_release, "proj-a", "1.1.0", "second", confirm=True)
+    again = abandon_release(git_release, "proj-a", "1.1.0", " first ", confirm=True)
     assert again["updated"] is False
     assert again["release"] == first["release"]
+    with pytest.raises(ValueError, match=r"already abandoned .*'first'.*first reason stays"):
+        abandon_release(git_release, "proj-a", "1.1.0", "second", confirm=True)
     assert _snapshot(git_release) == before
 
 
@@ -442,7 +523,7 @@ def test_an_abandoned_version_is_never_reused_with_a_different_set(git_release):
     b = _add(git_release, "b")
     before = _snapshot(git_release)
     for selection in ([a, b], [], None):
-        with pytest.raises(ValueError, match="different set"):
+        with pytest.raises(ValueError, match="different set.*ABANDONED.*NEW version"):
             release_entries(git_release, "proj-a", "1.1.0", entry_ids=selection)
         assert _snapshot(git_release) == before
     # The same set: a no-op that RETURNS the abandoned record (never resumed).
@@ -481,7 +562,7 @@ def test_get_unfinished_skips_completed_and_abandoned_but_explicit_reads_show_th
     assert get_release(proj, "proj-a")["version"] == "1.3.0"
     abandon_release(proj, "proj-a", "1.3.0", "skip", confirm=True)
     assert get_release(proj, "proj-a")["version"] == "1.2.0"
-    advance_release(proj, "proj-a", "1.2.0", "completed")
+    advance_release(proj, "proj-a", "1.2.0", "completed", release_commit_sha=COMMIT)
     assert get_release(proj, "proj-a")["version"] == "1.1.0"
     abandon_release(proj, "proj-a", "1.1.0", "skip", confirm=True)
     assert get_release(proj, "proj-a") is None
@@ -555,7 +636,7 @@ def test_version_only_reconstruction_of_the_current_version(proj):
     "ids-other-version", "higher-than-current", "lower-version-only", "existing-record",
     "no-candidate", "no-commit-for-completed", "commit-before-committed",
     "no-manifest", "abandoned-status", "unknown-status",
-    "without-git-with-sha", "without-git-tagged", "ambiguous-spellings",
+    "without-git-with-sha", "without-git-tagged", "without-git-pushed",
     "unparseable-current", "bad-sha",
 ])
 def test_reconstruction_refuses_every_inconsistency_without_writes(legacy, case):
@@ -598,9 +679,9 @@ def test_reconstruction_refuses_every_inconsistency_without_writes(legacy, case)
     elif case == "without-git-tagged":
         overrides.update(without_git=True, candidate_sha=None, release_commit_sha=None,
                          status="tagged")
-    elif case == "ambiguous-spellings":
-        _stamp_legacy(engine, other, "1.1")
-        overrides["entry_ids"] = [*ids, other]
+    elif case == "without-git-pushed":
+        overrides.update(without_git=True, candidate_sha=None, release_commit_sha=None,
+                         status="pushed")
     elif case == "unparseable-current":
         _set_current(engine, "2.0.0-rc1")
     elif case == "bad-sha":
@@ -692,8 +773,10 @@ def test_contract_is_project_scoped(proj):
 _DDL = re.compile(r"^\s*(ALTER|CREATE|DROP)\b", re.IGNORECASE)
 _DML = re.compile(r"^\s*(INSERT|UPDATE|DELETE)\b", re.IGNORECASE)
 NEW_COLUMNS = {
-    "releases": ["release_commit_sha", "manifest", "proof", "abandoned_at", "abandon_reason"],
-    "projects": ["version_files", "version_files_confirmed_at", "version_files_history"],
+    "releases": ["release_commit_sha", "manifest", "proof", "abandoned_at", "abandon_reason",
+                 "release_mode", "executor", "consent", "proposal", "render"],
+    "projects": ["version_files", "version_files_confirmed_at", "version_files_history",
+                 "release_executor", "changelog_pr_refs"],
 }
 
 
@@ -742,6 +825,11 @@ def test_three_bootstraps_heal_the_ledger_columns_then_converge(proj, capsys):
         k: old[k] for k in ("id", "entry_ids", "candidate_sha", "status")}
     assert (rec["release_commit_sha"], rec["manifest"], rec["proof"]) == (None, None, None)
     assert get_version_files(proj, "proj-a")["version_files"] is None
+    # The NOT NULL settings healed onto the existing project with their defaults.
+    project = get_project(proj, "proj-a")
+    assert (project["release_executor"], project["changelog_pr_refs"]) == ("dct", False)
+    assert (rec["release_mode"], rec["executor"], rec["consent"], rec["render"]) == (
+        None, None, None, None)
     # The healed columns are usable.
     advance_release(proj, "proj-a", "1.1.0", "committed", release_commit_sha=COMMIT,
                     manifest={"tree": "3" * 40})

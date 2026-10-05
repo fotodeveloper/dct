@@ -250,6 +250,42 @@ def set_changelog_path(engine: sa.Engine, slug: str, relpath: str) -> dict | Non
     return get_project(engine, slug)
 
 
+def _set_project_value(engine: sa.Engine, slug: str, **values) -> dict | None:
+    with engine.begin() as conn:
+        result = conn.execute(
+            projects.update()
+            .where(projects.c.slug == slug, projects.c.deleted_at.is_(None))
+            .values(**values, updated_at=datetime.now(UTC))
+        )
+        if result.rowcount == 0:
+            return None
+    return get_project(engine, slug)
+
+
+def set_release_executor(engine: sa.Engine, slug: str, executor: str) -> dict | None:
+    """Set who performs the project's release effects (K-85): 'dct' (the
+    effects layer — the default) or 'own' (the project's own release tool).
+
+    Copied onto each NEW release record at stamp time (releases.executor);
+    an unfinished release keeps the executor it was stamped with. Returns the
+    updated project row, or None when the slug does not resolve to a live
+    project. ValueError for any other value."""
+    from dct.core.releases import validate_executor
+
+    return _set_project_value(engine, slug, release_executor=validate_executor(executor))
+
+
+def set_changelog_pr_refs(engine: sa.Engine, slug: str, enabled: bool) -> dict | None:
+    """Opt the project's changelog render into `(#N)` PR references (K-90;
+    default off). Persisted per release at stamp time (releases.render), so
+    a change never alters a release already stamped. Returns the updated
+    project row, or None when the slug does not resolve to a live project.
+    TypeError unless `enabled` is a bool."""
+    if not isinstance(enabled, bool):
+        raise TypeError(f"changelog_pr_refs must be true or false, got {enabled!r}")
+    return _set_project_value(engine, slug, changelog_pr_refs=enabled)
+
+
 def resolve_changelog_path(project: dict) -> str | None:
     """Absolute path to a project's changelog file: {path}/{changelog_path} (#225).
 

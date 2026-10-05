@@ -236,6 +236,14 @@ def pytest_collection_modifyitems(items):
                 item.add_marker(pytest.mark.skip(reason=f"PG lane: {reason}"))
 
 
+def decorated_tool_count() -> int:
+    """K-94 B9: the expected MCP tool count, DERIVED from the source (one
+    `@mcp.tool(` decorator per tool in dct/mcp/server.py) — independent of the
+    registry the tests compare it with, and never a hard-coded constant."""
+    with open(os.path.join(REPO_ROOT, "dct", "mcp", "server.py"), encoding="utf-8") as fh:
+        return len(re.findall(r"^@mcp\.tool\(", fh.read(), flags=re.MULTILINE))
+
+
 @pytest.fixture
 def seed_project(engine):
     """Insert a test project and return its id."""
@@ -264,12 +272,15 @@ def srv(engine, monkeypatch):
 def cli_engine(engine, monkeypatch):
     """CLI harness: point `cli._get_engine` at the fixture engine, seed slug
     'proj-a'. Returns the engine so tests verify through the CORE layer rather
-    than through the CLI's own output."""
+    than through the CLI's own output. The read-only seam (K-84,
+    `cli._get_readonly_engine`) points at the same engine; the read-only
+    path itself is tested through a real subprocess in test_readonly_engine."""
     from dct import cli
     from dct.core.projects import create_project
 
     create_project(engine, slug="proj-a", name="Project A", path="/tmp/proj-a")
     monkeypatch.setattr(cli, "_get_engine", lambda: engine)
+    monkeypatch.setattr(cli, "_get_readonly_engine", lambda: engine)
     return engine
 
 

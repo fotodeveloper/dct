@@ -36,6 +36,27 @@ def _get_engine():
     return bootstrap_engine(create=True)
 
 
+def _get_readonly_engine():
+    """The read-only engine (K-84) for commands that promise no side effects;
+    a missing database or older schema exits 1 naming `dct db upgrade`."""
+    from dct.core.engine import readonly_engine
+    from dct.db import SchemaNotReady
+
+    try:
+        return readonly_engine()
+    except SchemaNotReady as e:
+        print(f"✗ Error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
+def cmd_db_upgrade(args):
+    """`dct db upgrade` — the explicit bootstrap: create the database (and
+    its directory) or upgrade its schema. Every write command runs the same
+    bootstrap implicitly; read-only commands never do (K-84)."""
+    bootstrap_engine(create=True).dispose()
+    print("✓ Database schema is up to date")
+
+
 def _detect_project(engine) -> str:
     """Auto-detect project slug from CWD. Exits if not found."""
     import os
@@ -461,6 +482,41 @@ def cmd_project_changelog(args):
     else:
         print(f"✗ Project '{args.slug}' not found", file=sys.stderr)
         sys.exit(1)
+
+
+def cmd_project_release_executor(args):
+    """`dct project release-executor <slug> [own|dct]` — get or set who
+    performs the project's release effects (K-85; default dct)."""
+    from dct.core.projects import get_project, set_release_executor
+
+    engine = _get_engine()
+    if args.executor is None:
+        project = get_project(engine, args.slug)
+    else:
+        project = set_release_executor(engine, args.slug, args.executor)
+    if not project:
+        print(f"✗ Project '{args.slug}' not found", file=sys.stderr)
+        sys.exit(1)
+    print(f"✓ {args.slug}: release-executor → {project['release_executor']}"
+          if args.executor is not None else f"{args.slug}: {project['release_executor']}")
+
+
+def cmd_project_changelog_pr_refs(args):
+    """`dct project changelog-pr-refs <slug> [on|off]` — get or set the
+    `(#N)` PR-reference render opt-in (K-90; default off)."""
+    from dct.core.projects import get_project, set_changelog_pr_refs
+
+    engine = _get_engine()
+    if args.state is None:
+        project = get_project(engine, args.slug)
+    else:
+        project = set_changelog_pr_refs(engine, args.slug, args.state == "on")
+    if not project:
+        print(f"✗ Project '{args.slug}' not found", file=sys.stderr)
+        sys.exit(1)
+    state = "on" if project["changelog_pr_refs"] else "off"
+    print(f"✓ {args.slug}: changelog-pr-refs → {state}" if args.state is not None
+          else f"{args.slug}: {state}")
 
 
 def cmd_project_manages_changelog(args):
@@ -1206,7 +1262,9 @@ def cmd_release_reconstruct(args):
     """`dct release reconstruct --version V [--confirm]` (K-60, legacy releases)."""
     from dct.workflows.release.effects import reconstruct
 
-    engine = _get_engine()
+    # The preview (no --confirm) writes nothing — it reads through the
+    # read-only engine (K-84); only --confirm bootstraps.
+    engine = _get_engine() if args.confirm else _get_readonly_engine()
     project_slug = args.project or _detect_project(engine)
     out = _run_effects("reconstruct", project_slug, args.json, lambda: reconstruct(
         engine, project_slug, args.version, confirm=args.confirm))
@@ -1259,7 +1317,7 @@ def cmd_clog_release_status(args):
     """
     from dct.core.releases import get_release
 
-    engine = _get_engine()
+    engine = _get_readonly_engine()
     project_slug = args.project or _detect_project(engine)
     try:
         record = get_release(engine, project_slug, args.version or None)
@@ -1356,7 +1414,7 @@ def cmd_release_plan(args):
 
     from dct.workflows.release import build_plan
 
-    engine = _get_engine()
+    engine = _get_readonly_engine()
     project_slug = args.project or _detect_project(engine)
     try:
         plan = build_plan(engine, project_slug, version=args.version or None,
@@ -1424,7 +1482,7 @@ def cmd_clog_candidates(args):
 
     from dct.workflows.release import commit_candidates
 
-    engine = _get_engine()
+    engine = _get_readonly_engine()
     project_slug = args.project or _detect_project(engine)
     try:
         result = commit_candidates(engine, project_slug)
@@ -2358,6 +2416,23 @@ def build_parser() -> argparse.ArgumentParser:
     p_proj_clog.add_argument("slug")
     p_proj_clog.add_argument("state", choices=["on", "off"])
 
+    p_proj_rexec = p_proj_sub.add_parser(
+        "release-executor",
+        help="Get/set who performs the project's release effects: dct (default) or own "
+             "(the project's own release tool, K-85)",
+    )
+    p_proj_rexec.add_argument("slug")
+    p_proj_rexec.add_argument("executor", nargs="?", choices=["dct", "own"],
+                              help="Omit to query the current value")
+
+    p_proj_prrefs = p_proj_sub.add_parser(
+        "changelog-pr-refs",
+        help="Get/set rendering `(#N)` PR references in the changelog (opt-in, K-90)",
+    )
+    p_proj_prrefs.add_argument("slug")
+    p_proj_prrefs.add_argument("state", nargs="?", choices=["on", "off"],
+                               help="Omit to query the current value")
+
     p_proj_mc = p_proj_sub.add_parser(
         "manages-changelog",
         help="Exit 0 if the project opts into dct changelog enforcement, else 1 (hook query)",
@@ -2525,7 +2600,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_clog_radv = p_clog_sub.add_parser(
         "release-advance",
         help="Move a release record forward after a verified step "
-             "(stamped → files_written → committed → tagged → completed)")
+             "(stamped → files_written → committed → tagged → pushed → completed)")
     p_clog_radv.add_argument("version", help="The release (X.Y or X.Y.Z)")
     p_clog_radv.add_argument("status", choices=RELEASE_FLOW)
     p_clog_radv.add_argument("--project", "-P")
@@ -2658,6 +2733,15 @@ def build_parser() -> argparse.ArgumentParser:
     p_tm.add_argument("--turn-id", default="")
     p_tm.add_argument("--session-id", default="")
     p_tm.add_argument("--project", default="")
+
+    # db (K-84: the explicit bootstrap read-only commands point to)
+    p_db = sub.add_parser("db", help="Database schema maintenance")
+    p_db_sub = p_db.add_subparsers(dest="db_command")
+    p_db_sub.add_parser(
+        "upgrade",
+        help="Create the database or upgrade its schema (what every write command "
+             "runs implicitly; read-only commands never do)",
+    )
 
     # config
     p_config = sub.add_parser("config", help="Inspect dct configuration")
@@ -2859,6 +2943,10 @@ def cmd_migrate_home(args):
         print(message)
 
 
+DB_COMMAND_MAP = {
+    "upgrade": cmd_db_upgrade,
+}
+
 COMMAND_MAP = {
     "integrate": cmd_integrate,
     "doctor": cmd_doctor,
@@ -2892,6 +2980,8 @@ PROJECT_COMMAND_MAP = {
     "changelog": cmd_project_changelog,
     "manages-changelog": cmd_project_manages_changelog,
     "changelog-path": cmd_project_changelog_path,
+    "release-executor": cmd_project_release_executor,
+    "changelog-pr-refs": cmd_project_changelog_pr_refs,
 }
 
 PLAN_COMMAND_MAP = {
@@ -3103,6 +3193,12 @@ def main():
         handler = PLAN_COMMAND_MAP.get(args.plan_command)
         if not handler:
             parser.parse_args(["plan", "--help"])
+            return
+        handler(args)
+    elif args.command == "db":
+        handler = DB_COMMAND_MAP.get(args.db_command)
+        if not handler:
+            parser.parse_args(["db", "--help"])
             return
         handler(args)
     elif args.command == "config":

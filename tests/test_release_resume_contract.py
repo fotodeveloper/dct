@@ -128,7 +128,10 @@ def test_abandon_keeps_the_record_the_stamps_and_the_version(engine):
     assert get_project(engine, "proj-a")["current_version"] == "1.1.0"
     stamped = [e["id"] for e in list_entries(engine, "proj-a") if e.get("version") == "1.1.0"]
     assert stamped == [eid]
-    # A repeat is a no-op, never a second transition.
-    again = effects.abandon(engine, "proj-a", "1.1.0", "again", confirm=True)
+    # A repeat is a no-op, never a second transition; a DIFFERENT reason is
+    # refused with a clear message (K-94 B5).
+    again = effects.abandon(engine, "proj-a", "1.1.0", "superseded by 1.2.0", confirm=True)
     assert again["outcome"] == "noop"
+    with pytest.raises(effects.ReleaseRefused, match="first reason stays"):
+        effects.abandon(engine, "proj-a", "1.1.0", "again", confirm=True)
     assert get_release(engine, "proj-a", "1.1.0")["abandon_reason"] == "superseded by 1.2.0"

@@ -217,7 +217,8 @@ def test_rerun_of_a_completed_release_returns_it_completed_and_writes_nothing(pr
     """Resuming a finished release must never reset its progress."""
     _add(proj, "a")
     release_entries(proj, "proj-a", "1.1.0")
-    done = advance_release(proj, "proj-a", "1.1.0", "completed")["release"]
+    done = advance_release(proj, "proj-a", "1.1.0", "completed",
+                           release_commit_sha="d" * 40)["release"]
     before = _snapshot(proj)
     out = release_entries(proj, "proj-a", "1.1.0")
     assert _snapshot(proj) == before
@@ -328,8 +329,12 @@ def test_release_with_an_out_of_contract_version_writes_nothing(proj, raw):
 def test_advance_moves_forward_only_for_every_status_pair(proj, start, target):
     """The forward flow; 'abandoned' and the terminal rules are covered pair
     by pair in test_release_ledger.py."""
+    def commit(status):  # K-94 B1: the release commit from 'committed' on
+        return ({"release_commit_sha": "d" * 40}
+                if RELEASE_FLOW.index(status) >= RELEASE_FLOW.index("committed") else {})
+
     release_entries(proj, "proj-a", "1.1.0", entry_ids=[])
-    advance_release(proj, "proj-a", "1.1.0", start)
+    advance_release(proj, "proj-a", "1.1.0", start, **commit(start))
     before = _snapshot(proj)
     if RELEASE_FLOW.index(target) < RELEASE_FLOW.index(start):
         with pytest.raises(ValueError, match="backwards|terminal"):
@@ -337,7 +342,7 @@ def test_advance_moves_forward_only_for_every_status_pair(proj, start, target):
         assert _snapshot(proj) == before
         assert get_release(proj, "proj-a", "1.1.0")["status"] == start
         return
-    out = advance_release(proj, "proj-a", "1.1.0", target)
+    out = advance_release(proj, "proj-a", "1.1.0", target, **commit(target))
     assert out["updated"] is (target != start)
     rec = get_release(proj, "proj-a", "1.1.0")
     assert rec["status"] == target

@@ -5,7 +5,7 @@ from datetime import UTC, datetime
 
 import sqlalchemy as sa
 
-from dct.core.version import same_version, version_key
+from dct.core.version import version_key
 from dct.db import changelog_entries, projects, releases, row_to_dict
 
 
@@ -28,9 +28,11 @@ def export_changelog_md(
     stored version equals the requested one under the version contract
     (1.1 == 1.1.0 == v1.1 — changelog.stored_spellings) lands in ONE block,
     in the full render too. The block is headed by the AUTHORITATIVE
-    spelling: the live release record's version when one exists, else the
-    stored spelling of the version's first-stamped entry (a legacy release
-    keeps its own spelling — nothing is invented, nothing is rewritten).
+    spelling (changelog.spelling_rule — the rule the reconstruction uses
+    too): the live release record's version when one exists, else the
+    stored spelling of the version's first-stamped entry (earliest
+    released_at, NULL last, ties → lowest id; a legacy release keeps its own
+    spelling — nothing is invented, nothing is rewritten).
     """
     from dct.core.changelog import stored_spellings
 
@@ -101,18 +103,14 @@ def _identity(version: str | None) -> object:
 
 
 def _spelling(entries: list[dict], recorded: list[str]) -> str:
-    """The authoritative spelling of one version block: the release record's
-    version, else the stored spelling of the first-stamped entry."""
-    stored = entries[0]["version"]
-    for candidate in recorded:
-        if same_version(candidate, stored):
-            return candidate
-    first = min(entries, key=lambda e: (_sortable(e.get("released_at")), e["id"]))
-    return first["version"]
+    """The authoritative spelling of one version block — the ONE legacy
+    spelling rule shared with the reconstruction (changelog.spelling_rule,
+    K-86 / K-93 A3): the release record's version, else the stored spelling
+    of the first-stamped entry (earliest released_at, NULL last, then the
+    lowest id)."""
+    from dct.core.changelog import spelling_rule
 
-
-def _sortable(value) -> str:
-    return value.isoformat() if hasattr(value, "isoformat") else str(value or "")
+    return spelling_rule(recorded, entries)
 
 
 def _render_version_block(

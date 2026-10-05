@@ -22,13 +22,13 @@ Register dct once and it is available in every Claude Code session. Opening a ne
 SQLAlchemy Core tables (not the ORM) with a `deleted_at` column for soft deletes (ledger pattern — nothing is ever hard-deleted). 14 tables:
 
 **Core**:
-- `projects` — slug, name, path, current_version, manages_changelog, changelog_path, version_files / version_files_confirmed_at / version_files_history (K-73: the owner-confirmed JSON list of repo-relative files a release must change; NULL = not learned; every replaced list is appended to the history)
+- `projects` — slug, name, path, current_version, manages_changelog, changelog_path, version_files / version_files_confirmed_at / version_files_history (K-73: the owner-confirmed JSON list of repo-relative files a release must change; NULL = not learned; every replaced list is appended to the history), release_executor (K-85: `dct` default \| `own`; `dct project release-executor`), changelog_pr_refs (K-90: render `(#N)` PR references, default off; `dct project changelog-pr-refs`)
 - `items` — project_id, type, title, short_title (nullable 50-char label, #817), priority, status, component, source_file, source_lines, resolution, tags (**DEPRECATED** — see below). Sprint membership is **not** a column: `in_current_sprint` is derived at read time from `item_sprints` (#216 dropped the legacy boolean).
 - `item_notes` — item_id, note (append-only)
 - `item_checkpoints` — item_id, text, status, kind, sort_order
 - `changelog_entries` — project_id, version, category, entry, component, source_file, source_lines, related_item_id, branch / worktree / branch_source (nullable git context the entry was written on, #801; `branch_source` = `client` or `server`)
 - `session_handoffs` — project_id, prompt, context_summary, scope, created_by, consumed_at, consumed_by
-- `releases` — durable release records (K-41): project_id, version (normalized), mode, entry_ids (JSON array of the exact set, `[]` = version-only), candidate_sha (immutable), checkout_root, release_commit_sha (set once), manifest (JSON object of verified artifacts, write-once per key), proof (JSON map entry id → proving commits / merge commit / PR), status (one state machine, `core/releases.TRANSITIONS`: stamped → files_written → committed → tagged → completed, plus terminal `abandoned` from any unfinished status), completed_at, abandoned_at, abandon_reason; one live record per (project, version). Written in the same transaction as the stamp (`release_entries`) — or, for a release older than records, by `reconstruct_release` without re-stamping — advanced by `core/releases.advance_release`, ended by `abandon_release`.
+- `releases` — durable release records (K-41): project_id, version (normalized), mode, entry_ids (JSON array of the exact set, `[]` = version-only), candidate_sha (immutable), checkout_root, release_commit_sha (set once), manifest (JSON object of verified artifacts, write-once per key), proof (JSON map entry id → proving commits / merge commit / PR), status (one state machine, `core/releases.TRANSITIONS`: stamped → files_written → committed → tagged → pushed → completed, plus terminal `abandoned` from any unfinished status), completed_at, abandoned_at, abandon_reason, release_mode (git \| without_git, the verified mode), executor (dct \| own, from the project at stamp time), consent / proposal / render (write-once JSON — [release-workflow.md](release-workflow.md#the-release-ledger-record-fields)); one live record per (project, version). Written in the same transaction as the stamp (`release_entries`) — or, for a release older than records, by `reconstruct_release` without re-stamping — advanced by `core/releases.advance_release`, ended by `abandon_release`.
 
 **Plans / sprints / decisions**:
 - `plans` — ulid, project_id, slug, title, kind, source_file, source_hash, status, sprint_id, imported_at
@@ -57,14 +57,17 @@ Full DDL lives in:
 - `migrations/006_changelog_branch.sql`
 - `migrations/007_releases.sql`
 - `migrations/008_release_ledger.sql`
+- `migrations/009_release_ledger_fields.sql`
 
-At runtime, the engine creates every MISSING table with all its indexes (`_create_missing_tables` — race-safe against a concurrent bootstrap: a duplicate table / index / relation error rolls the attempt back, the whole schema of those tables is re-checked and finished, at most `SCHEMA_CREATE_ATTEMPTS` tries, any other error propagates; tables that already exist are left to the explicit blocks below) plus an idempotent `_apply_schema_updates()` that:
+At runtime, the engine creates every MISSING table with all its indexes (`_create_missing_tables` — race-safe against a concurrent bootstrap: a duplicate table / index / relation error rolls the attempt back, the whole schema of those tables is re-checked and finished, at most `SCHEMA_CREATE_ATTEMPTS` tries, any other error propagates; tables that already exist are left to the explicit blocks below — except the release-ledger tables (`INDEX_HEALED_TABLES`, K-93 A2), whose missing required indexes every bootstrap completes, warning once instead of failing when existing rows violate a unique index) plus an idempotent `_apply_schema_updates()` that:
 - adds later columns in place (e.g. `item_checkpoints.kind` for gate checkpoints; new columns go through the duplicate-safe `_add_column_if_missing` — `ADD COLUMN IF NOT EXISTS` under a 5 s `lock_timeout` on PostgreSQL, a re-checked "duplicate column" error on SQLite),
 - handles dialect-specific bool literals (PostgreSQL strict, SQLite permissive), and
 - auto-migrates legacy `items.in_current_sprint=TRUE` flags into the new `item_sprints` table as a per-project "legacy sprint" (then drops the column), and
 - backfills `tags` / `item_tags` from the frozen `items.tags` JSON column (`_backfill_item_tags`): tolerant parse (bad JSON is dropped with a stderr note, never raised), per-item anti-join guard so re-tagged items are never re-seeded, and a one-shot stderr similarity report suggesting `dct tags merge` for near-duplicates — a suggestion, never a block.
 
 Schema updates run on the first engine bootstrap of a new-code session — verify destructive changes against a throwaway database and keep each step idempotent.
+
+Read-only commands (`dct release plan` / `status`, `dct clog candidates`, the `dct release reconstruct` preview) never bootstrap (K-84): they open the database read-only (`core.engine.readonly_engine` — SQLite `mode=ro` without a journal-mode change or file creation, PostgreSQL READ ONLY transactions), check that every table and column of the current schema exists (`db.check_schema_ready`) and otherwise refuse with a message naming `dct db upgrade`, the explicit bootstrap.
 
 ## Configuration
 

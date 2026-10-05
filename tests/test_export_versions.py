@@ -110,10 +110,13 @@ def test_v_prefixed_release_flow_core_cli_export(cli_engine, monkeypatch, capsys
     assert record["version"] == "1.6.0"
     assert get_project(engine, "proj-v")["current_version"] == "1.6.0"
 
-    # Re-running under another spelling is the same release (no-op, resume).
-    run_cli(monkeypatch, ["clog", "release", "-P", "proj-v", "1.6", "--entries", str(a)])
-    out = capsys.readouterr().out
-    assert "already released" in out and "version-sync skipped" not in out
+    # Re-running under another spelling is the same release — but the raw
+    # legacy stamp put an entry carrying 1.6 outside the record's set, so the
+    # retry is refused before any effect (K-94 B3), never extending the record.
+    with pytest.raises(SystemExit):
+        run_cli(monkeypatch, ["clog", "release", "-P", "proj-v", "1.6", "--entries", str(a)])
+    assert "no longer matches the record" in capsys.readouterr().err
+    assert get_release(engine, "proj-v", "1.6.0")["entry_ids"] == [a]
 
     for requested in ("v1.6.0", "1.6", "1.6.0"):
         md = export_changelog_md(engine, "proj-v", version=requested)

@@ -390,7 +390,7 @@ def test_own_release_tool_integration_uses_the_real_ledger_parameters():
     assert {"version", "entry_ids", "candidate_sha", "checkout_root", "proof"} <= named
     assert named <= set(inspect.signature(server.release_changelog).parameters)
     assert "advance_release(version=V, status=" in integration
-    statuses = re.findall(r"`(files_written|committed|tagged|completed)`", integration)
+    statuses = re.findall(r"`(files_written|committed|tagged|pushed|completed)`", integration)
     assert list(dict.fromkeys(statuses)) == list(RELEASE_FLOW[1:])
     assert set(inspect.signature(server.advance_release).parameters) >= {
         "version", "status", "release_commit_sha", "manifest"}

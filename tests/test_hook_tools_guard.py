@@ -37,7 +37,7 @@ def test_present_tools_pass_under_ci(monkeypatch):
 
 @pytest.mark.parametrize("module", [
     "test_hook_changelog_branch", "test_hook_bypass", "test_hook_plan_autoscan",
-    "test_codex_hooks",
+    "test_codex_hooks", "test_hook_task_mirror",
 ])
 def test_every_jq_hook_module_uses_the_shared_guard(module):
     from pathlib import Path

@@ -150,7 +150,7 @@ def test_release_with_an_unfinished_record_points_to_resume(cli_engine, monkeypa
     create_project(cli_engine, slug="proj-v", name="V", current_version="1.0.0")
     add_entry(cli_engine, "proj-v", "added", "a")
     release_entries(cli_engine, "proj-v", "1.1.0")
-    advance_release(cli_engine, "proj-v", "1.1.0", "committed")
+    advance_release(cli_engine, "proj-v", "1.1.0", "committed", release_commit_sha="1234567")
     assert _exit_code(monkeypatch, ["clog", "release", "-P", "proj-v", "1.1.0"]) == 1
     err = capsys.readouterr().err
     assert "release 1.1.0 is unfinished (committed)" in err and "dct release resume" in err
@@ -160,7 +160,7 @@ def test_release_rerun_of_a_completed_release_is_a_noop(cli_engine, monkeypatch,
     create_project(cli_engine, slug="proj-v", name="V", current_version="1.0.0")
     a = add_entry(cli_engine, "proj-v", "added", "a")["id"]
     release_entries(cli_engine, "proj-v", "1.1.0")
-    advance_release(cli_engine, "proj-v", "1.1.0", "completed")
+    advance_release(cli_engine, "proj-v", "1.1.0", "completed", release_commit_sha="1234567")
     run_cli(monkeypatch, ["clog", "release", "-P", "proj-v", "1.1.0", "--entries", str(a)])
     out = capsys.readouterr().out
     assert "already released" in out and "release record 1.1.0: completed" in out
@@ -171,7 +171,7 @@ def test_release_rerun_with_a_different_set_exits_nonzero(cli_engine, monkeypatc
     a = add_entry(cli_engine, "proj-v", "added", "a")["id"]
     add_entry(cli_engine, "proj-v", "added", "b")
     release_entries(cli_engine, "proj-v", "1.1.0", entry_ids=[a])
-    advance_release(cli_engine, "proj-v", "1.1.0", "completed")
+    advance_release(cli_engine, "proj-v", "1.1.0", "completed", release_commit_sha="1234567")
     assert _exit_code(monkeypatch, ["clog", "release", "-P", "proj-v", "1.1.0"]) == 1
     assert "different set" in capsys.readouterr().err
 
@@ -287,9 +287,14 @@ def test_release_abandon_keeps_everything_and_repeat_is_a_noop(recorded, monkeyp
     assert (rec["status"], rec["abandon_reason"], rec["entry_ids"]) == (
         "abandoned", "broken build", [a])
     assert get_project(engine, "proj-v")["current_version"] == "1.1.0"
-    run_cli(monkeypatch, ["clog", "release-abandon", "1.1.0", "--reason", "again",
+    run_cli(monkeypatch, ["clog", "release-abandon", "1.1.0", "--reason", "broken build",
                           "--confirm", "-P", "proj-v"])
     assert "already abandoned (broken build)" in capsys.readouterr().out
+    # K-94 B5: a DIFFERENT reason is not a compatible repeat.
+    assert _exit_code(monkeypatch, ["clog", "release-abandon", "1.1.0", "--reason", "again",
+                                    "--confirm", "-P", "proj-v"]) == 1
+    assert "first reason stays" in capsys.readouterr().err
+    assert get_release(engine, "proj-v", "1.1.0")["abandon_reason"] == "broken build"
     run_cli(monkeypatch, ["clog", "release-status", "--version", "1.1.0", "-P", "proj-v"])
     assert "abandoned:" in capsys.readouterr().out
 

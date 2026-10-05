@@ -65,7 +65,9 @@ dct/core/releases.py     — Release ledger (K-41/K-60/K-61): records written wi
                            the stamp, one state machine (TRANSITIONS; advance,
                            abandon), immutable candidate, write-once release
                            commit / manifest / proof, legacy reconstruction,
-                           the project's version-file contract (K-73)
+                           the project's version-file contract (K-73); the
+                           verified release_mode, executor and write-once
+                           consent / proposal / render (docs/release-workflow.md)
 dct/core/sprint.py       — Current-sprint ops; delegates to item_sprints
 dct/core/sprints.py      — First-class sprints (single source of truth)
 dct/core/handoff.py      — Session handoffs (cross-session prompt ledger)

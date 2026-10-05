@@ -333,7 +333,8 @@ def test_release_changelog_return_shape_selected(srv):
     assert set(release) == {"id", "version", "mode", "entry_ids", "candidate_sha",
                             "checkout_root", "release_commit_sha", "manifest", "proof",
                             "status", "created_at", "updated_at", "completed_at",
-                            "abandoned_at", "abandon_reason"}
+                            "abandoned_at", "abandon_reason", "release_mode",
+                            "executor", "consent", "proposal", "render"}
     assert (release["version"], release["entry_ids"], release["status"]) == (
         "1.0.0", [a], "stamped")
 

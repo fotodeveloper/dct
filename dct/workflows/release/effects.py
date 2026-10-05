@@ -894,13 +894,13 @@ def _continue(run: _Run, *, fresh: bool) -> None:
             run.step("files", "verified")
         if run.record["status"] == "files_written":
             _step_commit(run)
-        elif run.record["status"] in ("committed", "tagged"):
+        elif run.record["status"] in ("committed", "tagged", "pushed"):
             _check_committed_head(run)
             _verify_release_commit(run, run.record["release_commit_sha"])
             run.step("commit", "verified", commit=run.record["release_commit_sha"])
         if run.record["status"] == "committed":
             _step_tag(run)
-        elif run.record["status"] == "tagged":
+        elif run.record["status"] in ("tagged", "pushed"):
             commit = run.record["release_commit_sha"]
             if not any(t["commit"] == commit for t in _version_tags(run.repo, run.version)):
                 raise run.refuse(f"release {run.version} is recorded as tagged but no tag of "
@@ -1031,7 +1031,10 @@ def apply_release(
         stamped = release_entries(
             engine, project_slug, target, entry_ids=ids,
             candidate_sha=checkout["head"] if checkout else None,
-            checkout_root=checkout["repo_root"] if checkout else None, proof=proof)
+            checkout_root=checkout["repo_root"] if checkout else None, proof=proof,
+            # K-94 B1: _locate verified the checkout strictly — None means the
+            # project is CONFIRMED outside git (a detection error refuses).
+            release_mode="git" if checkout else "without_git")
     except ValueError as exc:
         raise ReleaseRefused(str(exc)) from None
     details = {"requested_version": target, "previous_version": plan["version"]["current"],

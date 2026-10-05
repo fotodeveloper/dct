@@ -700,6 +700,7 @@ def cli_proj(proj, engine, monkeypatch):
     from dct import cli
 
     monkeypatch.setattr(cli, "_get_engine", lambda: engine)
+    monkeypatch.setattr(cli, "_get_readonly_engine", lambda: engine)
     monkeypatch.chdir(proj[0])
     return proj
 

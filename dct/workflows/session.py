@@ -55,7 +55,12 @@ from dct.core.sprint import (
     _to_cols_rows,
 )
 from dct.core.text import PREVIEW_CHARS, preview  # noqa: F401 — re-exported (K-35)
-from dct.db import project_transaction, session_handoffs
+from dct.db import (
+    SerializationConflict,
+    is_serialization_failure,
+    project_transaction,
+    session_handoffs,
+)
 
 SNAPSHOT_SECTIONS = ("sprint", "handoff", "gates", "decisions", "recent_changes")
 
@@ -346,7 +351,8 @@ def pickup_work(
     transaction; the whole return is json.dumps-able (K-36).
 
     A PostgreSQL serialization conflict with a standalone consumer rolls back
-    the attempt. A server-selected target then degrades to ONE fresh pure read
+    the attempt (recognised by db.is_serialization_failure — the driver's
+    SQLSTATE 40001 and project_transaction's SerializationConflict alike). A server-selected target then degrades to ONE fresh pure read
     (never consumes a different handoff); an explicit id keeps its not-found
     error. Other database errors propagate unchanged.
     """
@@ -355,9 +361,8 @@ def pickup_work(
             engine, project_slug, consume=consume, handoff_id=handoff_id,
             scope=scope, consumed_by=consumed_by, since=since, include=include,
         )
-    except sa.exc.DBAPIError as exc:
-        state = getattr(exc.orig, "sqlstate", None) or getattr(exc.orig, "pgcode", None)
-        if state != "40001" or consume is False:
+    except (sa.exc.DBAPIError, SerializationConflict) as exc:
+        if not is_serialization_failure(exc) or consume is False:
             raise
         if handoff_id is not None:
             raise ValueError(_HANDOFF_NOT_FOUND.format(id=handoff_id)) from exc

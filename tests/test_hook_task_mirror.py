@@ -1,15 +1,22 @@
 """Sanity tests for hooks/dct-task-mirror.sh (v0.4.0 — item #34).
 
 Mirrors the shape of test_hook_plan_autoscan.py. We do NOT fire the shell
-hook end-to-end (that needs CC harness + real dct + jq); instead we verify
-file presence, syntax, and contract compliance. The worker's gating logic
-(#354 — config gate + silent project autodetect moved off the shell
-fast-path) IS exercised directly against the in-memory engine.
+hook end-to-end through the CC harness; we verify file presence, syntax and
+contract compliance, and (K-93 A5) that the hook really PARSES the payload:
+with jq present it hands a task-tool payload to the `dct _task-mirror`
+worker (a fake `dct` on PATH records the hand-off) and never spawns it for
+any other tool — those tests need jq and use the shared `hook_tools`
+sentinel (skip locally, FAIL under CI). Pure syntax / fail-open checks need
+no jq. The worker's gating logic (#354 — config gate + silent project
+autodetect moved off the shell fast-path) IS exercised directly against the
+in-memory engine.
 """
 
 import argparse
 import io
+import os
 import subprocess
+import time
 
 import pytest
 
@@ -110,6 +117,61 @@ def test_hook_noop_on_non_task_tool():
         capture_output=True, text=True, timeout=5,
     )
     assert result.returncode == 0
+
+
+# ── K-93 A5: the hook really parses the payload (needs jq) ───────────────────
+
+
+def _fake_dct(tmp_path):
+    """A `dct` on PATH that appends `<args>\t<stdin>` to calls.log."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    log = tmp_path / "calls.log"
+    script = bin_dir / "dct"
+    fd = os.open(script, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o755)
+    with os.fdopen(fd, "w") as fh:
+        fh.write('#!/usr/bin/env bash\nprintf "%s\\t%s\\n" "$*" "$(cat)" >> "' + str(log) + '"\n')
+    env = {**os.environ, "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
+           "TMPDIR": str(tmp_path)}
+    return env, log
+
+
+def _run_hook(payload, env):
+    return subprocess.run(["bash", str(HOOK_PATH)], input=payload, capture_output=True,
+                          text=True, timeout=10, env=env)
+
+
+def _wait_lines(log, count, timeout=10.0):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if log.exists() and len(log.read_text().splitlines()) >= count:
+            break
+        time.sleep(0.05)
+    return log.read_text().splitlines() if log.exists() else []
+
+
+@pytest.mark.usefixtures("hook_tools")
+@pytest.mark.parametrize("tool", ["TaskCreate", "TodoWrite"])
+def test_hook_hands_a_task_payload_to_the_worker(tmp_path, tool):
+    env, log = _fake_dct(tmp_path)
+    payload = '{"tool_name":"' + tool + '","tool_input":{"subject":"x"},"session_id":"s-1"}'
+    assert _run_hook(payload, env).returncode == 0
+    lines = _wait_lines(log, 1)
+    assert lines == [f"_task-mirror\t{payload}"]
+
+
+@pytest.mark.usefixtures("hook_tools")
+def test_hook_never_spawns_the_worker_for_another_tool(tmp_path):
+    """The parse decides: a non-task payload exits before any spawn. A task
+    payload sent AFTER it proves the fake works and bounds the wait."""
+    env, log = _fake_dct(tmp_path)
+    other = '{"tool_name":"Read","tool_input":{"file_path":"/tmp/x"}}'
+    assert _run_hook(other, env).returncode == 0
+    assert _run_hook('{"tool_name":"TodoWrite","tool_input":{}}', env).returncode == 0
+    _wait_lines(log, 1)
+    time.sleep(0.3)  # a stray spawn of the first call would have landed by now
+    lines = log.read_text().splitlines()
+    assert [line.split("\t", 1)[1] for line in lines] == ['{"tool_name":"TodoWrite","tool_input":{}}']
 
 
 # ── Worker gating (#354): config gate + silent project autodetect ─────────────

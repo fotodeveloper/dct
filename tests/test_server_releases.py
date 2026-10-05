@@ -10,7 +10,8 @@ SHA = "0123456789abcdef0123456789abcdef01234567"
 SHA2 = "fedcba9876543210fedcba9876543210fedcba98"
 RECORD_KEYS = {"id", "version", "mode", "entry_ids", "candidate_sha", "checkout_root",
                "release_commit_sha", "manifest", "proof", "status", "created_at",
-               "updated_at", "completed_at", "abandoned_at", "abandon_reason"}
+               "updated_at", "completed_at", "abandoned_at", "abandon_reason",
+               "release_mode", "executor", "consent", "proposal", "render"}
 
 
 @pytest.fixture
@@ -142,8 +143,10 @@ def test_abandon_release_ack_and_record(released):
     assert (rec["status"], rec["abandon_reason"]) == ("abandoned", "superseded")
     assert isinstance(rec["abandoned_at"], str)
     assert released.get_release(project="test") == {"release": None}
-    again = released.abandon_release("1.1.0", "other", confirm=True, project="test")
+    again = released.abandon_release("1.1.0", "superseded", confirm=True, project="test")
     assert again == {**out, "updated": False}
+    other = released.abandon_release("1.1.0", "other", confirm=True, project="test")
+    assert "first reason stays" in other["error"]
 
 
 def test_abandon_release_completed_is_an_error(released):

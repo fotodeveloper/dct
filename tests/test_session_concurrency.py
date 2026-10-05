@@ -252,3 +252,76 @@ def test_pickup_does_not_hide_other_database_errors(concurrent_engine, monkeypat
     with pytest.raises(sa.exc.OperationalError) as raised:
         session.pickup_work(eng, "test", consumed_by="agent")
     assert raised.value is error
+
+
+class _Sqlstate(Exception):
+    def __init__(self, sqlstate):
+        super().__init__(f"driver error {sqlstate}")
+        self.sqlstate = sqlstate
+
+
+class _Pgcode(Exception):
+    pgcode = "40001"
+
+
+def test_serialization_detector_recognises_driver_and_domain_errors():
+    """K-74: ONE detector for the driver error (SQLSTATE 40001 via psycopg 3
+    `sqlstate` or psycopg2 `pgcode`) AND the domain SerializationConflict
+    project_transaction translates it into — never by message text."""
+    from dct.db import SerializationConflict, is_serialization_failure
+
+    driver = sa.exc.OperationalError("UPDATE", {}, _Sqlstate("40001"))
+    assert is_serialization_failure(driver)
+    assert is_serialization_failure(sa.exc.OperationalError("UPDATE", {}, _Pgcode()))
+    assert is_serialization_failure(SerializationConflict("anything at all"))
+    # Wrapped: the domain error raised `from` the driver error.
+    try:
+        try:
+            raise driver
+        except sa.exc.DBAPIError as exc:
+            raise SerializationConflict("x") from exc
+    except SerializationConflict as wrapped:
+        assert is_serialization_failure(wrapped)
+    # Not serialization failures — even when the TEXT mentions 40001.
+    assert not is_serialization_failure(sa.exc.OperationalError("x", {}, _Sqlstate("40P01")))
+    assert not is_serialization_failure(RuntimeError("SQLSTATE 40001 serialization failure"))
+    assert not is_serialization_failure(ValueError("40001"))
+
+
+@pytest.mark.parametrize("mode", ["auto", "true", "explicit", "read"])
+def test_pickup_serialization_conflict_keeps_semantics_on_every_lane(
+    concurrent_engine, monkeypatch, mode,
+):
+    """K-74 regression on BOTH lanes: a 40001 inside the consume is turned
+    into SerializationConflict by project_transaction; pickup_work still
+    recognises it — auto/true → ONE fresh read without consumption, explicit
+    id → the controlled not-found refusal; the mutation is never retried."""
+    eng = concurrent_engine
+    create_project(eng, "test", "Test")
+    target = create_handoff(eng, "test", "First", "previous-agent")
+    attempts = []
+
+    def conflict(conn, handoff_id, consumed_by):
+        attempts.append(handoff_id)
+        raise sa.exc.OperationalError("UPDATE session_handoffs", {}, _Sqlstate("40001"))
+
+    monkeypatch.setattr(session.handoff_core, "_consume_handoff_conn", conflict)
+    kwargs = {"consumed_by": "loser"}
+    if mode == "true":
+        kwargs["consume"] = True
+    elif mode == "explicit":
+        kwargs["handoff_id"] = target["id"]
+    elif mode == "read":
+        kwargs["consume"] = False
+
+    if mode == "explicit":
+        with pytest.raises(ValueError, match=f"Handoff #{target['id']} not found or already consumed"):
+            session.pickup_work(eng, "test", **kwargs)
+    else:
+        result = session.pickup_work(eng, "test", **kwargs)
+        assert result["consumed"] is False
+        assert result["picked_up"] is None
+        assert result["handoff"]["latest"]["id"] == target["id"]
+    assert attempts == ([] if mode == "read" else [target["id"]])
+    pending = session.handoff_core.list_handoffs(eng, "test", unconsumed_only=True)
+    assert [row["id"] for row in pending] == [target["id"]]

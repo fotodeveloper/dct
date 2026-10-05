@@ -1229,9 +1229,11 @@ def release_changelog(
             {"<entry id>": ["<proving commit sha>", ...]} or
             {"<entry id>": {"commits": [...], "merge_commit": "<sha>" | null,
             "pr": <int> | null}}; every named entry must be in the release
-            set. Stored in a NEW record only (a re-run ignores it). Entries
-            without a commit proof are simply absent. Null/omitted (default)
-            = none.
+            set. Stored in a NEW record only and immutable: a re-run
+            returning an existing record with a DIFFERENT map — or with a
+            map when the record has none — is an error, the identical map
+            is the no-op. Entries without a commit proof are simply absent.
+            Null/omitted (default) = none.
 
     Release record + re-runs: the call's resolved set is the given ids
     ('selected'), [] ('version_only') or the entries already carrying the
@@ -1239,8 +1241,13 @@ def release_changelog(
     a record: the SAME set → whole-operation no-op returning that record
     (resume an interrupted release — also for a version lower than
     current_version and for a version-only release; an 'abandoned' record is
-    returned as it is and never resumed); a DIFFERENT set → error
-    ("version V was released with a different set: …"). Without a record
+    returned as it is and never resumed) — provided the live entries
+    carrying the version are still EXACTLY the record's set (else an error:
+    the record is never extended); a DIFFERENT set → error ("version V was
+    released with a different set: …"; for an abandoned record the error
+    says so). This tool stamps without a release_mode (the record then
+    needs its release commit to complete), with the project's
+    release_executor and changelog_pr_refs render setting. Without a record
     (a legacy release): a NEW record must hold EVERY entry already carrying
     the version — in 'selected' / 'version_only' an omitted legacy entry of
     that version is refused ("missing from the requested set"), never
@@ -1263,18 +1270,16 @@ def release_changelog(
         "all"|"selected"|"version_only", "entry_ids" (the selected ids — in mode
         'all' the ones stamped), "released" (count newly stamped),
         "already_released" (selected ids that already had this version),
-        "release" (the record, as get_release returns it — {id, version,
-        mode, entry_ids (the exact set), candidate_sha, checkout_root,
-        release_commit_sha, manifest, proof, status, created_at, updated_at,
-        completed_at, abandoned_at, abandon_reason} — or null for a legacy
-        no-op)} plus "warning" in mode 'all' when the stamped entries span
+        "release" (the record, as get_release returns it — or null for a
+        legacy no-op)} plus "warning" in mode 'all' when the stamped entries span
         several branches (null branch counted as its own). {"error": "..."}
         on failure — neither version nor bump_type; bump_type with no
         current_version; an invalid bump_type; an unsupported version format
         (requested) or a stored current_version outside the contract; a
         version too long for its columns; an unrecorded version lower than
         current_version; mode 'all' with nothing unreleased for a new
-        version; a recorded version with a different set; a new record that
+        version; a recorded version with a different set, a contradicting
+        proof, or live entries no longer matching its set; a new record that
         would omit an entry already carrying the version; a malformed proof
         or one naming entries outside the set; an invalid entry id; an
         invalid candidate_sha; a
@@ -1323,8 +1328,9 @@ def get_release(project: str = "", version: str = "") -> dict:
     record per project + version). Its status follows one state machine:
     stamped (DB stamped) → files_written (changelog file / version files
     written) → committed (release commit made) → tagged (tag created) →
-    completed; 'abandoned' (abandon_release) is reachable from every
-    unfinished status. 'completed' and 'abandoned' are terminal. Read-only.
+    pushed (commit and tag pushed) → completed; 'abandoned'
+    (abandon_release) is reachable from every unfinished status.
+    'completed' and 'abandoned' are terminal. Read-only.
 
     Args:
         project: Slug. Empty = auto-detect from CWD.
@@ -1344,7 +1350,17 @@ def get_release(project: str = "", version: str = "") -> dict:
         (object of the verified artifacts with content hashes, or null),
         proof (object entry id → {commits, merge_commit, pr}, or null),
         status, created_at, updated_at, completed_at, abandoned_at (ISO
-        datetimes or null), abandon_reason (text or null)}} or
+        datetimes or null), abandon_reason (text or null), release_mode
+        ("git" | "without_git" — the verified mode; only "without_git"
+        completes without a release commit — or null = unverified, recorded
+        before the field), executor ("dct" | "own" — who performs the
+        effects, copied from the project's release_executor at stamp time,
+        immutable; null on older records), consent (object — what the owner
+        approved: {version, entry_ids, candidate_sha, proposal_sha256,
+        render, push_target} — or null), proposal (object — the approved
+        version-file proposal {paths, base_blobs, expected_blobs, script,
+        candidate_sha} — or null), render (object — this release's
+        changelog render settings {"pr_refs": bool} — or null)}} or
         {"release": null} when there is no such record (no record for that
         version, or no unfinished release). A release made before records
         existed has no record. {"error": "..."} on an unsupported version
@@ -1388,14 +1404,14 @@ def advance_release(
     Call it after each release step is DONE and verified (also when a resumed
     run finds the effect already present): files_written after the changelog
     file and version files are written, committed after the release commit,
-    tagged after the tag, completed at the end. Each field below is a
-    SEPARATE top-level parameter.
+    tagged after the tag, pushed after the verified push, completed at the
+    end. Each field below is a SEPARATE top-level parameter.
 
     Args:
         version: The release (X.Y or X.Y.Z, leading "v" accepted); it must
             have a record (written by release_changelog).
         status: Target status, one of (in order) stamped / files_written /
-            committed / tagged / completed. Forward jumps of several steps are
+            committed / tagged / pushed / completed. Forward jumps of several steps are
             allowed; the CURRENT status again is an idempotent no-op; a lower
             one is refused; 'abandoned' is refused here (use
             abandon_release); a record that is 'completed' or 'abandoned'
@@ -1404,24 +1420,30 @@ def advance_release(
         release_commit_sha: The verified release commit (hex, 7-64 chars,
             stored lowercased) — recorded ONCE, on the move to 'committed'
             or later (refused below it); the stored value again is accepted,
-            a different one is refused. A record with a candidate_sha cannot
-            reach 'committed' or later without it. Empty (default) = not
-            passed. The candidate_sha is immutable and not accepted here.
+            a different one is refused. Every record cannot reach
+            'committed' or later — 'completed' included — without it, unless
+            its release_mode is "without_git" (a NULL candidate_sha does NOT
+            mean no git); a "without_git" record refuses it and the statuses
+            committed / tagged / pushed, and completes only with a manifest.
+            Empty (default) = not passed. The candidate_sha is immutable and
+            not accepted here.
         manifest: JSON object of the artifacts the caller produced and
             verified, e.g. {"changelog": {"path", "sha256", "section_date"},
             "version_files": [{"path", "sha256"}], "tree": "<git tree sha>"}
             — merged WRITE-ONCE per top-level key: a new key is added, an
             already recorded key must carry the same value (confirmation), a
             different value is refused. Keys non-empty strings (≤ 64 chars),
-            no null values, ≤ 65536 chars of JSON. Null/omitted (default) =
-            not passed.
+            no null values; the MERGED manifest ≤ 65536 bytes of canonical
+            JSON (sorted keys, compact, UTF-8). Null/omitted (default) = not
+            passed.
 
     Returns: slim ack {project, version (normalized), status (after the call),
         updated} — `updated` false when nothing changed (idempotent repeat).
         Fetch the full record with get_release. {"error": "..."} on an
         unknown status, 'abandoned', a version without a record, a backwards
         move, a move out of a terminal status, a changed or premature
-        release_commit_sha, 'committed'+ without a release commit, a
+        release_commit_sha, 'committed'+ without a release commit (or with
+        one / a git-only status on a "without_git" record), a
         manifest key recorded with a different value or a malformed
         manifest, an invalid SHA, an unsupported version format, tool-call
         markup, or an unresolvable project. Nothing is written on error.
@@ -1460,6 +1482,8 @@ def abandon_release(
     release_changelog for it with the same set returns this abandoned record
     (no-op), a different set is refused. Release the work again under a NEW
     version. A 'completed' release is never reclassified as abandoned.
+    Abandoning again with the SAME reason is a no-op (updated false); a
+    DIFFERENT reason is an error — the first reason stays.
 
     Args:
         version: The release (X.Y or X.Y.Z, leading "v" accepted); it must
@@ -1472,11 +1496,12 @@ def abandon_release(
 
     Returns: slim ack {project, version (normalized), status ('abandoned'),
         updated} — `updated` false when the record was already abandoned
-        (the first reason and time are kept). Fetch the full record with
-        get_release. {"error": "..."} without confirm, with an empty or
-        over-long reason, for a version without a record, a completed
-        release, an unsupported version format, tool-call markup, or an
-        unresolvable project. Nothing is written on error.
+        with the same reason (the first reason and time are kept). Fetch the
+        full record with get_release. {"error": "..."} without confirm, with
+        an empty or over-long reason, for an already abandoned record with a
+        different reason, a version without a record, a completed release,
+        an unsupported version format, tool-call markup, or an unresolvable
+        project. Nothing is written on error.
     """
     if (err := _reject_toolcall_markup(version=version, reason=reason)):
         return err

@@ -9,14 +9,31 @@ expected artifacts with their content hashes (`manifest`, write-once per
 key), the proof map (`proof`: entry id → proving commits, K-70) and a
 `status` that follows ONE state machine (TRANSITIONS):
 
-    stamped → files_written → committed → tagged → completed
-        └──────────┴─────────────┴──────────┴──→ abandoned
+    stamped → files_written → committed → tagged → pushed → completed
+        └──────────┴─────────────┴──────────┴────────┴──→ abandoned
 
 Forward moves may skip steps (the workflow verified the intermediate
 effects); 'completed' and 'abandoned' are terminal; a completed release is
 never reclassified as abandoned. 'abandoned' is reached ONLY through
 abandon_release (explicit confirmation + a reason), never through
-advance_release.
+advance_release. 'pushed' (K-97) = the release commit and the tag are on the
+push target; a push failure leaves the record 'tagged' and is resumed from
+there (never a new bump, commit or tag).
+
+K-94 B1: the record carries its verified RELEASE MODE (`release_mode`:
+'git' | 'without_git'; NULL = recorded before the field existed —
+unverified). A NULL candidate_sha never implies "no git": only a
+'without_git' record may complete without a release commit; it never
+reaches 'committed', 'tagged' or 'pushed' and completes only with its
+verified artifacts in the manifest. Every other record needs its
+release_commit_sha from 'committed' on (also to reach 'completed').
+
+Further ledger fields (docs/release-workflow.md, "The release ledger"):
+`executor` ('dct' | 'own', K-85 — copied from the project's
+release_executor at stamp time, immutable: a later project-setting change
+never takes over an unfinished release), `consent` (what the owner approved,
+K-97 F4), `proposal` (the approved version-file proposal, K-76) and `render`
+(the changelog render settings, K-90) — each JSON, validated, write-once.
 
 The record is INSERTED by changelog.release_entries in the same transaction
 as the stamp (insert_record — never a stamp without a record, never a record
@@ -47,12 +64,12 @@ import sqlalchemy as sa
 
 from dct.core.limits import ensure_fits
 from dct.core.projects import resolve_project_id
-from dct.core.version import normalize_version, same_version
+from dct.core.version import ensure_version_fits, normalize_version, same_version
 from dct.db import project_transaction, projects, releases
 
 # ── the state machine (ONE definition, used everywhere) ──────────────────────
 
-RELEASE_FLOW = ("stamped", "files_written", "committed", "tagged", "completed")
+RELEASE_FLOW = ("stamped", "files_written", "committed", "tagged", "pushed", "completed")
 ABANDONED = "abandoned"
 RELEASE_STATUSES = (*RELEASE_FLOW, ABANDONED)
 TERMINAL_STATUSES = frozenset({"completed", ABANDONED})
@@ -76,13 +93,30 @@ TRANSITIONS = _build_transitions()
 
 RELEASE_MODES = ("all", "selected", "version_only", "reconstructed")
 
+# K-94 B1: the verified release mode — whether the release has git effects.
+GIT_MODES = ("git", "without_git")
+WITHOUT_GIT = "without_git"
+# Statuses only a release WITH git can reach (they record git effects).
+GIT_ONLY_STATUSES = frozenset({"committed", "tagged", "pushed"})
+
+# K-85: who performs the release's effects — dct's effects layer, or the
+# project's own release tool. The project setting is projects.release_executor.
+EXECUTORS = ("dct", "own")
+DEFAULT_EXECUTOR = "dct"
+
 _SHA_RE = re.compile(r"[0-9a-fA-F]{7,64}", re.ASCII)
 _COMMITTED = RELEASE_FLOW.index("committed")
 _FILES_WRITTEN = RELEASE_FLOW.index("files_written")
 
 # Size caps for the JSON ledger fields — refused, never truncated (#792).
-MANIFEST_MAX_CHARS = 65536
-PROOF_MAX_CHARS = 262144
+# K-92 / K-94 B4: a JSON cap is BYTES of the field's CANONICAL JSON (sorted
+# keys, compact separators, UTF-8 — json_size), applied to the value that is
+# actually stored (for the manifest: the MERGED manifest). The abandon
+# reason is capped in characters.
+MANIFEST_MAX_BYTES = 65536
+PROOF_MAX_BYTES = 262144
+CONSENT_MAX_BYTES = 65536
+PROPOSAL_MAX_BYTES = 65536
 MANIFEST_KEY_MAX = 64
 ABANDON_REASON_MAX = 2000
 VERSION_FILES_MAX = 200
@@ -92,7 +126,10 @@ RECORD_FIELDS = (
     "id", "version", "mode", "entry_ids", "candidate_sha", "checkout_root",
     "release_commit_sha", "manifest", "proof", "status", "created_at",
     "updated_at", "completed_at", "abandoned_at", "abandon_reason",
+    "release_mode", "executor", "consent", "proposal", "render",
 )
+# JSON-encoded record columns (decoded by record_to_dict).
+_JSON_FIELDS = ("manifest", "proof", "consent", "proposal", "render")
 
 
 def check_transition(current: str, target: str) -> bool:
@@ -151,14 +188,31 @@ def _canonical(value) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
 
 
+def json_size(value) -> int:
+    """Bytes of `value`'s canonical JSON (sorted keys, compact separators,
+    UTF-8) — the ONE unit of every JSON size cap of the ledger (K-92)."""
+    return len(_canonical(value).encode("utf-8"))
+
+
+def ensure_json_fits(value, field: str, max_bytes: int) -> None:
+    """ValueError unless json_size(value) <= max_bytes (refused, never truncated)."""
+    size = json_size(value)
+    if size > max_bytes:
+        raise ValueError(
+            f"{field} too long: {size} bytes of canonical JSON, max {max_bytes} — "
+            f"refused, never truncated; nothing written."
+        )
+
+
 def validate_manifest(manifest: Mapping | None) -> dict | None:
     """None / {} → None; otherwise a JSON object whose keys are non-empty
     strings (≤ MANIFEST_KEY_MAX) and whose values are JSON values other than
     null — the manifest's content is the workflow's (K-49/K-73: e.g.
     {"changelog": {...}, "version_files": [...], "tree": "<sha>"}); the
     ledger only enforces the shape and write-once per key. TypeError for a
-    non-object, ValueError for any other violation (also when the canonical
-    JSON exceeds MANIFEST_MAX_CHARS)."""
+    non-object, ValueError for any other violation (also when its canonical
+    JSON exceeds MANIFEST_MAX_BYTES — the MERGED manifest is checked again
+    before it is stored, see merge_manifest)."""
     if manifest is None:
         return None
     if not isinstance(manifest, Mapping):
@@ -179,17 +233,15 @@ def validate_manifest(manifest: Mapping | None) -> dict | None:
         encoded = _canonical(out)
     except (TypeError, ValueError) as exc:
         raise ValueError(f"manifest must be JSON-serializable: {exc}") from None
-    if len(encoded) > MANIFEST_MAX_CHARS:
-        raise ValueError(
-            f"manifest too long: {len(encoded)} chars of JSON, max "
-            f"{MANIFEST_MAX_CHARS} — refused, never truncated"
-        )
+    ensure_json_fits(out, "manifest", MANIFEST_MAX_BYTES)
     return json.loads(encoded)
 
 
 def merge_manifest(stored: dict | None, incoming: dict | None) -> tuple[dict | None, bool]:
     """Write-once merge: a new key is added, a key already set must carry the
-    SAME value (a confirmation), a different value raises ValueError.
+    SAME value (a confirmation), a different value raises ValueError. The
+    MERGED manifest must fit MANIFEST_MAX_BYTES (K-92: two patches that fit
+    alone cannot jointly exceed the cap) — ValueError otherwise.
     Returns (merged manifest, changed)."""
     merged = dict(stored or {})
     changed = False
@@ -204,6 +256,8 @@ def merge_manifest(stored: dict | None, incoming: dict | None) -> tuple[dict | N
             continue
         merged[key] = value
         changed = True
+    if changed:
+        ensure_json_fits(merged, "manifest (merged)", MANIFEST_MAX_BYTES)
     return (merged or None), changed
 
 
@@ -267,8 +321,7 @@ def validate_proof(proof: Mapping | None) -> dict | None:
         }
     if not out:
         return None
-    if len(_canonical(out)) > PROOF_MAX_CHARS:
-        raise ValueError(f"proof too long, max {PROOF_MAX_CHARS} chars of JSON — refused")
+    ensure_json_fits(out, "proof", PROOF_MAX_BYTES)
     return out
 
 
@@ -284,6 +337,191 @@ def check_proof_scope(proof: dict | None, entry_ids: Iterable[int]) -> None:
         )
 
 
+def validate_release_mode(mode: str | None) -> str | None:
+    """None / "" → None (not stated); 'git' | 'without_git' → itself; else
+    ValueError. The caller states the mode it VERIFIED (K-94 B1: a project
+    confirmed outside git → 'without_git'; a detection error is never one)."""
+    if not mode:
+        return None
+    if mode not in GIT_MODES:
+        raise ValueError(f"release_mode must be one of {', '.join(GIT_MODES)}, got {mode!r}")
+    return mode
+
+
+def validate_executor(executor: str) -> str:
+    """'dct' | 'own' (K-85) → itself; anything else → ValueError."""
+    if executor not in EXECUTORS:
+        raise ValueError(
+            f"release executor must be one of {', '.join(EXECUTORS)}, got {executor!r}"
+        )
+    return executor
+
+
+_HEX64_RE = re.compile(r"[0-9a-f]{64}", re.ASCII)
+
+
+def _object(value, field: str, allowed: set[str], required: set[str] = frozenset()) -> Mapping:
+    if not isinstance(value, Mapping):
+        raise TypeError(f"{field} must be a JSON object, got {type(value).__name__}")
+    unknown = set(value) - allowed
+    if unknown:
+        raise ValueError(f"{field} has unknown keys: {', '.join(sorted(map(str, unknown)))}")
+    absent = required - set(value)
+    if absent:
+        raise ValueError(f"{field} needs the keys: {', '.join(sorted(absent))}")
+    return value
+
+
+def _text(value, field: str, limit: int = 500, *, optional: bool = False) -> str | None:
+    if value is None and optional:
+        return None
+    if not isinstance(value, str) or not value.strip() or value != value.strip() or len(value) > limit:
+        raise ValueError(f"{field} must be a non-empty, unpadded string of at most {limit} chars")
+    return value
+
+
+def _digest(value, field: str) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str) or not _HEX64_RE.fullmatch(value):
+        raise ValueError(f"{field} must be a lowercase hex SHA-256 (64 chars), got {value!r}")
+    return value
+
+
+RENDER_KEYS = frozenset({"pr_refs"})
+
+
+def validate_render(render: Mapping | None) -> dict | None:
+    """The changelog render settings persisted per release (K-90) —
+    {"pr_refs": bool} (render `(#N)` PR references from the stored proof
+    map); None / {} → None. Unknown keys → ValueError, a non-object or a
+    non-bool value → TypeError."""
+    if render is None:
+        return None
+    _object(render, "render", set(RENDER_KEYS))
+    if not render:
+        return None
+    pr_refs = render.get("pr_refs")
+    if not isinstance(pr_refs, bool):
+        raise TypeError(f"render.pr_refs must be true or false, got {pr_refs!r}")
+    return {"pr_refs": pr_refs}
+
+
+PROPOSAL_KEYS = frozenset({"paths", "base_blobs", "expected_blobs", "script", "candidate_sha"})
+
+
+def validate_proposal(proposal: Mapping | None) -> dict | None:
+    """The approved version-file proposal (K-76) in canonical form, or None.
+
+    {"paths": [repo-relative paths] (normalize_version_files; [] = an
+    approved empty contract), "base_blobs": {path: blob sha | null (absent
+    before the sync)}, "expected_blobs": {path: blob sha}, "script": null |
+    {"identity": str, "sha256": hex SHA-256 | null}, "candidate_sha": sha |
+    null}. base_blobs and expected_blobs name EXACTLY `paths`. Blob ids are
+    hex 7-64 chars (lowercased). ≤ PROPOSAL_MAX_BYTES of canonical JSON.
+    ValueError / TypeError otherwise."""
+    if proposal is None:
+        return None
+    _object(proposal, "proposal", set(PROPOSAL_KEYS), {"paths", "base_blobs", "expected_blobs"})
+    paths = normalize_version_files(proposal["paths"])
+    blobs = {}
+    for key, nullable in (("base_blobs", True), ("expected_blobs", False)):
+        raw = _object(proposal[key], f"proposal.{key}", set(paths))
+        if set(raw) != set(paths):
+            raise ValueError(f"proposal.{key} must name exactly the proposal's paths")
+        blobs[key] = {}
+        for path in paths:
+            sha = raw[path]
+            if sha is None and nullable:
+                blobs[key][path] = None
+                continue
+            if not sha:
+                raise ValueError(f"proposal.{key}[{path!r}] needs a blob id")
+            blobs[key][path] = validate_sha(sha, f"proposal.{key}[{path!r}]")
+    script = proposal.get("script")
+    if script is not None:
+        _object(script, "proposal.script", {"identity", "sha256"}, {"identity"})
+        script = {"identity": _text(script["identity"], "proposal.script.identity", 2000),
+                  "sha256": _digest(script.get("sha256"), "proposal.script.sha256")}
+    out = {
+        "paths": paths,
+        **blobs,
+        "script": script,
+        "candidate_sha": validate_sha(proposal.get("candidate_sha"), "proposal.candidate_sha"),
+    }
+    ensure_json_fits(out, "proposal", PROPOSAL_MAX_BYTES)
+    return out
+
+
+def proposal_digest(proposal: Mapping) -> str:
+    """SHA-256 of the canonical JSON of a validated proposal — what a consent
+    names (consent.proposal_sha256) so a changed proposal voids it."""
+    import hashlib
+
+    return hashlib.sha256(_canonical(validate_proposal(proposal)).encode("utf-8")).hexdigest()
+
+
+CONSENT_KEYS = frozenset({
+    "candidate_sha", "entry_ids", "version", "proposal_sha256", "render", "push_target",
+})
+PUSH_TARGET_KEYS = frozenset({"remote", "url", "branch", "tag"})
+
+
+def validate_consent(consent: Mapping | None) -> dict | None:
+    """What the owner approved for this release (K-97 F4) in canonical form,
+    or None — so a resume can tell whether the scope changed.
+
+    {"version": V (normalized, REQUIRED), "entry_ids": [ids] (REQUIRED,
+    sorted, deduplicated), "candidate_sha": sha | null, "proposal_sha256":
+    proposal_digest of the approved version-file proposal | null, "render":
+    validate_render | null, "push_target": null | {"remote" (required),
+    "url", "branch", "tag"} (strings)}. ≤ CONSENT_MAX_BYTES of canonical
+    JSON. ValueError / TypeError otherwise."""
+    if consent is None:
+        return None
+    _object(consent, "consent", set(CONSENT_KEYS), {"version", "entry_ids"})
+    raw_ids = consent["entry_ids"]
+    if isinstance(raw_ids, (str, bytes)) or not isinstance(raw_ids, (list, tuple)):
+        raise TypeError("consent.entry_ids must be a list of entry ids")
+    ids = sorted({_entry_id(i) for i in raw_ids})
+    push = consent.get("push_target")
+    if push is not None:
+        _object(push, "consent.push_target", set(PUSH_TARGET_KEYS), {"remote"})
+        push = {key: _text(push.get(key), f"consent.push_target.{key}", optional=key != "remote")
+                for key in sorted(PUSH_TARGET_KEYS)}
+    out = {
+        "version": normalize_version(_text(consent["version"], "consent.version", 50)),
+        "entry_ids": ids,
+        "candidate_sha": validate_sha(consent.get("candidate_sha"), "consent.candidate_sha"),
+        "proposal_sha256": _digest(consent.get("proposal_sha256"), "consent.proposal_sha256"),
+        "render": validate_render(consent.get("render")),
+        "push_target": push,
+    }
+    ensure_json_fits(out, "consent", CONSENT_MAX_BYTES)
+    return out
+
+
+def check_unchanged(field: str, stored, given, *, may_fill: bool = True) -> bool:
+    """Write-once rule of a ledger field: `given` None = not passed (True,
+    nothing to write); equal to `stored` = confirmation (True); `stored` None
+    and `may_fill` = first write (False — the caller writes it); a DIFFERENT
+    value — or, with may_fill=False, any value for a field the record does
+    not have — raises ValueError (K-94 B2: a contradicting value is refused,
+    never silently ignored). Values compare as canonical JSON."""
+    if given is None:
+        return True
+    if stored is None and may_fill:
+        return False
+    if stored is not None and _canonical(stored) == _canonical(given):
+        return True
+    recorded = "is not recorded on this release" if stored is None else \
+        "is already recorded with a different value"
+    raise ValueError(
+        f"{field} {recorded} — it is immutable; the given value contradicts the "
+        f"record; nothing written."
+    )
+
+
 # ── record I/O ────────────────────────────────────────────────────────────────
 
 
@@ -293,13 +531,14 @@ def _load_json(text: str | None):
 
 def record_to_dict(row) -> dict:
     """The public record shape (RECORD_FIELDS); `entry_ids` decoded to
-    list[int], `manifest` / `proof` decoded (None when not recorded; proof
-    keys are entry ids as strings, as in JSON)."""
+    list[int], the JSON fields (`manifest`, `proof`, `consent`, `proposal`,
+    `render`) decoded (None when not recorded; proof keys are entry ids as
+    strings, as in JSON)."""
     data = dict(row._mapping)
     record = {field: data.get(field) for field in RECORD_FIELDS}
     record["entry_ids"] = json.loads(data["entry_ids"])
-    record["manifest"] = _load_json(data.get("manifest"))
-    record["proof"] = _load_json(data.get("proof"))
+    for field in _JSON_FIELDS:
+        record[field] = _load_json(data.get(field))
     return record
 
 
@@ -316,6 +555,37 @@ def find_record(conn: sa.Connection, project_id: int, version: str):
     return None
 
 
+def project_release_settings(conn: sa.Connection, project_id: int) -> dict:
+    """The project's release settings read on the caller's connection:
+    {executor ('dct' | 'own', K-85), render ({"pr_refs": bool}, K-90)}."""
+    row = conn.execute(
+        sa.select(projects.c.release_executor, projects.c.changelog_pr_refs)
+        .where(projects.c.id == project_id)
+    ).first()
+    return {
+        "executor": row.release_executor or DEFAULT_EXECUTOR,
+        "render": {"pr_refs": bool(row.changelog_pr_refs)},
+    }
+
+
+def check_mode_consistency(release_mode: str | None, candidate_sha: str | None,
+                           release_commit_sha: str | None, status: str) -> None:
+    """K-94 B1 — a 'without_git' record has no candidate, no release commit
+    and never a git-only status; ValueError otherwise."""
+    if release_mode != WITHOUT_GIT:
+        return
+    if candidate_sha or release_commit_sha:
+        raise ValueError(
+            "a release without git has no candidate_sha / release_commit_sha; "
+            "nothing written."
+        )
+    if status in GIT_ONLY_STATUSES:
+        raise ValueError(
+            f"a release without git has no commit, tag or push — status '{status}' "
+            f"is refused; nothing written."
+        )
+
+
 def insert_record(
     conn: sa.Connection,
     project_id: int,
@@ -330,17 +600,31 @@ def insert_record(
     status: str = RELEASE_FLOW[0],
     release_commit_sha: str | None = None,
     manifest: dict | None = None,
+    release_mode: str | None = None,
+    consent: dict | None = None,
+    proposal: dict | None = None,
+    render: dict | None = None,
 ) -> dict:
     """Insert a record on the caller's (stamping) connection.
 
     Callers have validated every value and checked find_record under the same
     project write lock; the partial unique index still refuses a duplicate.
-    A record inserted as 'completed' (reconstruction) gets completed_at = now.
+    The version must fit the schema (ensure_version_fits — the value actually
+    stored, K-87). `executor` is copied from the project's release_executor
+    (K-85) — never a parameter. A record inserted as 'completed'
+    (reconstruction) gets completed_at = now.
     """
     if mode not in RELEASE_MODES:
         raise ValueError(f"Invalid release mode: '{mode}'")
     if status not in RELEASE_FLOW:
         raise ValueError(f"Invalid initial release status: '{status}'")
+    ensure_version_fits(version)
+    check_mode_consistency(release_mode, candidate_sha, release_commit_sha, status)
+    settings = project_release_settings(conn, project_id)
+
+    def encoded(value):
+        return None if value is None else _canonical(value)
+
     row = conn.execute(
         releases.insert().values(
             project_id=project_id,
@@ -350,9 +634,14 @@ def insert_record(
             candidate_sha=candidate_sha,
             checkout_root=checkout_root,
             release_commit_sha=release_commit_sha,
-            manifest=None if manifest is None else _canonical(manifest),
-            proof=None if proof is None else _canonical(proof),
+            manifest=encoded(manifest),
+            proof=encoded(proof),
             status=status,
+            release_mode=release_mode,
+            executor=settings["executor"],
+            consent=encoded(consent),
+            proposal=encoded(proposal),
+            render=encoded(render),
             created_at=now,
             updated_at=now,
             completed_at=now if status == "completed" else None,
@@ -369,6 +658,32 @@ def _require_record(conn: sa.Connection, pid: int, project_slug: str, version: s
             f"release_changelog writes it when it stamps the version."
         )
     return row
+
+
+def check_entry_set(conn: sa.Connection, project_id: int, row) -> None:
+    """K-94 B3 — the record's entry set must equal EXACTLY the live entries
+    carrying its version (under the version contract). ValueError naming
+    the difference otherwise; the record is never extended or shrunk."""
+    from dct.core.changelog import _entries_of_version
+
+    recorded = sorted(json.loads(row.entry_ids))
+    carrying = _entries_of_version(conn, project_id, row.version)
+    if recorded == carrying:
+        return
+    extra = sorted(set(carrying) - set(recorded))
+    lost = sorted(set(recorded) - set(carrying))
+    parts = []
+    if extra:
+        parts.append(f"carrying {row.version} but not in the record: "
+                     f"{', '.join(f'#{i}' for i in extra)}")
+    if lost:
+        parts.append(f"in the record but no longer live with {row.version}: "
+                     f"{', '.join(f'#{i}' for i in lost)}")
+    raise ValueError(
+        f"release {row.version}: the database's entry set no longer matches the record "
+        f"({'; '.join(parts)}) — a record is never extended or shrunk to fit; resolve "
+        f"the entries (or abandon the release) before any further effect; nothing done."
+    )
 
 
 # ── readers ───────────────────────────────────────────────────────────────────
@@ -390,14 +705,37 @@ def get_release(engine: sa.Engine, project_slug: str, version: str | None = None
         if version:
             row = find_record(conn, pid, version)
         else:
-            row = conn.execute(
-                sa.select(releases).where(
-                    releases.c.project_id == pid,
-                    releases.c.deleted_at.is_(None),
-                    releases.c.status.not_in(sorted(TERMINAL_STATUSES)),
-                ).order_by(releases.c.created_at.desc(), releases.c.id.desc()).limit(1)
-            ).first()
+            row = _latest_unfinished(conn, pid)
         return record_to_dict(row) if row is not None else None
+
+
+def _latest_unfinished(conn: sa.Connection, pid: int):
+    return conn.execute(
+        sa.select(releases).where(
+            releases.c.project_id == pid,
+            releases.c.deleted_at.is_(None),
+            releases.c.status.not_in(sorted(TERMINAL_STATUSES)),
+        ).order_by(releases.c.created_at.desc(), releases.c.id.desc()).limit(1)
+    ).first()
+
+
+def verify_release_entry_set(
+    engine: sa.Engine, project_slug: str, version: str | None = None
+) -> dict:
+    """K-94 B3 — the pre-effect gate of a resume / retry: the record of
+    `version` (default: the latest unfinished one) whose entry set equals
+    EXACTLY the live entries carrying its version. Returns the record;
+    ValueError when there is no such record or the sets differ (check_entry_set
+    — the record is never extended). Read-only: one consistent snapshot."""
+    if version:
+        version = normalize_version(version)
+    with project_transaction(engine, project_slug) as (conn, pid):
+        row = _require_record(conn, pid, project_slug, version) if version else \
+            _latest_unfinished(conn, pid)
+        if row is None:
+            raise ValueError(f"No unfinished release record in '{project_slug}'.")
+        check_entry_set(conn, pid, row)
+        return record_to_dict(row)
 
 
 # ── writers ───────────────────────────────────────────────────────────────────
@@ -411,11 +749,17 @@ def advance_release(
     *,
     release_commit_sha: str | None = None,
     manifest: Mapping | None = None,
+    release_mode: str | None = None,
+    consent: Mapping | None = None,
+    proposal: Mapping | None = None,
+    render: Mapping | None = None,
 ) -> dict:
     """Record verified progress: move the release record of `version` along
     the state machine and/or record the effects the workflow verified.
 
-    Inside project_transaction(write=True); nothing is written on error.
+    Inside project_transaction(write=True); nothing is written on error, and
+    every check runs before the single UPDATE (a refusal leaves status,
+    manifest and updated_at unchanged).
     - `status` must be a RELEASE_FLOW status: several steps at once are
       allowed (the workflow verified the intermediate effects); the stored
       status again is a no-op; a lower one raises ValueError ("backwards");
@@ -424,11 +768,20 @@ def advance_release(
       stamps completed_at.
     - `release_commit_sha` (hex, 7-64 chars, lowercased) is set ONCE, on the
       move into 'committed' or later; the stored value again is a
-      confirmation, a different one raises ValueError. A record with a
-      candidate_sha (a git release) cannot reach 'committed' or later
-      without it. The candidate_sha itself is immutable — never accepted here.
+      confirmation, a different one raises ValueError. K-94 B1: unless the
+      record's release_mode is 'without_git', no record reaches 'committed'
+      or later (also 'completed') without it — a NULL candidate_sha does not
+      mean "no git". A 'without_git' record refuses a release commit and the
+      git-only statuses (committed / tagged / pushed) and completes only with
+      a manifest (its verified artifacts). The candidate_sha itself is
+      immutable — never accepted here.
     - `manifest` (JSON object, see validate_manifest) is merged write-once
-      per key (merge_manifest).
+      per key (merge_manifest); the MERGED manifest must fit
+      MANIFEST_MAX_BYTES (K-92).
+    - `release_mode`, `consent`, `proposal`, `render` (validate_*) are
+      write-once: recorded when the record has none, the stored value again
+      is a confirmation, a different one raises ValueError (check_unchanged).
+      The executor is fixed at stamp time and never accepted here.
 
     Returns {"release": <record>, "updated": bool} — `updated` False when
     nothing changed (idempotent repeat).
@@ -442,6 +795,12 @@ def advance_release(
     version = normalize_version(version)
     sha = validate_sha(release_commit_sha, "release_commit_sha")
     incoming = validate_manifest(manifest)
+    once = {
+        "release_mode": validate_release_mode(release_mode),
+        "consent": validate_consent(consent),
+        "proposal": validate_proposal(proposal),
+        "render": validate_render(render),
+    }
     with project_transaction(engine, project_slug, write=True) as (conn, pid):
         row = _require_record(conn, pid, project_slug, version)
         moves = check_transition(row.status, status)
@@ -449,6 +808,13 @@ def advance_release(
         values: dict = {}
         if moves:
             values["status"] = status
+
+        for field, given in once.items():
+            stored = getattr(row, field)
+            stored = _load_json(stored) if field in _JSON_FIELDS else stored
+            if not check_unchanged(field, stored, given):
+                values[field] = given if field not in _JSON_FIELDS else _canonical(given)
+        mode = values.get("release_mode", row.release_mode)
 
         commit = row.release_commit_sha
         if sha is not None and sha != commit:
@@ -463,16 +829,25 @@ def advance_release(
                     f"later, not at '{final}'; nothing written."
                 )
             values["release_commit_sha"] = commit = sha
-        if (moves and row.candidate_sha is not None and commit is None
-                and _rank(final) >= _COMMITTED):
+        check_mode_consistency(mode, row.candidate_sha, commit, final)
+        if mode != WITHOUT_GIT and commit is None and _rank(final) >= _COMMITTED and (
+                moves or "release_mode" in values):
             raise ValueError(
                 f"Release {row.version} cannot be '{final}' without its release commit "
-                f"— pass release_commit_sha (the verified commit); nothing written."
+                f"— pass release_commit_sha (the verified commit); only a release "
+                f"recorded with release_mode 'without_git' completes without one; "
+                f"nothing written."
             )
 
         merged, changed = merge_manifest(_load_json(row.manifest), incoming)
         if changed:
             values["manifest"] = _canonical(merged)
+        if mode == WITHOUT_GIT and final == "completed" and not merged and (
+                moves or "release_mode" in values):
+            raise ValueError(
+                f"Release {row.version} (without git) completes only with the manifest "
+                f"of its verified artifacts; nothing written."
+            )
 
         if not values:
             return {"release": record_to_dict(row), "updated": False}
@@ -509,8 +884,10 @@ def abandon_release(
     rewound, no entry is unstamped or unlinked, and the record keeps blocking
     the version — a re-release of V with the same set returns this abandoned
     record (no-op), a different set is refused like for any recorded
-    version. An already-abandoned record is returned unchanged (`updated`
-    False — the first reason and time are kept). Stamps abandoned_at.
+    version. Repeating the abandonment with the SAME reason returns the
+    record unchanged (`updated` False); K-94 B5: a DIFFERENT reason is not a
+    compatible repeat — ValueError naming the recorded reason (the first
+    reason and time are kept). Stamps abandoned_at.
 
     Returns {"release": <record>, "updated": bool}.
     """
@@ -531,7 +908,13 @@ def abandon_release(
     with project_transaction(engine, project_slug, write=True) as (conn, pid):
         row = _require_record(conn, pid, project_slug, version)
         if row.status == ABANDONED:
-            return {"release": record_to_dict(row), "updated": False}
+            if row.abandon_reason == reason:
+                return {"release": record_to_dict(row), "updated": False}
+            raise ValueError(
+                f"Release {row.version} was already abandoned at {row.abandoned_at} with "
+                f"the reason {row.abandon_reason!r} — the first reason stays; a different "
+                f"one is not recorded; nothing written."
+            )
         if row.status == "completed":
             raise ValueError(
                 f"Release {row.version} is completed — a completed release is never "
@@ -574,9 +957,16 @@ def reconstruct_release(
       the version contract.
     - `version` must be a release the database proves: entries carry it, or
       (version-only) it is the project's current_version. Higher than a
-      parseable current_version, an unparseable current_version, or
-      stored spellings that disagree (e.g. both 1.1 and 1.1.0) → refused as
-      ambiguous. The record stores the stored spelling (normalized).
+      parseable current_version or an unparseable current_version →
+      refused.
+    - The record stores the AUTHORITATIVE spelling (K-86 / K-93 A3 —
+      changelog.resolve_version_spelling: the first-stamped entry's
+      spelling, earliest released_at, NULL last, ties → lowest id; else
+      current_version), normalized; the requested spelling is only compared
+      (same_version). Equivalent legacy spellings (1.1 and 1.1.0) are no
+      longer refused; they stay stored as they are. K-87: that FINAL value
+      must fit the schema (ensure_version_fits, widths read from the
+      schema) — ValueError "version too long" otherwise.
     - No live record for the version may exist.
     - `status` ∈ RELEASE_FLOW (never 'abandoned'): the furthest effect the
       workflow verified. `manifest` (validate_manifest) is required from
@@ -584,19 +974,22 @@ def reconstruct_release(
     - Git evidence: `candidate_sha` is REQUIRED; `release_commit_sha` is
       required from 'committed' on and refused below it. A project without
       git passes `without_git=True` instead — then both SHAs must be absent
-      and 'committed' / 'tagged' are refused (no git effects exist).
+      and 'committed' / 'tagged' / 'pushed' are refused (no git effects
+      exist).
     - `checkout_root` (optional, ABSOLUTE, normalize_worktree).
 
     The record gets mode 'reconstructed' (its provenance — the original
-    stamp mode is unknown) and completed_at = now when status is 'completed'.
-    Returns the record.
+    stamp mode is unknown), release_mode 'git' / 'without_git' (from
+    without_git), the project's current release executor (K-85), no consent,
+    proposal or render (unknown for a legacy release) and completed_at = now
+    when status is 'completed'. Returns the record.
     """
     from dct.core.changelog import (
         _dedupe_ids,
         _entries_of_version,
         _parses,
         normalize_worktree,
-        stored_spellings,
+        resolve_version_spelling,
     )
     from dct.core.version import compare_versions
 
@@ -626,9 +1019,9 @@ def reconstruct_release(
                 "without_git=True records a release of a project without git — "
                 "candidate_sha / release_commit_sha must be absent; nothing written."
             )
-        if status in ("committed", "tagged"):
+        if status in GIT_ONLY_STATUSES:
             raise ValueError(
-                f"a release without git has no commit or tag — status '{status}' "
+                f"a release without git has no commit, tag or push — status '{status}' "
                 f"is not reconstructible; nothing written."
             )
     else:
@@ -679,24 +1072,19 @@ def reconstruct_release(
                 f"{carrying} carrying it, requested {ids} — a reconstruction "
                 f"records exactly the stamped set; nothing written."
             )
-        spellings = {normalize_version(v) for v in stored_spellings(conn, pid, version)}
-        if not carrying:
-            if not same_version(current, version):
-                raise ValueError(
-                    f"no entry carries {version} and it is not the current version "
-                    f"({current}) — the database does not prove this release; "
-                    f"nothing written."
-                )
-            spellings = {normalize_version(current)}
-        if len(spellings) != 1:
+        if not carrying and not same_version(current, version):
             raise ValueError(
-                f"version {version} is stored under several spellings "
-                f"({', '.join(sorted(spellings))}) — ambiguous; nothing written."
+                f"no entry carries {version} and it is not the current version "
+                f"({current}) — the database does not prove this release; "
+                f"nothing written."
             )
+        spelling = resolve_version_spelling(conn, pid, version)
+        final = normalize_version(spelling["authoritative"])
         return insert_record(
-            conn, pid, version=spellings.pop(), mode="reconstructed", entry_ids=ids,
+            conn, pid, version=final, mode="reconstructed", entry_ids=ids,
             candidate_sha=candidate, checkout_root=root, now=datetime.now(UTC),
             status=status, release_commit_sha=commit, manifest=recorded_manifest,
+            release_mode=WITHOUT_GIT if without_git else "git",
         )
 
 
