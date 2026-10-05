@@ -71,14 +71,18 @@ bump is chosen (Step 3). In ONE parallel message:
 - `git rev-parse --show-toplevel`, `git rev-parse --git-common-dir`, `git branch --show-current`
 
 Resolve `checkout`, `root` and `F` (section above), then call
-`mcp__dct__get_release(project)` (no version = the latest record that is not
-`completed`):
+`mcp__dct__get_release(project)` (no version = the latest record that is
+neither `completed` nor `abandoned`):
 
 - **A record** → an earlier release did not finish. Show it (`version`,
   `status`, `entry_ids`, `candidate_sha`, `checkout_root`, `created_at`) and
   ask via `AskUserQuestion`: `"Finish release v<version> (resume)"` /
-  `"Stop"`. On resume follow **Resume path** below and do NOT continue with
-  Step 1 — no WIP commit, no new bump.
+  `"Abandon release v<version>"` / `"Stop"`. On resume follow **Resume
+  path** below and do NOT continue with Step 1 — no WIP commit, no new bump.
+  On abandon ask for the reason, then
+  `mcp__dct__abandon_release(version=V, reason=<reason>, confirm=true, project)`
+  — the record, the stamps and `current_version` stay, `V` stays taken; the
+  work is released later under a NEW version.
 - **No record** → the legacy check. With `CUR` = `current_version` set: if
   `git rev-parse -q --verify "refs/tags/v$CUR"` fails, or `F` exists without a
   line starting with `## [CUR]`, the state is AMBIGUOUS — an unfinished
@@ -410,7 +414,7 @@ git add -- <F> <version-synced-files> && git commit -m "release: v<version>"
   recognizes this prefix and bypasses the changelog-presence check.
 
 Then pin the release commit in the record:
-`mcp__dct__advance_release(version=V, status="committed", project, candidate_sha=$(git rev-parse HEAD))`.
+`mcp__dct__advance_release(version=V, status="committed", project, release_commit_sha=$(git rev-parse HEAD))`.
 
 ### Step 9: Tag the release commit, then record `tagged`
 
@@ -488,8 +492,8 @@ the stamp and the record were written together.
    make it per Step 8; HEAD already a commit whose subject is exactly
    `release: v<V>` and whose parent is `candidate_sha` → it exists, skip;
    anything else → STOP. Then
-   `advance_release(version=V, status="committed", project, candidate_sha=<release commit SHA>)`.
-   Status `committed` or later: the record's `candidate_sha` must be a commit
+   `advance_release(version=V, status="committed", project, release_commit_sha=<release commit SHA>)`.
+   Status `committed` or later: the record's `release_commit_sha` must be a commit
    with subject `release: v<V>` that is HEAD or an ancestor of HEAD, else
    STOP.
 5. **Tag** — missing → `git tag v<V> <release commit>`; present and pointing

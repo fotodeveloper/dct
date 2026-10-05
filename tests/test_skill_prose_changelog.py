@@ -212,7 +212,8 @@ def test_every_release_call_passes_version_entry_ids_and_the_pin(text):
 ])
 def test_release_advances_the_record_in_order(text):
     """Normal path: one advance per finished effect, in status order; the
-    move to 'committed' re-pins the release commit."""
+    move to 'committed' records the release commit (K-61: separately — the
+    candidate commit is immutable and never passed to advance_release)."""
     body = text()
     if "**Normal path:**" in body:  # the fallback doc
         normal = _section(body, "**Normal path:**", "**Resume path**")
@@ -222,7 +223,8 @@ def test_release_advances_the_record_in_order(text):
     statuses = [re.search(r'"(\w+)"', c).group(1) for c in calls]
     assert statuses == ["files_written", "committed", "tagged", "completed"]
     committed = calls[1]
-    assert "candidate_sha=$(git rev-parse HEAD" in committed
+    assert "release_commit_sha=$(git rev-parse HEAD" in committed
+    assert not any("candidate_sha" in c for c in calls), calls
 
 
 @pytest.mark.parametrize("text", [

@@ -15,7 +15,7 @@ from dct import __version__, migrate, paths
 from dct.config import Config, load_config, save_config
 from dct.core.engine import bootstrap_engine
 from dct.core.items import TERMINAL_STATUSES
-from dct.core.releases import RELEASE_STATUSES
+from dct.core.releases import RELEASE_FLOW
 from dct.db import create_tables, get_engine
 
 # Windows-policy seam (tests flip it): dispatches the daemonization,
@@ -1211,18 +1211,27 @@ def _print_release_record(record: dict) -> None:
     print(f"Release {record['version']}: {record['status']} (mode: {record['mode']})")
     print(f"  entries:       {ids}")
     print(f"  candidate sha: {record['candidate_sha'] or '-'}")
+    print(f"  release commit: {record['release_commit_sha'] or '-'}")
     print(f"  checkout root: {record['checkout_root'] or '-'}")
+    manifest = record["manifest"] or {}
+    print(f"  manifest:      {', '.join(sorted(manifest)) or '-'}")
+    proof = record["proof"] or {}
+    print(f"  proof:         {len(proof)} of {len(record['entry_ids'])} entries"
+          if proof else "  proof:         -")
     print(f"  created:       {_fmt_date(record['created_at'])}")
     print(f"  updated:       {_fmt_date(record['updated_at'])}")
     if record["completed_at"]:
         print(f"  completed:     {_fmt_date(record['completed_at'])}")
+    if record["abandoned_at"]:
+        print(f"  abandoned:     {_fmt_date(record['abandoned_at'])} — {record['abandon_reason']}")
 
 
 def cmd_clog_release_status(args):
     """`dct clog release-status` — read a release record (read-only, K-41).
 
-    --version V → that release's record; without it → the latest unfinished
-    (not completed) record. Mirrors the get_release MCP tool.
+    --version V → that release's record, whatever its status; without it →
+    the latest unfinished (neither completed nor abandoned) record. Mirrors
+    the get_release MCP tool.
     """
     from dct.core.releases import get_release
 
@@ -1242,7 +1251,9 @@ def cmd_clog_release_status(args):
 
 def cmd_clog_release_advance(args):
     """`dct clog release-advance V STATUS` — move a release record forward
-    (K-41); mirrors the advance_release MCP tool. Errors exit 1."""
+    and/or record the verified release commit (K-41, K-61); mirrors the
+    advance_release MCP tool (candidate_sha is immutable — not accepted;
+    the manifest is written by the release workflow). Errors exit 1."""
     from dct.core.releases import advance_release, get_release
 
     engine = _get_engine()
@@ -1251,7 +1262,7 @@ def cmd_clog_release_advance(args):
         before = get_release(engine, project_slug, args.version)
         out = advance_release(
             engine, project_slug, args.version, args.status,
-            candidate_sha=args.candidate_sha or None,
+            release_commit_sha=args.release_commit_sha or None,
         )
     except Exception as e:
         print(f"✗ Error: {e}", file=sys.stderr)
@@ -1262,6 +1273,30 @@ def cmd_clog_release_advance(args):
         return
     previous = before["status"] if before else "?"
     print(f"✓ Release {record['version']}: {previous} → {record['status']}")
+
+
+def cmd_clog_release_abandon(args):
+    """`dct clog release-abandon V --reason "…" --confirm` — end an unfinished
+    release as abandoned (K-60, ledger only); mirrors the abandon_release MCP
+    tool. Errors exit 1."""
+    from dct.core.releases import abandon_release
+
+    engine = _get_engine()
+    project_slug = args.project or _detect_project(engine)
+    try:
+        out = abandon_release(
+            engine, project_slug, args.version, args.reason or "", confirm=args.confirm,
+        )
+    except Exception as e:
+        print(f"✗ Error: {e}", file=sys.stderr)
+        sys.exit(1)
+    record = out["release"]
+    if not out["updated"]:
+        print(f"✓ Release {record['version']} was already abandoned "
+              f"({record['abandon_reason']})")
+        return
+    print(f"✓ Release {record['version']} abandoned — the record, the stamped entries "
+          f"and current_version stay; release the work under a new version")
 
 
 def cmd_clog_update(args):
@@ -2334,11 +2369,23 @@ def build_parser() -> argparse.ArgumentParser:
         help="Move a release record forward after a verified step "
              "(stamped → files_written → committed → tagged → completed)")
     p_clog_radv.add_argument("version", help="The release (X.Y or X.Y.Z)")
-    p_clog_radv.add_argument("status", choices=RELEASE_STATUSES)
+    p_clog_radv.add_argument("status", choices=RELEASE_FLOW)
     p_clog_radv.add_argument("--project", "-P")
     p_clog_radv.add_argument(
-        "--candidate-sha",
-        help="Re-pin the candidate commit (allowed while the record is below 'committed')")
+        "--release-commit-sha",
+        help="The verified release commit — recorded once, from 'committed' on "
+             "(the candidate commit is immutable)")
+
+    p_clog_rabandon = p_clog_sub.add_parser(
+        "release-abandon",
+        help="End an unfinished release as abandoned (keeps the record, stamps and "
+             "current_version)")
+    p_clog_rabandon.add_argument("version", help="The release (X.Y or X.Y.Z)")
+    p_clog_rabandon.add_argument("--reason", required=True, help="Why (stored on the record)")
+    p_clog_rabandon.add_argument(
+        "--confirm", action="store_true",
+        help="Required: the version stays taken by the abandoned record")
+    p_clog_rabandon.add_argument("--project", "-P")
 
     p_clog_update = p_clog_sub.add_parser(
         "update",
@@ -2620,6 +2667,7 @@ CLOG_COMMAND_MAP = {
     "release": cmd_clog_release,
     "release-status": cmd_clog_release_status,
     "release-advance": cmd_clog_release_advance,
+    "release-abandon": cmd_clog_release_abandon,
     "update": cmd_clog_update,
     "delete": cmd_clog_delete,
     "export": cmd_clog_export,

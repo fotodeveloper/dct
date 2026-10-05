@@ -16,6 +16,7 @@ from sqlalchemy import event
 from dct.core.changelog import add_entry, list_entries, release_entries
 from dct.core.projects import create_project, get_project
 from dct.core.releases import (
+    RELEASE_FLOW,
     RELEASE_STATUSES,
     advance_release,
     get_release,
@@ -392,7 +393,8 @@ def released(proj):
 
 
 def test_statuses_are_ordered_forward():
-    assert RELEASE_STATUSES == ("stamped", "files_written", "committed", "tagged", "completed")
+    assert RELEASE_FLOW == ("stamped", "files_written", "committed", "tagged", "completed")
+    assert RELEASE_STATUSES == (*RELEASE_FLOW, "abandoned")
 
 
 def test_advance_one_step(released):
@@ -403,8 +405,9 @@ def test_advance_one_step(released):
 
 
 def test_advance_multi_step_jump(released):
-    out = advance_release(released, "proj-a", "1.1.0", "committed")
+    out = advance_release(released, "proj-a", "1.1.0", "committed", release_commit_sha=SHA2)
     assert out["release"]["status"] == "committed"
+    assert out["release"]["release_commit_sha"] == SHA2
 
 
 def test_advance_same_status_is_an_idempotent_noop(released):
@@ -416,7 +419,7 @@ def test_advance_same_status_is_an_idempotent_noop(released):
 
 
 def test_advance_backwards_is_refused_without_writes(released):
-    advance_release(released, "proj-a", "1.1.0", "tagged")
+    advance_release(released, "proj-a", "1.1.0", "tagged", release_commit_sha=SHA2)
     before = _snapshot(released)
     with pytest.raises(ValueError, match="backwards"):
         advance_release(released, "proj-a", "1.1.0", "committed")
@@ -425,7 +428,8 @@ def test_advance_backwards_is_refused_without_writes(released):
 
 def test_advance_to_completed_stamps_completed_at_once(released):
     assert get_release(released, "proj-a", "1.1.0")["completed_at"] is None
-    first = advance_release(released, "proj-a", "1.1.0", "completed")["release"]
+    first = advance_release(released, "proj-a", "1.1.0", "completed",
+                            release_commit_sha=SHA2)["release"]
     assert first["completed_at"] is not None
     again = advance_release(released, "proj-a", "1.1.0", "completed")
     assert again["updated"] is False
@@ -462,33 +466,18 @@ def test_advance_is_project_scoped(released):
         advance_release(released, "proj-b", "1.1.0", "files_written")
 
 
-@pytest.mark.parametrize("target", ["stamped", "files_written", "committed"])
-def test_candidate_sha_repin_allowed_before_committed(released, target):
-    """The repin is allowed while the STORED status is below committed — also
-    on the transition INTO committed (the skill pins its release commit)."""
-    out = advance_release(released, "proj-a", "1.1.0", target, candidate_sha=SHA2)
-    assert out["release"]["candidate_sha"] == SHA2
-    assert out["updated"] is True
-
-
-def test_candidate_sha_change_refused_once_committed(released):
-    advance_release(released, "proj-a", "1.1.0", "committed")
-    before = _snapshot(released)
-    with pytest.raises(ValueError, match="candidate_sha cannot change"):
-        advance_release(released, "proj-a", "1.1.0", "tagged", candidate_sha=SHA2)
-    assert _snapshot(released) == before
-
-
-def test_same_candidate_sha_after_committed_is_fine(released):
-    advance_release(released, "proj-a", "1.1.0", "committed")
-    out = advance_release(released, "proj-a", "1.1.0", "tagged", candidate_sha=SHA.upper())
-    assert out["release"]["status"] == "tagged"
-    assert out["release"]["candidate_sha"] == SHA
+def test_advance_no_longer_accepts_a_candidate_sha(released):
+    """K-61: the candidate is the immutable base of the release — no re-pin path."""
+    with pytest.raises(TypeError):
+        advance_release(released, "proj-a", "1.1.0", "committed", candidate_sha=SHA2)
+    assert get_release(released, "proj-a", "1.1.0")["candidate_sha"] == SHA
 
 
 def test_advance_invalid_sha_is_refused(released):
-    with pytest.raises(ValueError, match="candidate_sha"):
-        advance_release(released, "proj-a", "1.1.0", "files_written", candidate_sha="nothex!")
+    before = _snapshot(released)
+    with pytest.raises(ValueError, match="release_commit_sha"):
+        advance_release(released, "proj-a", "1.1.0", "committed", release_commit_sha="nothex!")
+    assert _snapshot(released) == before
 
 
 # ── get_release ───────────────────────────────────────────────────────────────

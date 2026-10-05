@@ -19,7 +19,7 @@ import pytest
 from dct.assets import skills_dir
 from dct.core.changelog import add_entry, release_entries
 from dct.core.projects import create_project
-from dct.core.releases import RELEASE_STATUSES, advance_release, get_release
+from dct.core.releases import RELEASE_FLOW, advance_release, get_release
 
 FALLBACKS = Path(__file__).resolve().parent.parent / "docs" / "assistant-fallbacks.md"
 CANDIDATE = "a" * 40
@@ -53,12 +53,13 @@ RESUME_DOCS = [
 
 
 def _documented_advances(text: str) -> list[tuple[str, bool]]:
-    """(status, re-pins candidate_sha) for each advance_release call, in order."""
+    """(status, records release_commit_sha) for each advance_release call, in order."""
     calls = re.findall(r"advance_release\(((?:[^()]|\([^()]*\))*)\)", text)
     out = []
     for args in calls:
         status = re.search(r'"(\w+)"', args).group(1)
-        out.append((status, "candidate_sha=" in args))
+        assert "candidate_sha=" not in args, f"candidate_sha is immutable (K-61): {args}"
+        out.append((status, "release_commit_sha=" in args))
     return out
 
 
@@ -66,12 +67,12 @@ def _documented_advances(text: str) -> list[tuple[str, bool]]:
 def test_resume_advances_every_effect_in_the_codes_status_order(doc):
     advances = _documented_advances(doc())
     statuses = [s for s, _ in advances]
-    assert all(s in RELEASE_STATUSES for s in statuses), statuses
+    assert all(s in RELEASE_FLOW for s in statuses), statuses
     # Every status after 'stamped' is reachable by a documented resume call,
-    # in the record's forward order.
-    assert statuses == list(RELEASE_STATUSES[1:]), statuses
-    # Only the move into 'committed' re-pins (the release commit SHA).
-    assert [s for s, repin in advances if repin] == ["committed"]
+    # in the record's forward order (never 'abandoned' — that is explicit).
+    assert statuses == list(RELEASE_FLOW[1:]), statuses
+    # Only the move into 'committed' records the release commit.
+    assert [s for s, commit in advances if commit] == ["committed"]
 
 
 @pytest.mark.parametrize("doc", RESUME_DOCS)
@@ -91,36 +92,37 @@ def _interrupted_release(engine, crashed_at: str):
     eid = add_entry(engine, "proj-a", "added", "shipped work")["id"]
     release_entries(engine, "proj-a", "1.1.0", entry_ids=[eid],
                     candidate_sha=CANDIDATE, checkout_root="/tmp/proj-a")
-    for status in RELEASE_STATUSES[1:RELEASE_STATUSES.index(crashed_at) + 1]:
+    for status in RELEASE_FLOW[1:RELEASE_FLOW.index(crashed_at) + 1]:
         sha = RELEASE_COMMIT if status == "committed" else None
-        advance_release(engine, "proj-a", "1.1.0", status, candidate_sha=sha)
+        advance_release(engine, "proj-a", "1.1.0", status, release_commit_sha=sha)
     return eid
 
 
 @pytest.mark.parametrize("doc", RESUME_DOCS)
-@pytest.mark.parametrize("crashed_at", RELEASE_STATUSES[:-1])
+@pytest.mark.parametrize("crashed_at", RELEASE_FLOW[:-1])
 def test_replaying_the_documented_resume_finishes_every_interrupted_release(
     engine, doc, crashed_at,
 ):
     """Interrupt after each effect, then follow the documented walk: an effect
     whose status the record already passed is only verified (no call); every
     other documented advance must be ACCEPTED, and the record ends completed
-    with the release commit pinned."""
+    with the release commit recorded and the candidate untouched."""
     eid = _interrupted_release(engine, crashed_at)
     pending = get_release(engine, "proj-a")  # Step 0: the unfinished record
     assert (pending["version"], pending["status"]) == ("1.1.0", crashed_at)
     assert pending["entry_ids"] == [eid]
 
-    stored = RELEASE_STATUSES.index(crashed_at)
-    for status, repins in _documented_advances(doc()):
-        if RELEASE_STATUSES.index(status) < stored:
+    stored = RELEASE_FLOW.index(crashed_at)
+    for status, records_commit in _documented_advances(doc()):
+        if RELEASE_FLOW.index(status) < stored:
             continue  # "Status X or later: verify only"
-        sha = RELEASE_COMMIT if repins else None
-        advance_release(engine, "proj-a", "1.1.0", status, candidate_sha=sha)
+        sha = RELEASE_COMMIT if records_commit else None
+        advance_release(engine, "proj-a", "1.1.0", status, release_commit_sha=sha)
 
     done = get_release(engine, "proj-a", "1.1.0")
     assert done["status"] == "completed" and done["completed_at"] is not None
-    assert done["candidate_sha"] == RELEASE_COMMIT
+    assert done["release_commit_sha"] == RELEASE_COMMIT
+    assert done["candidate_sha"] == CANDIDATE
     assert done["entry_ids"] == [eid]
     assert get_release(engine, "proj-a") is None, "nothing left to resume"
     # A second resume of the same version is a no-op returning the record.

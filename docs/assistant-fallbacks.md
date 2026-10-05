@@ -246,7 +246,7 @@ where that export is `""` — `## [V] - <date>` followed by the line
     per the project-specific template. Then
     `advance_release(V, "files_written", project)`.
 13. Stage the changelog file `F` + any files modified by the sync script (explicit paths); commit with literal message `release: vX.Y.Z` — no scope, no description, no suffix, no `Changelog:` trailer. Then
-    `advance_release(V, "committed", project, candidate_sha=$(git rev-parse HEAD))`
+    `advance_release(V, "committed", project, release_commit_sha=$(git rev-parse HEAD))`
     — the record now pins the release commit.
 14. **Tag** the release commit: `git tag vX.Y.Z`; then
     `advance_release(V, "tagged", project)`. A tag `vX.Y.Z` that already
@@ -256,7 +256,10 @@ where that export is `""` — `## [V] - <date>` followed by the line
     step they must confirm (`git push origin vX.Y.Z`). Finish with
     `advance_release(V, "completed", project)`.
 
-**Resume path** (a record from `get_release`, status not `completed`): show
+**Resume path** (a record from `get_release`, status neither `completed`
+nor `abandoned`; the owner may instead abandon it —
+`abandon_release(V, reason, confirm=true, project)`, which keeps the record,
+the stamps and `current_version`): show
 the record (`version`, `status`, `entry_ids`, `candidate_sha`,
 `checkout_root`, `created_at`) and get the owner's consent to finish it.
 Then verify each effect against reality, in order, SKIP an effect that
@@ -280,8 +283,8 @@ advance the record after each verified or finished effect:
    the release commit as in step 13; HEAD already a commit with subject
    exactly `release: vV` whose parent is `candidate_sha` → it exists, skip;
    anything else → STOP. Then
-   `advance_release(V, "committed", project, candidate_sha=<release commit SHA>)`.
-   Status `committed` or later: the record's `candidate_sha` must be a commit
+   `advance_release(V, "committed", project, release_commit_sha=<release commit SHA>)`.
+   Status `committed` or later: the record's `release_commit_sha` must be a commit
    with subject `release: vV` that is HEAD or an ancestor of HEAD (else STOP).
 5. Tag: missing → `git tag vV <release commit>`; present and pointing at the
    release commit → skip; pointing elsewhere → STOP. Then

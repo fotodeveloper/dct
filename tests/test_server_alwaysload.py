@@ -30,7 +30,7 @@ EXPECTED_COLD = {
     # changelog edit / delete (#359) — rare, surgical corrections
     "update_changelog", "delete_changelog",
     # release records (K-41) — /release resume + progress, session-edge only
-    "get_release", "advance_release",
+    "get_release", "advance_release", "abandon_release",
 }
 
 

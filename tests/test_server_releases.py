@@ -1,5 +1,6 @@
-"""MCP surface of the durable release record (K-41): release_changelog's
-candidate_sha / checkout_root + `release`, get_release, advance_release."""
+"""MCP surface of the durable release record (K-41, K-60, K-61):
+release_changelog's candidate_sha / checkout_root / proof + `release`,
+get_release, advance_release (release_commit_sha, manifest), abandon_release."""
 
 import json
 
@@ -8,7 +9,8 @@ import pytest
 SHA = "0123456789abcdef0123456789abcdef01234567"
 SHA2 = "fedcba9876543210fedcba9876543210fedcba98"
 RECORD_KEYS = {"id", "version", "mode", "entry_ids", "candidate_sha", "checkout_root",
-               "status", "created_at", "updated_at", "completed_at"}
+               "release_commit_sha", "manifest", "proof", "status", "created_at",
+               "updated_at", "completed_at", "abandoned_at", "abandon_reason"}
 
 
 @pytest.fixture
@@ -76,12 +78,100 @@ def test_advance_release_ack_shape_and_idempotent_repeat(released):
     assert again == {**out, "updated": False}
 
 
-def test_advance_release_repins_sha_before_committed(released):
-    released.advance_release("1.1.0", "committed", project="test", candidate_sha=SHA2)
+def test_advance_release_records_the_release_commit_once(released):
+    out = released.advance_release("1.1.0", "committed", project="test",
+                                   release_commit_sha=SHA2)
+    assert out["updated"] is True
     rec = released.get_release(project="test", version="1.1.0")["release"]
-    assert (rec["status"], rec["candidate_sha"]) == ("committed", SHA2)
-    out = released.advance_release("1.1.0", "tagged", project="test", candidate_sha=SHA)
-    assert "candidate_sha cannot change" in out["error"]
+    assert (rec["status"], rec["candidate_sha"], rec["release_commit_sha"]) == (
+        "committed", SHA, SHA2)
+    out = released.advance_release("1.1.0", "tagged", project="test", release_commit_sha=SHA)
+    assert "cannot change" in out["error"]
+    assert released.get_release(project="test", version="1.1.0")["release"]["status"] == (
+        "committed")
+
+
+def test_advance_release_has_no_candidate_sha_parameter():
+    import inspect
+
+    from dct.mcp.server import advance_release
+
+    params = inspect.signature(advance_release).parameters
+    assert "candidate_sha" not in params
+    assert {"release_commit_sha", "manifest"} <= set(params)
+
+
+def test_advance_release_committed_without_release_commit_is_an_error(released):
+    out = released.advance_release("1.1.0", "committed", project="test")
+    assert "release commit" in out["error"]
+    assert released.get_release(project="test")["release"]["status"] == "stamped"
+
+
+def test_advance_release_manifest_is_write_once_per_key(released):
+    manifest = {"changelog": {"path": "changelog.md", "sha256": "a" * 64}}
+    out = released.advance_release("1.1.0", "files_written", project="test",
+                                   manifest=manifest)
+    assert out["updated"] is True
+    rec = released.get_release(project="test", version="1.1.0")["release"]
+    assert rec["manifest"] == manifest
+    again = released.advance_release("1.1.0", "files_written", project="test",
+                                     manifest=manifest)
+    assert again["updated"] is False
+    other = {"changelog": {"path": "changelog.md", "sha256": "b" * 64}}
+    out = released.advance_release("1.1.0", "files_written", project="test", manifest=other)
+    assert "different value" in out["error"]
+    assert released.get_release(project="test", version="1.1.0")["release"]["manifest"] == (
+        manifest)
+
+
+def test_advance_release_refuses_abandoned_as_a_target(released):
+    out = released.advance_release("1.1.0", "abandoned", project="test")
+    assert "abandon_release" in out["error"]
+    assert released.get_release(project="test")["release"]["status"] == "stamped"
+
+
+def test_abandon_release_ack_and_record(released):
+    refused = released.abandon_release("1.1.0", "superseded", project="test")
+    assert "confirm" in refused["error"]
+    assert "reason" in released.abandon_release(
+        "1.1.0", "  ", confirm=True, project="test")["error"]
+    out = released.abandon_release("1.1.0", "superseded", confirm=True, project="test")
+    assert out == {"project": "test", "version": "1.1.0", "status": "abandoned",
+                   "updated": True}
+    rec = released.get_release(project="test", version="1.1.0")["release"]
+    assert (rec["status"], rec["abandon_reason"]) == ("abandoned", "superseded")
+    assert isinstance(rec["abandoned_at"], str)
+    assert released.get_release(project="test") == {"release": None}
+    again = released.abandon_release("1.1.0", "other", confirm=True, project="test")
+    assert again == {**out, "updated": False}
+
+
+def test_abandon_release_completed_is_an_error(released):
+    released.advance_release("1.1.0", "completed", project="test", release_commit_sha=SHA2)
+    out = released.abandon_release("1.1.0", "late", confirm=True, project="test")
+    assert "never reclassified" in out["error"]
+
+
+def test_abandon_release_markup_is_an_error(released):
+    out = released.abandon_release("1.1.0", "<parameter name=x>", confirm=True,
+                                   project="test")
+    assert "tool-call markup" in out["error"]
+
+
+def test_release_changelog_stores_the_proof_map(srv):
+    a = srv.add_changelog("added", "a", project="test")["id"]
+    out = srv.release_changelog(project="test", version="1.1.0", entry_ids=[a],
+                                proof={str(a): [SHA]})
+    assert out["release"]["proof"] == {str(a): {"commits": [SHA], "merge_commit": None,
+                                                "pr": None}}
+
+
+def test_release_changelog_proof_outside_the_set_is_an_error(srv):
+    a = srv.add_changelog("added", "a", project="test")["id"]
+    out = srv.release_changelog(project="test", version="1.1.0", entry_ids=[a],
+                                proof={str(a + 99): [SHA]})
+    assert "outside the release set" in out["error"]
+    assert srv.count_unreleased_changelog(project="test") == {"count": 1}
 
 
 @pytest.mark.parametrize("version,status,match", [
@@ -94,8 +184,10 @@ def test_advance_release_errors(released, version, status, match):
 
 
 def test_advance_release_backwards_is_an_error(released):
+    released.advance_release("1.1.0", "tagged", project="test", release_commit_sha=SHA2)
+    assert "backwards" in released.advance_release("1.1.0", "committed", project="test")["error"]
     released.advance_release("1.1.0", "completed", project="test")
-    assert "backwards" in released.advance_release("1.1.0", "tagged", project="test")["error"]
+    assert "terminal" in released.advance_release("1.1.0", "tagged", project="test")["error"]
     assert released.get_release(project="test") == {"release": None}  # all completed
 
 
@@ -106,7 +198,7 @@ def test_advance_release_unknown_project_is_an_error(srv):
 def test_new_release_tools_are_deferred():
     from dct.mcp.server import _ALWAYS_LOAD_TOOLS
 
-    assert not {"get_release", "advance_release"} & _ALWAYS_LOAD_TOOLS
+    assert not {"get_release", "advance_release", "abandon_release"} & _ALWAYS_LOAD_TOOLS
 
 
 # ── K-62: a new version-only release must be explicit over MCP too ───────────

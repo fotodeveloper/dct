@@ -397,6 +397,7 @@ def release_entries(
     entry_ids: Iterable[int] | None = None,
     candidate_sha: str | None = None,
     checkout_root: str | None = None,
+    proof: Mapping | None = None,
 ) -> dict:
     """Stamp changelog entries with a version, set the project's current_version
     and write the durable release record (K-41) — ONE transaction.
@@ -425,6 +426,14 @@ def release_entries(
     `candidate_sha` (hex commit id, 7-64 chars, stored lowercased) and
     `checkout_root` (ABSOLUTE path, normalize_worktree) are pinned in the
     record; both are validated BEFORE any read or write (ValueError).
+    K-61: the candidate_sha of a record is IMMUTABLE — no later call
+    re-pins it (core.releases.advance_release records the release commit
+    separately as release_commit_sha).
+    `proof` (K-70, optional): the proof map {entry id: [proving commit
+    SHAs] or {commits, merge_commit, pr}} — shape checked before any read
+    (core.releases.validate_proof); every entry it names must be in the
+    resolved set (else ValueError); stored in the NEW record only (a re-run
+    returning an existing record ignores it, like candidate_sha).
 
     The call's RESOLVED SET: 'selected' → the given ids; 'version_only' → [];
     'all' → the live entries already carrying V plus every unreleased entry.
@@ -444,7 +453,12 @@ def release_entries(
     from `version`. (2) a non-empty current_version that does not parse
     under the contract (a legacy value such as `2.0.0-rc1`) → refused:
     without a parseable baseline the never-rewind guard cannot run (K-54);
-    a bump from it is refused the same way. (3) V lower than current_version
+    a bump from it is refused the same way. (2b) K-61 — the record's set
+    must be EXACTLY every live entry carrying V: in modes 'selected' and
+    'version_only' an entry that already carries V (a legacy stamp) but is
+    missing from the request → ValueError naming it, BEFORE stamping —
+    never a silent extension of the selection ('all' includes them by
+    construction). (3) V lower than current_version
     → refused, releases never rewind. (4) mode 'all' with nothing to stamp →
     refused (see above). (5) stamp the
     not-yet-stamped entries (version, released_at, updated_at), set
@@ -471,6 +485,7 @@ def release_entries(
     if version:
         version = normalize_version(version)
     sha = release_records.validate_candidate_sha(candidate_sha)
+    proof_map = release_records.validate_proof(proof)
     root = normalize_worktree(checkout_root)
     ensure_fits(release_records.releases, {"checkout_root": root})
     ids = None if entry_ids is None else _dedupe_ids(entry_ids)
@@ -558,6 +573,16 @@ def release_entries(
             return result
         if current and not _parses(current):
             raise _unsupported_current(project_slug, current)
+        if mode != "all":
+            omitted = sorted(set(_entries_of_version(conn, pid, version)) - set(resolved))
+            if omitted:
+                raise ValueError(
+                    f"Changelog entries already carrying {version} are missing from the "
+                    f"requested set: {', '.join(f'#{i}' for i in omitted)} — a release "
+                    f"record holds EVERY entry of its version; request them too; "
+                    f"nothing released."
+                )
+        release_records.check_proof_scope(proof_map, resolved)
         if current and compare_versions(version, current) < 0:
             raise ValueError(
                 f"Version {version} is lower than the current version {current} of "
@@ -590,7 +615,7 @@ def release_entries(
         )
         result["release"] = release_records.insert_record(
             conn, pid, version=version, mode=mode, entry_ids=resolved,
-            candidate_sha=sha, checkout_root=root, now=now,
+            candidate_sha=sha, checkout_root=root, now=now, proof=proof_map,
         )
         result["released"] = released
         result["current_version"] = version

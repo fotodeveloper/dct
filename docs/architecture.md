@@ -22,13 +22,13 @@ Register dct once and it is available in every Claude Code session. Opening a ne
 SQLAlchemy Core tables (not the ORM) with a `deleted_at` column for soft deletes (ledger pattern — nothing is ever hard-deleted). 14 tables:
 
 **Core**:
-- `projects` — slug, name, path, current_version, manages_changelog, changelog_path
+- `projects` — slug, name, path, current_version, manages_changelog, changelog_path, version_files / version_files_confirmed_at / version_files_history (K-73: the owner-confirmed JSON list of repo-relative files a release must change; NULL = not learned; every replaced list is appended to the history)
 - `items` — project_id, type, title, short_title (nullable 50-char label, #817), priority, status, component, source_file, source_lines, resolution, tags (**DEPRECATED** — see below). Sprint membership is **not** a column: `in_current_sprint` is derived at read time from `item_sprints` (#216 dropped the legacy boolean).
 - `item_notes` — item_id, note (append-only)
 - `item_checkpoints` — item_id, text, status, kind, sort_order
 - `changelog_entries` — project_id, version, category, entry, component, source_file, source_lines, related_item_id, branch / worktree / branch_source (nullable git context the entry was written on, #801; `branch_source` = `client` or `server`)
 - `session_handoffs` — project_id, prompt, context_summary, scope, created_by, consumed_at, consumed_by
-- `releases` — durable release records (K-41): project_id, version (normalized), mode, entry_ids (JSON array of the exact set, `[]` = version-only), candidate_sha, checkout_root, status (forward only: stamped → files_written → committed → tagged → completed), completed_at; one live record per (project, version). Written in the same transaction as the stamp (`release_entries`), advanced by `core/releases.advance_release`.
+- `releases` — durable release records (K-41): project_id, version (normalized), mode, entry_ids (JSON array of the exact set, `[]` = version-only), candidate_sha (immutable), checkout_root, release_commit_sha (set once), manifest (JSON object of verified artifacts, write-once per key), proof (JSON map entry id → proving commits / merge commit / PR), status (one state machine, `core/releases.TRANSITIONS`: stamped → files_written → committed → tagged → completed, plus terminal `abandoned` from any unfinished status), completed_at, abandoned_at, abandon_reason; one live record per (project, version). Written in the same transaction as the stamp (`release_entries`) — or, for a release older than records, by `reconstruct_release` without re-stamping — advanced by `core/releases.advance_release`, ended by `abandon_release`.
 
 **Plans / sprints / decisions**:
 - `plans` — ulid, project_id, slug, title, kind, source_file, source_hash, status, sprint_id, imported_at
@@ -56,6 +56,7 @@ Full DDL lives in:
 - `migrations/005_items_short_title.sql`
 - `migrations/006_changelog_branch.sql`
 - `migrations/007_releases.sql`
+- `migrations/008_release_ledger.sql`
 
 At runtime, the engine creates every MISSING table with all its indexes (`_create_missing_tables` — race-safe against a concurrent bootstrap: a duplicate table / index / relation error rolls the attempt back, the whole schema of those tables is re-checked and finished, at most `SCHEMA_CREATE_ATTEMPTS` tries, any other error propagates; tables that already exist are left to the explicit blocks below) plus an idempotent `_apply_schema_updates()` that:
 - adds later columns in place (e.g. `item_checkpoints.kind` for gate checkpoints; new columns go through the duplicate-safe `_add_column_if_missing` — `ADD COLUMN IF NOT EXISTS` under a 5 s `lock_timeout` on PostgreSQL, a re-checked "duplicate column" error on SQLite),

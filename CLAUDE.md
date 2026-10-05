@@ -61,8 +61,11 @@ dct/db.py                — SQLAlchemy Core tables + engine factory + migration
 dct/core/projects.py     — Projects CRUD (+ realpath-canonical CWD detection)
 dct/core/items.py        — Items / notes / checkpoints CRUD
 dct/core/changelog.py    — Changelog entries CRUD + release stamping
-dct/core/releases.py     — Durable release records (K-41): written with the
-                           stamp, advanced forward-only by the release workflow
+dct/core/releases.py     — Release ledger (K-41/K-60/K-61): records written with
+                           the stamp, one state machine (TRANSITIONS; advance,
+                           abandon), immutable candidate, write-once release
+                           commit / manifest / proof, legacy reconstruction,
+                           the project's version-file contract (K-73)
 dct/core/sprint.py       — Current-sprint ops; delegates to item_sprints
 dct/core/sprints.py      — First-class sprints (single source of truth)
 dct/core/handoff.py      — Session handoffs (cross-session prompt ledger)
@@ -85,7 +88,7 @@ dct/services/            — Service layer (reserved for future shared app ops)
 dct/workflows/session.py — G1 composed ops: get_context_snapshot /
                            pickup_work / handoff_work (one impl for MCP,
                            CLI and skills; single transaction each)
-dct/mcp/server.py        — MCP server, SDK 2.2 MCPServer (59 tools);
+dct/mcp/server.py        — MCP server, SDK 2.2 MCPServer (60 tools);
                            dct/server.py is a compat shim
 dct/cli.py               — argparse CLI entry point
 dct/export.py            — Keep a Changelog MD export

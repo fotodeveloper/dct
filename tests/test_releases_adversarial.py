@@ -26,7 +26,7 @@ import sqlalchemy as sa
 from dct.core import releases as release_records
 from dct.core.changelog import add_entry, list_entries, release_entries
 from dct.core.projects import create_project, get_project
-from dct.core.releases import RELEASE_STATUSES, advance_release, get_release
+from dct.core.releases import RELEASE_FLOW, advance_release, get_release
 from dct.core.version import (
     bump,
     compare_versions,
@@ -324,13 +324,15 @@ def test_release_with_an_out_of_contract_version_writes_nothing(proj, raw):
 # ── advance_release: every (from, to) pair ───────────────────────────────────
 
 
-@pytest.mark.parametrize("start,target", list(itertools.product(RELEASE_STATUSES, repeat=2)))
+@pytest.mark.parametrize("start,target", list(itertools.product(RELEASE_FLOW, repeat=2)))
 def test_advance_moves_forward_only_for_every_status_pair(proj, start, target):
+    """The forward flow; 'abandoned' and the terminal rules are covered pair
+    by pair in test_release_ledger.py."""
     release_entries(proj, "proj-a", "1.1.0", entry_ids=[])
     advance_release(proj, "proj-a", "1.1.0", start)
     before = _snapshot(proj)
-    if RELEASE_STATUSES.index(target) < RELEASE_STATUSES.index(start):
-        with pytest.raises(ValueError, match="backwards"):
+    if RELEASE_FLOW.index(target) < RELEASE_FLOW.index(start):
+        with pytest.raises(ValueError, match="backwards|terminal"):
             advance_release(proj, "proj-a", "1.1.0", target)
         assert _snapshot(proj) == before
         assert get_release(proj, "proj-a", "1.1.0")["status"] == start

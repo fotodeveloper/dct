@@ -72,6 +72,15 @@ projects = sa.Table(
     # /release resolves {path}/{changelog_path}. Constrained to the project root
     # by set_changelog_path (leading '/' stripped, '..' escape rejected).
     sa.Column("changelog_path", sa.String(500), nullable=False, server_default="changelog.md"),
+    # K-73: the project's version-file contract — JSON array of repo-relative
+    # paths the release's version sync must change (NULL = not learned yet,
+    # [] = learned: none). Set only with explicit confirmation
+    # (core/releases.set_version_files); every replaced contract is appended
+    # to version_files_history (JSON array of {version_files, confirmed_at,
+    # replaced_at}) — the ledger of earlier contracts.
+    sa.Column("version_files", sa.Text),
+    sa.Column("version_files_confirmed_at", sa.DateTime),
+    sa.Column("version_files_history", sa.Text),
     sa.Column("created_at", sa.DateTime, nullable=False, server_default=sa.text("CURRENT_TIMESTAMP")),
     sa.Column("updated_at", sa.DateTime, nullable=False, server_default=sa.text("CURRENT_TIMESTAMP")),
     sa.Column("deleted_at", sa.DateTime),
@@ -333,8 +342,13 @@ decisions = sa.Table(
 # One row per release of a project version, written in the SAME transaction as
 # the changelog stamp (core/changelog.release_entries) and advanced
 # forward-only by the release workflow (core/releases.advance_release):
-# stamped → files_written → committed → tagged → completed. `entry_ids` is the
-# JSON array of the release's exact entry set ([] for a version-only release).
+# stamped → files_written → committed → tagged → completed, or ended by an
+# explicit abandon_release (status 'abandoned', K-60) — the state machine lives
+# in core/releases.TRANSITIONS. `entry_ids` is the JSON array of the release's
+# exact entry set ([] for a version-only release). K-61: `candidate_sha` is
+# immutable once written; `release_commit_sha` is set once. `manifest` (JSON
+# object: the expected artifacts and their content hashes) and `proof` (JSON
+# object: entry id → proving commits) are write-once per key.
 releases = sa.Table(
     "releases",
     metadata,
@@ -345,10 +359,15 @@ releases = sa.Table(
     sa.Column("entry_ids", sa.Text, nullable=False),  # JSON array of ints
     sa.Column("candidate_sha", sa.String(64)),
     sa.Column("checkout_root", sa.String(500)),  # normalize_worktree
+    sa.Column("release_commit_sha", sa.String(64)),
+    sa.Column("manifest", sa.Text),  # JSON object, NULL = no effect recorded yet
+    sa.Column("proof", sa.Text),  # JSON object {entry id: {commits, merge_commit, pr}}
     sa.Column("status", sa.String(16), nullable=False),
     sa.Column("created_at", sa.DateTime, nullable=False, server_default=sa.text("CURRENT_TIMESTAMP")),
     sa.Column("updated_at", sa.DateTime, nullable=False, server_default=sa.text("CURRENT_TIMESTAMP")),
     sa.Column("completed_at", sa.DateTime),
+    sa.Column("abandoned_at", sa.DateTime),
+    sa.Column("abandon_reason", sa.Text),
     sa.Column("deleted_at", sa.DateTime),
     *_provenance_columns(),
 )
@@ -717,6 +736,25 @@ def _add_column_if_missing(
     return True
 
 
+# Columns _apply_schema_updates heals onto an existing database (K-60, K-61,
+# K-73) — table → [(column, DDL type)]. TIMESTAMP is portable (SQLite stores
+# the value as SQLAlchemy's DateTime would).
+RELEASE_LEDGER_COLUMNS: dict[str, tuple[tuple[str, str], ...]] = {
+    "releases": (
+        ("release_commit_sha", "VARCHAR(64)"),
+        ("manifest", "TEXT"),
+        ("proof", "TEXT"),
+        ("abandoned_at", "TIMESTAMP"),
+        ("abandon_reason", "TEXT"),
+    ),
+    "projects": (
+        ("version_files", "TEXT"),
+        ("version_files_confirmed_at", "TIMESTAMP"),
+        ("version_files_history", "TEXT"),
+    ),
+}
+
+
 def _apply_schema_updates(engine: sa.Engine) -> None:
     """Idempotent schema updates for existing DBs (lightweight migration runner).
 
@@ -757,6 +795,21 @@ def _apply_schema_updates(engine: sa.Engine) -> None:
         ):
             if column not in cl_cols:
                 _add_column_if_missing(engine, "changelog_entries", column, ddl_type)
+
+    # K-60/K-61: release-record columns added after the `releases` table
+    # first shipped on development databases, and K-73: the project's
+    # version-file contract. Nullable, no backfill (an older record simply has
+    # no release commit / manifest / proof yet). Each column is healed
+    # independently by the duplicate-safe helper; the inspector check keeps
+    # bootstraps 2-3 free of DDL.
+    tables_now = set(inspector.get_table_names())
+    for table, additions in RELEASE_LEDGER_COLUMNS.items():
+        if table not in tables_now:
+            continue
+        present = {c["name"] for c in inspector.get_columns(table)}
+        for column, ddl_type in additions:
+            if column not in present:
+                _add_column_if_missing(engine, table, column, ddl_type)
 
     # #222: opt-in changelog enforcement. Add projects.manages_changelog and,
     # on first add, backfill — a project KEEPS enforcement only if it already

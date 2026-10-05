@@ -1,5 +1,6 @@
-"""CLI surface of the durable release record (K-41): `clog release` pins the
-checkout's HEAD + root, `clog release-status`, `clog release-advance`."""
+"""CLI surface of the durable release record (K-41, K-60, K-61): `clog release`
+pins the checkout's HEAD + root, `clog release-status`, `clog release-advance`,
+`clog release-abandon`."""
 
 import shutil
 from pathlib import Path
@@ -190,9 +191,19 @@ def test_release_status_without_version_shows_the_unfinished_one(recorded, monke
 
 def test_release_status_none_unfinished(recorded, monkeypatch, capsys):
     engine, _ = recorded
-    advance_release(engine, "proj-v", "1.1.0", "completed")
+    advance_release(engine, "proj-v", "1.1.0", "completed", release_commit_sha="1234567")
     run_cli(monkeypatch, ["clog", "release-status", "-P", "proj-v"])
     assert "No unfinished release" in capsys.readouterr().out
+
+
+def test_release_status_shows_the_ledger_fields(recorded, monkeypatch, capsys):
+    engine, _ = recorded
+    advance_release(engine, "proj-v", "1.1.0", "committed", release_commit_sha="1234567",
+                    manifest={"changelog": {"sha256": "a" * 64}, "tree": "b" * 40})
+    run_cli(monkeypatch, ["clog", "release-status", "--version", "1.1.0", "-P", "proj-v"])
+    out = capsys.readouterr().out
+    assert "release commit: 1234567" in out
+    assert "manifest:      changelog, tree" in out
 
 
 def test_release_status_unknown_version(recorded, monkeypatch, capsys):
@@ -218,17 +229,61 @@ def test_release_advance_moves_forward_and_repeat_is_a_noop(recorded, monkeypatc
     assert "unchanged" in capsys.readouterr().out
 
 
-def test_release_advance_repins_sha(recorded, monkeypatch):
+def test_release_advance_records_the_release_commit(recorded, monkeypatch):
     engine, _ = recorded
     run_cli(monkeypatch, ["clog", "release-advance", "1.1.0", "committed", "-P", "proj-v",
-                          "--candidate-sha", "1234567"])
+                          "--release-commit-sha", "1234567"])
     rec = get_release(engine, "proj-v", "1.1.0")
-    assert (rec["status"], rec["candidate_sha"]) == ("committed", "1234567")
+    assert (rec["status"], rec["candidate_sha"], rec["release_commit_sha"]) == (
+        "committed", "abcdef0", "1234567")
+
+
+def test_release_advance_has_no_candidate_sha_option(recorded, monkeypatch):
+    assert _exit_code(monkeypatch, ["clog", "release-advance", "1.1.0", "committed",
+                                    "-P", "proj-v", "--candidate-sha", "1234567"]) == 2
+    assert get_release(recorded[0], "proj-v", "1.1.0")["candidate_sha"] == "abcdef0"
+
+
+def test_release_advance_rejects_abandoned_at_the_parser(recorded, monkeypatch):
+    assert _exit_code(monkeypatch, ["clog", "release-advance", "1.1.0", "abandoned",
+                                    "-P", "proj-v"]) == 2
+
+
+# ── clog release-abandon ─────────────────────────────────────────────────────
+
+
+def test_release_abandon_needs_confirm(recorded, monkeypatch, capsys):
+    engine, _ = recorded
+    assert _exit_code(monkeypatch, ["clog", "release-abandon", "1.1.0", "--reason", "x",
+                                    "-P", "proj-v"]) == 1
+    assert "confirm" in capsys.readouterr().err
+    assert get_release(engine, "proj-v", "1.1.0")["status"] == "stamped"
+
+
+def test_release_abandon_needs_a_reason_at_the_parser(recorded, monkeypatch):
+    assert _exit_code(monkeypatch, ["clog", "release-abandon", "1.1.0", "--confirm",
+                                    "-P", "proj-v"]) == 2
+
+
+def test_release_abandon_keeps_everything_and_repeat_is_a_noop(recorded, monkeypatch, capsys):
+    engine, a = recorded
+    run_cli(monkeypatch, ["clog", "release-abandon", "1.1.0", "--reason", "broken build",
+                          "--confirm", "-P", "proj-v"])
+    assert "abandoned" in capsys.readouterr().out
+    rec = get_release(engine, "proj-v", "1.1.0")
+    assert (rec["status"], rec["abandon_reason"], rec["entry_ids"]) == (
+        "abandoned", "broken build", [a])
+    assert get_project(engine, "proj-v")["current_version"] == "1.1.0"
+    run_cli(monkeypatch, ["clog", "release-abandon", "1.1.0", "--reason", "again",
+                          "--confirm", "-P", "proj-v"])
+    assert "already abandoned (broken build)" in capsys.readouterr().out
+    run_cli(monkeypatch, ["clog", "release-status", "--version", "1.1.0", "-P", "proj-v"])
+    assert "abandoned:" in capsys.readouterr().out
 
 
 def test_release_advance_backwards_exits_nonzero(recorded, monkeypatch, capsys):
     engine, _ = recorded
-    advance_release(engine, "proj-v", "1.1.0", "tagged")
+    advance_release(engine, "proj-v", "1.1.0", "tagged", release_commit_sha="1234567")
     assert _exit_code(monkeypatch, ["clog", "release-advance", "1.1.0", "committed",
                                     "-P", "proj-v"]) == 1
     assert "backwards" in capsys.readouterr().err
