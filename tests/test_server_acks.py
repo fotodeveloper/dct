@@ -291,8 +291,11 @@ def test_resolve_item_unknown_id_error_unchanged(srv):
 
 
 def test_add_changelog_ack_shape(srv):
-    out = srv.add_changelog("added", "shipped a slim ack layer", project="test", component="server")
-    assert set(out) == {"id", "project", "category", "component"}
+    out = srv.add_changelog("added", "shipped a slim ack layer", project="test", component="server",
+                            branch="feat/x", worktree="/tmp/test")
+    assert set(out) == {"id", "project", "category", "component", "branch", "branch_source"}
+    assert out["branch"] == "feat/x"
+    assert out["branch_source"] == "client"
     assert out["project"] == "test"
     assert out["category"] == "added"
     assert out["component"] == "server"
@@ -301,13 +304,45 @@ def test_add_changelog_ack_shape(srv):
 
 def test_add_changelog_component_may_be_null(srv):
     out = srv.add_changelog("fixed", "a bug", project="test")
-    assert set(out) == {"id", "project", "category", "component"}
+    assert set(out) == {"id", "project", "category", "component", "branch", "branch_source"}
     assert out["component"] is None
+    # /tmp/test is not a checkout containing the test process cwd → unknown.
+    assert out["branch"] is None and out["branch_source"] is None
 
 
 def test_add_changelog_markup_rejected(srv):
     out = srv.add_changelog("added", "<invoke name=x> broken", project="test")
     assert "error" in out and "Malformed MCP tool call" in out["error"]
+
+
+# ── release / update / delete changelog (#801, #359) ─────────────────────────
+
+
+_RELEASE_KEYS = {"project", "version", "current_version", "mode", "entry_ids",
+                 "released", "already_released"}
+
+
+def test_release_changelog_return_shape_selected(srv):
+    a = srv.add_changelog("added", "a", project="test")["id"]
+    out = srv.release_changelog(project="test", version="1.0.0", entry_ids=[a])
+    assert set(out) == _RELEASE_KEYS
+    assert out == {"project": "test", "version": "1.0.0", "current_version": "1.0.0",
+                   "mode": "selected", "entry_ids": [a], "released": 1,
+                   "already_released": []}
+
+
+def test_update_changelog_ack_shape(srv):
+    eid = srv.add_changelog("added", "old", project="test")["id"]
+    out = srv.update_changelog(eid, project="test", entry="new body text", category="fixed")
+    assert out == {"id": eid, "project": "test", "updated_fields": ["entry", "category"]}
+    assert "entry" not in out
+
+
+def test_delete_changelog_ack(srv):
+    eid = srv.add_changelog("added", "x", project="test")["id"]
+    assert srv.delete_changelog(eid, project="test") == {"deleted": True, "id": eid}
+    assert srv.count_unreleased_changelog(project="test") == {"count": 0}
+    assert set(srv.delete_changelog(eid, project="test")) == {"error"}
 
 
 # ── handoff tools ─────────────────────────────────────────────────────────────

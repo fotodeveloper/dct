@@ -125,10 +125,22 @@ while IFS= read -r file; do
   esac
 done <<< "$staged"
 
-# If no changelog file staged, check dct database for unreleased entries
+# If no changelog file staged, check dct database for unreleased entries of
+# THIS branch (#801) — entries written on other branches describe code this
+# commit does not contain, so they do not satisfy the gate; entries with no
+# recorded branch (pre-tracking / undetected) still count.
+# Version skew: an older dct rejects --branch → fall back to the project-wide
+# count. Fail-open: if even that yields no integer (dct or its database is
+# broken), let the commit through — a hook must never block the host
+# operation because of its own failure. Never pass an empty --branch.
+branch=""
 if [ "$has_changelog" = false ]; then
-  count=$(dct clog count --project "$project" 2>/dev/null)
-  if [ "${count:-0}" -gt 0 ]; then
+  branch=$(git branch --show-current 2>/dev/null)
+  count=""
+  [ -n "$branch" ] && count=$(dct clog count --project "$project" --branch "$branch" --include-unbranched 2>/dev/null)
+  case "$count" in ''|*[!0-9]*) count=$(dct clog count --project "$project" 2>/dev/null);; esac
+  case "$count" in ''|*[!0-9]*) exit 0;; esac
+  if [ "$count" -gt 0 ]; then
     has_changelog=true
   fi
 fi
@@ -138,6 +150,15 @@ if [ "$has_changelog" = true ]; then
 fi
 
 # Block the commit
-reason="App code staged but no changelog entry found for project '$project'. Add a changelog entry with /clog or stage a changelog file."
-echo "{\"hookSpecificOutput\":{\"hookEventName\":\"PreToolUse\",\"permissionDecision\":\"deny\",\"permissionDecisionReason\":\"$reason\"}}"
+reason="App code staged but no changelog entry found for project '$project'"
+if [ -n "$branch" ]; then
+  reason="$reason on branch '$branch'. Unreleased entries written on other branches do not count — move one here with: dct clog update <id> --branch $branch."
+else
+  reason="$reason."
+fi
+reason="$reason Add a changelog entry with /clog or stage a changelog file."
+# jq builds the JSON: a branch name may legally contain '"', which string
+# interpolation would turn into invalid JSON (jq is a hard dependency above).
+jq -cn --arg reason "$reason" \
+  '{hookSpecificOutput: {hookEventName: "PreToolUse", permissionDecision: "deny", permissionDecisionReason: $reason}}'
 exit 2

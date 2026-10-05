@@ -27,6 +27,8 @@ EXPECTED_COLD = {
     "list_sprints", "ingest_plan_file", "supersede_decision",
     # tag dictionary admin (#611) — tagging itself rides on the hot item tools
     "add_tag", "list_tags", "merge_tag",
+    # changelog edit / delete (#359) — rare, surgical corrections
+    "update_changelog", "delete_changelog",
 }
 
 

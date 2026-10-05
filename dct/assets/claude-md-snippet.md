@@ -54,11 +54,11 @@ Rules of thumb:
 - `idea` = exploratory, not yet decided to build
 - `improvement` = existing thing works but could be better (refactor, UX polish, perf)
 
-**MCP tools** — 55 total; most important:
+**MCP tools** — 57 total; most important:
 - `pickup_work`, `handoff_work`, `get_context_snapshot` — composed session-edge ops; prefer them over chaining the granular tools below
 - `list_projects`, `list_items`, `get_item`, `create_item`, `update_item`, `resolve_item`, `add_note`
 - `add_checkpoint`, `list_checkpoints`, `complete_checkpoint`, `reject_checkpoint`, `reopen_checkpoint`
-- `add_changelog`, `list_changelog`, `count_unreleased_changelog`, `release_changelog`, `export_changelog`
+- `add_changelog`, `list_changelog`, `count_unreleased_changelog`, `release_changelog`, `update_changelog`, `delete_changelog`, `export_changelog`
 - `set_sprint`, `clear_sprint`, `review_sprint`, `list_sprints`, `update_sprint`
 - `create_handoff`, `list_handoffs`, `get_handoff`, `consume_handoff`, `delete_handoff`
 - `add_tag`, `list_tags`, `merge_tag` — global tag dictionary admin (deferred; load via ToolSearch)

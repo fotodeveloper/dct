@@ -1,6 +1,6 @@
 # dct — MCP Tools Reference
 
-Complete catalogue of the **55 MCP tools** the dct server exposes to Claude Code, grouped by domain. ← back to the [README](../README.md).
+Complete catalogue of the **57 MCP tools** the dct server exposes to Claude Code, grouped by domain. ← back to the [README](../README.md).
 
 The dct MCP server is registered at **user scope** (`~/.claude.json`), so every tool below is callable from any Claude Code session as `mcp__dct__<name>`. Most list/create tools accept an empty `project=""` and auto-detect the project from the session's working directory (longest-prefix match); pass `project=<slug>` to override.
 
@@ -45,14 +45,20 @@ Project registration, rename, version, and changelog-location changes are **CLI-
 | `reopen_checkpoint` | Revert a checkpoint back to pending, typically from done. |
 | `list_checkpoints` | List checkpoints for an item in sort order. |
 
-## Changelog (5)
+## Changelog (7)
+
+Entries carry the git `branch` / `worktree` they were written on (`branch_source`
+= `client` when the caller supplied them, `server` when the MCP server detected
+them in its own cwd; null = unknown).
 
 | Tool | Purpose |
 |---|---|
-| `add_changelog` | Add an unreleased changelog entry (version stays NULL until release). |
-| `list_changelog` | List changelog entries for a project. |
-| `count_unreleased_changelog` | Count unreleased entries (used by the commit gate). |
-| `release_changelog` | Stamp every unreleased entry with a version and bump `current_version`. |
+| `add_changelog` | Add an unreleased changelog entry (version stays NULL until release); pass `branch` / `worktree`. |
+| `list_changelog` | List changelog entries for a project; optional `branch` / `worktree` / `include_unbranched` filters. |
+| `count_unreleased_changelog` | Count unreleased entries (used by the commit gate); same optional filters. |
+| `release_changelog` | Stamp all unreleased entries, an explicit `entry_ids` set, or none (`[]`, version only) and set `current_version` — idempotent, never rewinds. |
+| `update_changelog` | Amend an unreleased entry (text, category, component, source, related item, branch, worktree). Deferred. |
+| `delete_changelog` | Soft-delete an unreleased entry. Deferred. |
 | `export_changelog` | Export changelog as Keep a Changelog markdown. |
 
 ## Sprints (11)
@@ -177,7 +183,10 @@ Write ops return a minimal ack, not the full record. `get_item` / `get_handoff` 
 | `add_note` | `{id, item_id, item_title}` |
 | `add_checkpoint` | `{id, item_id, item_title, kind, status, sort_order}` |
 | `complete_checkpoint` / `reject_checkpoint` / `reopen_checkpoint` | `{id, item_id, status, progress}` |
-| `add_changelog` | `{id, project, category, component}` |
+| `add_changelog` | `{id, project, category, component, branch, branch_source}` |
+| `update_changelog` | `{id, project, updated_fields}` |
+| `delete_changelog` | `{deleted, id}` |
+| `release_changelog` | `{project, version, current_version, mode, entry_ids, released, already_released}` (+ `warning`) |
 | `create_handoff` | `{id, project, scope, created_at}` |
 | `handoff_work` | `{handoff_id, project, scope, created_at, sprint: {sprint_id, code, open_size, items} \| null}` — no prompt echo |
 | `pickup_work` | snapshot + `{picked_up: full handoff \| null, consumed: bool}` (read-heavy op — not a slim ack) |
@@ -196,4 +205,4 @@ Write ops return a minimal ack, not the full record. `get_item` / `get_handoff` 
 
 ---
 
-**Total: 55 tools.** This list is generated from `dct/mcp/server.py`; if it drifts, `dct server` prints the live set.
+**Total: 57 tools.** This list is generated from `dct/mcp/server.py`; if it drifts, `dct server` prints the live set.

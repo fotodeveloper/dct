@@ -8,6 +8,7 @@ seam through which a test file reaches the in-memory DB — is stated once.
 
 import os
 import re
+import subprocess
 import sys
 
 import pytest
@@ -279,3 +280,25 @@ def run_cli(monkeypatch, argv):
 
     monkeypatch.setattr(sys, "argv", ["dct", *argv])
     cli.main()
+
+
+def git(repo, *args: str) -> str:
+    """Run git in `repo` with a hermetic identity (no global signing / hooks)
+    and return stdout. For tests that build throwaway repositories."""
+    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+    result = subprocess.run(
+        ["git", "-C", str(repo), "-c", "user.email=t@t", "-c", "user.name=t",
+         "-c", "commit.gpgsign=false", "-c", "core.hooksPath=/dev/null", *args],
+        env=env, capture_output=True, text=True, check=True,
+    )
+    return result.stdout.strip()
+
+
+def make_git_repo(path, branch: str = "main"):
+    """A git repo at `path` on `branch` with one commit; returns the realpath."""
+    path.mkdir(parents=True, exist_ok=True)
+    git(path, "init", "-q", "-b", branch)
+    (path / "README").write_text("x\n")
+    git(path, "add", "README")
+    git(path, "commit", "-q", "-m", "init")
+    return os.path.realpath(path)

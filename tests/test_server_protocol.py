@@ -57,7 +57,7 @@ def test_str_returning_tool_stays_plain_text(srv):
 
 
 def test_every_tool_survives_a_wire_call(srv):
-    """All-55 sweep (#429): every registered tool is called through the wire
+    """All-57 sweep (#429): every registered tool is called through the wire
     with EMPTY args in one client session. Tools with defaults execute (their
     {"error"}/data payloads are normal results); tools with required params
     come back as SDK validation errors (is_error=True) — and in BOTH cases the
@@ -66,29 +66,29 @@ def test_every_tool_survives_a_wire_call(srv):
         outcomes = {}
         async with Client(srv.mcp) as client:
             tools = (await client.list_tools()).tools
-            assert len(tools) == 55
+            assert len(tools) == 57
             for tool in tools:
                 result = await client.call_tool(tool.name, {})
                 assert result.content and result.content[0].text.strip(), tool.name
                 outcomes[tool.name] = result.is_error
-            # The session survived all 55 calls — one more proves liveness.
+            # The session survived all 57 calls — one more proves liveness.
             final = await client.call_tool("list_projects", {})
             assert final.is_error is False
         return outcomes
 
     outcomes = asyncio.run(sweep())
-    assert len(outcomes) == 55
+    assert len(outcomes) == 57
 
 
 def test_every_tool_description_and_schema_match_signatures():
-    """Docstring pipeline + schema derivation hold for ALL 55 tools on v2:
+    """Docstring pipeline + schema derivation hold for ALL 57 tools on v2:
     the wire description is non-empty (the docstring IS the contract the
     calling model reads) and inputSchema properties equal the function
     signature exactly — no dropped params, no ghosts."""
     import inspect
 
     tools = asyncio.run(S.mcp.list_tools())
-    assert len(tools) == 55
+    assert len(tools) == 57
     for tool in tools:
         assert (tool.description or "").strip(), f"{tool.name}: empty description"
         fn = getattr(S, tool.name)

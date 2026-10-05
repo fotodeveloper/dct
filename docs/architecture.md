@@ -26,7 +26,7 @@ SQLAlchemy Core tables (not the ORM) with a `deleted_at` column for soft deletes
 - `items` — project_id, type, title, short_title (nullable 50-char label, #817), priority, status, component, source_file, source_lines, resolution, tags (**DEPRECATED** — see below). Sprint membership is **not** a column: `in_current_sprint` is derived at read time from `item_sprints` (#216 dropped the legacy boolean).
 - `item_notes` — item_id, note (append-only)
 - `item_checkpoints` — item_id, text, status, kind, sort_order
-- `changelog_entries` — project_id, version, category, entry, component, source_file, related_item_id
+- `changelog_entries` — project_id, version, category, entry, component, source_file, source_lines, related_item_id, branch / worktree / branch_source (nullable git context the entry was written on, #801; `branch_source` = `client` or `server`)
 - `session_handoffs` — project_id, prompt, context_summary, scope, created_by, consumed_at, consumed_by
 
 **Plans / sprints / decisions**:
@@ -53,6 +53,7 @@ Full DDL lives in:
 - `migrations/003_plans_sprints_decisions.sql`
 - `migrations/004_tags.sql`
 - `migrations/005_items_short_title.sql`
+- `migrations/006_changelog_branch.sql`
 
 At runtime, the engine applies schema via `metadata.create_all()` plus an idempotent `_apply_schema_updates()` that:
 - adds later columns in place (e.g. `item_checkpoints.kind` for gate checkpoints; new columns go through the duplicate-safe `_add_column_if_missing` — `ADD COLUMN IF NOT EXISTS` under a 5 s `lock_timeout` on PostgreSQL, a re-checked "duplicate column" error on SQLite),

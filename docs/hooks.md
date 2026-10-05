@@ -103,7 +103,7 @@ Properties of the merge:
 
 | Hook | Event / matcher | Purpose |
 |---|---|---|
-| `dct-check-changelog.sh` | `PreToolUse` / `Bash` | blocks `git commit` when app code changed but no unreleased changelog entry exists; **on by default** per project once wired (`dct project changelog <slug> off` opts a project out); bypasses `release:` commits and doc-only changes |
+| `dct-check-changelog.sh` | `PreToolUse` / `Bash` | blocks `git commit` when app code changed but no unreleased changelog entry exists for the current branch (unbranched entries count; see below); **on by default** per project once wired (`dct project changelog <slug> off` opts a project out); bypasses `release:` commits and doc-only changes |
 | `dct-check-changelog-on-stop.sh` | `Stop` | session-end reminder if unreleased entries are pending (same per-project gate) |
 | `dct-plan-autoscan.sh` | `PostToolUse` / `Edit\|Write\|MultiEdit` | background rescan of plan-like markdown (plans, specs, ADRs, roadmaps); fire-and-forget, never blocks |
 | `dct-task-mirror.sh` | `PreToolUse` / `TodoWrite\|TaskCreate` | mirrors Claude Code tasks into dct as non-blocking `cc-task` checkpoints |
@@ -201,6 +201,34 @@ Ordering is cheapest-first:
 Measured fast paths (`time bash …`): no-changes / exempt-only / changelog-touched
 all ~40–50 ms (shell + git forks, no Python); the verdict path drops from
 ~415 ms on a cache miss (two Python starts) to ~50 ms on a cache hit.
+
+## Per-branch changelog count (#801)
+
+Changelog entries record the git branch they were written on, so both
+changelog hooks count only the entries that can belong to the current commit:
+
+```bash
+b=$(git branch --show-current 2>/dev/null); count=""
+[ -n "$b" ] && count=$(dct clog count --project "$project" --branch "$b" --include-unbranched 2>/dev/null)
+case "$count" in ''|*[!0-9]*) count=$(dct clog count --project "$project" 2>/dev/null);; esac
+```
+
+- **This branch plus unbranched.** Entries of other branches describe code the
+  commit does not contain and do not satisfy the gate; entries with no recorded
+  branch (written before branch tracking, or outside git) still count. The
+  deny message says so and shows how to move an entry:
+  `dct clog update <id> --branch <b>`.
+- **Never an empty `--branch`.** On a detached HEAD the hook skips straight
+  to the project-wide count.
+- **Version skew.** An older `dct` rejects `--branch` (non-integer output) →
+  the hook falls back to the project-wide count.
+- **Own failure.** When even the fallback yields no integer (dct or its
+  database is broken) the two hooks deliberately differ:
+  - `check-changelog.sh` (blocking) **fails open** — `exit 0`, the commit
+    goes through. A hook must never block the host operation because of its
+    own failure.
+  - `check-changelog-on-stop.sh` (non-blocking) **keeps reminding** — the
+    count is treated as 0, since erring towards a reminder costs nothing.
 
 ## The five rules every dct hook follows
 

@@ -733,6 +733,23 @@ def cmd_delete(args):
         sys.exit(1)
 
 
+def _ids(raw: str | None, flag: str, noun: str = "item") -> list[int] | None:
+    """Parse a comma-separated id flag. None → flag unused; empty/garbage →
+    ValueError (a blank shell var must never read as "no ids" or wipe
+    anything — K-27)."""
+    if raw is None:
+        return None
+    try:
+        ids = [int(x.strip()) for x in raw.split(",") if x.strip()]
+    except ValueError:
+        raise ValueError(
+            f"{flag} expects comma-separated {noun} ids, got: {raw!r}"
+        ) from None
+    if not ids:
+        raise ValueError(f"{flag} got no ids ({raw!r}) — omit the flag instead")
+    return ids
+
+
 # ── Handoff commands ──────────────────────────────────────────────────────────
 
 def cmd_handoff_create(args):
@@ -747,21 +764,6 @@ def cmd_handoff_create(args):
         project = args.project or _detect_project(engine)
         prompt = _read_text_arg(args.prompt, args.prompt_file)
         identity = args.created_by or _default_identity()
-
-        def _ids(raw: str | None, flag: str) -> list[int] | None:
-            # None → flag unused; empty/garbage → error (a blank shell var
-            # must never read as "no items" or wipe anything — K-27).
-            if raw is None:
-                return None
-            try:
-                ids = [int(x.strip()) for x in raw.split(",") if x.strip()]
-            except ValueError:
-                raise ValueError(
-                    f"{flag} expects comma-separated item ids, got: {raw!r}"
-                ) from None
-            if not ids:
-                raise ValueError(f"{flag} got no ids ({raw!r}) — omit the flag instead")
-            return ids
 
         result = handoff_work(
             engine, project,
@@ -939,7 +941,9 @@ def cmd_pickup(args):
 # ── Changelog commands ────────────────────────────────────────────────────────
 
 def cmd_clog_add(args):
-    from dct.core.changelog import add_entry
+    import os
+
+    from dct.core.changelog import add_entry, resolve_branch_fields
 
     engine = _get_engine()
     kwargs = {}
@@ -952,11 +956,27 @@ def cmd_clog_add(args):
 
     try:
         project_slug = args.project or _detect_project(engine)
+        # The CLI runs in the caller's directory, so detected context is the
+        # caller's own → branch_source='client' either way.
+        kwargs.update(resolve_branch_fields(
+            engine, project_slug, branch=args.branch, worktree=args.worktree,
+            cwd=os.getcwd(), detected_source="client",
+        ))
         e = add_entry(engine, project_slug, args.category, args.entry, **kwargs)
-        print(f"✓ Changelog #{e['id']} [{e['category']}] — {e['entry'][:60]}")
+        where = f" @ {e['branch']}" if e.get("branch") else ""
+        print(f"✓ Changelog #{e['id']} [{e['category']}]{where} — {e['entry'][:60]}")
     except Exception as e:
         print(f"✗ Error: {e}", file=sys.stderr)
         sys.exit(1)
+
+
+def _branch_filter_kwargs(args) -> dict:
+    """`clog list` / `clog count` branch filters → core keyword arguments."""
+    return {
+        "branch": args.branch or None,
+        "worktree": args.worktree or None,
+        "include_unbranched": args.include_unbranched,
+    }
 
 
 def cmd_clog_list(args):
@@ -964,8 +984,10 @@ def cmd_clog_list(args):
 
     engine = _get_engine()
     project_slug = args.project or _detect_project(engine)
-    entries = list_entries(engine, project_slug, unreleased_only=args.unreleased)
-    headers = ["#", "Category", "Entry", "Version", "Created"]
+    entries = list_entries(
+        engine, project_slug, unreleased_only=args.unreleased, **_branch_filter_kwargs(args)
+    )
+    headers = ["#", "Category", "Entry", "Version", "Branch", "Created"]
     rows = []
     for e in entries:
         rows.append([
@@ -973,6 +995,7 @@ def cmd_clog_list(args):
             e["category"],
             e["entry"][:50],
             e["version"] or "(unreleased)",
+            e["branch"] or "",
             _fmt_date(e["created_at"]),
         ])
     _print_table(headers, rows, max_widths={2: 50})
@@ -983,54 +1006,130 @@ def cmd_clog_count(args):
 
     engine = _get_engine()
     project_slug = args.project or _detect_project(engine)
-    count = count_unreleased(engine, project_slug)
+    # Bare integer on stdout — hooks parse it (never decorate this line).
+    count = count_unreleased(engine, project_slug, **_branch_filter_kwargs(args))
     print(count)
 
 
+def _release_checkout_root(project: dict) -> str | None:
+    """Root to run the version-sync script from: the CURRENT checkout's toplevel
+    when it lies inside the project path (a release from a linked worktree must
+    not write into the main checkout), else the registered project path."""
+    import os
+
+    from dct.core.gitinfo import git_context
+    from dct.core.projects import _path_is_within
+
+    path = project.get("path")
+    if not path:
+        return None
+    context = git_context(os.getcwd())
+    if context and _path_is_within(
+        os.path.realpath(context["worktree"]), os.path.realpath(path)
+    ):
+        return context["worktree"]
+    return path
+
+
 def cmd_clog_release(args):
+    import os
     import subprocess
 
     from dct.core.changelog import count_unreleased, release_entries
     from dct.core.projects import get_project
-    from dct.core.version import bump
 
     engine = _get_engine()
     project_slug = args.project or _detect_project(engine)
 
-    version = args.version
-    if not version:
-        bump_type = args.bump
-        if not bump_type:
-            print("✗ Provide a version or --patch/--minor/--major", file=sys.stderr)
-            sys.exit(1)
-        project = get_project(engine, project_slug)
-        if not project:
-            print(f"✗ Project '{project_slug}' not found", file=sys.stderr)
-            sys.exit(1)
-        current = project.get("current_version")
-        if not current:
-            print(f"✗ No current version for '{project_slug}'. Use explicit version: dct clog release {project_slug} 0.1.0", file=sys.stderr)
-            sys.exit(1)
-        version = bump(current, bump_type)
-        print(f"  {current} → {version} ({bump_type})")
+    if not args.version and not args.bump:
+        print("✗ Provide a version or --patch/--minor/--major", file=sys.stderr)
+        sys.exit(1)
+    try:
+        entry_ids = [] if args.no_entries else _ids(args.entries, "--entries", "entry")
+    except ValueError as e:
+        print(f"✗ Error: {e}", file=sys.stderr)
+        sys.exit(1)
 
-    unreleased = count_unreleased(engine, project_slug)
-    if unreleased == 0:
+    project = get_project(engine, project_slug)
+    if not project:
+        print(f"✗ Project '{project_slug}' not found", file=sys.stderr)
+        sys.exit(1)
+    if not args.version and not project.get("current_version"):
+        print(f"✗ No current version for '{project_slug}'. Use explicit version: dct clog release {project_slug} 0.1.0", file=sys.stderr)
+        sys.exit(1)
+
+    # The guard covers the SELECTED set: all unreleased entries (legacy) —
+    # an explicit --entries list is non-empty by construction and validated
+    # strictly by core; --no-entries is a deliberate version-only release.
+    if entry_ids is None and count_unreleased(engine, project_slug) == 0:
         print(f"✗ No unreleased entries for '{project_slug}'", file=sys.stderr)
         sys.exit(1)
 
-    count = release_entries(engine, project_slug, version)
-    print(f"✓ Released {count} entries as {version}")
+    try:
+        result = release_entries(
+            engine, project_slug, args.version or None,
+            bump_type=None if args.version else args.bump, entry_ids=entry_ids,
+        )
+    except Exception as e:
+        print(f"✗ Error: {e}", file=sys.stderr)
+        sys.exit(1)
 
-    project = get_project(engine, project_slug)
-    if project and project.get("path"):
-        import os
+    version = result["version"]
+    if args.bump and not args.version:
+        print(f"  {project['current_version']} → {version} ({args.bump})")
+    print(f"✓ Released {result['released']} entries as {version} (mode: {result['mode']})")
+    if result["already_released"]:
+        print(f"  already in {version}: {len(result['already_released'])} "
+              f"({', '.join(f'#{i}' for i in result['already_released'])})")
+    if result.get("warning"):
+        print(f"  ⚠ {result['warning']}", file=sys.stderr)
+
+    root = _release_checkout_root(project)
+    if root:
         for sync_path in ["scripts/dct-version-sync.sh", "scripts/version-sync.sh"]:
-            full_path = os.path.join(project["path"], sync_path)
+            full_path = os.path.join(root, sync_path)
             if os.path.isfile(full_path):
                 print(f"  Running {sync_path}...")
                 subprocess.run(["bash", full_path, version], check=False)
                 break
+
+
+def cmd_clog_update(args):
+    from dct.core.changelog import update_entry
+
+    engine = _get_engine()
+    # An empty value ("") clears a nullable field; entry/category cannot be
+    # cleared (core refuses an empty entry). --item-id 0 unlinks the item.
+    fields = {}
+    for name in ("entry", "category"):
+        if getattr(args, name) is not None:
+            fields[name] = getattr(args, name)
+    for name in ("component", "source_file", "source_lines", "branch", "worktree"):
+        value = getattr(args, name)
+        if value is not None:
+            fields[name] = value or None
+    if args.item_id is not None:
+        fields["related_item_id"] = args.item_id or None
+    try:
+        project_slug = args.project or _detect_project(engine)
+        e = update_entry(engine, project_slug, args.id, **fields)
+        print(f"✓ Changelog #{e['id']} updated: {', '.join(fields)}")
+    except Exception as e:
+        print(f"✗ Error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
+def cmd_clog_delete(args):
+    from dct.core.changelog import delete_entry
+
+    engine = _get_engine()
+    try:
+        project_slug = args.project or _detect_project(engine)
+        delete_entry(engine, project_slug, args.id)
+        print(f"✓ Changelog #{args.id} deleted")
+    except Exception as e:
+        print(f"✗ Error: {e}", file=sys.stderr)
+        sys.exit(1)
 
 
 def cmd_clog_export(args):
@@ -2006,13 +2105,26 @@ def build_parser() -> argparse.ArgumentParser:
     p_clog_add.add_argument("--component", "-c")
     p_clog_add.add_argument("--source-file", "-f")
     p_clog_add.add_argument("--item-id", type=int)
+    p_clog_add.add_argument(
+        "--branch", help="Branch the change was made on (default: detected in CWD)")
+    p_clog_add.add_argument(
+        "--worktree", help="Checkout toplevel of the change (default: detected in CWD)")
+
+    def _add_branch_filters(p):
+        p.add_argument("--branch", help="Only entries written on this branch")
+        p.add_argument("--worktree", help="Only entries of this exact worktree path")
+        p.add_argument(
+            "--include-unbranched", action="store_true",
+            help="With --branch: also entries with no recorded branch")
 
     p_clog_list = p_clog_sub.add_parser("list", help="List changelog entries")
     p_clog_list.add_argument("--project", "-P")
     p_clog_list.add_argument("--unreleased", "-u", action="store_true")
+    _add_branch_filters(p_clog_list)
 
     p_clog_count = p_clog_sub.add_parser("count", help="Count unreleased entries")
     p_clog_count.add_argument("--project", "-P")
+    _add_branch_filters(p_clog_count)
 
     p_clog_release = p_clog_sub.add_parser("release", help="Release: bump version and stamp changelog")
     p_clog_release.add_argument("version", nargs="?")
@@ -2021,6 +2133,32 @@ def build_parser() -> argparse.ArgumentParser:
     p_clog_bump.add_argument("--patch", dest="bump", action="store_const", const="patch")
     p_clog_bump.add_argument("--minor", dest="bump", action="store_const", const="minor")
     p_clog_bump.add_argument("--major", dest="bump", action="store_const", const="major")
+    p_clog_sel = p_clog_release.add_mutually_exclusive_group()
+    p_clog_sel.add_argument(
+        "--entries", help="Comma-separated entry ids to stamp (default: all unreleased)")
+    p_clog_sel.add_argument(
+        "--no-entries", action="store_true",
+        help="Version-only release: stamp no entries, only set the version")
+
+    p_clog_update = p_clog_sub.add_parser(
+        "update",
+        help="Amend an unreleased changelog entry (\"\" clears a field, --item-id 0 unlinks)")
+    p_clog_update.add_argument("id", type=int)
+    p_clog_update.add_argument("--project", "-P")
+    p_clog_update.add_argument("--entry")
+    p_clog_update.add_argument(
+        "--category", choices=["added", "changed", "fixed", "removed"])
+    p_clog_update.add_argument("--component", "-c")
+    p_clog_update.add_argument("--source-file", "-f")
+    p_clog_update.add_argument("--source-lines")
+    p_clog_update.add_argument("--item-id", type=int)
+    p_clog_update.add_argument("--branch")
+    p_clog_update.add_argument("--worktree")
+
+    p_clog_delete = p_clog_sub.add_parser(
+        "delete", help="Soft-delete an unreleased changelog entry")
+    p_clog_delete.add_argument("id", type=int)
+    p_clog_delete.add_argument("--project", "-P")
 
     p_clog_export = p_clog_sub.add_parser("export", help="Export to Keep a Changelog markdown")
     p_clog_export.add_argument("--project", "-P")
@@ -2280,6 +2418,8 @@ CLOG_COMMAND_MAP = {
     "list": cmd_clog_list,
     "count": cmd_clog_count,
     "release": cmd_clog_release,
+    "update": cmd_clog_update,
+    "delete": cmd_clog_delete,
     "export": cmd_clog_export,
 }
 

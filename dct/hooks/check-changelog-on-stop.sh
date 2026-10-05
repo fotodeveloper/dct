@@ -97,9 +97,17 @@ if [ -z "$cached" ]; then
   fi
 fi
 
-# Project manages its changelog in dct. Check dct DB for unreleased entries.
-count=$(dct clog count --project "$project" 2>/dev/null)
-if [ "${count:-0}" -gt 0 ]; then
+# Project manages its changelog in dct. Check dct DB for unreleased entries of
+# THIS branch (#801; unbranched entries count too), falling back to the
+# project-wide count when an older dct rejects --branch. Unlike the blocking
+# commit hook, a failing count keeps REMINDING (non-blocking, so erring towards
+# the reminder costs nothing). Never pass an empty --branch.
+branch=$(git branch --show-current 2>/dev/null)
+count=""
+[ -n "$branch" ] && count=$(dct clog count --project "$project" --branch "$branch" --include-unbranched 2>/dev/null)
+case "$count" in ''|*[!0-9]*) count=$(dct clog count --project "$project" 2>/dev/null);; esac
+case "$count" in ''|*[!0-9]*) count=0;; esac
+if [ "$count" -gt 0 ]; then
   exit 0
 fi
 

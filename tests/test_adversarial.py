@@ -241,7 +241,7 @@ class TestSoftDeleteIntegrity:
     def test_deleted_changelog_not_counted(self, engine):
         create_project(engine, slug="p", name="P")
         e = add_entry(engine, "p", "added", "Feature")
-        delete_entry(engine, e["id"])
+        delete_entry(engine, "p", e["id"])
         assert count_unreleased(engine, "p") == 0
 
 
@@ -396,7 +396,7 @@ class TestChangelogEdgeCases:
         # Release with nothing unreleased should return 0
         from dct.core.changelog import release_entries
         released = release_entries(engine, "p", "1.0")
-        assert released == 0
+        assert released["released"] == 0
 
     def test_multiple_releases(self, engine):
         create_project(engine, slug="p", name="P")
@@ -424,7 +424,9 @@ class TestChangelogEdgeCases:
         assert entries[0]["version"] is None
 
     def test_delete_nonexistent_entry(self, engine):
-        assert delete_entry(engine, 99999) is False
+        create_project(engine, slug="p", name="P")
+        with pytest.raises(ValueError, match="not found"):
+            delete_entry(engine, "p", 99999)
 
 
 # ── MCP tool-call markup guard (#240) ─────────────────────────────────────────

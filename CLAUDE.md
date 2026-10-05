@@ -76,7 +76,7 @@ dct/services/            — Service layer (reserved for future shared app ops)
 dct/workflows/session.py — G1 composed ops: get_context_snapshot /
                            pickup_work / handoff_work (one impl for MCP,
                            CLI and skills; single transaction each)
-dct/mcp/server.py        — MCP server, SDK 2.2 MCPServer (55 tools);
+dct/mcp/server.py        — MCP server, SDK 2.2 MCPServer (57 tools);
                            dct/server.py is a compat shim
 dct/cli.py               — argparse CLI entry point
 dct/export.py            — Keep a Changelog MD export

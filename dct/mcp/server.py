@@ -41,7 +41,8 @@ _INSTRUCTIONS = (
         "  item: id, item_type, priority, status, in_current_sprint, cp=[done,total],\n"
         "  component, tags (list[str]), created_at, short_title (2-4 word label, may be\n"
         "  null), title — list_items(view='full') appends description; changelog: id, version,\n"
-        "  category, component, related_item_id, created_at, released_at, entry;\n"
+        "  category, component, branch, branch_source, related_item_id,\n"
+        "  related_item_short_title, created_at, released_at, worktree, entry;\n"
         "  checkpoint: id, status, sort_order, text; handoff: id, scope, created_by,\n"
         "  created_at, consumed_at, prompt (200-char preview). format='markdown' (lossy)\n"
         "  or 'dict' (full-key dicts) opt in.\n\n"
@@ -320,8 +321,9 @@ ITEM_COLS_BRIEF = [
 ITEM_COLS_FULL = ITEM_COLS_BRIEF + ["description"]
 ITEM_VIEWS = {"brief": ITEM_COLS_BRIEF, "full": ITEM_COLS_FULL}
 CHANGELOG_COLS = [
-    "id", "version", "category", "component", "related_item_id",
-    "created_at", "released_at", "entry",
+    "id", "version", "category", "component", "branch", "branch_source",
+    "related_item_id", "related_item_short_title", "created_at", "released_at",
+    "worktree", "entry",
 ]
 CHECKPOINT_COLS = ["id", "status", "sort_order", "text"]
 TAG_COLS = ["id", "name", "item_count", "created_at", "description"]
@@ -985,6 +987,8 @@ def add_changelog(
     source_file: str = "",
     source_lines: str = "",
     related_item_id: int = 0,
+    branch: str = "",
+    worktree: str = "",
 ) -> dict:
     """Add an unreleased changelog entry (version stays NULL until release_changelog stamps it).
 
@@ -998,16 +1002,35 @@ def add_changelog(
         source_file: Optional relative path of the file the change touched.
         source_lines: Optional line range (e.g. "42-58").
         related_item_id: Tracked-item id to link (0 = none).
+        branch: Git branch the change was made on (`git branch --show-current`),
+            ≤ 255 chars. PASS IT: this server's cwd is the directory the session
+            STARTED in and does not follow a mid-session `cd` into another
+            worktree, so its own detection can name the wrong branch.
+        worktree: Toplevel of the checkout the change was made in
+            (`git rev-parse --show-toplevel`), ≤ 500 chars.
+            Either given → both stored as passed (a missing one stays null),
+            branch_source='client'; an over-long value is REFUSED, never
+            truncated. Neither given → detected from this server's cwd, kept
+            only when that checkout lies inside the project's registered path
+            (branch_source='server'); otherwise, outside git, or detached HEAD
+            (branch only) → null.
 
-    Returns: slim ack {id, project, category, component} — `project` is the
-        resolved slug, `component` may be null. NOT the entry text echo (nor the
-        full row). {"error": "..."} on failure — empty/whitespace entry, invalid
-        category, literal tool-call markup in `entry`, or an unresolvable project
-        (explicit slug not found, or empty `project` with an unregistered CWD).
+    Returns: slim ack {id, project, category, component, branch, branch_source}
+        — `project` is the resolved slug; component / branch / branch_source may
+        be null. NOT the entry text echo (nor the full row). {"error": "..."} on
+        failure — empty/whitespace entry, invalid category, literal tool-call
+        markup in a free-text field, an over-long branch/worktree, or an
+        unresolvable project (explicit slug not found, or empty `project` with
+        an unregistered CWD).
     """
-    if (err := _reject_toolcall_markup(entry=entry)):
+    if (err := _reject_toolcall_markup(
+        entry=entry, component=component, source_file=source_file,
+        source_lines=source_lines, branch=branch, worktree=worktree,
+    )):
         return err
-    from dct.core.changelog import add_entry
+    import os
+
+    from dct.core.changelog import add_entry, resolve_branch_fields
 
     kwargs: dict = {}
     if component: kwargs["component"] = component
@@ -1016,10 +1039,19 @@ def add_changelog(
     if related_item_id: kwargs["related_item_id"] = related_item_id
 
     try:
+        engine = _get_engine()
         project_slug = _resolve_project(project, required=True)
         assert project_slug is not None
-        row = add_entry(_get_engine(), project_slug, category, entry, **kwargs)
-        return {"id": row["id"], "project": project_slug, "category": row["category"], "component": row["component"]}
+        kwargs.update(resolve_branch_fields(
+            engine, project_slug, branch=branch or None, worktree=worktree or None,
+            cwd=os.getcwd(), detected_source="server",
+        ))
+        row = add_entry(engine, project_slug, category, entry, **kwargs)
+        return {
+            "id": row["id"], "project": project_slug, "category": row["category"],
+            "component": row["component"], "branch": row["branch"],
+            "branch_source": row["branch_source"],
+        }
     except Exception as e:
         return {"error": str(e)}
 
@@ -1029,32 +1061,60 @@ def list_changelog(
     project: str = "",
     unreleased_only: bool = True,
     format: str = "structured",
+    branch: str = "",
+    worktree: str = "",
+    include_unbranched: bool = False,
 ):
-    """List changelog entries for a project.
+    """List changelog entries for a project, newest first.
 
     Args:
         project: Slug. Empty = CWD auto-detect.
         unreleased_only: True (default) → only entries without a version; False → all.
         format: 'structured' (default, {cols,rows}) | 'markdown' | 'dict'.
+        branch: Only entries written on this branch. Empty (default) = no branch
+            filter — every entry, exactly as before branch tracking.
+        worktree: Only entries whose worktree equals this path exactly
+            (combinable with branch). Empty = no worktree filter.
+        include_unbranched: With `branch`: also entries whose branch is null
+            (pre-tracking or undetected). Ignored without `branch`.
 
-    Returns: {cols, rows} by default, list[dict] for 'dict', markdown str for 'markdown'.
+    Returns: {cols, rows} by default — cols = [id, version, category, component,
+        branch, branch_source, related_item_id, related_item_short_title,
+        created_at, released_at, worktree, entry]; related_item_short_title is
+        the related item's short_title (or its title compacted to 50 chars),
+        null when there is no related item. list[dict] for 'dict', markdown str
+        for 'markdown'. {"error": "..."} on an unresolvable project.
     """
     from dct.core.changelog import list_entries
     try:
         project_slug = _resolve_project(project, required=True)
         assert project_slug is not None
-        rows = list_entries(_get_engine(), project_slug, unreleased_only=unreleased_only)
+        rows = list_entries(
+            _get_engine(), project_slug, unreleased_only=unreleased_only,
+            branch=branch or None, worktree=worktree or None,
+            include_unbranched=include_unbranched,
+        )
         return _format_list(rows, CHANGELOG_COLS, format)
     except Exception as e:
         return {"error": str(e)}
 
 
 @mcp.tool(structured_output=False)
-def count_unreleased_changelog(project: str = "") -> dict:
+def count_unreleased_changelog(
+    project: str = "",
+    branch: str = "",
+    worktree: str = "",
+    include_unbranched: bool = False,
+) -> dict:
     """Count unreleased changelog entries (version=NULL) for a project.
 
     Args:
         project: Slug. Empty = auto-detect from CWD.
+        branch: Count only entries written on this branch. Empty (default) = the
+            whole project, exactly as before branch tracking.
+        worktree: Count only entries of this exact worktree path (combinable).
+        include_unbranched: With `branch`: also count entries whose branch is
+            null. Ignored without `branch`.
 
     Returns: {"count": <int>} on success, {"error": "..."} on failure.
     Typical use: gate before /release (stop if count == 0).
@@ -1063,53 +1123,164 @@ def count_unreleased_changelog(project: str = "") -> dict:
     try:
         project_slug = _resolve_project(project, required=True)
         assert project_slug is not None
-        return {"count": count_unreleased(_get_engine(), project_slug)}
+        return {"count": count_unreleased(
+            _get_engine(), project_slug, branch=branch or None,
+            worktree=worktree or None, include_unbranched=include_unbranched,
+        )}
     except Exception as e:
         return {"error": str(e)}
 
 
 @mcp.tool(structured_output=False)
-def release_changelog(project: str = "", version: str = "", bump_type: str = "") -> dict:
-    """Stamp every unreleased entry (version=NULL) with a version AND set the
-    project's current_version to that version.
+def release_changelog(
+    project: str = "",
+    version: str = "",
+    bump_type: str = "",
+    entry_ids: list[int] | None = None,
+) -> dict:
+    """Stamp changelog entries with a version AND set the project's
+    current_version to that version — one locked transaction.
 
-    Provide either an explicit version OR a bump_type — explicit version wins.
+    Provide either an explicit version OR a bump_type — explicit version wins
+    (bump_type is then ignored). The bumped version is computed INSIDE the
+    transaction and returned.
 
     Args:
         project: Slug. Empty = auto-detect from CWD.
         version: Explicit version like "0.2.0". Takes precedence over bump_type.
+            Pass it explicitly when RETRYING a release (a retried bump would
+            bump again).
         bump_type: patch / minor / major — bumped from the project's current_version.
+        entry_ids: JSON array of changelog entry ids (e.g. [12, 15]) — NOT a CSV
+            string. Omitted/null (default) = every unreleased entry of the
+            project (legacy, mode 'all'). [] = stamp nothing, only set the
+            version (mode 'version_only'). A list = exactly those entries (mode
+            'selected'); STRICT — an unknown, foreign or deleted id, or one
+            already released in ANOTHER version, fails the whole call.
+            Duplicates are ignored.
 
-    Side effect: also stamps released_at on every entry it versions, and writes
-    current_version onto the project row. current_version is bumped even when
-    there are zero unreleased entries (released = 0).
+    Idempotent: when nothing is left to stamp — every selected entry already
+    carries the version ('selected'), current_version already equals it
+    ('version_only'), or both ('all') — the call is a no-op and writes nothing.
+    Never rewinds: a version lower than current_version is refused (compared
+    when both parse as dotted numbers). Stamping sets version + released_at.
 
-    Returns: {"released": <count>, "version": "<version>", "project": "<slug>"}
-        on success (released = number of changelog entries stamped; the project
-        row update is not counted). On failure returns {"error": "..."}, e.g.:
-        neither version nor bump_type given; bump_type set but the project has no
-        current_version to bump from; an invalid bump_type (not patch/minor/major);
-        or the project can't be resolved (empty project + unregistered CWD, or an
-        unknown slug).
+    Returns: {"project", "version", "current_version" (after the call), "mode":
+        "all"|"selected"|"version_only", "entry_ids" (the selected ids — in mode
+        'all' the ones stamped), "released" (count newly stamped),
+        "already_released" (selected ids that already had this version)} plus
+        "warning" in mode 'all' when the stamped entries span several branches
+        (null branch counted as its own). {"error": "..."} on failure — neither
+        version nor bump_type; bump_type with no current_version; an invalid
+        bump_type; a version lower than current_version; an invalid entry id;
+        or an unresolvable project. Nothing is written on error.
     """
     from dct.core.changelog import release_entries
-    from dct.core.projects import get_project
-    from dct.core.version import bump
 
     try:
-        engine = _get_engine()
         project_slug = _resolve_project(project, required=True)
         assert project_slug is not None
-        if not version:
-            if not bump_type:
-                return {"error": "Provide version or bump_type (patch/minor/major)"}
-            proj = get_project(engine, project_slug)
-            if not proj or not proj.get("current_version"):
-                return {"error": f"No current version for '{project_slug}'. Provide explicit version."}
-            version = bump(proj["current_version"], bump_type)
+        if not version and not bump_type:
+            return {"error": "Provide version or bump_type (patch/minor/major)"}
+        result = release_entries(
+            _get_engine(), project_slug, version or None,
+            bump_type=None if version else bump_type, entry_ids=entry_ids,
+        )
+        return {"project": project_slug, **result}
+    except Exception as e:
+        return {"error": str(e)}
 
-        count = release_entries(engine, project_slug, version)
-        return {"released": count, "version": version, "project": project_slug}
+
+_CLEAR = "__clear__"
+
+
+@mcp.tool(structured_output=False)
+def update_changelog(
+    entry_id: int,
+    project: str = "",
+    entry: str = "",
+    category: str = "",
+    component: str = "",
+    source_file: str = "",
+    source_lines: str = "",
+    related_item_id: int = 0,
+    branch: str = "",
+    worktree: str = "",
+) -> dict:
+    """Amend an UNRELEASED changelog entry in place (released entries are history).
+
+    Each field below is a SEPARATE top-level parameter. Only non-empty args are
+    applied; omit a field to leave it unchanged.
+
+    Args:
+        entry_id: The entry to change (id from list_changelog / add_changelog).
+        project: Slug the entry must belong to. Empty = auto-detect from CWD.
+        entry: New changelog line (cannot be blanked).
+        category: added / changed / fixed / removed.
+        component: New component; '__clear__' = null.
+        source_file: New source path, ≤ 500 chars; '__clear__' = null.
+        source_lines: New line range, ≤ 100 chars; '__clear__' = null.
+        related_item_id: New linked item id; 0 (default) = unchanged, -1 = unlink.
+        branch: Move the entry to this branch, ≤ 255 chars; '__clear__' = null.
+        worktree: New worktree path, ≤ 500 chars; '__clear__' = null.
+            Setting (or clearing) branch/worktree marks branch_source='client'.
+
+    Returns: slim ack {id, project, updated_fields} — `updated_fields` lists the
+        applied field names. {"error": "..."} when no field is given, the entry
+        is unknown / another project's / deleted, it is already released, the
+        category is invalid, a value is too long, or a free-text field carries
+        tool-call markup. Nothing is written on error.
+    """
+    if (err := _reject_toolcall_markup(
+        entry=entry, component=component, source_file=source_file,
+        source_lines=source_lines, branch=branch, worktree=worktree,
+    )):
+        return err
+    from dct.core.changelog import update_entry
+
+    fields: dict = {}
+    if entry:
+        fields["entry"] = entry
+    if category:
+        fields["category"] = category
+    for name, value in (
+        ("component", component), ("source_file", source_file),
+        ("source_lines", source_lines), ("branch", branch), ("worktree", worktree),
+    ):
+        if value:
+            fields[name] = None if value == _CLEAR else value
+    if related_item_id:
+        fields["related_item_id"] = None if related_item_id == -1 else related_item_id
+
+    try:
+        project_slug = _resolve_project(project, required=True)
+        assert project_slug is not None
+        row = update_entry(_get_engine(), project_slug, entry_id, **fields)
+        return {"id": row["id"], "project": project_slug, "updated_fields": list(fields)}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@mcp.tool(structured_output=False)
+def delete_changelog(entry_id: int, project: str = "") -> dict:
+    """Soft-delete an UNRELEASED changelog entry (the row stays as ledger history).
+
+    Args:
+        entry_id: The entry to delete.
+        project: Slug the entry must belong to. Empty = auto-detect from CWD.
+
+    Returns: {"deleted": true, "id": <entry_id>} on success; {"error": "..."}
+        when the entry is unknown / another project's / already deleted, or
+        already released (released entries are history), or the project cannot
+        be resolved.
+    """
+    from dct.core.changelog import delete_entry
+
+    try:
+        project_slug = _resolve_project(project, required=True)
+        assert project_slug is not None
+        delete_entry(_get_engine(), project_slug, entry_id)
+        return {"deleted": True, "id": entry_id}
     except Exception as e:
         return {"error": str(e)}
 

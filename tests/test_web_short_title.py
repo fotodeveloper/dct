@@ -54,3 +54,19 @@ def test_label_is_html_escaped(engine, client):
     body = _body(client, "/p/proj-a/items")
     assert "<b>bold</b>" not in body
     assert "&lt;b&gt;bold&lt;/b&gt;" in body
+
+
+def test_changelog_related_item_renders_id_and_label(engine, client):
+    """#801/C4: a changelog entry's related item shows `#id · label` — the
+    short_title, or the title compacted to 50 chars when there is none."""
+    from dct.core.changelog import add_entry
+
+    labelled = create_item(engine, "proj-a", "todo", "Labelled", short_title="Web label")
+    bare = create_item(engine, "proj-a", "todo", "B" * 80)
+    add_entry(engine, "proj-a", "added", "with label", related_item_id=labelled["id"])
+    add_entry(engine, "proj-a", "fixed", "with title", related_item_id=bare["id"])
+    add_entry(engine, "proj-a", "fixed", "no item")
+    body = _body(client, "/p/proj-a/changelog")
+    assert f'#{labelled["id"]} · Web label</a>' in body
+    assert f'#{bare["id"]} · {"B" * 49}…</a>' in body
+    assert body.count('class="rel"') == 2

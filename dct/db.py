@@ -153,6 +153,15 @@ changelog_entries = sa.Table(
     sa.Column("source_file", sa.String(500)),
     sa.Column("source_lines", sa.String(100)),
     sa.Column("related_item_id", sa.Integer, sa.ForeignKey("items.id")),
+    # #801: the branch / worktree the entry was written on, so a release can
+    # tell entries of other branches apart. `branch_source` records who
+    # supplied them: 'client' (the caller passed them, or the CLI detected
+    # them in the caller's directory) or 'server' (the MCP server detected
+    # them in its own cwd). All nullable — NULL = unknown (not a repo,
+    # detached HEAD for `branch`, or a pre-#801 row).
+    sa.Column("branch", sa.String(255)),
+    sa.Column("worktree", sa.String(500)),
+    sa.Column("branch_source", sa.String(16)),
     sa.Column("created_at", sa.DateTime, nullable=False, server_default=sa.text("CURRENT_TIMESTAMP")),
     sa.Column("updated_at", sa.DateTime, nullable=False, server_default=sa.text("CURRENT_TIMESTAMP")),
     sa.Column("released_at", sa.DateTime),
@@ -598,6 +607,19 @@ def _apply_schema_updates(engine: sa.Engine) -> None:
     # helper — two processes may bootstrap the same old database at once.
     if "short_title" not in col_names:
         _add_column_if_missing(engine, "items", "short_title", "VARCHAR(50)")
+
+    # #801: changelog_entries.branch / worktree / branch_source (nullable, no
+    # backfill — pre-#801 entries stay "unbranched"). Each column is healed
+    # independently by the duplicate-safe helper.
+    if "changelog_entries" in inspector.get_table_names():
+        cl_cols = {c["name"] for c in inspector.get_columns("changelog_entries")}
+        for column, ddl_type in (
+            ("branch", "VARCHAR(255)"),
+            ("worktree", "VARCHAR(500)"),
+            ("branch_source", "VARCHAR(16)"),
+        ):
+            if column not in cl_cols:
+                _add_column_if_missing(engine, "changelog_entries", column, ddl_type)
 
     # #222: opt-in changelog enforcement. Add projects.manages_changelog and,
     # on first add, backfill — a project KEEPS enforcement only if it already

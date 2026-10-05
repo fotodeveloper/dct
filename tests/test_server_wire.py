@@ -156,12 +156,12 @@ def test_2026_era_request_negotiates_a_supported_version(tmp_path):
     assert result["protocolVersion"] in {"2025-11-25", "2026-07-28"}
 
 
-def test_tools_list_over_spawned_stdio_carries_55_tools_and_13_alwaysload(tmp_path):
+def test_tools_list_over_spawned_stdio_carries_57_tools_and_13_alwaysload(tmp_path):
     responses = _handshake(tmp_path, "2025-06-18", extra_requests=[
         {"jsonrpc": "2.0", "id": 2, "method": "tools/list"},
     ])
     tools = next(r for r in responses if r.get("id") == 2)["result"]["tools"]
-    assert len(tools) == 55
+    assert len(tools) == 57
     hot = [t["name"] for t in tools
            if (t.get("_meta") or {}).get("anthropic/alwaysLoad") is True]
     assert len(hot) == 13
