@@ -21,7 +21,7 @@ import sys
 from pathlib import Path
 
 import pytest
-from conftest import git, make_git_repo
+from conftest import git, make_git_repo, require_tools, run_cli
 
 from dct.core.changelog import add_entry
 from dct.core.projects import create_project
@@ -33,23 +33,11 @@ COMMIT_HOOK = HOOKS_DIR / "check-changelog.sh"
 STOP_HOOK = HOOKS_DIR / "check-changelog-on-stop.sh"
 LIB_NAME = "dct-changelog-count.lib.sh"
 
-_MISSING_TOOLS = [t for t in ("git", "jq") if shutil.which(t) is None]
+@pytest.fixture(autouse=True)
+def _hook_dependencies():
+    """K-45/K-65: skip locally, FAIL under CI when git or jq is missing."""
+    require_tools("bash", "git", "jq")
 
-# K-45: locally a missing jq/git skips the module; under CI (GitHub Actions
-# sets CI=true) the skip is disabled and the sentinel below FAILS instead, so
-# the hook suite can never go silently green on a runner without jq.
-pytestmark = pytest.mark.skipif(
-    bool(_MISSING_TOOLS) and not os.environ.get("CI"),
-    reason=f"{' and '.join(_MISSING_TOOLS)} required by the hooks",
-)
-
-
-@pytest.mark.skipif(not os.environ.get("CI"),
-                    reason="sentinel for CI only; set CI=1 to arm it")
-def test_ci_runner_has_the_hook_dependencies():
-    assert not _MISSING_TOOLS, (
-        f"CI is set but {_MISSING_TOOLS} missing — the changelog hook tests "
-        "would otherwise be skipped silently")
 
 _COMMIT_PAYLOAD = json.dumps({"tool_input": {"command": 'git commit -m "feat: x"'}})
 
@@ -159,7 +147,7 @@ def test_commit_denied_when_only_other_branches_have_entries(repo, tmp_path):
     reason = json.loads(r.stdout)["hookSpecificOutput"]["permissionDecisionReason"]
     assert "on branch 'feat/x'" in reason
     assert "entries written on other branches do not" in reason
-    assert "dct clog update <id> --branch=feat/x" in reason
+    assert "dct clog update <ENTRY_ID> --branch=feat/x" in reason
     assert "THIS specific change" in reason and "/clog" in reason
 
 
@@ -319,7 +307,9 @@ def _branch_repo(tmp_path, name: str) -> Path:
 
 
 def _guidance_command(text: str) -> str:
-    m = re.search(r"move it here with: (dct clog update <id> \S+) — otherwise", text)
+    # K-65: the placeholder is marked as text to replace, never a ready command.
+    assert "replace <ENTRY_ID> with the number of that entry" in text, text
+    m = re.search(r": (dct clog update <ENTRY_ID> \S+) — otherwise", text)
     assert m, text
     return m.group(1)
 
@@ -341,11 +331,19 @@ def test_pasted_guidance_command_executes_nothing(tmp_path, branch, hook):
         r = _stop_hook(root, env)
         assert r.returncode == 0 and "Reminder" in r.stdout
         text = r.stdout
-    command = _guidance_command(text).replace("<id>", "7")
+    template = _guidance_command(text)
+    command = template.replace("<ENTRY_ID>", "7")
 
     paste_dir = tmp_path / "paste"
     paste_dir.mkdir()
     (bin_dir / "argv.log").unlink()
+    # Pasted WITHOUT replacing the placeholder, bash refuses the redirection
+    # from a missing file `ENTRY_ID` — dct is never called, nothing changes.
+    unedited = subprocess.run(["bash", "-c", template], cwd=paste_dir, env=env,
+                              capture_output=True, text=True, timeout=30)
+    assert unedited.returncode != 0
+    assert not (bin_dir / "argv.log").exists() or _calls(bin_dir) == []
+    assert list(paste_dir.iterdir()) == []
     pasted = subprocess.run(["bash", "-c", command], cwd=paste_dir, env=env,
                             capture_output=True, text=True, timeout=30)
     assert pasted.returncode == 0, pasted.stderr
@@ -376,7 +374,7 @@ def test_dash_branch_is_never_parsed_as_an_option(tmp_path):
     calls = _count_calls(bin_dir)
     _assert_branch_args_well_formed(calls)
     assert "--branch=-x" in calls[0]
-    assert "dct clog update <id> --branch=-x " in reason
+    assert "dct clog update <ENTRY_ID> --branch=-x " in reason
 
 
 def test_dash_branch_counts_its_own_entry_with_the_real_cli(tmp_path):
@@ -431,7 +429,7 @@ def test_stop_per_branch_reminder_offers_the_move_for_this_change_only(repo, tmp
     out = _stop_hook(repo, env).stdout
     assert "on branch 'feat/x'" in out and "other branches do not" in out
     assert "THIS specific change" in out
-    assert "dct clog update <id> --branch=feat/x" in out
+    assert "dct clog update <ENTRY_ID> --branch=feat/x" in out
 
 
 def test_stop_broken_count_keeps_the_generic_reminder(repo, tmp_path):
@@ -530,3 +528,50 @@ def test_doctor_flags_a_copied_install_missing_its_lib(tmp_path, installed, monk
     (copy_dir / LIB_NAME).unlink()
     row = hook_assets()
     assert row["status"] == "error" and LIB_NAME in row["message"]
+
+
+@pytest.mark.parametrize("drift", ["missing", "outdated"])
+def test_dct_upgrade_heals_a_drifted_hook_lib_and_doctor_is_clean_again(
+        tmp_path, installed, monkeypatch, capsys, drift):
+    """K-65: hook_assets REPORTS a missing / outdated lib — and the report
+    alone proves nothing. Run the real `dct upgrade` install path (editable
+    method → no package manager is invoked; every Claude path points into
+    tmp_path, Codex is not detected) and re-run doctor: the drift is gone."""
+    from dct import update
+    from dct.integrations import codex
+
+    copy_dir = installed(copy=True)
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setattr(claude, "CLAUDE_HOOKS_DIR", copy_dir)
+    claude_json = tmp_path / "claude.json"
+    claude_json.write_text(json.dumps({"mcpServers": {"dct": {"command": "dct", "args": ["server"]}}}))
+    monkeypatch.setattr(claude, "CLAUDE_JSON", claude_json)
+    for attr, name in (("CLAUDE_MD", "CLAUDE.md"), ("CLAUDE_SETTINGS", "settings.json"),
+                       ("CLAUDE_SKILLS_DIR", "skills")):
+        monkeypatch.setattr(claude, attr, tmp_path / name)
+    monkeypatch.setattr(codex.CodexIntegration, "detect", lambda self: False)
+    monkeypatch.setattr(update, "detect_install_method", lambda *a, **k: "editable")
+
+    def _no_package_manager(*a, **k):
+        raise AssertionError("the test must never run a real package upgrade")
+
+    monkeypatch.setattr(update, "upgrade_command", _no_package_manager)
+
+    def hook_assets():
+        return next(c for c in claude.ClaudeIntegration().doctor() if c["check"] == "hook_assets")
+
+    lib = copy_dir / LIB_NAME
+    if drift == "missing":
+        lib.unlink()
+    else:
+        lib.write_text("# stale lib from an older install\n")
+    before = hook_assets()
+    assert before["status"] == "error" and LIB_NAME in before["message"]
+
+    run_cli(monkeypatch, ["upgrade"])
+    out = capsys.readouterr()
+    assert "claude: Packaged integration assets refreshed" in out.out, (out.out, out.err)
+
+    after = hook_assets()
+    assert after["status"] == "ok", after
+    assert lib.read_bytes() == (HOOKS_DIR / LIB_NAME).read_bytes()

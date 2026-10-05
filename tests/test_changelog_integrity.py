@@ -14,7 +14,6 @@ Every test runs on the in-memory SQLite engine and on the PostgreSQL lane.
 """
 
 from concurrent.futures import ThreadPoolExecutor
-from threading import Event
 
 import pytest
 import sqlalchemy as sa
@@ -314,10 +313,92 @@ def concurrent_engine(engine, tmp_path):
         eng.dispose()
 
 
-def test_edit_committed_before_the_release_is_included(concurrent_engine, monkeypatch):
-    """The edit holds the project lock; a release started meanwhile waits and
-    then stamps the EDITED row (PG before K-39: the release snapshot missed
-    the edit and its UPDATE died with SQLSTATE 40001)."""
+class LockProbe:
+    """Positive, sleep-free proof that a competitor transaction is BLOCKED on
+    the project write lock while the holder still holds it (K-64).
+
+    The competitor runs through `run()` in a worker thread; the probe watches
+    that thread's statements on the engine:
+    - PostgreSQL: project_transaction polls `pg_try_advisory_lock`; a SECOND
+      attempt from the competitor exists only because the first one was
+      refused — the lock was held when it tried.
+    - SQLite: right before the competitor's `BEGIN IMMEDIATE` a separate
+      connection with a zero busy timeout tries to take the same write lock;
+      "database is locked" proves the holder still holds it at that moment,
+      so the competitor's statement can only return after the release.
+    `blocked` is set on that proof; `free` records a probe that found the
+    lock FREE (the holder lost it — a failure, never retried away).
+    """
+
+    def __init__(self, engine):
+        import threading
+
+        self.engine = engine
+        self.blocked = threading.Event()
+        self.free = threading.Event()
+        self.thread_id: int | None = None
+        self.attempts = 0
+        sa.event.listen(engine, "before_cursor_execute", self._observe)
+
+    def close(self):
+        sa.event.remove(self.engine, "before_cursor_execute", self._observe)
+
+    def run(self, fn, *args, **kwargs):
+        import threading
+
+        self.thread_id = threading.get_ident()
+        return fn(*args, **kwargs)
+
+    def _observe(self, conn, cursor, statement, parameters, context, executemany):
+        import threading
+
+        if threading.get_ident() != self.thread_id:
+            return
+        if "pg_try_advisory_lock" in statement:
+            self.attempts += 1
+            if self.attempts >= 2:
+                self.blocked.set()
+        elif statement.strip().upper() == "BEGIN IMMEDIATE":
+            self._probe_sqlite_write_lock()
+
+    def _probe_sqlite_write_lock(self):
+        import sqlite3
+
+        probe = sqlite3.connect(self.engine.url.database, timeout=0, isolation_level=None)
+        try:
+            probe.execute("BEGIN IMMEDIATE")
+        except sqlite3.OperationalError as exc:
+            if "locked" in str(exc):
+                self.blocked.set()
+                return
+            raise
+        else:
+            probe.execute("ROLLBACK")
+            self.free.set()
+        finally:
+            probe.close()
+
+    def wait_until_blocked(self, timeout: float = 15) -> None:
+        assert self.blocked.wait(timeout), (
+            "the competitor never reached the held lock"
+            + (" — the probe found it FREE" if self.free.is_set() else ""))
+        assert not self.free.is_set()
+
+
+@pytest.fixture
+def lock_probe(concurrent_engine):
+    probe = LockProbe(concurrent_engine)
+    try:
+        yield probe
+    finally:
+        probe.close()
+
+
+def test_edit_committed_before_the_release_is_included(
+        concurrent_engine, monkeypatch, lock_probe):
+    """The edit holds the project lock; a release started meanwhile is PROVEN
+    to wait on it (LockProbe), then stamps the EDITED row (PG before K-39:
+    the release snapshot missed the edit and its UPDATE died with 40001)."""
     eng = concurrent_engine
     create_project(eng, "proj-c", "C", current_version="1.0.0")
     eid = add_entry(eng, "proj-c", "added", "original")["id"]
@@ -328,8 +409,9 @@ def test_edit_committed_before_the_release_is_included(concurrent_engine, monkey
 
         def read_then_start_release(conn, project_id, entry_id):
             row = original(conn, project_id, entry_id)
-            futures.append(pool.submit(release_entries, eng, "proj-c", "1.1.0"))
-            Event().wait(0.5)  # the release must be blocked on the lock now
+            futures.append(pool.submit(lock_probe.run, release_entries, eng, "proj-c", "1.1.0"))
+            lock_probe.wait_until_blocked()
+            assert not futures[0].done()
             return row
 
         monkeypatch.setattr(changelog, "_load_unreleased_entry", read_then_start_release)
@@ -342,10 +424,11 @@ def test_edit_committed_before_the_release_is_included(concurrent_engine, monkey
 
 @pytest.mark.parametrize("operation", ["update", "delete"])
 def test_edit_after_the_release_gets_the_controlled_refusal(
-    concurrent_engine, monkeypatch, operation,
+    concurrent_engine, monkeypatch, lock_probe, operation,
 ):
-    """The release holds the project lock; an edit started meanwhile waits and
-    is then refused as 'already released' — never a raw serialization error."""
+    """The release holds the project lock; an edit started meanwhile is
+    PROVEN to wait on it, then is refused as 'already released' — never a
+    raw serialization error."""
     eng = concurrent_engine
     create_project(eng, "proj-c", "C", current_version="1.0.0")
     eid = add_entry(eng, "proj-c", "added", "original")["id"]
@@ -363,8 +446,9 @@ def test_edit_after_the_release_gets_the_controlled_refusal(
 
         def validate_then_start_edit(*args, **kwargs):
             result = validate(*args, **kwargs)
-            futures.append(pool.submit(edit))
-            Event().wait(0.5)  # the edit must be blocked on the lock now
+            futures.append(pool.submit(lock_probe.run, edit))
+            lock_probe.wait_until_blocked()
+            assert not futures[0].done()
             return result
 
         monkeypatch.setattr(records, "validate_project_rows", validate_then_start_edit)
@@ -374,3 +458,75 @@ def test_edit_after_the_release_gets_the_controlled_refusal(
     assert released["released"] == 1
     row = _row(eng, eid, "proj-c")
     assert (row["entry"], row["version"]) == ("original", "1.1.0")
+
+
+# ── K-64: a serialization failure is a controlled refusal, never retried ─────
+
+
+class _Sqlstate40001(Exception):
+    sqlstate = "40001"
+
+
+def test_serialization_failure_becomes_a_controlled_refusal(proj):
+    """Any 40001 escaping a project transaction is rolled back and surfaces
+    as SerializationConflict — the body's earlier writes are not kept."""
+    from dct.db import SerializationConflict, project_transaction
+
+    before = _snapshot(proj)
+    with (
+        pytest.raises(SerializationConflict, match="40001.*nothing was written"),
+        project_transaction(proj, "proj-a", write=True) as (conn, pid),
+    ):
+        conn.execute(projects.update().where(projects.c.id == pid)
+                     .values(description="half-written"))
+        raise sa.exc.OperationalError("UPDATE ...", {}, _Sqlstate40001())
+    assert _snapshot(proj) == before
+
+
+def test_other_driver_errors_are_not_disguised(proj):
+    from dct.db import project_transaction
+
+    class _Other(Exception):
+        sqlstate = "23505"
+
+    with pytest.raises(sa.exc.IntegrityError), project_transaction(proj, "proj-a", write=True):
+        raise sa.exc.IntegrityError("INSERT ...", {}, _Other())
+
+
+def test_real_pg_serialization_failure_in_a_release_is_refused_without_writes(
+        concurrent_engine, monkeypatch):
+    """A writer OUTSIDE the project lock changes the project row after the
+    release's REPEATABLE READ snapshot: PostgreSQL raises 40001 on the
+    release's UPDATE. No automatic retry — a controlled refusal, nothing
+    written by the release (the outsider's own commit stays)."""
+    eng = concurrent_engine
+    if eng.dialect.name != "postgresql":
+        pytest.skip("SQLite's BEGIN IMMEDIATE excludes every other writer — no 40001")
+    from dct.core import releases as release_records
+    from dct.db import SerializationConflict
+
+    create_project(eng, "proj-c", "C", current_version="1.0.0")
+    eid = add_entry(eng, "proj-c", "added", "x")["id"]
+    url = eng.url.render_as_string(hide_password=False)
+    outsider = get_engine(url)
+    find = release_records.find_record
+
+    def find_then_outsider_writes(conn, pid, version):
+        row = find(conn, pid, version)       # the snapshot is established
+        with outsider.begin() as other:
+            other.execute(projects.update().where(projects.c.id == pid)
+                          .values(description="changed by a non-participant"))
+        return row
+
+    monkeypatch.setattr(release_records, "find_record", find_then_outsider_writes)
+    try:
+        with pytest.raises(SerializationConflict):
+            release_entries(eng, "proj-c", "1.1.0")
+    finally:
+        outsider.dispose()
+    row = _row(eng, eid, "proj-c")
+    assert row["version"] is None
+    with eng.begin() as conn:
+        assert conn.execute(sa.select(projects.c.current_version, projects.c.description)
+                            .where(projects.c.slug == "proj-c")).one() == (
+            "1.0.0", "changed by a non-participant")

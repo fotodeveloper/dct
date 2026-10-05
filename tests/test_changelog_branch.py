@@ -18,7 +18,7 @@ from dct.core.changelog import (
 )
 from dct.core.items import create_item
 from dct.core.projects import create_project, get_project
-from dct.db import changelog_entries, projects
+from dct.db import changelog_entries, projects, releases
 
 needs_git = pytest.mark.skipif(shutil.which("git") is None, reason="git not available")
 
@@ -445,11 +445,16 @@ def test_release_equal_version_with_trailing_zero_is_not_a_rewind(proj):
     assert release_entries(proj, "proj-a", "1.5.0")["released"] == 1
 
 
-def test_release_unparsable_versions_are_not_compared(proj):
+def test_release_unparsable_current_version_is_refused_not_skipped(proj):
+    """K-54: an unparseable stored current_version no longer switches the
+    never-rewind guard off — the stamp is refused, nothing is written."""
     with proj.begin() as conn:
         conn.execute(projects.update().values(current_version="2026-rc"))
     _add(proj, "a")
-    assert release_entries(proj, "proj-a", "0.1.0")["current_version"] == "0.1.0"
+    before = _snapshot(proj)
+    with pytest.raises(ValueError, match="'2026-rc'.*not a supported version"):
+        release_entries(proj, "proj-a", "0.1.0")
+    assert _snapshot(proj) == before
 
 
 def test_release_version_only_sets_version_and_stamps_nothing(mixed):
@@ -634,7 +639,7 @@ def test_release_bump_of_unsupported_current_is_refused_without_writes(proj):
         conn.execute(projects.update().values(current_version="2026-rc"))
     _add(proj, "a")
     before = _snapshot(proj)
-    with pytest.raises(ValueError, match="Unsupported version"):
+    with pytest.raises(ValueError, match="'2026-rc'.*not a supported version"):
         release_entries(proj, "proj-a", bump_type="patch")
     assert _snapshot(proj) == before
 
@@ -676,12 +681,32 @@ def test_release_all_never_released_lower_version_is_still_a_rewind(proj):
     assert _snapshot(proj) == before
 
 
-def test_release_all_with_require_entries_refuses_an_implicit_version_only(proj):
-    """K-31: the CLI's consent rule — mode 'all' with nothing to stamp and a
-    NEW version would silently become a version-only release."""
+@pytest.mark.parametrize("kwargs", [{"version": "1.1.0"}, {"bump_type": "minor"}])
+def test_release_all_with_nothing_unreleased_refuses_an_implicit_version_only(proj, kwargs):
+    """K-31 / K-62: core refuses for EVERY caller — mode 'all' with nothing
+    to stamp and a NEW version would silently become a version-only release;
+    that one needs entry_ids=[] explicitly."""
     before = _snapshot(proj)
-    with pytest.raises(ValueError, match="No unreleased entries"):
-        release_entries(proj, "proj-a", "1.1.0", require_entries=True)
+    with pytest.raises(ValueError, match="No unreleased entries.*must be explicit"):
+        release_entries(proj, "proj-a", **kwargs)
     assert _snapshot(proj) == before
-    # The no-op retry of the current version stays allowed under the flag.
-    assert release_entries(proj, "proj-a", "1.0.0", require_entries=True)["released"] == 0
+    # The no-op retry of the current version stays allowed.
+    assert release_entries(proj, "proj-a", "1.0.0")["released"] == 0
+    # The explicit version-only release goes through.
+    assert release_entries(proj, "proj-a", "1.1.0", entry_ids=[])["mode"] == "version_only"
+
+
+def test_release_all_empty_resumes_a_recorded_and_a_historical_release(proj):
+    """The no-op of an EXISTING release (with a record, or a legacy one
+    without) is resolved BEFORE the empty-set refusal."""
+    _add(proj, "a")
+    release_entries(proj, "proj-a", "1.1.0")               # recorded
+    assert release_entries(proj, "proj-a", "1.1.0")["release"]["version"] == "1.1.0"
+    _add(proj, "b")
+    release_entries(proj, "proj-a", "1.2.0")
+    with proj.begin() as conn:
+        conn.execute(releases.delete())                     # legacy: no records
+    before = _snapshot(proj)
+    out = release_entries(proj, "proj-a", "1.1.0")          # historical retry
+    assert (out["released"], out["release"]) == (0, None)
+    assert _snapshot(proj) == before

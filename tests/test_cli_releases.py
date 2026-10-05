@@ -7,8 +7,8 @@ from pathlib import Path
 import pytest
 from conftest import git, make_git_repo, run_cli
 
-from dct.core.changelog import add_entry, release_entries
-from dct.core.projects import create_project
+from dct.core.changelog import add_entry, list_entries, release_entries
+from dct.core.projects import create_project, get_project
 from dct.core.releases import advance_release, get_release
 
 needs_git = pytest.mark.skipif(shutil.which("git") is None, reason="git not available")
@@ -69,17 +69,77 @@ def test_release_of_a_project_without_path_pins_nothing(cli_engine, monkeypatch)
 
 
 @needs_git
-def test_release_in_a_repo_without_commits_pins_no_sha(cli_engine, monkeypatch, tmp_path):
+def test_release_in_a_repo_without_commits_is_refused_before_stamping(
+        cli_engine, monkeypatch, tmp_path, capsys):
+    """K-52: a repository without a first commit is not a project without
+    git — there is no HEAD to pin, so nothing is stamped."""
     repo = tmp_path / "empty"
     repo.mkdir()
     git(repo, "init", "-q", "-b", "main")
     create_project(cli_engine, slug="proj-e", name="E", path=str(repo), current_version="1.0.0")
-    add_entry(cli_engine, "proj-e", "added", "a")
+    eid = add_entry(cli_engine, "proj-e", "added", "a")["id"]
     monkeypatch.chdir(repo)
-    run_cli(monkeypatch, ["clog", "release", "-P", "proj-e", "1.1.0"])
-    rec = get_release(cli_engine, "proj-e", "1.1.0")
-    assert rec["candidate_sha"] is None
-    assert rec["checkout_root"] == str(repo.resolve())
+    assert _exit_code(monkeypatch, ["clog", "release", "-P", "proj-e", "1.1.0"]) == 1
+    assert "no commit" in capsys.readouterr().err
+    _assert_nothing_released(cli_engine, "proj-e", eid)
+
+
+def _assert_nothing_released(engine, slug, eid):
+    assert get_project(engine, slug)["current_version"] == "1.0.0"
+    assert get_release(engine, slug, "1.1.0") is None
+    assert [e["version"] for e in list_entries(engine, slug) if e["id"] == eid] == [None]
+
+
+def test_release_with_git_missing_is_refused_before_stamping(
+        cli_engine, monkeypatch, tmp_path, capsys):
+    """K-52: without git a registered directory cannot be CONFIRMED to be
+    outside a repository — never silently treated as "no git"."""
+    from dct.core import gitinfo
+
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    create_project(cli_engine, slug="proj-p", name="P", path=str(plain), current_version="1.0.0")
+    eid = add_entry(cli_engine, "proj-p", "added", "a")["id"]
+    monkeypatch.setattr(gitinfo.shutil, "which", lambda name: None)
+    monkeypatch.chdir(plain)
+    assert _exit_code(monkeypatch, ["clog", "release", "-P", "proj-p", "1.1.0"]) == 1
+    err = capsys.readouterr().err
+    assert "Cannot verify" in err and "git is not on PATH" in err and "nothing released" in err
+    _assert_nothing_released(cli_engine, "proj-p", eid)
+
+
+def test_release_with_a_failing_git_is_refused_before_stamping(
+        cli_engine, monkeypatch, tmp_path, capsys):
+    """Exit 128 with any message other than git's "not a git repository"
+    (here: dubious ownership) proves nothing — refuse."""
+    import os
+
+    from dct.core import gitinfo
+
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    fake = tmp_path / "git"
+    fd = os.open(fake, os.O_WRONLY | os.O_CREAT, 0o755)
+    with os.fdopen(fd, "w") as f:
+        f.write("#!/bin/bash\necho 'fatal: detected dubious ownership' >&2\nexit 128\n")
+    create_project(cli_engine, slug="proj-p", name="P", path=str(plain), current_version="1.0.0")
+    eid = add_entry(cli_engine, "proj-p", "added", "a")["id"]
+    monkeypatch.setattr(gitinfo.shutil, "which", lambda name: str(fake))
+    monkeypatch.chdir(plain)
+    assert _exit_code(monkeypatch, ["clog", "release", "-P", "proj-p", "1.1.0"]) == 1
+    assert "dubious ownership" in capsys.readouterr().err
+    _assert_nothing_released(cli_engine, "proj-p", eid)
+
+
+def test_release_of_a_project_whose_directory_is_gone_is_refused(
+        cli_engine, monkeypatch, tmp_path, capsys):
+    create_project(cli_engine, slug="proj-p", name="P", path=str(tmp_path / "gone"),
+                   current_version="1.0.0")
+    eid = add_entry(cli_engine, "proj-p", "added", "a")["id"]
+    monkeypatch.chdir(tmp_path)
+    assert _exit_code(monkeypatch, ["clog", "release", "-P", "proj-p", "1.1.0"]) == 1
+    assert "does not exist" in capsys.readouterr().err
+    _assert_nothing_released(cli_engine, "proj-p", eid)
 
 
 def test_release_rerun_reports_the_existing_record(cli_engine, monkeypatch, capsys):

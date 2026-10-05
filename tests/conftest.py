@@ -8,6 +8,7 @@ seam through which a test file reaches the in-memory DB — is stated once.
 
 import os
 import re
+import shutil
 import subprocess
 import sys
 
@@ -302,3 +303,27 @@ def make_git_repo(path, branch: str = "main"):
     git(path, "add", "README")
     git(path, "commit", "-q", "-m", "init")
     return os.path.realpath(path)
+
+
+def require_tools(*tools: str) -> None:
+    """The ONE missing-tool guard for tests that drive shell hooks (K-45, K-65).
+
+    Locally a missing tool (jq, git, bash) SKIPS the calling test; under CI
+    (GitHub Actions sets CI=true) it FAILS instead, so a runner without jq can
+    never turn the hook suites silently green. Call it at the top of a test,
+    or use the `hook_tools` fixture / a module-level autouse fixture.
+    """
+    missing = [tool for tool in tools if shutil.which(tool) is None]
+    if not missing:
+        return
+    if os.environ.get("CI"):
+        pytest.fail(
+            f"CI is set but {missing} missing — the hook tests that need them "
+            f"would otherwise be skipped silently", pytrace=False)
+    pytest.skip(f"{' and '.join(missing)} required by the hooks")
+
+
+@pytest.fixture
+def hook_tools():
+    """bash + jq for a test that runs a dct hook (see require_tools)."""
+    require_tools("bash", "jq")

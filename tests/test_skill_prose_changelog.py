@@ -63,10 +63,13 @@ def test_dct_import_stops_instead_of_retrying_on_an_outdated_create_ack():
     pytest.param(lambda: _codex("track"), id="codex-track"),
 ])
 def test_update_keeps_the_label_unless_asked_to_change_it(text):
-    """K-40: short_title is optional on update — omitting it keeps the label."""
+    """K-40: short_title is optional on update — omitting it keeps the label;
+    K-56: a whitespace-only value is explicit and clears it, in both clients."""
     flat = " ".join(text().split())
-    assert re.search(r"omit it to keep the stored label", flat)
+    assert re.search(r'omit it \(or pass `""`\) to keep the stored label', flat)
     assert "'__clear__'" in flat
+    assert re.search(r"whitespace-only value (is not \"omitted\" — it strips to empty and )?"
+                     r"(also )?clears", flat)
     assert "always pass" not in flat.lower().split("update_item")[-1]
 
 

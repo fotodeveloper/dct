@@ -73,7 +73,9 @@ dct/core/version.py      — Version contract (parse / normalize / compare / bum
                            X.Y | X.Y.Z, leading v dropped) + project-file autodetect
 dct/core/gitinfo.py      — Git readers (toplevel / branch / common dir) +
                            resolve_checkout: same-repo checkout of a project
-                           (repo root vs project root)
+                           (repo root vs project root), best-effort; the
+                           STRICT verify_release_checkout (confirmed repo /
+                           confirmed non-repo / error) gates the CLI release
 dct/core/records.py      — Shared STRICT project-row id validator
 dct/core/checkpoints.py  — Item checkpoint helpers
 dct/core/ids.py          — ULID generation

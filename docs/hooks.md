@@ -241,9 +241,11 @@ dct_changelog_guidance           # the deny / reminder text for the path taken
   CLI, or no branch checked out) and never mentions other branches.
 - **Paste-safe command.** Agents copy the guidance into a shell, and Git
   allows `;`, `$(...)` and backticks in branch names (`feat/x;true`,
-  `feat/$(id)`). The ready-to-run `dct clog update <id> --branch=<b>` quotes
-  its WHOLE argument with `printf %q`, so pasting it into bash runs nothing
-  but `dct`. The deny JSON itself is built by `jq --arg`.
+  `feat/$(id)`). The offered `dct clog update <ENTRY_ID> --branch=<b>` is a
+  template: the text says to replace `<ENTRY_ID>` with the entry's number
+  first (pasted unedited, bash refuses the `<` redirection and runs nothing).
+  The branch argument is quoted WHOLE with `printf %q`, so the edited line
+  runs nothing but `dct`. The deny JSON itself is built by `jq --arg`.
 - **Own failure.** When even the fallback yields no integer (dct or its
   database is broken), or the lib cannot be found, the two hooks deliberately
   differ — the lib only reports, each hook applies its own policy:

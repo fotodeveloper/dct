@@ -20,9 +20,9 @@ key is missing, report an unsupported (outdated) DCT MCP server contract that
 needs a restart or upgrade — do not retry the create (the item exists) and do
 not claim the label was saved. Preserve returned integer IDs. Update existing
 items instead of duplicating them; on `update_item` `short_title` is optional —
-omit it to keep the stored label, pass it only to change the label
-(`'__clear__'` removes it). For accepted non-trivial implementation add 3–7
-checkpoints before coding, complete each as verified, reject abandoned checkpoints
+omit it (or pass `""`) to keep the stored label, pass it only to change the
+label (`'__clear__'` removes it; a whitespace-only value also clears it).
+For accepted non-trivial implementation add 3–7 checkpoints before coding, complete each as verified, reject abandoned checkpoints
 rather than deleting them. Include a user-validation gate for user-facing features
 when project conventions require one. Do not claim completion without evidence or
 silently bypass pending gates. Use `resolve_item` for closing and report returned

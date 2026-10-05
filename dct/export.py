@@ -5,7 +5,8 @@ from datetime import UTC, datetime
 
 import sqlalchemy as sa
 
-from dct.db import changelog_entries, projects, row_to_dict
+from dct.core.version import same_version, version_key
+from dct.db import changelog_entries, projects, releases, row_to_dict
 
 
 def export_changelog_md(
@@ -22,7 +23,17 @@ def export_changelog_md(
     /release flow prepends into an existing changelog.md (see item #214); an
     unknown version renders to an empty string. When `version` is None
     (default) the full file is rendered: header + [Unreleased] + every version.
+
+    Versions are selected and grouped SEMANTICALLY (K-55): every entry whose
+    stored version equals the requested one under the version contract
+    (1.1 == 1.1.0 == v1.1 — changelog.stored_spellings) lands in ONE block,
+    in the full render too. The block is headed by the AUTHORITATIVE
+    spelling: the live release record's version when one exists, else the
+    stored spelling of the version's first-stamped entry (a legacy release
+    keeps its own spelling — nothing is invented, nothing is rewritten).
     """
+    from dct.core.changelog import stored_spellings
+
     with engine.begin() as conn:
         row = conn.execute(
             sa.select(projects.c.id).where(projects.c.slug == project_slug, projects.c.deleted_at.is_(None))
@@ -35,25 +46,30 @@ def export_changelog_md(
             .where(changelog_entries.c.project_id == pid, changelog_entries.c.deleted_at.is_(None))
         )
         if version is not None:
-            q = q.where(changelog_entries.c.version == version)
+            q = q.where(changelog_entries.c.version.in_(stored_spellings(conn, pid, version)))
         q = q.order_by(changelog_entries.c.released_at.desc().nulls_first(), changelog_entries.c.created_at)
         rows = [row_to_dict(r) for r in conn.execute(q)]
+        recorded = list(conn.execute(
+            sa.select(releases.c.version).where(
+                releases.c.project_id == pid, releases.c.deleted_at.is_(None)
+            ).order_by(releases.c.id)
+        ).scalars())
 
     category_order = ["added", "changed", "fixed", "removed"]
 
-    # Group by version
-    versions: dict[str | None, list[dict]] = defaultdict(list)
+    # Group by SEMANTIC version; unreleased entries under None.
+    versions: dict[object, list[dict]] = defaultdict(list)
     for row in rows:
-        versions[row["version"]].append(row)
+        versions[_identity(row["version"])].append(row)
 
     # Single-version render: emit just the one block, no file-level header, so
     # the append-only release flow can prepend it into the existing file.
     if version is not None:
-        entries = versions.get(version)
-        if not entries:
+        released = [entries for key, entries in versions.items() if key is not None]
+        if not released:
             return ""
         block: list[str] = []
-        _render_version_block(version, entries, category_order, block)
+        _render_version_block(_spelling(released[0], recorded), released[0], category_order, block)
         return "\n".join(block)
 
     lines = ["# Changelog\n", ""]
@@ -65,11 +81,38 @@ def export_changelog_md(
         _render_version_entries(versions[None], category_order, lines)
 
     # Released versions (sorted by released_at of each version's first entry, desc)
-    released = {k: v for k, v in versions.items() if k is not None}
-    for ver in sorted(released, key=lambda v: released[v][0].get("released_at") or "", reverse=True):
-        _render_version_block(ver, released[ver], category_order, lines)
+    released_groups = [entries for key, entries in versions.items() if key is not None]
+    for entries in sorted(released_groups, key=lambda e: e[0].get("released_at") or "", reverse=True):
+        _render_version_block(_spelling(entries, recorded), entries, category_order, lines)
 
     return "\n".join(lines)
+
+
+def _identity(version: str | None) -> object:
+    """The grouping key of a stored version: None (unreleased), the
+    contract's comparable key, or — for a legacy unparseable value — the raw
+    string itself (it equals only itself, as in same_version)."""
+    if version is None:
+        return None
+    try:
+        return ("version", version_key(version))
+    except ValueError:
+        return ("raw", version)
+
+
+def _spelling(entries: list[dict], recorded: list[str]) -> str:
+    """The authoritative spelling of one version block: the release record's
+    version, else the stored spelling of the first-stamped entry."""
+    stored = entries[0]["version"]
+    for candidate in recorded:
+        if same_version(candidate, stored):
+            return candidate
+    first = min(entries, key=lambda e: (_sortable(e.get("released_at")), e["id"]))
+    return first["version"]
+
+
+def _sortable(value) -> str:
+    return value.isoformat() if hasattr(value, "isoformat") else str(value or "")
 
 
 def _render_version_block(

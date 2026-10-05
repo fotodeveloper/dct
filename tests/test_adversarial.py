@@ -393,9 +393,12 @@ class TestChangelogEdgeCases:
         create_project(engine, slug="p", name="P")
         count = count_unreleased(engine, "p")
         assert count == 0
-        # Release with nothing unreleased should return 0
+        # K-62: a NEW release with nothing unreleased is refused unless the
+        # version-only intent is explicit (entry_ids=[]).
         from dct.core.changelog import release_entries
-        released = release_entries(engine, "p", "1.0")
+        with pytest.raises(ValueError, match="must be explicit"):
+            release_entries(engine, "p", "1.0")
+        released = release_entries(engine, "p", "1.0", entry_ids=[])
         assert released["released"] == 0
 
     def test_multiple_releases(self, engine):

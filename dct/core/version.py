@@ -7,8 +7,15 @@ zeros of each component) — callers store the NORMALIZED form, so a later bump
 and a `v$CUR` tag never see `vv1.6.0`. Anything else is refused with
 ValueError("Unsupported version ...") — never silently skipped.
 
+`storable_version` is the ONE gate of every version WRITE (K-54, K-58):
+normalize, then check the width of EVERY version column the value can land
+in (ensure_version_fits — limits read from the schema, never typed in).
+Release, `project set-version`, `project add` and auto-detection all pass
+through it; prerelease / build suffixes are refused, not interpreted.
+
 `detect_version` is separate: it reports whatever a project file says (raw)
-and never raises.
+and never raises; create_project runs its result through storable_version
+and REPORTS an unsupported one instead of storing a substitute.
 """
 
 import json
@@ -41,6 +48,32 @@ def normalize_version(version: str) -> str:
     Raises ValueError for an unsupported format (see module docstring).
     """
     return format_version(parse_version(version))
+
+
+def ensure_version_fits(version: str) -> None:
+    """ValueError ("version too long ...") unless `version` fits every column
+    a version is stored in: projects.current_version,
+    changelog_entries.version and releases.version (widths read from the
+    schema, so widening or narrowing a column moves the guard)."""
+    from dct.core.limits import ensure_fits
+    from dct.db import changelog_entries, projects, releases
+
+    for table, column in (
+        (projects, "current_version"),
+        (changelog_entries, "version"),
+        (releases, "version"),
+    ):
+        ensure_fits(table, {column: version}, {column: "version"})
+
+
+def storable_version(version: str) -> str:
+    """The form a write stores: normalize_version + ensure_version_fits.
+
+    Raises ValueError ("Unsupported version ..." / "version too long ...").
+    """
+    normalized = normalize_version(version)
+    ensure_version_fits(normalized)
+    return normalized
 
 
 def version_key(version: str) -> tuple[int, ...]:

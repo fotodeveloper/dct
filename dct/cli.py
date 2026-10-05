@@ -208,6 +208,7 @@ def cmd_init(args):
         try:
             project = create_project(engine, slug=slug, name=name, path=proj_path)
             print(f"  ✓ Project '{slug}' registered")
+            _warn_unsupported_detection(project)
             version = project.get("current_version")
             source = project.get("_detected_source")
             if version and source:
@@ -215,8 +216,8 @@ def cmd_init(args):
             elif not version:
                 picked = _prompt_version()
                 if picked:
-                    set_version(engine, slug, picked)
-                    print(f"    ✓ Version set to {picked}")
+                    stored = set_version(engine, slug, picked)["current_version"]
+                    print(f"    ✓ Version set to {stored}")
                 else:
                     print(f"    ⚠ No version — run `dct project set-version {slug} <v>` later")
         except Exception as e:
@@ -348,6 +349,7 @@ def cmd_project_add(args):
         sys.exit(1)
 
     print(f"✓ Project '{args.slug}' registered at {path}")
+    _warn_unsupported_detection(project)
 
     version = project.get("current_version")
     source = project.get("_detected_source")
@@ -361,12 +363,30 @@ def cmd_project_add(args):
     # No version on the row — try an interactive prompt, else warn & bail out.
     picked = _prompt_version() if sys.stdin.isatty() else None
     if picked:
-        set_version(engine, args.slug, picked)
-        print(f"  ✓ Version set to {picked}")
+        try:
+            stored = set_version(engine, args.slug, picked)["current_version"]
+        except ValueError as e:
+            print(f"✗ Error: {e}", file=sys.stderr)
+            sys.exit(1)
+        print(f"  ✓ Version set to {stored}")
     else:
+        what = ("No supported version stored" if project.get("_detected_unsupported")
+                else "No version detected")
         print(
-            f"  ⚠ No version detected. Run `dct project set-version {args.slug} <version>` "
+            f"  ⚠ {what}. Run `dct project set-version {args.slug} <version>` "
             f"before using `/release`.",
+            file=sys.stderr,
+        )
+
+
+def _warn_unsupported_detection(project: dict) -> None:
+    """Say so when create_project detected a version the contract refuses
+    (K-54) — it was NOT stored and nothing was substituted."""
+    unsupported = project.get("_detected_unsupported")
+    if unsupported:
+        print(
+            f"  ⚠ Detected version {unsupported['version']!r} in {unsupported['source']} "
+            f"is not stored: {unsupported['reason']}",
             file=sys.stderr,
         )
 
@@ -375,9 +395,14 @@ def cmd_project_set_version(args):
     from dct.core.projects import set_version
 
     engine = _get_engine()
-    project = set_version(engine, args.slug, args.version)
+    try:
+        project = set_version(engine, args.slug, args.version)
+    except ValueError as e:
+        print(f"✗ Error: {e}", file=sys.stderr)
+        sys.exit(1)
     if project:
-        print(f"✓ {args.slug} → {args.version}")
+        # The STORED (normalized) form — what /release and tags will use.
+        print(f"✓ {args.slug} → {project['current_version']}")
     else:
         print(f"✗ Project '{args.slug}' not found", file=sys.stderr)
         sys.exit(1)
@@ -583,6 +608,7 @@ def cmd_add(args):
 
 def cmd_list(args):
     from dct.core.items import list_items
+    from dct.core.text import visible_label
 
     engine = _get_engine()
     kwargs = {}
@@ -616,7 +642,7 @@ def cmd_list(args):
         slug = slug_map.get(i.get("project_id"), "?")
         rows.append([
             str(i["id"]), slug, i["item_type"], i["priority"], i["status"],
-            i.get("short_title") or "", i["title"][:60],
+            visible_label(i.get("short_title")) or "", i["title"][:60],
         ])
 
     # Label is capped below its 50-char column so the title keeps its room.
@@ -625,6 +651,7 @@ def cmd_list(args):
 
 def cmd_show(args):
     from dct.core.items import get_item
+    from dct.core.text import visible_label
 
     engine = _get_engine()
     item = get_item(engine, args.id)
@@ -634,7 +661,7 @@ def cmd_show(args):
 
     print(f"#{item['id']}  {item['item_type']}/{item['priority']}  [{item['status']}]")
     print(f"Title:       {item['title']}")
-    if item.get("short_title"):
+    if visible_label(item.get("short_title")):
         print(f"Short title: {item['short_title']}")
     if item.get("description"):
         print(f"Description: {item['description']}")
@@ -1023,32 +1050,40 @@ def cmd_clog_count(args):
 _VERSION_SYNC_SCRIPTS = ("scripts/dct-version-sync.sh", "scripts/version-sync.sh")
 
 
-def _release_project_root(project: dict) -> tuple[str | None, str | None]:
-    """(project root, checkout root) of the release (K-34, K-41).
+def _release_project_root(project: dict) -> tuple[str | None, str | None, str | None]:
+    """(project root, checkout root, HEAD commit) of the release (K-34, K-41, K-52).
 
     The project root is the directory the version-sync script is looked up
     in and RUN FROM; the checkout root (git toplevel of the current checkout)
-    is pinned in the release record together with its HEAD.
+    and its HEAD (a full commit id) are pinned in the release record.
+    Resolved STRICTLY (gitinfo.verify_release_checkout) — the best-effort
+    readers' "None" never means "no git" here:
     - Registered path inside git: the caller's cwd must be a checkout of the
-      SAME repository (gitinfo.resolve_checkout — main checkout or any linked
-      worktree, never a nested foreign repo or a submodule); the result is
-      that checkout's `project_root` (a monorepo subproject maps to the same
-      subdirectory of the current worktree) and `repo_root`. Not a checkout,
-      or the cwd no longer exists → SystemExit(1) BEFORE anything is
+      SAME repository (main checkout or any linked worktree, never a nested
+      foreign repo or a submodule) with a first commit; the result is that
+      checkout's `project_root` (a monorepo subproject maps to the same
+      subdirectory of the current worktree), `repo_root` and HEAD.
+    - Registered path CONFIRMED outside git: (registered path, None, None) —
+      the documented path of a project without git.
+    - Anything not confirmed — not a checkout, a deleted cwd or project
+      directory, git missing / timing out / failing, a broken repository, a
+      repository without commits — SystemExit(1) BEFORE anything is
       stamped: a mutating release never silently switches to the main
       checkout.
-    - Registered path outside git: (registered path, None) — legacy behaviour.
-    - No registered path: (None, None) — no version-sync, nothing pinned.
+    - No registered path: (None, None, None) — no version-sync, nothing pinned.
     """
-    from dct.core.gitinfo import git_toplevel, resolve_checkout
+    from dct.core.gitinfo import (
+        CheckoutVerificationError,
+        NotACheckoutError,
+        verify_release_checkout,
+    )
 
     path = project.get("path")
     if not path:
-        return None, None
-    if git_toplevel(path) is None:
-        return path, None
-    checkout = resolve_checkout(path)
-    if checkout is None:
+        return None, None, None
+    try:
+        checkout = verify_release_checkout(path)
+    except NotACheckoutError:
         print(
             f"✗ The current directory is not a checkout of project '{project['slug']}' "
             f"({path}) — run `dct clog release` from the project's main checkout or "
@@ -1056,7 +1091,16 @@ def _release_project_root(project: dict) -> tuple[str | None, str | None]:
             file=sys.stderr,
         )
         sys.exit(1)
-    return checkout["project_root"], checkout["repo_root"]
+    except CheckoutVerificationError as e:
+        print(
+            f"✗ Cannot verify the release checkout of project '{project['slug']}' "
+            f"({path}): {e} — nothing released.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    if checkout is None:
+        return path, None, None
+    return checkout["project_root"], checkout["repo_root"], checkout["head"]
 
 
 def _run_version_sync(root: str, version: str) -> None:
@@ -1089,11 +1133,11 @@ def cmd_clog_release(args):
     """`dct clog release` — stamp entries (core release_entries), then sync files.
 
     Checks that conflict with idempotency are left to core (K-31): a retry of
-    a released version is a no-op there. The only CLI-side consent rule is
-    `require_entries` — mode 'all' with nothing unreleased refuses unless the
-    call is a no-op; a version-only release needs `--no-entries`. The
-    checkout is verified BEFORE stamping (_release_project_root); its HEAD
-    (gitinfo.git_head) and root are pinned in the release record (K-41) as
+    a released version is a no-op there, and mode 'all' with nothing
+    unreleased refuses unless the call is a no-op (core rule for every
+    caller, K-62) — a version-only release needs `--no-entries`. The
+    checkout is verified STRICTLY BEFORE stamping (_release_project_root,
+    K-52); its HEAD and root are pinned in the release record (K-41) as
     candidate_sha / checkout_root. Version-sync runs only when the project's
     current_version equals the requested version after the call — a real
     release, a version-only release, or an explicit resume of the current
@@ -1103,7 +1147,6 @@ def cmd_clog_release(args):
     (`dct clog release-advance`).
     """
     from dct.core.changelog import release_entries
-    from dct.core.gitinfo import git_head
     from dct.core.projects import get_project
     from dct.core.version import same_version
 
@@ -1123,14 +1166,13 @@ def cmd_clog_release(args):
     if not project:
         print(f"✗ Project '{project_slug}' not found", file=sys.stderr)
         sys.exit(1)
-    root, checkout_root = _release_project_root(project)
+    root, checkout_root, head = _release_project_root(project)
 
     try:
         result = release_entries(
             engine, project_slug, args.version or None,
             bump_type=None if args.version else args.bump, entry_ids=entry_ids,
-            require_entries=entry_ids is None,
-            candidate_sha=git_head(checkout_root) if checkout_root else None,
+            candidate_sha=head,
             checkout_root=checkout_root,
         )
     except Exception as e:

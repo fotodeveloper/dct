@@ -10,6 +10,7 @@ import os
 import subprocess
 
 import pytest
+from conftest import require_tools
 
 from dct.integrations.claude import HOOKS_DIR
 
@@ -33,6 +34,9 @@ def _run_hook(command: str, env_overrides: dict | None = None) -> subprocess.Com
 def _skip_if_dct_missing():
     if not HOOK_PATH.exists():
         pytest.skip(f"Hook script not found at {HOOK_PATH}")
+    # Without jq the hook exits 0 at its dependency guard, so every bypass
+    # assertion (exit 0) would pass without testing anything (K-65).
+    require_tools("bash", "jq")
 
 
 class TestReleaseBypassInline:

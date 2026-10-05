@@ -175,20 +175,165 @@ def test_two_concurrent_bootstraps_both_add_the_column_once(two_engines):
     assert get_item(first, item["id"])["title"] == "Survives the race"
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "BUG: create_tables() → metadata.create_all(checkfirst) is not race-safe — "
-    "two bootstraps of a database without `releases` both pass the existence "
-    "check and the second CREATE TABLE fails — for owner triage"))
-def test_two_concurrent_bootstraps_both_create_the_releases_table(two_engines):
+_RELEASES_INDEX = "ix_releases_project_version_live"
+
+
+def _index_names(engine, table) -> list[str]:
+    return [ix["name"] for ix in sa.inspect(engine).get_indexes(table)]
+
+
+def _assert_bootstraps_are_quiet(engine, capsys, runs=(2, 3)) -> None:
+    """Bootstraps 2..3 after the race: no DDL, no DML on this change, no output."""
+    seen = _record_all(engine)
+    for n in runs:
+        seen.clear()
+        create_tables(engine)
+        ddl = [st for st in seen if _DDL.match(st)]
+        touching = [st for st in seen if _DML.match(st) and _CHANGE.search(st)]
+        assert ddl == [], f"bootstrap {n} issued DDL: {ddl}"
+        assert touching == [], f"bootstrap {n} wrote: {touching}"
+        out = capsys.readouterr()
+        assert out.out == "" and out.err == "", f"bootstrap {n} printed output"
+
+
+_AT_CREATE_TABLE = re.compile(r"CREATE TABLE releases\b", re.IGNORECASE)
+_AT_CREATE_INDEX = re.compile(rf"CREATE UNIQUE INDEX {_RELEASES_INDEX}\b", re.IGNORECASE)
+
+
+@pytest.mark.parametrize("needles", [
+    [_AT_CREATE_TABLE],
+    [_AT_CREATE_TABLE, _AT_CREATE_INDEX],
+], ids=["at-create-table", "at-create-table-then-index"])
+def test_two_concurrent_bootstraps_both_create_the_releases_table_and_index(
+        two_engines, capsys, needles):
+    """K-59: both bootstraps pass their existence check, then meet at the
+    barrier right before CREATE TABLE (and, in the second case, again right
+    before CREATE INDEX — the loser of the table race has re-checked and
+    found the table WITHOUT its index); the loser recognises the
+    concurrent-creation conflict, re-checks the WHOLE required schema of the
+    table (a table that exists does not prove its unique index exists) and
+    finishes it."""
     first, _ = two_engines
+    if first.dialect.name == "postgresql" and _AT_CREATE_INDEX in needles:
+        pytest.skip("PostgreSQL creates a table and its indexes in ONE transaction — "
+                    "no other session can see the table without its index")
     with first.begin() as conn:
         conn.execute(sa.text("DROP TABLE releases"))
 
-    _hold_both_at(two_engines, re.compile(r"CREATE TABLE releases\b", re.IGNORECASE))
+    for needle in needles:
+        _hold_both_at(two_engines, needle)
     errors = _bootstrap_concurrently(two_engines)
 
     assert errors == [None, None], errors
     assert sa.inspect(first).get_table_names().count("releases") == 1
+    assert _index_names(first, "releases").count(_RELEASES_INDEX) == 1
+    capsys.readouterr()
+    for eng in two_engines:
+        _assert_bootstraps_are_quiet(eng, capsys)
+
+
+def test_a_table_seen_without_its_index_after_a_conflict_is_finished(engine, capsys):
+    """The conflicting creator has so far created only the bare table (on
+    SQLite CREATE TABLE and CREATE INDEX commit separately): the retry after
+    the conflict must not trust the table alone and creates the index."""
+    from dct import db
+
+    with engine.begin() as conn:
+        conn.execute(sa.text("DROP TABLE releases"))
+    real = db._create_table_objects
+    calls = []
+
+    def lose_the_race_once(eng, table):
+        if table.name == "releases" and not calls:
+            calls.append(table.name)
+            # The "other process" created the bare table only, then died.
+            with eng.begin() as conn:
+                conn.execute(sa.schema.CreateTable(table))
+            raise _duplicate_table_error(eng)
+        return real(eng, table)
+
+    db._create_table_objects = lose_the_race_once
+    try:
+        create_tables(engine)
+    finally:
+        db._create_table_objects = real
+    assert calls == ["releases"]
+    assert _index_names(engine, "releases").count(_RELEASES_INDEX) == 1
+    capsys.readouterr()
+    _assert_bootstraps_are_quiet(engine, capsys)
+
+
+def _duplicate_table_error(engine) -> Exception:
+    """The error the dialect raises for CREATE TABLE of an existing table."""
+    try:
+        with engine.begin() as conn:
+            conn.execute(sa.text("CREATE TABLE releases (id INTEGER)"))
+    except sa.exc.DBAPIError as exc:
+        return exc
+    raise AssertionError("CREATE TABLE of an existing table did not fail")
+
+
+def test_a_conflict_that_never_resolves_gives_up_after_bounded_attempts(engine):
+    from dct import db
+
+    with engine.begin() as conn:
+        conn.execute(sa.text("DROP TABLE releases"))
+    attempts = []
+
+    def always_conflict(eng, table):
+        attempts.append(table.name)
+        raise _duplicate_table_error_from_items(eng)
+
+    real = db._create_table_objects
+    db._create_table_objects = always_conflict
+    try:
+        with pytest.raises(sa.exc.DBAPIError):
+            create_tables(engine)
+    finally:
+        db._create_table_objects = real
+    assert len(attempts) == db.SCHEMA_CREATE_ATTEMPTS
+
+
+def _duplicate_table_error_from_items(engine) -> Exception:
+    try:
+        with engine.begin() as conn:
+            conn.execute(sa.text("CREATE TABLE items (id INTEGER)"))
+    except sa.exc.DBAPIError as exc:
+        return exc
+    raise AssertionError("CREATE TABLE of an existing table did not fail")
+
+
+def test_other_creation_errors_are_never_swallowed(engine):
+    from dct import db
+
+    with engine.begin() as conn:
+        conn.execute(sa.text("DROP TABLE releases"))
+    attempts = []
+
+    def broken(eng, table):
+        attempts.append(table.name)
+        raise sa.exc.OperationalError("CREATE TABLE releases", {}, Exception("disk I/O error"))
+
+    real = db._create_table_objects
+    db._create_table_objects = broken
+    try:
+        with pytest.raises(sa.exc.OperationalError, match="disk I/O error"):
+            create_tables(engine)
+    finally:
+        db._create_table_objects = real
+    assert attempts == ["releases"]   # no retry of an unrelated error
+
+
+def test_tables_that_predate_the_bootstrap_are_not_retrofitted(engine):
+    """Only objects of tables THIS bootstrap found missing are completed — an
+    index missing on an old, already-present table is not created behind the
+    owner's back (that stays the job of an explicit migration block)."""
+    with engine.begin() as conn:
+        conn.execute(sa.text("DROP INDEX ix_items_project_status_deleted"))
+    seen = _record_all(engine)
+    create_tables(engine)
+    assert [st for st in seen if _DDL.match(st)] == []
+    assert "ix_items_project_status_deleted" not in _index_names(engine, "items")
 
 
 # ── PostgreSQL: lock_timeout is scoped to the ALTER's transaction ────────────

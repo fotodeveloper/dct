@@ -18,11 +18,18 @@ def create_project(
 ) -> dict:
     """Create (or undelete) a project row.
 
-    When `current_version` is not supplied and `path` is set, attempts best-effort
-    version detection from VERSION / pyproject.toml / package.json / Cargo.toml /
-    src-tauri/tauri.conf.json. The returned dict carries a transient
-    `_detected_source` key naming the file that produced the version — callers
-    (CLI) may surface it to the user; it is not persisted.
+    An explicit `current_version` passes the version write contract
+    (core.version.storable_version — normalized, refused with ValueError when
+    unsupported or too long; nothing is written then). When it is not
+    supplied and `path` is set, attempts best-effort version detection from
+    VERSION / pyproject.toml / package.json / Cargo.toml /
+    src-tauri/tauri.conf.json; a detected version is normalized the same way.
+    The returned dict carries a transient `_detected_source` key naming the
+    file that produced the stored version — callers (CLI) may surface it to
+    the user; it is not persisted. A DETECTED version the contract refuses
+    is never stored and never substituted: current_version stays NULL and
+    the transient `_detected_unsupported` = {version (raw), source, reason}
+    reports it, so the caller can say so explicitly.
     """
     if not slug or not slug.strip():
         raise ValueError("Project slug cannot be empty")
@@ -34,12 +41,23 @@ def create_project(
     if path is not None:
         path = os.path.realpath(path)
 
+    from dct.core.version import detect_version, storable_version
+
     detected_source: str | None = None
-    if current_version is None and path:
-        from dct.core.version import detect_version
+    detected_unsupported: dict | None = None
+    if current_version is not None:
+        current_version = storable_version(current_version)
+    elif path:
         detected_version, detected_source = detect_version(path)
         if detected_version:
-            current_version = detected_version
+            try:
+                current_version = storable_version(detected_version)
+            except ValueError as exc:
+                detected_unsupported = {
+                    "version": detected_version, "source": detected_source,
+                    "reason": str(exc),
+                }
+                detected_source = None
         else:
             detected_source = None  # no detection → nothing to report
 
@@ -61,10 +79,7 @@ def create_project(
             )
             row = conn.execute(sa.select(projects).where(projects.c.id == deleted._mapping["id"])).first()
             assert row is not None, "undelete must return its row"
-            result_dict = row_to_dict(row)
-            if detected_source:
-                result_dict["_detected_source"] = detected_source
-            return result_dict
+            return _with_detection(row_to_dict(row), detected_source, detected_unsupported)
 
         inserted = conn.execute(
             projects.insert()
@@ -72,10 +87,16 @@ def create_project(
             .returning(projects)
         ).first()
         assert inserted is not None, "INSERT RETURNING must return a row"
-        result_dict = row_to_dict(inserted)
-        if detected_source:
-            result_dict["_detected_source"] = detected_source
-        return result_dict
+        return _with_detection(row_to_dict(inserted), detected_source, detected_unsupported)
+
+
+def _with_detection(row: dict, source: str | None, unsupported: dict | None) -> dict:
+    """Attach the transient detection report keys (never persisted)."""
+    if source:
+        row["_detected_source"] = source
+    if unsupported:
+        row["_detected_unsupported"] = unsupported
+    return row
 
 
 def list_projects(engine: sa.Engine, include_deleted: bool = False) -> list[dict]:
@@ -149,6 +170,15 @@ def delete_project(engine: sa.Engine, slug: str) -> bool:
 
 
 def set_version(engine: sa.Engine, slug: str, version: str) -> dict | None:
+    """Set the project's current_version; returns the row, None if unknown.
+
+    The version passes the ONE write contract (core.version.storable_version,
+    K-54): `v1.6.0` is stored as `1.6.0`; an unsupported format or a value
+    wider than a version column raises ValueError and nothing is written.
+    """
+    from dct.core.version import storable_version
+
+    version = storable_version(version)
     with engine.begin() as conn:
         result = conn.execute(
             projects.update()

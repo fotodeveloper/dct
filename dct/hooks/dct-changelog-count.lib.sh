@@ -45,15 +45,17 @@ dct_changelog_count() {
 # dct_changelog_guidance
 #   Prints (no trailing newline) what to do about a missing entry, worded for
 #   the path dct_changelog_count actually took. Only the per-branch path
-#   mentions other branches and offers the metadata move; the ready-to-run
-#   command quotes its WHOLE argument with `printf %q`, because agents paste
+#   mentions other branches and offers the metadata move. The command is a
+#   TEMPLATE: `<ENTRY_ID>` is explicitly marked as text to replace (pasted
+#   unedited, bash refuses the `<` redirection and runs nothing, K-65); its
+#   branch argument is quoted WHOLE with `printf %q`, because agents paste
 #   this text into a shell and Git allows `;`, `$(...)` and backticks in
 #   branch names (K-33).
 dct_changelog_guidance() {
   local arg
   if [ "$DCT_CL_FALLBACK" = 0 ] && [ -n "$DCT_CL_BRANCH" ]; then
     arg=$(printf '%q' "--branch=$DCT_CL_BRANCH")
-    printf '%s' "No unreleased entry on branch '$DCT_CL_BRANCH' (this branch, unbranched and server-detected entries count; entries written on other branches do not). Only if an existing entry describes THIS specific change, move it here with: dct clog update <id> $arg — otherwise add a new entry with /clog."
+    printf '%s' "No unreleased entry on branch '$DCT_CL_BRANCH' (this branch, unbranched and server-detected entries count; entries written on other branches do not). Only if an existing entry describes THIS specific change, move it here — replace <ENTRY_ID> with the number of that entry first (the line does not run as is): dct clog update <ENTRY_ID> $arg — otherwise add a new entry with /clog."
   elif [ -n "$DCT_CL_BRANCH" ]; then
     printf '%s' "No unreleased entry in the whole project (this dct CLI could not count per branch, so the project-wide count was used). Add a new entry with /clog."
   else

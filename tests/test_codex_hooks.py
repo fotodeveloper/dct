@@ -9,6 +9,7 @@ import time
 from pathlib import Path
 
 import pytest
+from conftest import require_tools
 
 from dct.integrations import codex_hooks as hooks
 
@@ -152,8 +153,7 @@ def test_subprocess_irrelevant_event_does_not_create_database(tmp_path):
 
 
 def test_subprocess_reuses_real_changelog_policy(tmp_path):
-    if not all(shutil.which(tool) for tool in ('git', 'bash', 'jq')):
-        pytest.skip('Shared shell policy dependencies unavailable')
+    require_tools('git', 'bash', 'jq')
     from dct.core.projects import create_project
     from dct.db import create_tables, get_engine
     env = isolated_env(tmp_path)
@@ -218,8 +218,7 @@ def test_mirror_config_gate_precedes_database_bootstrap(tmp_path, mode):
 
 
 def test_subprocess_autoscan_uses_shared_plan_filter_and_actual_provenance(tmp_path):
-    if not all(shutil.which(tool) for tool in ('bash', 'jq')):
-        pytest.skip('Shared autoscan dependencies unavailable')
+    require_tools('bash', 'jq')
     import sqlalchemy as sa
 
     from dct.core.projects import create_project

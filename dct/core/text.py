@@ -8,6 +8,8 @@ rule (item_label) and the free-text clear sentinel (CLEAR, K-48) live here too.
 
 from __future__ import annotations
 
+import unicodedata
+
 PREVIEW_CHARS = 200
 
 # The literal a client passes in a free-text update parameter to NULL a
@@ -35,14 +37,34 @@ def preview(text: str | None, limit: int = PREVIEW_CHARS) -> str | None:
     return text if len(text) <= limit else text[: limit - 1] + "…"
 
 
+def is_blank_label(text: str | None) -> bool:
+    """True when `text` has no visible content (K-64): None, or only
+    whitespace and Unicode format characters (category Cf — zero-width
+    space / joiners, BOM, bidi marks). The ONE blank rule for labels; it
+    never removes Cf characters from visible text."""
+    if not isinstance(text, str):
+        return True
+    return all(ch.isspace() or unicodedata.category(ch) == "Cf" for ch in text)
+
+
+def visible_label(short_title: str | None) -> str | None:
+    """`short_title` when it has visible content, else None — the shared
+    fallback for DISPLAYING a stored label (CLI show / list, web views): a
+    blank label stored before the write rule renders as no label. Raw API
+    data keeps the stored value."""
+    return None if is_blank_label(short_title) else short_title
+
+
 def item_label(short_title: str | None, title: str | None) -> str | None:
     """The ONE rule for a row that REFERENCES an item (#817, B4).
 
-    Returns `short_title` when it is a string with visible content, otherwise
-    the title compacted to ITEM_LABEL_CHARS (ellipsis included). An empty or
-    whitespace-only short_title (one stored before K-43 normalized writes)
-    counts as missing. None title with no short_title → None.
+    Returns `short_title` when it has visible content (visible_label),
+    otherwise the title compacted to ITEM_LABEL_CHARS (ellipsis included).
+    A blank short_title — empty, whitespace or format characters only (one
+    stored before K-43 / K-64 normalized writes) — counts as missing. None
+    title with no short_title → None.
     """
-    if isinstance(short_title, str) and short_title.strip():
-        return short_title
+    label = visible_label(short_title)
+    if label is not None:
+        return label
     return preview(title, ITEM_LABEL_CHARS)

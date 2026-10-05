@@ -87,10 +87,7 @@ def test_hook_exits_on_missing_file(tmp_path):
     assert result.returncode == 0
 
 
-@pytest.mark.skipif(
-    subprocess.run(["which", "jq"], capture_output=True).returncode != 0,
-    reason="jq not installed — integration aspect unverifiable",
-)
+@pytest.mark.usefixtures("hook_tools")
 def test_hook_no_stdout_leak_on_quick_exit():
     """Hook should print nothing on the no-op paths (tests CC UI cleanliness)."""
     payload = '{"tool_name": "Bash", "tool_input": {"command": "ls"}}'

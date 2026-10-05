@@ -33,10 +33,11 @@ From user request, identify which fields to change:
 
 `short_title` is the item's label: a 2-4 word English noun phrase (≤ 50 chars,
 no item number, no project name — longer is refused). It is OPTIONAL on
-update: omit it to keep the stored label — pass it only when the user asks to
-change the label, never re-send or invent one on a status / priority / field
-update. Pass `'__clear__'` to clear it (same convention as `component` /
-`description` / `resolution`).
+update: omit it (or pass `""`) to keep the stored label — pass it only when
+the user asks to change the label, never re-send or invent one on a status /
+priority / field update. Pass `'__clear__'` to clear it (same convention as
+`component` / `description` / `resolution`); a whitespace-only value is not
+"omitted" — it strips to empty and clears the label too.
 
 `update_item` does NOT change sprint membership — `in_current_sprint` is a
 derived, read-only field. Sprint changes go through dedicated tools

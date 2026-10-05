@@ -16,7 +16,9 @@ the STORED branch exactly whatever its source, while `include_unbranched`
 treats a server-detected row like an unbranched one.
 """
 
-import os
+import ntpath
+import posixpath
+import re
 from collections.abc import Iterable, Mapping
 from datetime import UTC, datetime
 
@@ -27,8 +29,10 @@ from dct.core.limits import ensure_fits
 from dct.core.projects import resolve_project_id
 from dct.core.text import item_label
 from dct.core.version import (
+    SUPPORTED_FORMATS,
     bump,
     compare_versions,
+    ensure_version_fits,
     normalize_version,
     parse_version,
     same_version,
@@ -68,28 +72,42 @@ def _fits(column: str, value: str | None) -> str | None:
     return value
 
 
-def normalize_worktree(path: str | None) -> str | None:
-    """The ONE worktree path contract (K-42) — stored values and the filter.
+_WINDOWS_DRIVE_ABSOLUTE = re.compile(r"[A-Za-z]:[\\/]", re.ASCII)
+_WINDOWS_UNC = re.compile(r"\\\\[^\\/]+[\\/][^\\/]+")
 
-    None / "" → None. Anything else must be an ABSOLUTE path, else ValueError
-    ("worktree must be an absolute path ..."): a relative (or `~`) path is
-    ambiguous on the server. Normalization is purely textual —
-    os.path.normpath, which also drops a trailing separator (except for the
-    root itself) — with NO filesystem access: a client path may live in
-    another filesystem namespace than this server, so it is never resolved
-    with realpath, never checked for existence. (Values the server detects
-    itself come from gitinfo, already realpath-canonical on this machine.)
+
+def normalize_worktree(path: str | None) -> str | None:
+    """The ONE worktree path contract (K-42, K-64) — stored values and the filter.
+
+    None / "" → None. Anything else must be an ABSOLUTE path in the CLIENT's
+    syntax, detected from the text itself (the server may run on another OS
+    than the client):
+      - POSIX: starts with `/` → posixpath.normpath;
+      - Windows drive: `C:\\...` or `C:/...` → ntpath.normpath (separators
+        become `\\`);
+      - Windows UNC: `\\\\server\\share...` → ntpath.normpath.
+    Everything else raises ValueError ("worktree must be an absolute path
+    ..."): a relative or `~` path, a drive-relative `C:x`, a rooted path
+    without a drive (`\\x`) or a UNC prefix without a share are ambiguous on
+    the server. Normalization is purely textual (it also drops a trailing
+    separator, except for a root) with NO filesystem access: a client path
+    may live in another filesystem namespace than this server, so it is
+    never resolved with realpath, never checked for existence. (Values the
+    server detects itself come from gitinfo, already realpath-canonical on
+    this machine; a release checkout is verified separately, K-52.)
     Historical rows are never rewritten; only new writes and filter
     arguments pass through here.
     """
     if not path:
         return None
-    if not os.path.isabs(path):
-        raise ValueError(
-            f"worktree must be an absolute path (the checkout toplevel, "
-            f"`git rev-parse --show-toplevel`), got {path!r}"
-        )
-    return os.path.normpath(path)
+    if path.startswith("/"):
+        return posixpath.normpath(path)
+    if _WINDOWS_DRIVE_ABSOLUTE.match(path) or _WINDOWS_UNC.match(path):
+        return ntpath.normpath(path)
+    raise ValueError(
+        f"worktree must be an absolute path (the checkout toplevel, "
+        f"`git rev-parse --show-toplevel`), got {path!r}"
+    )
 
 
 def decide_branch_fields(
@@ -291,7 +309,9 @@ def list_entries(
 ) -> list[dict]:
     """Live entries of a project, newest first.
 
-    `unreleased_only` wins over `version`. Branch filters: see
+    `unreleased_only` wins over `version`; `version` selects every stored
+    spelling of that version (stored_spellings — 1.1 == 1.1.0 == v1.1, K-55);
+    the rows keep their stored value. Branch filters: see
     _branch_conditions. Each row also carries `item_short_title` (K-38) —
     item_label() of the related item when it is a LIVE item of the same
     project, else None (no link, or a dangling historical id — the stored
@@ -321,7 +341,7 @@ def list_entries(
         if unreleased_only:
             q = q.where(changelog_entries.c.version.is_(None))
         elif version:
-            q = q.where(changelog_entries.c.version == version)
+            q = q.where(changelog_entries.c.version.in_(stored_spellings(conn, pid, version)))
         for cond in _branch_conditions(branch, worktree, include_unbranched):
             q = q.where(cond)
         rows = []
@@ -375,7 +395,6 @@ def release_entries(
     *,
     bump_type: str | None = None,
     entry_ids: Iterable[int] | None = None,
-    require_entries: bool = False,
     candidate_sha: str | None = None,
     checkout_root: str | None = None,
 ) -> dict:
@@ -394,10 +413,15 @@ def release_entries(
         foreign or soft-deleted id, or one already released in ANOTHER
         version, raises ValueError and nothing is written; a non-int id raises
         TypeError. Duplicates are ignored.
-    `require_entries` (mode 'all' only — the CLI's consent rule, K-31): when
-    nothing is unreleased and the call is not a no-op, raise ValueError
-    instead of silently performing a version-only release (that one needs
-    entry_ids=[] explicitly).
+    A NEW release with no entries must be explicit (K-31, K-62 — every
+    caller: MCP, CLI, direct core): mode 'all' with nothing unreleased that
+    is NOT a no-op raises ValueError ("No unreleased entries ... must be
+    explicit") instead of silently performing a version-only release — that
+    one needs entry_ids=[]. Decided inside the release transaction (no
+    earlier count a concurrent writer could invalidate), AFTER the no-op
+    checks, so an existing release (recorded or historical) still resumes.
+    An explicit [] states version-only INTENT; it is not proof that a human
+    consented (the skills still ask).
     `candidate_sha` (hex commit id, 7-64 chars, stored lowercased) and
     `checkout_root` (ABSOLUTE path, normalize_worktree) are pinned in the
     record; both are validated BEFORE any read or write (ValueError).
@@ -417,13 +441,21 @@ def release_entries(
     or a version live entries of the project already carry — a historical
     retry ('all'); `release` is None then. A historical no-op leaves
     current_version untouched, so the result's `current_version` differs
-    from `version`. (2) V lower than current_version → refused, releases
-    never rewind (applied whenever current_version parses; a legacy
-    unparseable current_version is not compared). (3) stamp the
+    from `version`. (2) a non-empty current_version that does not parse
+    under the contract (a legacy value such as `2.0.0-rc1`) → refused:
+    without a parseable baseline the never-rewind guard cannot run (K-54);
+    a bump from it is refused the same way. (3) V lower than current_version
+    → refused, releases never rewind. (4) mode 'all' with nothing to stamp →
+    refused (see above). (5) stamp the
     not-yet-stamped entries (version, released_at, updated_at), set
     current_version = V and insert the record (status 'stamped', entry_ids =
     the resolved set). Versions are equal when their components match after
     dropping trailing zeros (1.5 == 1.5.0).
+
+    The final version (explicit after normalization, or bumped) must fit
+    EVERY version column (core.version.ensure_version_fits, K-58 — widths
+    from the schema) before anything is written: ValueError "version too
+    long" otherwise.
 
     Returns {version (requested, normalized), current_version (after the
     call), mode, entry_ids, released (count newly stamped), already_released
@@ -454,8 +486,11 @@ def release_entries(
                 raise ValueError(
                     f"No current version for '{project_slug}'. Provide explicit version."
                 )
+            if not _parses(current):
+                raise _unsupported_current(project_slug, current)
             version = bump(current, bump_type)
         assert version is not None
+        ensure_version_fits(version)
         is_current = same_version(current, version)
         record = release_records.find_record(conn, pid, version)
 
@@ -521,17 +556,18 @@ def release_entries(
             return result
         if nothing_to_do:
             return result
-        if mode == "all" and not to_stamp and require_entries:
+        if current and not _parses(current):
+            raise _unsupported_current(project_slug, current)
+        if current and compare_versions(version, current) < 0:
+            raise ValueError(
+                f"Version {version} is lower than the current version {current} of "
+                f"'{project_slug}' — releases never rewind; nothing released."
+            )
+        if mode == "all" and not to_stamp:
             raise ValueError(
                 f"No unreleased entries for '{project_slug}' — a version-only "
                 f"release of {version} must be explicit (entry_ids=[] / "
                 f"--no-entries); nothing released."
-            )
-
-        if current and _parses(current) and compare_versions(version, current) < 0:
-            raise ValueError(
-                f"Version {version} is lower than the current version {current} of "
-                f"'{project_slug}' — releases never rewind; nothing released."
             )
 
         now = datetime.now(UTC)
@@ -567,6 +603,17 @@ def release_entries(
         return result
 
 
+def _unsupported_current(project_slug: str, current: str) -> ValueError:
+    """The controlled refusal for a stored current_version outside the
+    contract (K-54): without a parseable baseline the never-rewind guard
+    cannot run, so nothing new is stamped."""
+    return ValueError(
+        f"The current version {current!r} of '{project_slug}' is not a supported "
+        f"version ({SUPPORTED_FORMATS}) — releases cannot be ordered against it; "
+        f"set a supported one with `dct project set-version`; nothing released."
+    )
+
+
 def _parses(version: str) -> bool:
     try:
         parse_version(version)
@@ -575,16 +622,25 @@ def _parses(version: str) -> bool:
     return True
 
 
-def _entries_of_version(conn: sa.Connection, project_id: int, version: str) -> list[int]:
-    """Ids of the live entries of the project that already carry `version`
-    (under the version contract — a legacy `v1.1.0` row matches `1.1.0`)."""
+def stored_spellings(conn: sa.Connection, project_id: int, version: str) -> list[str]:
+    """Every STORED spelling of `version` among the project's live entries —
+    the ONE version selector (K-55): equality is the version contract's
+    (same_version: 1.1 == 1.1.0 == v1.1; an unparseable value matches only
+    itself), so a filter never misses a legacy spelling. Sorted."""
     c = changelog_entries.c
     stored = conn.execute(
         sa.select(c.version).distinct().where(
             c.project_id == project_id, c.version.is_not(None), c.deleted_at.is_(None)
         )
     ).scalars()
-    matching = [v for v in stored if same_version(v, version)]
+    return sorted(v for v in stored if same_version(v, version))
+
+
+def _entries_of_version(conn: sa.Connection, project_id: int, version: str) -> list[int]:
+    """Ids of the live entries of the project that already carry `version`
+    (under the version contract — a legacy `v1.1.0` row matches `1.1.0`)."""
+    c = changelog_entries.c
+    matching = stored_spellings(conn, project_id, version)
     if not matching:
         return []
     return list(conn.execute(

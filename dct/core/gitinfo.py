@@ -9,8 +9,12 @@ Composites:
   - git_context(cwd)    — {branch, worktree}: changelog branch metadata;
   - resolve_checkout(project_path, cwd) — whether `cwd` is a checkout of the
     SAME repository as a registered project, with its repo root and project
-    root (K-34). Used by changelog detection (MCP add_changelog, CLI clog add)
-    and by the CLI release's version-sync step.
+    root (K-34). Best-effort: used by changelog detection (MCP add_changelog,
+    CLI clog add).
+STRICT (raises instead of guessing — the mutating release path only, K-52):
+  - verify_release_checkout(project_path, cwd) — a CONFIRMED checkout (with
+    its full HEAD commit), a CONFIRMED non-repository (None), or a
+    CheckoutVerificationError. Used by the CLI release before it stamps.
 
 The Codex hook bridge (autoscan ownership bound to the current worktree) uses
 git_toplevel alone — exactly one git process, no branch read.
@@ -19,10 +23,28 @@ git_toplevel alone — exactly one git process, no branch read.
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
 
 GIT_TIMEOUT_SECONDS = 2
+
+# A full object id: SHA-1 (40) or SHA-256 (64) lowercase hex.
+_FULL_SHA_RE = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", re.ASCII)
+# git's own wording for "this directory is outside any repository" (C locale).
+_NOT_A_REPOSITORY = "not a git repository"
+
+
+class CheckoutVerificationError(RuntimeError):
+    """The strict resolver could not CONFIRM where it is (K-52): git missing,
+    a timeout, a permission error, a deleted directory, a broken repository,
+    a failed HEAD / common-dir read, or a repository without a first commit.
+    Never means "no git"."""
+
+
+class NotACheckoutError(CheckoutVerificationError):
+    """`cwd` is confirmed NOT to be a checkout of the project's repository
+    (outside git, another repository, a nested repo or a submodule)."""
 
 
 def _git(git: str, cwd: str, *args: str) -> str | None:
@@ -157,6 +179,14 @@ def _current_directory() -> str | None:
         return None
 
 
+def _project_root(project_path: str, project_toplevel: str, repo_root: str) -> str:
+    """The project's directory inside the checkout `repo_root`: the project's
+    path relative to the toplevel of the checkout that holds it, re-anchored
+    (a monorepo subproject maps to the same subdirectory of every worktree)."""
+    relative = os.path.relpath(os.path.realpath(project_path), project_toplevel)
+    return repo_root if relative == "." else os.path.join(repo_root, relative)
+
+
 def resolve_checkout(
     project_path: str | None, cwd: str | os.PathLike[str] | None = None
 ) -> dict | None:
@@ -197,11 +227,126 @@ def resolve_checkout(
     if current is None or current[1] != project[1]:
         return None
     repo_root, common = current
-    relative = os.path.relpath(os.path.realpath(project_path), project[0])
-    project_root = repo_root if relative == "." else os.path.join(repo_root, relative)
     return {
         "repo_root": repo_root,
-        "project_root": project_root,
+        "project_root": _project_root(os.fspath(project_path), project[0], repo_root),
         "branch": git_branch(target),
+        "git_common_dir": common,
+    }
+
+
+# ── strict resolver (K-52) ───────────────────────────────────────────────────
+
+
+def _strict_git(cwd: str, *args: str) -> subprocess.CompletedProcess:
+    """`git -C <cwd> <args>` with its exit code and stderr, or a
+    CheckoutVerificationError when git is missing, cannot be started or times
+    out. GIT_* variables are dropped (see _git) and the C locale is forced so
+    git's messages can be matched."""
+    git = shutil.which("git")
+    if not git:
+        raise CheckoutVerificationError("git is not on PATH — the checkout cannot be verified")
+    env = {key: value for key, value in os.environ.items()
+           if not key.startswith("GIT_") and key != "LANGUAGE"}
+    env["LC_ALL"] = "C"
+    try:
+        return subprocess.run(
+            [git, "-C", cwd, *args],
+            env=env, capture_output=True, text=True,
+            timeout=GIT_TIMEOUT_SECONDS, check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise CheckoutVerificationError(
+            f"git timed out after {GIT_TIMEOUT_SECONDS}s in {cwd}") from exc
+    except (OSError, subprocess.SubprocessError, ValueError) as exc:
+        raise CheckoutVerificationError(f"could not run git in {cwd}: {exc}") from exc
+
+
+def _git_entry_on_path(path: str) -> str | None:
+    """The first `.git` entry (file, directory or link) at `path` or above."""
+    current = os.path.realpath(path)
+    while True:
+        candidate = os.path.join(current, ".git")
+        if os.path.lexists(candidate):
+            return candidate
+        parent = os.path.dirname(current)
+        if parent == current:
+            return None
+        current = parent
+
+
+def _strict_location(path: str, what: str) -> tuple[str, str] | None:
+    """(toplevel, common dir) realpaths of the work tree holding `path`, None
+    when `path` is CONFIRMED to be outside every repository, else
+    CheckoutVerificationError.
+
+    Confirmed non-repository = git fails with its own "not a git repository"
+    message AND no `.git` entry exists on the path or any parent. An exit
+    code (128) or a message alone proves nothing: a broken `.git`, a
+    filesystem boundary, a permission or ownership problem all fail too.
+    """
+    if not os.path.isdir(path):
+        raise CheckoutVerificationError(f"{what} {path} does not exist or is not a directory")
+    result = _strict_git(path, "rev-parse", "--show-toplevel", "--git-common-dir")
+    detail = (result.stderr or "").strip() or f"exit code {result.returncode}"
+    if result.returncode == 0:
+        lines = result.stdout.splitlines()
+        if len(lines) != 2 or not all(lines):
+            raise CheckoutVerificationError(
+                f"unexpected `git rev-parse` output for {what} {path}: {result.stdout!r}")
+        return os.path.realpath(lines[0]), _absolute_git_path(path, lines[1])
+    if _NOT_A_REPOSITORY in detail.lower():
+        entry = _git_entry_on_path(path)
+        if entry is None:
+            return None
+        raise CheckoutVerificationError(
+            f"git reports {what} {path} as {detail!r}, but {entry} exists — "
+            f"broken or unreachable repository")
+    raise CheckoutVerificationError(f"git could not verify {what} {path}: {detail}")
+
+
+def verify_release_checkout(
+    project_path: str, cwd: str | os.PathLike[str] | None = None
+) -> dict | None:
+    """STRICT checkout resolution for a mutating release (K-52).
+
+    - `project_path` CONFIRMED outside git (see _strict_location) → None: the
+      documented explicit path of a project without git.
+    - `project_path` inside a work tree: `cwd` (default: the process cwd)
+      must be a checkout of the SAME repository (same git common dir — main
+      checkout or any linked worktree), else NotACheckoutError; its HEAD
+      must be a full existing commit id (a repository without a first
+      commit is an error, never "no git"). Returns {repo_root, project_root,
+      head, git_common_dir} (project_root as in resolve_checkout).
+    - Anything that cannot be CONFIRMED — git missing, timeout, permission
+      error, deleted directory (also a deleted process cwd), broken
+      repository, failed common-dir / HEAD read — raises
+      CheckoutVerificationError. Never falls back to the main checkout.
+    """
+    project = _strict_location(os.fspath(project_path), "project path")
+    if project is None:
+        return None
+    target = os.fspath(cwd) if cwd is not None else _current_directory()
+    if target is None:
+        raise CheckoutVerificationError("the current directory no longer exists")
+    current = _strict_location(target, "current directory")
+    if current is None or current[1] != project[1]:
+        raise NotACheckoutError(
+            f"{target} is not a checkout of the repository at {project_path}")
+    repo_root, common = current
+    result = _strict_git(target, "rev-parse", "--verify", "-q", "HEAD^{commit}")
+    head = result.stdout.strip().lower() if result.returncode == 0 else ""
+    if result.returncode != 0:
+        detail = (result.stderr or "").strip()
+        raise CheckoutVerificationError(
+            f"the checkout {repo_root} has no commit to release from "
+            f"(HEAD unreadable{': ' + detail if detail else ''})")
+    if not _FULL_SHA_RE.fullmatch(head):
+        raise CheckoutVerificationError(
+            f"HEAD of {repo_root} is not a full commit id: {head!r}")
+    return {
+        "repo_root": repo_root,
+        "project_root": _project_root(os.fspath(project_path), project[0], repo_root),
+        "head": head,
         "git_common_dir": common,
     }

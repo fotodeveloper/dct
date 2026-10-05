@@ -230,13 +230,10 @@ def test_rerun_of_a_completed_release_returns_it_completed_and_writes_nothing(pr
 _TOO_LONG = "1.0." + "9" * 47  # 51 chars once normalized
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "BUG: release_entries never runs ensure_fits on the version — a 51+ char "
-    "version is stored silently on SQLite (raw DataError on PG) in "
-    "changelog_entries.version / projects.current_version / releases.version "
-    "(String(50)) — dct/core/changelog.py:439-457 — for owner triage"))
 @pytest.mark.parametrize("how", ["explicit", "bump"])
 def test_a_version_longer_than_its_column_is_refused_without_writes(proj, how):
+    """K-58: ensure_fits runs on the explicit AND the bumped version before
+    any write — no stamp, no current_version, no record, no updated_at."""
     _add(proj, "a")
     if how == "bump":
         # 50 chars — fits — but its patch bump carries into a 51st character.

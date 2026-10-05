@@ -107,3 +107,41 @@ def test_new_release_tools_are_deferred():
     from dct.mcp.server import _ALWAYS_LOAD_TOOLS
 
     assert not {"get_release", "advance_release"} & _ALWAYS_LOAD_TOOLS
+
+
+# ── K-62: a new version-only release must be explicit over MCP too ───────────
+
+
+def test_release_changelog_with_nothing_unreleased_needs_explicit_empty_ids(srv):
+    from dct.core.projects import get_project, set_version
+    from dct.core.releases import get_release
+
+    set_version(srv._get_engine(), "test", "1.0.0")
+    for kwargs in ({"version": "1.1.0"}, {"bump_type": "minor"}):
+        out = srv.release_changelog(project="test", **kwargs)
+        assert set(out) == {"error"} and "must be explicit" in out["error"], out
+    engine = srv._get_engine()
+    assert get_project(engine, "test")["current_version"] == "1.0.0"
+    assert get_release(engine, "test", "1.1.0") is None
+    out = srv.release_changelog(project="test", version="1.1.0", entry_ids=[])
+    assert out["mode"] == "version_only" and out["current_version"] == "1.1.0"
+    # Resuming the same (recorded) version-only release stays a no-op.
+    again = srv.release_changelog(project="test", version="1.1.0", entry_ids=[])
+    assert again["release"]["id"] == out["release"]["id"]
+
+
+def test_release_changelog_unparseable_current_version_is_a_controlled_error(srv):
+    import sqlalchemy as sa
+
+    from dct.db import projects
+
+    engine = srv._get_engine()
+    with engine.begin() as conn:
+        conn.execute(projects.update().where(projects.c.slug == "test")
+                     .values(current_version="2.0.0-rc1"))
+    srv.add_changelog("added", "x", project="test")
+    out = srv.release_changelog(project="test", version="1.0.0")
+    assert set(out) == {"error"} and "not a supported version" in out["error"]
+    with engine.begin() as conn:
+        assert conn.execute(sa.select(projects.c.current_version)
+                            .where(projects.c.slug == "test")).scalar() == "2.0.0-rc1"

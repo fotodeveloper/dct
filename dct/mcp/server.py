@@ -585,10 +585,11 @@ def update_item(
         item_id: Target item.
         title: New title (non-empty, ≤ 500 chars — ≤ 80 recommended; blank or
             '__clear__' is refused).
-        short_title: Optional new 2-4 word label (≤ 50 chars, refused not
-            truncated; surrounding whitespace is stripped). Omit (or blank) =
-            keep the current label — do NOT re-send one when changing other
-            fields; '__clear__' nulls it.
+        short_title: Optional new 2-4 word label (≤ 50 chars counted BEFORE
+            stripping, refused not truncated; surrounding whitespace is
+            stripped). Omit (or "") = keep the current label — do NOT re-send
+            one when changing other fields; a whitespace-only value strips to
+            empty and CLEARS the label (null), as does '__clear__'.
         status: open / in_progress / resolved / wont_fix.
         priority: P1 / P2 / P3 / future.
         component: Component or module name (≤ 100 chars).
@@ -636,17 +637,10 @@ def update_item(
     ]:
         if value == CLEAR:
             kwargs[field] = ""
-        elif field == "short_title" and value and not value.strip():
-            # Whitespace-only is a BLANK value here, i.e. omitted (K-43): it
-            # never clears an existing label — only CLEAR does. The raw value
-            # is still length-checked first (refused, never truncated).
-            from dct.core.limits import ensure_fits
-            from dct.db import items as items_table
-            try:
-                ensure_fits(items_table, {"short_title": value})
-            except ValueError as e:
-                return {"error": str(e)}
         elif value:
+            # Any NON-EMPTY string is explicit input (K-56) — a whitespace-only
+            # short_title too: core's normalize_short_title checks the raw
+            # length, strips, and stores NULL for an empty result.
             kwargs[field] = value
     # Sentinel (K-16): only an explicit list reaches core — None means "leave
     # the tags alone", so it must NOT be passed through as a kwarg.
@@ -1026,9 +1020,12 @@ def add_changelog(
             worktree, so its own detection can name the wrong branch.
         worktree: Toplevel of the checkout the change was made in
             (`git rev-parse --show-toplevel`), ≤ 500 chars; must be an
-            ABSOLUTE path (relative / `~` → refused). Stored after a purely
-            textual normalization (normpath, no trailing separator) — never
-            resolved against this server's filesystem.
+            ABSOLUTE path in the client's own syntax — POSIX `/...`, Windows
+            `C:\\...` / `C:/...` or UNC `\\\\server\\share\\...` (relative,
+            `~`, drive-relative `C:x` or rooted `\\x` → refused). Stored after
+            a purely textual normalization by that syntax (posixpath /
+            ntpath normpath, no trailing separator) — never resolved against
+            this server's filesystem.
             Either given → both stored as passed (a missing one stays null),
             branch_source='client'; an over-long value is REFUSED, never
             truncated. Neither given → detected from this server's cwd, kept
@@ -1205,19 +1202,24 @@ def release_changelog(
         bump_type: patch / minor / major — bumped from the project's current_version.
         entry_ids: JSON array of changelog entry ids (e.g. [12, 15]) — NOT a CSV
             string. Omitted/null (default) = every unreleased entry of the
-            project (legacy, mode 'all'). [] = stamp nothing, only set the
-            version (mode 'version_only'). A list = exactly those entries (mode
-            'selected'); STRICT — an unknown, foreign or deleted id, or one
-            already released in ANOTHER version, fails the whole call.
-            Duplicates are ignored.
+            project (mode 'all'); with NOTHING unreleased a NEW version is
+            refused ("No unreleased entries ... must be explicit") — pass []
+            for that (changed: older servers silently set the version).
+            [] = stamp nothing, only set the version (mode 'version_only' —
+            states the intent; a human's consent is still the caller's job).
+            A list = exactly those entries (mode 'selected'); STRICT — an
+            unknown, foreign or deleted id, or one already released in
+            ANOTHER version, fails the whole call. Duplicates are ignored.
         candidate_sha: The commit the release is cut from (`git rev-parse
             HEAD` of the release checkout), hex, 7-64 chars, stored
             lowercased. Empty (default) = not pinned. Recommended for
             /release: it lets a resumed run prove which commit it was
             releasing; advance_release may re-pin it until 'committed'.
         checkout_root: ABSOLUTE path of the checkout the release runs in (its
-            `git rev-parse --show-toplevel`), normalized textually (trailing
-            "/" dropped; relative → error; never resolved on this server).
+            `git rev-parse --show-toplevel`), POSIX or Windows syntax,
+            normalized textually like a changelog worktree (trailing
+            separator dropped; relative → error; never resolved on this
+            server).
             Empty (default) = not recorded. Recommended for /release: a
             resume must run in the same checkout. Both are pinned only when
             the call writes a NEW record; a re-run never re-pins them.
@@ -1236,7 +1238,10 @@ def release_changelog(
     retry) — the call is a no-op, writes nothing and returns release=null;
     after a historical no-op the returned current_version differs from
     version. Never rewinds: an unrecorded version lower than current_version
-    is refused (whenever current_version parses; 1.5 == 1.5.0). Stamping
+    is refused (1.5 == 1.5.0); a stored current_version outside the version
+    contract (e.g. "2.0.0-rc1") refuses every new stamp — fix it with
+    `dct project set-version`. The version must fit every version column
+    (≤ 50 chars, refused never truncated). Stamping
     sets version + released_at and creates the record with status 'stamped'
     — the workflow then moves it forward with advance_release.
 
@@ -1252,9 +1257,10 @@ def release_changelog(
         several branches (null branch counted as its own). {"error": "..."}
         on failure — neither version nor bump_type; bump_type with no
         current_version; an invalid bump_type; an unsupported version format
-        (requested, or the current_version a bump starts from); an unrecorded
-        version lower than current_version; a recorded version with a
-        different set; an invalid entry id; an invalid candidate_sha; a
+        (requested) or a stored current_version outside the contract; a
+        version too long for its columns; an unrecorded version lower than
+        current_version; mode 'all' with nothing unreleased for a new
+        version; a recorded version with a different set; an invalid entry id; an invalid candidate_sha; a
         relative or over-long (> 500) checkout_root; tool-call markup in
         candidate_sha / checkout_root; or an unresolvable project. Nothing is
         written on error.
@@ -1515,7 +1521,11 @@ def export_changelog(project: str = "", include_unreleased: bool = True, version
             top. Ignored when `version` is set (single-version render never
             includes Unreleased).
         version: When non-empty, render only that version's `## [version]`
-            section, headerless, for the append-only prepend flow.
+            section, headerless, for the append-only prepend flow. Matched
+            semantically (1.1 == 1.1.0 == v1.1): every entry of an equal
+            version lands in ONE section, headed by the release record's
+            version (else the stored spelling of a legacy release) — the
+            same grouping as the full export.
 
     Returns: markdown str on success, {"error": "..."} dict on failure —
         aligned with every other MCP tool in this server. Callers should

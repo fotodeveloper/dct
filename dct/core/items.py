@@ -11,6 +11,7 @@ from dct.core.tags import (
     tag_id_for_name_conn,
     tags_for_items_conn,
 )
+from dct.core.text import is_blank_label
 from dct.db import (
     item_checkpoints,
     item_notes,
@@ -126,13 +127,18 @@ def normalize_short_title(short_title: str | None) -> str | None:
 
     FIRST the raw value is length-checked against items.short_title (> 50
     chars → ValueError, refused, never truncated — surrounding spaces count),
-    THEN it is stripped; an empty result is NULL. None → None. A caller that
-    omits the field never reaches here, so omission never clears a label.
+    THEN a blank value (text.is_blank_label: only whitespace and Unicode
+    format characters, K-64) is NULL and anything else is stripped of
+    surrounding whitespace — format characters inside a visible label are
+    kept. None → None. A caller that omits the field never reaches here, so
+    omission never clears a label.
     """
     if short_title is None:
         return None
     ensure_fits(items, {"short_title": short_title})
-    return short_title.strip() or None
+    if is_blank_label(short_title):
+        return None
+    return short_title.strip()
 
 
 def _has_tag_exists(tag_id: int):

@@ -45,6 +45,10 @@ def create_app(engine=None, *, read_only: bool = True) -> flask.Flask:
     app.jinja_env.filters["render_markdown"] = render_markdown
     app.jinja_env.filters["to_iso"] = to_iso
     app.jinja_env.filters["parse_tags"] = parse_tags
+    # Shared blank-label fallback (K-64): a stored label of only whitespace /
+    # format characters renders as no label.
+    from dct.core.text import visible_label
+    app.jinja_env.filters["visible_label"] = visible_label
 
     from importlib import import_module
 

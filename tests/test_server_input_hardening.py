@@ -118,10 +118,25 @@ def test_update_item_status_only_keeps_the_label(srv):
     assert srv.get_item(iid)["short_title"] == "Chosen label"
 
 
-def test_update_item_whitespace_only_label_is_blank_not_a_clear(srv):
+@pytest.mark.parametrize("blank", [" ", "   ", "\t\n"])
+def test_update_item_whitespace_only_label_is_an_explicit_value_that_clears(srv, blank):
+    """K-56: only the default "" means "unchanged"; any non-empty string —
+    whitespace-only included — is explicit input to the shared
+    normalization (raw limit, strip, empty → NULL), as in core and CLI."""
     iid = srv.create_item("todo", "T", project="test", short_title="Chosen label")["id"]
-    out = srv.update_item(iid, short_title="   ", priority="P1")
-    assert out["short_title"] == "Chosen label" and out["priority"] == "P1"
+    out = srv.update_item(iid, short_title=blank, priority="P1")
+    assert out["short_title"] is None and out["priority"] == "P1"
+    assert srv.get_item(iid)["short_title"] is None
+
+
+def test_update_item_empty_label_still_means_unchanged(srv):
+    iid = srv.create_item("todo", "T", project="test", short_title="Chosen label")["id"]
+    assert srv.update_item(iid, short_title="", priority="P1")["short_title"] == "Chosen label"
+
+
+def test_update_item_clear_sentinel_still_clears(srv):
+    iid = srv.create_item("todo", "T", project="test", short_title="Chosen label")["id"]
+    assert srv.update_item(iid, short_title="__clear__")["short_title"] is None
 
 
 def test_update_item_whitespace_only_label_over_the_limit_is_refused(srv):
@@ -142,7 +157,8 @@ def test_update_item_docstring_does_not_demand_the_label():
 
     update_doc = " ".join(server.update_item.__doc__.split())
     assert "always pass it" not in update_doc
-    assert "Omit (or blank) = keep the current label" in update_doc
+    assert 'Omit (or "") = keep the current label' in update_doc
+    assert "whitespace-only value strips to empty and CLEARS the label" in update_doc
     for creator in (server.create_item, server.promote_section_to_item,
                     server.promote_checkpoint_to_item):
         assert "always pass it" in creator.__doc__

@@ -334,7 +334,8 @@ def test_release_from_a_deleted_cwd_is_refused(gitproj, monkeypatch, capsys):
     monkeypatch.chdir(gone)
     os.rmdir(gone)
     assert _exit_code(monkeypatch, ["clog", "release", "-P", "proj-g", "1.1.0"]) == 1
-    assert "not a checkout" in capsys.readouterr().err
+    err = capsys.readouterr().err
+    assert "the current directory no longer exists" in err and "nothing released" in err
     assert get_project(engine, "proj-g")["current_version"] == "1.0.0"
     assert not (main / "VERSION").exists()
 

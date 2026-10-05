@@ -6,6 +6,7 @@ Uses Core (not ORM) for portability between PostgreSQL and SQLite.
 
 import contextlib
 import json
+import re
 import sys
 import time
 from collections import Counter
@@ -506,6 +507,19 @@ def get_engine(database_url: str) -> sa.Engine:
     return engine
 
 
+class SerializationConflict(RuntimeError):
+    """A project transaction lost a serialization race (SQLSTATE 40001) and
+    was rolled back — nothing written; the caller may re-run it."""
+
+
+def is_serialization_failure(exc: BaseException) -> bool:
+    """True for a driver error carrying SQLSTATE 40001 (psycopg's
+    SerializationFailure; `sqlstate` on psycopg 3, `pgcode` on psycopg2)."""
+    orig = getattr(exc, "orig", exc)
+    code = getattr(orig, "sqlstate", None) or getattr(orig, "pgcode", None)
+    return code == "40001"
+
+
 @contextlib.contextmanager
 def project_transaction(engine: sa.Engine, project_slug: str, *, write: bool = False):
     """A consistent project snapshot, optionally serializing composed writers.
@@ -520,6 +534,12 @@ def project_transaction(engine: sa.Engine, project_slug: str, *, write: bool = F
     writers still follow their own concurrency contracts. The database's
     global isolation policy is unchanged. Lock waits are bounded to five
     seconds, matching SQLite's default connection timeout.
+
+    The lock protects only its participants: a writer that does not take it
+    can still make a REPEATABLE READ transaction here fail with a
+    serialization failure (SQLSTATE 40001). That is never retried
+    automatically; it surfaces as SerializationConflict — a controlled
+    refusal after the rollback (nothing written), safe to re-run.
     """
     # Local import: projects uses the table definitions in this module.
     from dct.core.projects import resolve_project_id
@@ -551,11 +571,20 @@ def project_transaction(engine: sa.Engine, project_slug: str, *, write: bool = F
                     conn.rollback()  # end SQLAlchemy's autocommit bookkeeping
                 conn.execution_options(isolation_level="REPEATABLE READ")
 
-            with conn.begin():
-                if conn.dialect.name == "sqlite":
-                    conn.exec_driver_sql("BEGIN IMMEDIATE" if write else "BEGIN")
-                project_id = resolve_project_id(conn, project_slug)
-                yield conn, project_id
+            try:
+                with conn.begin():
+                    if conn.dialect.name == "sqlite":
+                        conn.exec_driver_sql("BEGIN IMMEDIATE" if write else "BEGIN")
+                    project_id = resolve_project_id(conn, project_slug)
+                    yield conn, project_id
+            except sa.exc.DBAPIError as exc:
+                if not is_serialization_failure(exc):
+                    raise
+                raise SerializationConflict(
+                    f"A concurrent transaction changed the data of project "
+                    f"'{project_slug}' (serialization failure, SQLSTATE 40001) — "
+                    f"rolled back, nothing was written; re-run the operation."
+                ) from exc
         finally:
             if locked_project is not None:
                 try:
@@ -571,8 +600,78 @@ def project_transaction(engine: sa.Engine, project_slug: str, *, write: bool = F
 
 
 def create_tables(engine: sa.Engine) -> None:
-    metadata.create_all(engine)
+    _create_missing_tables(engine)
     _apply_schema_updates(engine)
+
+
+# Bounded attempts for the concurrent-creation race (K-59): each retry
+# follows a conflict another bootstrap caused by creating the same object.
+SCHEMA_CREATE_ATTEMPTS = 3
+
+# PostgreSQL: duplicate_table (42P07 — tables AND indexes, "relation already
+# exists") and duplicate_object (42710). A CREATE racing an uncommitted
+# CREATE of the same name fails on the catalog's unique index instead
+# (23505 on pg_type / pg_class name indexes) — only those count.
+_PG_DUPLICATE_SQLSTATES = {"42P07", "42710"}
+_PG_CATALOG_NAME_INDEXES = ("pg_type_typname_nsp_index", "pg_class_relname_nsp_index")
+_SQLITE_DUPLICATE = re.compile(r"\b(table|index) \S+ already exists\b", re.IGNORECASE)
+
+
+def _is_concurrent_creation_conflict(engine: sa.Engine, exc: sa.exc.DBAPIError) -> bool:
+    """True only for "the object I am creating was just created by someone
+    else" — never for any other error (those propagate unchanged)."""
+    orig = getattr(exc, "orig", None)
+    if engine.dialect.name == "postgresql":
+        code = getattr(orig, "sqlstate", None) or getattr(orig, "pgcode", None)
+        if code in _PG_DUPLICATE_SQLSTATES:
+            return True
+        return code == "23505" and any(name in str(orig) for name in _PG_CATALOG_NAME_INDEXES)
+    return isinstance(exc, sa.exc.OperationalError) and bool(_SQLITE_DUPLICATE.search(str(orig)))
+
+
+def _create_table_objects(engine: sa.Engine, table: sa.Table) -> None:
+    """Create `table` if absent plus every metadata index of it that is absent,
+    in ONE transaction (atomic on PostgreSQL; SQLite's driver commits DDL
+    statement by statement). Re-reads the live schema first, so a retry only
+    finishes what is still missing."""
+    inspector = sa.inspect(engine)
+    exists = inspector.has_table(table.name)
+    present = {ix["name"] for ix in inspector.get_indexes(table.name)} if exists else set()
+    missing = sorted((ix for ix in table.indexes if ix.name not in present), key=lambda ix: ix.name)
+    if exists and not missing:
+        return
+    with engine.begin() as conn:
+        if not exists:
+            conn.execute(sa.schema.CreateTable(table))
+        for index in missing:
+            conn.execute(sa.schema.CreateIndex(index))
+
+
+def _create_missing_tables(engine: sa.Engine) -> None:
+    """Create every metadata table this database lacks, WITH its indexes —
+    safe against a concurrent bootstrap creating the same objects (K-59).
+
+    Scope: the tables missing at the first look. Their whole required schema
+    (table + every index) is completed — a table that exists does not prove
+    its unique index exists. Tables that predate this bootstrap are left to
+    _apply_schema_updates' explicit blocks (no silent index retrofit on an
+    old database). A concurrent-creation conflict (duplicate table / index /
+    relation, see _is_concurrent_creation_conflict) rolls the attempt back
+    and re-checks the whole set; any other error propagates; at most
+    SCHEMA_CREATE_ATTEMPTS attempts. No missing table → no DDL at all.
+    """
+    existing = set(sa.inspect(engine).get_table_names())
+    pending = [table for table in metadata.sorted_tables if table.name not in existing]
+    if not pending:
+        return
+    for attempt in range(1, SCHEMA_CREATE_ATTEMPTS + 1):
+        try:
+            for table in pending:  # FK order
+                _create_table_objects(engine, table)
+            return
+        except sa.exc.DBAPIError as exc:
+            if attempt == SCHEMA_CREATE_ATTEMPTS or not _is_concurrent_creation_conflict(engine, exc):
+                raise
 
 
 def _column_exists(engine: sa.Engine, table: str, column: str) -> bool:
