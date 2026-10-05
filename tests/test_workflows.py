@@ -133,7 +133,9 @@ def test_snapshot_sprint_items_pin_their_columns_and_never_leak_tags(engine, pro
 
     tbl = get_context_snapshot(engine, "proj-a")["sprint"]["items"]
 
-    assert tbl["cols"] == ["id", "sprint_id", "priority", "status", "cp", "title"]
+    assert tbl["cols"] == [
+        "id", "sprint_id", "priority", "status", "cp", "short_title", "title",
+    ]
     assert "tags" not in tbl["cols"]
     assert tbl["rows"] and all(len(r) == len(tbl["cols"]) for r in tbl["rows"])
     assert dict(zip(tbl["cols"], tbl["rows"][0]))["id"] == a["id"]
@@ -145,7 +147,9 @@ def test_snapshot_sprint_items_pin_their_columns_and_never_leak_tags(engine, pro
 
     with engine.begin() as conn:
         raw = _query_sprint_items_with_cp(conn, resolve_project_id(conn, "proj-a"))
-    assert [set(r) for r in raw] == [{"id", "sprint_id", "priority", "status", "cp", "title"}]
+    assert [set(r) for r in raw] == [
+        {"id", "sprint_id", "priority", "status", "cp", "short_title", "title"}
+    ]
 
 
 def test_snapshot_sprint_checkpoints_expose_next_step(engine, proj):
@@ -184,6 +188,11 @@ def test_snapshot_gates_filtering(engine, proj):
     rows = [dict(zip(tbl["cols"], r)) for r in tbl["rows"]]
     assert [r["checkpoint_id"] for r in rows] == [gate["id"]]
     assert rows[0]["kind"] == "dogfood" and rows[0]["item_title"] == "In sprint"
+    assert tbl["cols"] == [
+        "item_id", "checkpoint_id", "kind", "priority", "item_short_title", "item_title", "text",
+    ]
+    # No short_title stored → the label falls back to the (short) title.
+    assert rows[0]["item_short_title"] == "In sprint"
     assert snap["summary"]["gates_pending"] == 1
 
 

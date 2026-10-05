@@ -4,6 +4,7 @@ import argparse
 import atexit
 import contextlib
 import os
+import shlex
 import signal
 import socket
 import subprocess
@@ -15,6 +16,7 @@ from dct import __version__, migrate, paths
 from dct.config import Config, load_config, save_config
 from dct.core.engine import bootstrap_engine
 from dct.core.items import TERMINAL_STATUSES
+from dct.core.releases import RELEASE_FLOW
 from dct.db import create_tables, get_engine
 
 # Windows-policy seam (tests flip it): dispatches the daemonization,
@@ -33,6 +35,27 @@ def _web_logfile() -> Path:
 
 def _get_engine():
     return bootstrap_engine(create=True)
+
+
+def _get_readonly_engine():
+    """The read-only engine (K-84) for commands that promise no side effects;
+    a missing database or older schema exits 1 naming `dct db upgrade`."""
+    from dct.core.engine import readonly_engine
+    from dct.db import SchemaNotReady
+
+    try:
+        return readonly_engine()
+    except SchemaNotReady as e:
+        print(f"✗ Error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
+def cmd_db_upgrade(args):
+    """`dct db upgrade` — the explicit bootstrap: create the database (and
+    its directory) or upgrade its schema. Every write command runs the same
+    bootstrap implicitly; read-only commands never do (K-84)."""
+    bootstrap_engine(create=True).dispose()
+    print("✓ Database schema is up to date")
 
 
 def _detect_project(engine) -> str:
@@ -207,6 +230,7 @@ def cmd_init(args):
         try:
             project = create_project(engine, slug=slug, name=name, path=proj_path)
             print(f"  ✓ Project '{slug}' registered")
+            _warn_unsupported_detection(project)
             version = project.get("current_version")
             source = project.get("_detected_source")
             if version and source:
@@ -214,8 +238,8 @@ def cmd_init(args):
             elif not version:
                 picked = _prompt_version()
                 if picked:
-                    set_version(engine, slug, picked)
-                    print(f"    ✓ Version set to {picked}")
+                    stored = set_version(engine, slug, picked)["current_version"]
+                    print(f"    ✓ Version set to {stored}")
                 else:
                     print(f"    ⚠ No version — run `dct project set-version {slug} <v>` later")
         except Exception as e:
@@ -347,6 +371,7 @@ def cmd_project_add(args):
         sys.exit(1)
 
     print(f"✓ Project '{args.slug}' registered at {path}")
+    _warn_unsupported_detection(project)
 
     version = project.get("current_version")
     source = project.get("_detected_source")
@@ -360,12 +385,30 @@ def cmd_project_add(args):
     # No version on the row — try an interactive prompt, else warn & bail out.
     picked = _prompt_version() if sys.stdin.isatty() else None
     if picked:
-        set_version(engine, args.slug, picked)
-        print(f"  ✓ Version set to {picked}")
+        try:
+            stored = set_version(engine, args.slug, picked)["current_version"]
+        except ValueError as e:
+            print(f"✗ Error: {e}", file=sys.stderr)
+            sys.exit(1)
+        print(f"  ✓ Version set to {stored}")
     else:
+        what = ("No supported version stored" if project.get("_detected_unsupported")
+                else "No version detected")
         print(
-            f"  ⚠ No version detected. Run `dct project set-version {args.slug} <version>` "
+            f"  ⚠ {what}. Run `dct project set-version {args.slug} <version>` "
             f"before using `/release`.",
+            file=sys.stderr,
+        )
+
+
+def _warn_unsupported_detection(project: dict) -> None:
+    """Say so when create_project detected a version the contract refuses
+    (K-54) — it was NOT stored and nothing was substituted."""
+    unsupported = project.get("_detected_unsupported")
+    if unsupported:
+        print(
+            f"  ⚠ Detected version {unsupported['version']!r} in {unsupported['source']} "
+            f"is not stored: {unsupported['reason']}",
             file=sys.stderr,
         )
 
@@ -374,9 +417,14 @@ def cmd_project_set_version(args):
     from dct.core.projects import set_version
 
     engine = _get_engine()
-    project = set_version(engine, args.slug, args.version)
+    try:
+        project = set_version(engine, args.slug, args.version)
+    except ValueError as e:
+        print(f"✗ Error: {e}", file=sys.stderr)
+        sys.exit(1)
     if project:
-        print(f"✓ {args.slug} → {args.version}")
+        # The STORED (normalized) form — what /release and tags will use.
+        print(f"✓ {args.slug} → {project['current_version']}")
     else:
         print(f"✗ Project '{args.slug}' not found", file=sys.stderr)
         sys.exit(1)
@@ -435,6 +483,41 @@ def cmd_project_changelog(args):
     else:
         print(f"✗ Project '{args.slug}' not found", file=sys.stderr)
         sys.exit(1)
+
+
+def cmd_project_release_executor(args):
+    """`dct project release-executor <slug> [own|dct]` — get or set who
+    performs the project's release effects (K-85; default dct)."""
+    from dct.core.projects import get_project, set_release_executor
+
+    engine = _get_engine()
+    if args.executor is None:
+        project = get_project(engine, args.slug)
+    else:
+        project = set_release_executor(engine, args.slug, args.executor)
+    if not project:
+        print(f"✗ Project '{args.slug}' not found", file=sys.stderr)
+        sys.exit(1)
+    print(f"✓ {args.slug}: release-executor → {project['release_executor']}"
+          if args.executor is not None else f"{args.slug}: {project['release_executor']}")
+
+
+def cmd_project_changelog_pr_refs(args):
+    """`dct project changelog-pr-refs <slug> [on|off]` — get or set the
+    `(#N)` PR-reference render opt-in (K-90; default off)."""
+    from dct.core.projects import get_project, set_changelog_pr_refs
+
+    engine = _get_engine()
+    if args.state is None:
+        project = get_project(engine, args.slug)
+    else:
+        project = set_changelog_pr_refs(engine, args.slug, args.state == "on")
+    if not project:
+        print(f"✗ Project '{args.slug}' not found", file=sys.stderr)
+        sys.exit(1)
+    state = "on" if project["changelog_pr_refs"] else "off"
+    print(f"✓ {args.slug}: changelog-pr-refs → {state}" if args.state is not None
+          else f"{args.slug}: {state}")
 
 
 def cmd_project_manages_changelog(args):
@@ -561,6 +644,8 @@ def cmd_add(args):
         kwargs["priority"] = args.priority
     if args.component:
         kwargs["component"] = args.component
+    if args.short_title:
+        kwargs["short_title"] = args.short_title
     if args.tags:
         # Shell passes `--tags "a,b,c"` as a string; core expects list[str].
         # Normalize at the CLI boundary so core stays pure (see #31).
@@ -580,6 +665,7 @@ def cmd_add(args):
 
 def cmd_list(args):
     from dct.core.items import list_items
+    from dct.core.text import visible_label
 
     engine = _get_engine()
     kwargs = {}
@@ -602,7 +688,7 @@ def cmd_list(args):
         # Unknown tag — the core error carries the known-names suggestion.
         print(f"✗ Error: {e}", file=sys.stderr)
         sys.exit(1)
-    headers = ["#", "Project", "Type", "Pri", "Status", "Title"]
+    headers = ["#", "Project", "Type", "Pri", "Status", "Label", "Title"]
 
     # Build project_id → slug cache
     from dct.core.projects import list_projects
@@ -611,13 +697,18 @@ def cmd_list(args):
     rows = []
     for i in items:
         slug = slug_map.get(i.get("project_id"), "?")
-        rows.append([str(i["id"]), slug, i["item_type"], i["priority"], i["status"], i["title"][:60]])
+        rows.append([
+            str(i["id"]), slug, i["item_type"], i["priority"], i["status"],
+            visible_label(i.get("short_title")) or "", i["title"][:60],
+        ])
 
-    _print_table(headers, rows, max_widths={5: 60})
+    # Label is capped below its 50-char column so the title keeps its room.
+    _print_table(headers, rows, max_widths={5: 30, 6: 60})
 
 
 def cmd_show(args):
     from dct.core.items import get_item
+    from dct.core.text import visible_label
 
     engine = _get_engine()
     item = get_item(engine, args.id)
@@ -627,6 +718,8 @@ def cmd_show(args):
 
     print(f"#{item['id']}  {item['item_type']}/{item['priority']}  [{item['status']}]")
     print(f"Title:       {item['title']}")
+    if visible_label(item.get("short_title")):
+        print(f"Short title: {item['short_title']}")
     if item.get("description"):
         print(f"Description: {item['description']}")
     if item.get("component"):
@@ -665,6 +758,10 @@ def cmd_update(args):
         kwargs["component"] = args.component
     if args.resolution:
         kwargs["resolution"] = args.resolution
+    if args.short_title is not None:
+        # `is not None` on purpose: `--short-title ""` clears the label (core
+        # stores "" as NULL), while omitting the flag leaves it untouched.
+        kwargs["short_title"] = args.short_title
     if args.tags is not None:
         # `is not None` on purpose: `--tags ""` is a legal CLEAR (empty list),
         # while omitting the flag leaves the item's tags untouched.
@@ -721,6 +818,23 @@ def cmd_delete(args):
         sys.exit(1)
 
 
+def _ids(raw: str | None, flag: str, noun: str = "item") -> list[int] | None:
+    """Parse a comma-separated id flag. None → flag unused; empty/garbage →
+    ValueError (a blank shell var must never read as "no ids" or wipe
+    anything — K-27)."""
+    if raw is None:
+        return None
+    try:
+        ids = [int(x.strip()) for x in raw.split(",") if x.strip()]
+    except ValueError:
+        raise ValueError(
+            f"{flag} expects comma-separated {noun} ids, got: {raw!r}"
+        ) from None
+    if not ids:
+        raise ValueError(f"{flag} got no ids ({raw!r}) — omit the flag instead")
+    return ids
+
+
 # ── Handoff commands ──────────────────────────────────────────────────────────
 
 def cmd_handoff_create(args):
@@ -735,21 +849,6 @@ def cmd_handoff_create(args):
         project = args.project or _detect_project(engine)
         prompt = _read_text_arg(args.prompt, args.prompt_file)
         identity = args.created_by or _default_identity()
-
-        def _ids(raw: str | None, flag: str) -> list[int] | None:
-            # None → flag unused; empty/garbage → error (a blank shell var
-            # must never read as "no items" or wipe anything — K-27).
-            if raw is None:
-                return None
-            try:
-                ids = [int(x.strip()) for x in raw.split(",") if x.strip()]
-            except ValueError:
-                raise ValueError(
-                    f"{flag} expects comma-separated item ids, got: {raw!r}"
-                ) from None
-            if not ids:
-                raise ValueError(f"{flag} got no ids ({raw!r}) — omit the flag instead")
-            return ids
 
         result = handoff_work(
             engine, project,
@@ -927,7 +1026,7 @@ def cmd_pickup(args):
 # ── Changelog commands ────────────────────────────────────────────────────────
 
 def cmd_clog_add(args):
-    from dct.core.changelog import add_entry
+    from dct.core.changelog import add_entry, resolve_branch_fields
 
     engine = _get_engine()
     kwargs = {}
@@ -940,11 +1039,37 @@ def cmd_clog_add(args):
 
     try:
         project_slug = args.project or _detect_project(engine)
+        # The CLI runs in the caller's directory, so detected context is the
+        # caller's own → branch_source='client' either way.
+        kwargs.update(resolve_branch_fields(
+            engine, project_slug, branch=args.branch, worktree=args.worktree,
+            use_process_cwd=True, detected_source="client",
+        ))
         e = add_entry(engine, project_slug, args.category, args.entry, **kwargs)
-        print(f"✓ Changelog #{e['id']} [{e['category']}] — {e['entry'][:60]}")
+        where = f" @ {e['branch']}" if e.get("branch") else ""
+        print(f"✓ Changelog #{e['id']} [{e['category']}]{where} — {e['entry'][:60]}")
     except Exception as e:
         print(f"✗ Error: {e}", file=sys.stderr)
         sys.exit(1)
+
+
+def _branch_filter_kwargs(args) -> dict:
+    """`clog list` / `clog count` branch filters → core keyword arguments.
+
+    A relative --worktree is refused here (exit 1, message on stderr) under
+    the same contract core applies (normalize_worktree, K-42)."""
+    from dct.core.changelog import normalize_worktree
+
+    try:
+        worktree = normalize_worktree(args.worktree)
+    except ValueError as e:
+        print(f"✗ Error: {e}", file=sys.stderr)
+        sys.exit(1)
+    return {
+        "branch": args.branch or None,
+        "worktree": worktree,
+        "include_unbranched": args.include_unbranched,
+    }
 
 
 def cmd_clog_list(args):
@@ -952,8 +1077,10 @@ def cmd_clog_list(args):
 
     engine = _get_engine()
     project_slug = args.project or _detect_project(engine)
-    entries = list_entries(engine, project_slug, unreleased_only=args.unreleased)
-    headers = ["#", "Category", "Entry", "Version", "Created"]
+    entries = list_entries(
+        engine, project_slug, unreleased_only=args.unreleased, **_branch_filter_kwargs(args)
+    )
+    headers = ["#", "Category", "Entry", "Version", "Branch", "Created"]
     rows = []
     for e in entries:
         rows.append([
@@ -961,6 +1088,7 @@ def cmd_clog_list(args):
             e["category"],
             e["entry"][:50],
             e["version"] or "(unreleased)",
+            e["branch"] or "",
             _fmt_date(e["created_at"]),
         ])
     _print_table(headers, rows, max_widths={2: 50})
@@ -971,54 +1099,823 @@ def cmd_clog_count(args):
 
     engine = _get_engine()
     project_slug = args.project or _detect_project(engine)
-    count = count_unreleased(engine, project_slug)
+    # Bare integer on stdout — hooks parse it (never decorate this line).
+    count = count_unreleased(engine, project_slug, **_branch_filter_kwargs(args))
     print(count)
 
 
-def cmd_clog_release(args):
-    import subprocess
+def _release_ids(raw: str | None, flag: str = "--entries") -> list[int] | None:
+    try:
+        return _ids(raw, flag, "entry")
+    except ValueError as e:
+        print(f"✗ Error: {e}", file=sys.stderr)
+        sys.exit(1)
 
-    from dct.core.changelog import count_unreleased, release_entries
-    from dct.core.projects import get_project
-    from dct.core.version import bump
+
+def _print_effects(out: dict) -> None:
+    """Human rendering of an effects-layer result (dct.workflows.release.effects)."""
+    for step in out["steps"]:
+        extra = ", ".join(f"{k}={v}" for k, v in step.items() if k not in ("step", "result"))
+        print(f"  {step['step']}: {step['result']}{' (' + extra + ')' if extra else ''}")
+    record = out.get("release")
+    if record:
+        print(f"  release record {record['version']}: {record['status']}")
+    for warning in out["warnings"]:
+        print(f"  ⚠ {warning}", file=sys.stderr)
+
+
+def _run_effects(action: str, project_slug: str, as_json: bool, call) -> dict:
+    """Run one effects-layer call; a refusal / failure prints its reason
+    (or the JSON result with outcome 'refused' / 'failed' / 'conflict') and
+    exits with its code (1, the failing version-sync script's code, or 75
+    for a lost serialization race — K-88: the effects layer reports the
+    step, the effects it observed and the re-read record; nothing is
+    retried)."""
+    import json
+
+    from dct.core.gitinfo import CheckoutVerificationError
+    from dct.workflows.release.effects import (
+        ReleaseConflict,
+        ReleaseRefused,
+        SyncFailed,
+        result,
+    )
+
+    try:
+        out = call()
+    except ReleaseRefused as e:
+        outcome = ("failed" if isinstance(e, SyncFailed)
+                   else "conflict" if isinstance(e, ReleaseConflict) else "refused")
+        code = e.exit_code
+        failure = result(action, project_slug, outcome, release=e.release, steps=e.steps,
+                         details={**e.details, "error": str(e)},
+                         version=(e.release or {}).get("version"))
+        message = str(e)
+    except (CheckoutVerificationError, ValueError) as e:
+        code, message = 1, str(e)
+        failure = result(action, project_slug, "refused", details={"error": message})
+    else:
+        if as_json:
+            print(json.dumps(out, indent=2, default=_json_default))
+        return out
+    if as_json:
+        print(json.dumps(failure, indent=2, default=_json_default))
+    else:
+        for step in failure["steps"]:
+            print(f"  {step['step']}: {step['result']}")
+        # K-109: a release commit that changed older changelog history is
+        # SHOWN — the diff of what it changed besides its own section.
+        for item in failure["details"].get("history") or []:
+            total = item.get("diff_lines", len(item["diff"]))
+            print(f"  changelog history changed by {item['commit']} ({total} diff line(s), "
+                  f"sha256 {item['diff_sha256']}):", file=sys.stderr)
+            for line in item["diff"]:
+                print(f"    {line}", file=sys.stderr)
+            if total > len(item["diff"]):
+                print(f"    … {total - len(item['diff'])} more line(s) — see --json",
+                      file=sys.stderr)
+    print(f"✗ {message}", file=sys.stderr)
+    sys.exit(code)
+
+
+REMOVED_CONFIRM_VERSION_FILES = (
+    "--confirm-version-files was removed (K-76): the version-file set is no longer "
+    "confirmed after the stamp. Run `dct release prepare --version V (--entries … | "
+    "--no-entries) --plan-digest D`, review the proposed files and pass its "
+    "proposal_sha256 as --proposal-digest; nothing released.")
+
+
+def _refuse_removed_flag(args) -> None:
+    """The removed --confirm-version-files (kept as a hidden, refusing flag so
+    an old invocation gets the new procedure instead of a usage error)."""
+    if getattr(args, "confirm_version_files", False):
+        print(f"✗ {REMOVED_CONFIRM_VERSION_FILES}", file=sys.stderr)
+        sys.exit(1)
+
+
+RELEASE_EXECUTOR_EPILOG = (
+    "Executor: a project whose release executor is 'own' (`dct project release-executor "
+    "<slug> own`) gets no effect from dct — prepare / apply / resume refuse before any write; "
+    "its own tool uses `dct release plan --json` and the ledger (MCP release_changelog / "
+    "advance_release). Resume performs only a release dct stamped with the owner's consent. "
+    "A lost database serialization race exits 75 (outcome 'conflict': the step, the effects "
+    "already performed, the re-read record) — never retried automatically. ")
+
+RELEASE_LOCK_EPILOG = (
+    "Locks: the command holds the release operation lock of the repository of the "
+    "project's REGISTERED path (one at a time, also across worktrees; another release "
+    "command refuses at once). A project without a registered path, or with a path that "
+    "cannot be verified, is refused — dct never locks on a substitute key. ")
+
+RELEASE_PUSH_EPILOG = RELEASE_EXECUTOR_EPILOG + RELEASE_LOCK_EPILOG + (
+    "Commit (needs git >= 2.36): the repository's hooks run explicitly (pre-commit, "
+    "prepare-commit-msg, commit-msg on a temporary index holding the approved tree), the "
+    "commit is created on the pinned candidate and published by a compare-and-swap of the "
+    "branch HEAD names, then post-commit. A refusing hook, a hook that changes the approved "
+    "content or message, a HEAD that moved or a branch switch stops the release with "
+    "NOTHING published (resume after fixing; nothing is reset). Push (after the tag): `git "
+    "push --atomic --no-follow-tags --recurse-submodules=no <url> "
+    "<commit>:refs/heads/<branch> <commit>:refs/tags/v<V>` to ONE approved destination — "
+    "exactly those two refs: no tag push.followTags would add, no submodule commit (a "
+    "submodule is never pushed; publishing the commit a gitlink names is the owner's). A "
+    "NEW release that pushes needs the COMPLETE approved target: --push-remote, "
+    "--push-branch and --push-url, the `push_target` that `dct release prepare` showed (the "
+    "current branch's upstream and its push URL, `git remote get-url --push --all`) and the "
+    "owner approved — apply never selects it itself, a missing or mismatching part is "
+    "refused before the stamp; --no-push is an explicit local release. The URL must be one "
+    "of the remote's push URLs (several: it chooses ONE, no mirror mode) and must not be "
+    "readable as a remote NAME or rewritten by insteadOf (write a path as ./name, an "
+    "absolute path or a real URL). The same URL is read before the stamp and to verify "
+    "the push. A failed push leaves the release 'tagged'; `dct release resume` retries only "
+    "the push, to the approved URL.")
+
+
+def _add_push_flags(parser) -> None:
+    """The push target of `release apply` / `clog release` (K-97 F2; K-123:
+    all three are required there for a new release that pushes) and of
+    `release takeover` (its preview derives what is not given)."""
+    parser.add_argument(
+        "--push-remote",
+        help="Remote to push the release commit and tag to. apply / clog release: REQUIRED "
+             "for a new release that pushes, with --push-branch and --push-url (the "
+             "push_target `dct release prepare` showed). takeover: default the branch's "
+             "upstream")
+    parser.add_argument(
+        "--push-branch",
+        help="Branch of that remote. apply / clog release: REQUIRED with --push-remote. "
+             "takeover: default the upstream's branch when it is on that remote")
+    parser.add_argument(
+        "--push-url",
+        help="Which ONE of the remote's push URLs (`git remote get-url --push --all`) the "
+             "release goes to; refused when it is not one of them. apply / clog release: "
+             "REQUIRED with --push-remote. takeover: required when the remote has several")
+    parser.add_argument(
+        "--no-push", action="store_true",
+        help="An explicit local release: commit and tag, nothing pushed")
+
+
+def _apply_from_args(args, *, strict: bool) -> None:
+    """`dct release apply` and its alias `dct clog release` (strict)."""
+    from dct.workflows.release.effects import apply_release
+
+    _refuse_removed_flag(args)
+    engine = _get_engine()
+    project_slug = args.project or _detect_project(engine)
+    version = getattr(args, "version", None) or None
+    if not version and not args.bump:
+        print("✗ Provide a version or --patch/--minor/--major", file=sys.stderr)
+        sys.exit(1)
+    entry_ids = None if args.no_entries else _release_ids(args.entries)
+    as_json = getattr(args, "json", False)
+    out = _run_effects("apply", project_slug, as_json, lambda: apply_release(
+        engine, project_slug, version=version, bump_type=None if version else args.bump,
+        entry_ids=entry_ids, no_entries=args.no_entries,
+        confirm=args.confirm, strict=strict,
+        plan_digest=None if strict else args.plan_digest,
+        proposal_digest=args.proposal_digest, push_remote=args.push_remote,
+        push_branch=args.push_branch, push_url=args.push_url, no_push=args.no_push))
+    if as_json:
+        return
+    details = out["details"]
+    if details.get("bump"):
+        print(f"  {details['previous_version']} → {out['version']} ({details['bump']})")
+    if out["outcome"] == "completed":
+        print(f"✓ Released {details['released']} entries as {out['version']} "
+              f"(mode: {details['mode']}) — current version: {details['current_version']}")
+        target = details.get("push_target")
+        print(f"  pushed to {target['remote']} {target['url']} ({target['branch']}, "
+              f"{target['tag']})" if target else "  not pushed (no push target approved)")
+    else:
+        print(f"✓ {details['requested_version']} already released — nothing to do "
+              f"(mode: {details['mode']}); current version: {details['current_version']}")
+    _print_effects(out)
+
+
+def cmd_clog_release(args):
+    """`dct clog release` — an alias of `dct release apply` (K-72).
+
+    Flags map 1:1 (version or --patch/--minor/--major, --entries /
+    --no-entries, --proposal-digest, and the COMPLETE approved push target
+    --push-remote + --push-branch + --push-url, or --no-push — K-123, as
+    for apply); --confirm is REQUIRED as for apply (K-96 D1:
+    the alias commits, tags and pushes — running it is not the
+    confirmation), and so is --proposal-digest for a new release (K-117:
+    the alias never prepares or approves a proposal by itself — run `dct
+    release prepare` and approve its proposal_sha256).
+    Decisions that need the owner are REFUSED instead of
+    guessed: a missing proposal digest, unproven entries (no --entries =
+    every unreleased entry, all of which must be proven), a proof range
+    that does not start at v<current_version>. No --plan-digest: the plan
+    is derived inside the call for the candidate it pins, the stamp is
+    bound to it the same way (K-80/K-81), and the approved proposal must
+    have been prepared for exactly that plan (K-116 H2). Effects, order
+    and verification: see dct.workflows.release.effects.
+    """
+    _apply_from_args(args, strict=True)
+
+
+def cmd_release_apply(args):
+    """`dct release apply` — one release from the APPROVED plan and the
+    APPROVED proposal (effects layer, K-80 / K-76): --plan-digest is the
+    snapshot_digest of `dct release plan` with the same version and
+    selection; the plan is re-derived for the candidate apply pins and a
+    different snapshot is refused before any write. --proposal-digest is the
+    proposal_sha256 of `dct release prepare` (required for a new release)."""
+    _apply_from_args(args, strict=False)
+
+
+def cmd_release_prepare(args):
+    """`dct release prepare` — the PREPARE stage before the stamp (K-76):
+    the version-sync script runs once, isolated (a temporary worktree of
+    the pinned candidate, or a copy of a project outside git), and its
+    result is stored as the project's pending version-file proposal for the
+    owner to approve (`apply --proposal-digest`). Nothing is stamped."""
+    from dct.workflows.release.effects import prepare_release
 
     engine = _get_engine()
     project_slug = args.project or _detect_project(engine)
+    version = args.version or None
+    if not version and not args.bump:
+        print("✗ Provide a version or --patch/--minor/--major", file=sys.stderr)
+        sys.exit(1)
+    entry_ids = None if args.no_entries else _release_ids(args.entries)
+    out = _run_effects("prepare", project_slug, args.json, lambda: prepare_release(
+        engine, project_slug, version=version, bump_type=None if version else args.bump,
+        entry_ids=entry_ids, no_entries=args.no_entries, plan_digest=args.plan_digest))
+    if args.json:
+        return
+    details = out["details"]
+    contract = details["contract"]
+    proposal = details["proposal"]
+    print(f"✓ Prepared {out['version']} — version files: "
+          f"{', '.join(proposal['paths']) or '(none)'}")
+    if contract["change"]:
+        print(f"  contract: {contract['confirmed'] if contract['confirmed'] is not None else '(not learned yet)'}"
+              f" → {contract['proposed']} — approving the proposal records it")
+    for check in details["checks"]:
+        extra = check.get("value") or f"{check.get('changed_lines')} changed line(s)"
+        print(f"  {check['path']}: {check['check']} ({extra})")
+    sync = details["sync"]
+    if sync and sync["output"]:
+        dropped = sync["output_dropped_bytes"]
+        print(f"  sync output ({sync['output_bytes']} bytes"
+              f"{f', {dropped} dropped' if dropped else ''}):")
+        for line in sync["output"].splitlines():
+            print(f"    {line}")
+    print(f"  proposal digest {details['proposal_sha256']}")
+    target = details.get("push_target")
+    print(f"  push target (default): {target['remote']} {target['branch']} ({target['url']}), "
+          f"tag {target['tag']}" if target else
+          "  push target: none by default — apply needs --push-remote … --push-branch … "
+          "--push-url … or --no-push (see the warnings)")
+    push = (f"--push-remote {shlex.quote(target['remote'])} --push-branch "
+            f"{shlex.quote(target['branch'])} --push-url {shlex.quote(target['url'])}"
+            if target else "(--push-remote … --push-branch … --push-url … | --no-push)")
+    print(f"  next: dct release apply --version {out['version']} … --plan-digest "
+          f"{details['plan_digest']} --proposal-digest {details['proposal_sha256']} {push} "
+          f"--confirm")
+    _print_effects(out)
 
-    version = args.version
-    if not version:
-        bump_type = args.bump
-        if not bump_type:
-            print("✗ Provide a version or --patch/--minor/--major", file=sys.stderr)
-            sys.exit(1)
-        project = get_project(engine, project_slug)
-        if not project:
-            print(f"✗ Project '{project_slug}' not found", file=sys.stderr)
-            sys.exit(1)
-        current = project.get("current_version")
-        if not current:
-            print(f"✗ No current version for '{project_slug}'. Use explicit version: dct clog release {project_slug} 0.1.0", file=sys.stderr)
-            sys.exit(1)
-        version = bump(current, bump_type)
-        print(f"  {current} → {version} ({bump_type})")
 
-    unreleased = count_unreleased(engine, project_slug)
-    if unreleased == 0:
-        print(f"✗ No unreleased entries for '{project_slug}'", file=sys.stderr)
+def cmd_release_resume(args):
+    """`dct release resume` — finish the unfinished release record. No
+    --confirm (K-97 F4): it executes the consent stored at apply (version,
+    entries, candidate, proposal, push target) and refuses whatever lies
+    outside it."""
+    from dct.workflows.release.effects import resume_release
+
+    engine = _get_engine()
+    project_slug = args.project or _detect_project(engine)
+    _refuse_removed_flag(args)
+    out = _run_effects("resume", project_slug, args.json, lambda: resume_release(
+        engine, project_slug))
+    if args.json:
+        return
+    if out["outcome"] == "noop":
+        print("✓ No unfinished release — nothing to resume")
+    else:
+        print(f"✓ Release {out['version']} completed")
+    _print_effects(out)
+
+
+def cmd_release_attest(args):
+    """`dct release attest --entries … --confirm` — the empty attestation commit."""
+    from dct.workflows.release.effects import attest
+
+    engine = _get_engine()
+    project_slug = args.project or _detect_project(engine)
+    ids = _release_ids(args.entries)
+    out = _run_effects("attest", project_slug, args.json, lambda: attest(
+        engine, project_slug, ids or [], confirm=args.confirm))
+    if args.json:
+        return
+    details = out["details"]
+    print(f"✓ Attested {', '.join(f'#{i}' for i in details['entry_ids'])} in "
+          f"{details['head']} — the release candidate is now this commit")
+
+
+def cmd_release_abandon(args):
+    """`dct release abandon --version V --reason … --confirm` (K-60)."""
+    from dct.workflows.release.effects import abandon
+
+    engine = _get_engine()
+    project_slug = args.project or _detect_project(engine)
+    out = _run_effects("abandon", project_slug, args.json, lambda: abandon(
+        engine, project_slug, args.version, args.reason or "", confirm=args.confirm))
+    if args.json:
+        return
+    record = out["release"]
+    if out["outcome"] == "noop":
+        print(f"✓ Release {record['version']} was already abandoned ({record['abandon_reason']})")
+        return
+    print(f"✓ Release {record['version']} abandoned — the record, the stamped entries and "
+          f"current_version stay; release the work under a new version")
+
+
+def _print_scope(scope: dict) -> None:
+    """The recorded scope of a reconstruction (K-110), one line per fact."""
+    if scope.get("adapter") == "own":
+        print(f"  verified (own adapter): artifacts {scope['artifacts']}, commit "
+              f"{'yes' if scope['commit'] else 'no'}, tag {'yes' if scope['tag'] else 'no'}")
+    else:
+        contract = scope["contract"]
+        shown = "UNKNOWN (never confirmed)" if contract is None else (
+            "confirmed: none" if not contract else "confirmed: " + ", ".join(contract))
+        print(f"  contract:       {shown}")
+        print(f"  verified:       changelog {scope['changelog']}, history {scope['history']}, "
+              f"version files {scope['version_files']}, commit "
+              f"{'yes' if scope['commit'] else 'no'}, tag {'yes' if scope['tag'] else 'no'}")
+    if scope["limited"]:
+        print("  scope:          LIMITED — no changelog section and no version file verified")
+
+
+def cmd_release_reconstruct(args):
+    """`dct release reconstruct --version V [--release-commit SHA |
+    --evidence FILE] [--confirm]` (K-60, legacy releases; K-109, K-110,
+    K-119: the own adapter takes --evidence)."""
+    from dct.workflows.release.effects import reconstruct
+
+    # The preview (no --confirm) writes nothing — it reads through the
+    # read-only engine (K-84); only --confirm bootstraps.
+    engine = _get_engine() if args.confirm else _get_readonly_engine()
+    project_slug = args.project or _detect_project(engine)
+
+    def call():
+        supplied = None
+        if args.evidence:
+            try:
+                with open(args.evidence, encoding="utf-8") as fh:
+                    supplied = _json_arg("--evidence", fh.read())
+            except OSError as exc:
+                raise ValueError(f"--evidence: cannot read {args.evidence}: {exc}") from None
+        return reconstruct(engine, project_slug, args.version, confirm=args.confirm,
+                           release_commit=args.release_commit or None, evidence=supplied)
+
+    out = _run_effects("reconstruct", project_slug, args.json, call)
+    if args.json:
+        return
+    evidence = out["details"]["evidence"]
+    print(f"Evidence for {evidence['version']}:")
+    print(f"  entries:        {', '.join(f'#{i}' for i in evidence['entry_ids']) or '(none)'}")
+    print(f"  candidate:      {evidence['candidate_sha'] or '-'}")
+    print(f"  release commit: {evidence['release_commit_sha'] or '-'}")
+    print(f"  tag:            {evidence['tag'] or '-'}")
+    manifest = evidence["manifest"]
+    if manifest.get("changelog"):
+        print(f"  changelog:      {manifest['changelog']['path']} "
+              f"({manifest['changelog']['section_date']})")
+    files = manifest.get("version_files", manifest.get("artifacts") or [])
+    print(f"  {'artifacts' if 'artifacts' in manifest else 'version files'}:  "
+          f"{', '.join(f['path'] for f in files) or '-'}")
+    _print_scope(evidence["verification"])
+    for other in evidence.get("candidates") or []:
+        if other["commit"] != evidence["release_commit_sha"]:
+            print(f"  other candidate: {other['commit']} — "
+                  f"{'verified (not used)' if other['verified'] else other['reason']}")
+    print(f"  stage proven:   {evidence['status']}")
+    # M9: the executor is an assignment made NOW, never historical provenance.
+    print(f"  responsibility: {out['details']['executor']['assigned']} — the executor "
+          f"ASSIGNED to the record for its further handling (the project's current setting), "
+          f"not who made the release")
+    for warning in out["warnings"]:
+        print(f"  ⚠ {warning}", file=sys.stderr)
+    if out["outcome"] == "preview":
+        print("  (preview — nothing written; re-run with --confirm to record it)")
+    else:
+        print(f"✓ Release {out['version']} recorded as {out['release']['status']} "
+              f"(mode: reconstructed)")
+    for way in out["details"]["finish"]:
+        print(f"  to finish ({way['way']}): {way['command']}")
+        print(f"      {way['what']}")
+
+
+def cmd_release_takeover(args):
+    """`dct release takeover --version V [push flags | --no-push]
+    [--takeover-digest D --confirm]` (K-119 M3, K-117 J4) — dct takes over
+    an existing record without a consent from its VERIFIED artifacts."""
+    from dct.workflows.release.effects import takeover
+
+    engine = _get_engine() if args.confirm else _get_readonly_engine()
+    project_slug = args.project or _detect_project(engine)
+    out = _run_effects("takeover", project_slug, args.json, lambda: takeover(
+        engine, project_slug, args.version, confirm=args.confirm,
+        takeover_digest=args.takeover_digest or None, push_remote=args.push_remote,
+        push_branch=args.push_branch, push_url=args.push_url, no_push=args.no_push))
+    if args.json:
+        return
+    details = out["details"]
+    consent, taken = details["consent"], details["consent"]["takeover"]
+    print(f"Takeover of release {out['version']} (record: {details['record_status']}):")
+    print(f"  entries:        {', '.join(f'#{i}' for i in consent['entry_ids']) or '(none)'}")
+    print(f"  candidate:      {consent['candidate_sha']}")
+    print(f"  release commit: {taken['release_commit_sha']} (tree {taken['tree']})")
+    print(f"  artifacts:      sha256 {taken['artifacts_sha256']} — "
+          f"{', '.join(details['proposal']['paths']) or 'no version files'}")
+    tag = details["evidence"]["tag_proof"]
+    print(f"  tag:            {tag['name'] + ' (exists, verified)' if tag else 'missing'}")
+    target = consent["push_target"]
+    print(f"  push target:    {target['remote']} {target['branch']} ({target['url']}), tag "
+          f"{target['tag']}" if target else "  push target:    none (--no-push: finished locally)")
+    print(f"  proven stage:   {details['stage']}; record after the takeover: "
+          f"{details['status_after']}")
+    print(f"  still missing:  {', '.join(details['missing_effects']) or 'nothing'} "
+          f"(performed by `dct release resume`)")
+    print("  responsibility: dct — assigned by this takeover, not who made the release")
+    if out["outcome"] == "preview":
+        print("  (preview — nothing written: no bump, no re-stamp, no recorded value changes)")
+        print(f"  next: dct release takeover --version {out['version']} … --takeover-digest "
+              f"{details['takeover_digest']} --confirm   (same push flags)")
+    else:
+        print(f"✓ Release {out['version']} taken over by dct — next: dct release resume")
+    _print_effects(out)
+
+
+def cmd_release_version_files(args):
+    """`dct release version-files [--set PATHS | --none] [--confirm]`
+    (K-110) — show / confirm the project's version-file contract."""
+    from dct.workflows.release.effects import version_files_contract
+
+    writes = args.confirm and (args.set is not None or args.none)
+    engine = _get_engine() if writes else _get_readonly_engine()
+    project_slug = args.project or _detect_project(engine)
+    paths = None
+    if args.none:
+        paths = []
+    elif args.set is not None:
+        paths = [part.strip() for part in args.set.split(",") if part.strip()]
+        if not paths:
+            print("✗ --set needs at least one path (use --none for a project without "
+                  "version files)", file=sys.stderr)
+            sys.exit(1)
+    if args.confirm and paths is None:
+        print("✗ --confirm needs --set <paths> or --none", file=sys.stderr)
+        sys.exit(1)
+    out = _run_effects("version-files", project_slug, args.json, lambda: version_files_contract(
+        engine, project_slug, paths=paths, confirm=args.confirm))
+    if args.json:
+        return
+    contract = out["details"]["contract"]
+
+    def shown(files):
+        return "UNKNOWN (never confirmed)" if files is None else (
+            "none (confirmed: the project has no version files)" if not files
+            else ", ".join(files))
+
+    print(f"Version-file contract of {project_slug}: {shown(contract['version_files'])}"
+          + (f" — confirmed {contract['confirmed_at']}" if contract["confirmed_at"] else ""))
+    if out["outcome"] == "preview":
+        print(f"  proposed:       {shown(out['details']['proposed'])}"
+              f"{'' if out['details']['change'] else ' (no change)'}")
+        print("  (preview — nothing written; re-run with --confirm to confirm it)")
+    elif out["outcome"] == "confirmed":
+        print("✓ Contract confirmed")
+    elif out["outcome"] == "noop":
+        print("✓ Contract unchanged (already confirmed)")
+    elif out["outcome"] == "none":
+        print("  confirm it: dct release version-files --set <path>[,<path>…] --confirm   or   "
+              "dct release version-files --none --confirm")
+
+
+def _print_release_record(record: dict) -> None:
+    from dct.core.releases import proof_pr_origins
+
+    ids = ", ".join(f"#{i}" for i in record["entry_ids"]) or "(none — version only)"
+    print(f"Release {record['version']}: {record['status']} (mode: {record['mode']})")
+    print(f"  entries:       {ids}")
+    print(f"  candidate sha: {record['candidate_sha'] or '-'}")
+    print(f"  release commit: {record['release_commit_sha'] or '-'}")
+    tag, push = record.get("tag_proof"), record.get("push_proof")
+    print(f"  tag proof:     {tag['name']} → {tag['commit']}"
+          f"{' (annotated)' if tag['annotated'] else ''}, recorded {tag['recorded_at']}"
+          if tag else "  tag proof:     -")
+    print(f"  push proof:    {push['target']['remote']} {push['target']['branch'] or '-'} "
+          f"{push['target']['tag']} → {push['tag_commit']}, recorded {push['recorded_at']}"
+          if push else "  push proof:    -")
+    print(f"  checkout root: {record['checkout_root'] or '-'}")
+    for dup in record.get("duplicates") or []:
+        print(f"  DUPLICATE:     record #{dup['id']} ({dup['version']}, {dup['status']}) — "
+              f"the ledger is ambiguous; every write of this version is refused")
+    manifest = record["manifest"] or {}
+    print(f"  manifest:      {', '.join(sorted(manifest)) or '-'}")
+    proof = record["proof"] or {}
+    print(f"  proof:         {len(proof)} of {len(record['entry_ids'])} entries"
+          if proof else "  proof:         -")
+    # K-116 H7: a PR number is shown WITH its origin — a client's declaration
+    # is never presented as one recognised in git.
+    origins = {"git": "recognised in git (the entry's merge)", "client": "client attestation"}
+    for entry_id, ref in proof_pr_origins(proof).items():
+        print(f"    #{entry_id}: PR #{ref['pr']} — "
+              f"{origins.get(ref['pr_source'], 'origin not recorded')}")
+    print(f"  created:       {_fmt_date(record['created_at'])}")
+    print(f"  updated:       {_fmt_date(record['updated_at'])}")
+    if record["completed_at"]:
+        print(f"  completed:     {_fmt_date(record['completed_at'])}")
+    if record["abandoned_at"]:
+        print(f"  abandoned:     {_fmt_date(record['abandoned_at'])} — {record['abandon_reason']}")
+
+
+def cmd_clog_release_status(args):
+    """`dct clog release-status` — read a release record (read-only, K-41).
+
+    --version V → that release's record, whatever its status; without it →
+    the latest unfinished (neither completed nor abandoned) record. Mirrors
+    the get_release MCP tool.
+    """
+    from dct.core.releases import get_release
+
+    engine = _get_readonly_engine()
+    project_slug = args.project or _detect_project(engine)
+    try:
+        record = get_release(engine, project_slug, args.version or None)
+    except Exception as e:
+        print(f"✗ Error: {e}", file=sys.stderr)
+        sys.exit(1)
+    if getattr(args, "json", False):
+        import json
+
+        from dct.workflows.release.effects import result
+
+        print(json.dumps(result("status", project_slug, "found" if record else "none",
+                                version=record["version"] if record else None,
+                                release=record), indent=2, default=_json_default))
+        return
+    if record is None:
+        print(f"No release record for {args.version}" if args.version
+              else "No unfinished release")
+        return
+    _print_release_record(record)
+
+
+def _json_arg(flag: str, raw: str):
+    """Parse a CLI argument that carries JSON; ValueError naming the flag
+    for text that is not JSON (its SHAPE is validated by the core)."""
+    import json
+
+    try:
+        return json.loads(raw)
+    except ValueError as exc:
+        raise ValueError(f"{flag} must be a JSON object: {exc}") from None
+
+
+def cmd_clog_release_advance(args):
+    """`dct clog release-advance V STATUS` — the LEDGER path (K-96 D10): an
+    adapter of effects.record_progress — core advance_release as the actor
+    'ledger' (state machine, write-once fields, the release commit rule),
+    under the project operation lock. For a release dct does not execute (a
+    project's own tool, a record stamped outside `dct release apply`); a
+    release dct executes is refused (`dct release resume` records its
+    progress). candidate_sha is immutable — not accepted; the manifest is
+    written by the release workflow. --tag-proof / --push-proof (K-115 G4)
+    take the JSON identities the caller verified — the ledger requires them
+    for tagged / pushed / completed of a record with git. Errors exit 1 (a
+    lost serialization race 75)."""
+    from dct.workflows.release.effects import record_progress
+
+    engine = _get_engine()
+    project_slug = args.project or _detect_project(engine)
+    as_json = getattr(args, "json", False)
+
+    def advance():
+        proofs = {}
+        for name in ("tag_proof", "push_proof"):
+            raw = getattr(args, name, None)
+            if raw:
+                proofs[name] = _json_arg(f"--{name.replace('_', '-')}", raw)
+        return record_progress(engine, project_slug, args.version, args.status,
+                               release_commit_sha=args.release_commit_sha or None, **proofs)
+
+    out = _run_effects("advance", project_slug, as_json, advance)
+    if as_json:
+        return
+    record = out["release"]
+    if not out["details"]["updated"]:
+        print(f"✓ Release {record['version']} unchanged: {record['status']}")
+        return
+    print(f"✓ Release {record['version']}: {out['details']['previous_status'] or '?'} → "
+          f"{record['status']}")
+
+
+def cmd_clog_release_abandon(args):
+    """`dct clog release-abandon V --reason "…" --confirm` — an adapter of
+    `dct release abandon` (K-96 D10): the same effects.abandon (core
+    abandon_release under the project operation lock). Errors exit 1."""
+    cmd_release_abandon(args)
+
+
+def _proof_layer_error(e: Exception) -> None:
+    """Exit 1 with a one-line reason for a failed read-only plan / candidates."""
+    print(f"✗ Error: {e}", file=sys.stderr)
+    sys.exit(1)
+
+
+def _print_entry_line(entry: dict, extra: str = "") -> None:
+    where = f" @ {entry['branch']}" if entry.get("branch") else ""
+    flag = " [uncertain]" if entry.get("uncertain") else ""
+    print(f"  #{entry['id']} [{entry['category']}]{where}{flag} {entry['entry'][:60]}{extra}")
+
+
+def cmd_release_plan(args):
+    """`dct release plan` — the read-only proof layer (K-72 layer 1).
+
+    Prints the plan of the release cut from the CURRENT checkout (verified
+    strictly, K-52) — or, with --json, the stable JSON document
+    (dct.workflows.release.PLAN_KEYS; schema in docs/release-workflow.md).
+    Writes nothing: no database row, no ref, index or work-tree change.
+    """
+    import json
+
+    from dct.workflows.release import build_plan
+
+    engine = _get_readonly_engine()
+    project_slug = args.project or _detect_project(engine)
+    entry_ids = None if args.no_entries else _release_ids(args.entries)
+    try:
+        plan = build_plan(engine, project_slug, version=args.version or None,
+                          bump_type=None if args.version else args.bump,
+                          entry_ids=entry_ids, no_entries=args.no_entries)
+    except Exception as e:
+        _proof_layer_error(e)
+    if args.json:
+        print(json.dumps(plan, indent=2, default=_json_default))
+        return
+    version = plan["version"]
+    print(f"Release plan for {plan['project']} ({plan['kind']}): "
+          f"{version['current'] or '-'} → {version['target'] or '(no target version given)'}")
+    routing = plan["executor"]
+    print(f"  executor: {routing['project']} (the project's setting — it decides a NEW release)")
+    if plan["unfinished_release"]:
+        rec = plan["unfinished_release"]
+        print(f"  unfinished release {rec['version']}: {rec['status']} — resume or abandon it")
+        owned = routing["record"]
+        # K-119: an unfinished release is routed by its RECORD.
+        print(f"    recorded executor: {owned['executor'] or 'dct (not recorded)'}; progress "
+              f"recorded by: {owned['progress_owner']}; consent: "
+              f"{'recorded' if owned['consent'] else 'none'}")
+    checkout = plan["checkout"]
+    resume = plan["resume"]
+    if not checkout["git"]:
+        print(f"  checkout: none ({checkout['reason']})")
+    elif resume is not None:
+        # K-95 C5: the RECORDED release first; today's HEAD separately.
+        print(f"  recorded candidate: {resume['candidate_sha'] or '-'} — entries "
+              f"{', '.join(f'#{i}' for i in resume['entry_ids']) or '(version-only)'}; "
+              f"status {resume['status']}")
+        done = [k for k, v in resume["effects"].items() if v]
+        print(f"  effects recorded: {', '.join(done) or '-'}")
+        print(f"  current HEAD: {resume['head']} on {checkout['branch'] or '(detached HEAD)'}"
+              f"{'' if resume['head_is_candidate'] else ' — NOT the recorded candidate'}")
+    else:
+        print(f"  candidate: {checkout['candidate_sha']} on "
+              f"{checkout['branch'] or '(detached HEAD)'} in {checkout['repo_root']}")
+        rng = plan["range"]
+        print(f"  range: {rng['display'] or '(empty)'} — {rng['commit_count']} commits"
+              f"{' [confirm the base]' if rng['confirm_required'] else ''}"
+              f"{' [approximate]' if rng['approximate'] else ''}")
+        for alt in rng["alternatives"]:
+            print(f"    equally near: {alt['name']} ({alt['sha'][:12]})")
+    if resume is not None:
+        new = resume["new_unreleased"]
+        print(f"New unreleased entries since the record ({len(new)}) — not part of it:")
+        for entry in new:
+            _print_entry_line(entry, "")
+        for warning in plan["warnings"]:
+            print(f"  ⚠ {warning}", file=sys.stderr)
+        return
+    proven, unproven = plan["entries"]["proven"], plan["entries"]["unproven"]
+    print(f"Proven ({len(proven)}):")
+    for entry in proven:
+        merge = f" via {entry['merge_commit'][:12]}" if entry["merge_commit"] else ""
+        pr = f" (#{entry['pr']})" if entry["pr"] else ""
+        pr += " [several merges — ambiguous]" if entry.get("ambiguous") else ""
+        _print_entry_line(entry, f" ← {', '.join(c[:12] for c in entry['commits'])}{merge}{pr}")
+    print(f"Unproven ({len(unproven)}):")
+    for entry in unproven:
+        _print_entry_line(entry, f" — {entry['reason']}")
+    for i, group in enumerate(plan["attestation_groups"]):
+        print(f"Attestation proposal {i} ({group['branch'] or 'unbranched'}): "
+              f"{', '.join(f'#{n}' for n in group['entry_ids'])} — "
+              f"squash {', '.join(c[:12] for c in group['squash_commits'])} "
+              f"[{', '.join(group['signals'])}]")
+    for cite in plan["foreign_citations"]:
+        print(f"  cited #{cite['id']}: {cite['reason']}"
+              f"{' (' + cite['version'] + ')' if cite['version'] else ''} — not stamped")
+    index = plan["index"]
+    if index is not None:
+        dirty = [a["path"] for a in index["release_artifacts"]
+                 if a["staged"] or a["unstaged"] or a["conflicted"]]
+        print(f"Index: {'clean' if index['clean'] else 'NOT clean'}"
+              f"{' — release artifacts changed: ' + ', '.join(dirty) if dirty else ''}")
+    files = (plan["version_files"] or {}).get("version_files")
+    print(f"Version files: {', '.join(files) if files else '(not learned yet)' if files is None else '(none)'}")
+    if plan["snapshot"] is not None:
+        selected = plan["snapshot"]["selected_ids"]
+        print(f"Snapshot: {', '.join(f'#{i}' for i in selected) or '(version-only)'} → "
+              f"{plan['version']['target'] or '-'}; plan digest {plan['snapshot_digest']}")
+        print(f"Next: dct release prepare --version {plan['version']['target'] or 'V'} "
+              f"{'--entries ' + ','.join(map(str, selected)) if selected else '--no-entries'} "
+              f"--plan-digest {plan['snapshot_digest']} — runs the version sync isolated and "
+              f"shows the version files for approval (K-76)")
+    for warning in plan["warnings"]:
+        print(f"  ⚠ {warning}", file=sys.stderr)
+
+
+def cmd_clog_candidates(args):
+    """`dct clog candidates` — /commit's changelog candidates (K-53), read-only.
+
+    confirmed (client provenance of THIS checkout and branch) vs uncertain
+    (server / no provenance, or any entry on a detached HEAD — never
+    attached automatically), minus the ids the range already proves, plus
+    the staged file list. --json prints the stable document
+    (dct.workflows.release.CANDIDATE_KEYS).
+    """
+    import json
+
+    from dct.workflows.release import commit_candidates
+
+    engine = _get_readonly_engine()
+    project_slug = args.project or _detect_project(engine)
+    try:
+        result = commit_candidates(engine, project_slug)
+    except Exception as e:
+        _proof_layer_error(e)
+    if args.json:
+        print(json.dumps(result, indent=2, default=_json_default))
+        return
+    checkout = result["checkout"]
+    if checkout["git"]:
+        print(f"Checkout: {checkout['toplevel']} on "
+              f"{checkout['branch'] or '(detached HEAD)'} at {checkout['head'] or '-'}")
+    for title, key in (("Confirmed", "confirmed"), ("Uncertain — confirm before attaching",
+                                                    "uncertain"),
+                       ("Other branch in this worktree", "other_branch")):
+        print(f"{title} ({len(result[key])}):")
+        for entry in result[key]:
+            reason = entry.get("uncertain_reason")
+            _print_entry_line(entry, f" — {reason}" if reason else "")
+    if result["already_proven"]:
+        print(f"Already proven in the range: "
+              f"{', '.join(f'#{i}' for i in result['already_proven'])}")
+    print(f"Staged files ({len(result['staged_files'])}): {', '.join(result['staged_files'])}")
+    for warning in result["warnings"]:
+        print(f"  ⚠ {warning}", file=sys.stderr)
+
+
+def cmd_clog_update(args):
+    from dct.core.changelog import update_entry
+
+    engine = _get_engine()
+    # An empty value ("") clears a nullable field; entry/category cannot be
+    # cleared (core refuses an empty entry). --item-id 0 unlinks the item.
+    fields = {}
+    for name in ("entry", "category"):
+        if getattr(args, name) is not None:
+            fields[name] = getattr(args, name)
+    for name in ("component", "source_file", "source_lines", "branch", "worktree"):
+        value = getattr(args, name)
+        if value is not None:
+            fields[name] = value or None
+    if args.item_id is not None:
+        fields["related_item_id"] = args.item_id or None
+    try:
+        project_slug = args.project or _detect_project(engine)
+        e = update_entry(engine, project_slug, args.id, **fields)
+        print(f"✓ Changelog #{e['id']} updated: {', '.join(fields)}")
+    except Exception as e:
+        print(f"✗ Error: {e}", file=sys.stderr)
         sys.exit(1)
 
-    count = release_entries(engine, project_slug, version)
-    print(f"✓ Released {count} entries as {version}")
 
-    project = get_project(engine, project_slug)
-    if project and project.get("path"):
-        import os
-        for sync_path in ["scripts/dct-version-sync.sh", "scripts/version-sync.sh"]:
-            full_path = os.path.join(project["path"], sync_path)
-            if os.path.isfile(full_path):
-                print(f"  Running {sync_path}...")
-                subprocess.run(["bash", full_path, version], check=False)
-                break
+def cmd_clog_delete(args):
+    from dct.core.changelog import delete_entry
+
+    engine = _get_engine()
+    try:
+        project_slug = args.project or _detect_project(engine)
+        delete_entry(engine, project_slug, args.id)
+        print(f"✓ Changelog #{args.id} deleted")
+    except Exception as e:
+        print(f"✗ Error: {e}", file=sys.stderr)
+        sys.exit(1)
 
 
 def cmd_clog_export(args):
@@ -1889,6 +2786,23 @@ def build_parser() -> argparse.ArgumentParser:
     p_proj_clog.add_argument("slug")
     p_proj_clog.add_argument("state", choices=["on", "off"])
 
+    p_proj_rexec = p_proj_sub.add_parser(
+        "release-executor",
+        help="Get/set who performs the project's release effects: dct (default) or own "
+             "(the project's own release tool, K-85)",
+    )
+    p_proj_rexec.add_argument("slug")
+    p_proj_rexec.add_argument("executor", nargs="?", choices=["dct", "own"],
+                              help="Omit to query the current value")
+
+    p_proj_prrefs = p_proj_sub.add_parser(
+        "changelog-pr-refs",
+        help="Get/set rendering `(#N)` PR references in the changelog (opt-in, K-90)",
+    )
+    p_proj_prrefs.add_argument("slug")
+    p_proj_prrefs.add_argument("state", nargs="?", choices=["on", "off"],
+                               help="Omit to query the current value")
+
     p_proj_mc = p_proj_sub.add_parser(
         "manages-changelog",
         help="Exit 0 if the project opts into dct changelog enforcement, else 1 (hook query)",
@@ -1926,6 +2840,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_add.add_argument("title")
     p_add.add_argument("--priority", "-p", default="P2")
     p_add.add_argument("--component", "-c")
+    p_add.add_argument("--short-title", "-S",
+                       help="2-4 word label shown next to the item number "
+                            "(≤ 50 chars, refused not truncated)")
     p_add.add_argument("--tags", "-t")
     p_add.add_argument("--description", "-d")
     p_add.add_argument("--source-file", "-f")
@@ -1952,6 +2869,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_update.add_argument("--priority", "-p")
     p_update.add_argument("--component", "-c")
     p_update.add_argument("--resolution")
+    p_update.add_argument("--short-title", default=None,
+                          help="2-4 word label (≤ 50 chars). Omit to leave it "
+                               "unchanged; --short-title \"\" clears it.")
     # No "-t" short alias here on purpose (K-25): "-t" already means --type on
     # `list` and --tags on `add`, so on `update` it would silently tag an item
     # with what the user meant as a type. Long flag only.
@@ -1988,25 +2908,368 @@ def build_parser() -> argparse.ArgumentParser:
     p_clog_add.add_argument("--component", "-c")
     p_clog_add.add_argument("--source-file", "-f")
     p_clog_add.add_argument("--item-id", type=int)
+    p_clog_add.add_argument(
+        "--branch", help="Branch the change was made on (default: detected in CWD)")
+    p_clog_add.add_argument(
+        "--worktree", help="Checkout toplevel of the change (default: detected in CWD)")
+
+    def _add_branch_filters(p):
+        p.add_argument(
+            "--branch",
+            help="Only entries whose stored branch is exactly this (any branch source)")
+        p.add_argument(
+            "--worktree",
+            help="Only entries of this absolute worktree path (normalized as on write)")
+        p.add_argument(
+            "--include-unbranched", action="store_true",
+            help="With --branch: also uncertain entries — no recorded branch, or "
+                 "detected by the MCP server (branch_source=server, any branch)")
 
     p_clog_list = p_clog_sub.add_parser("list", help="List changelog entries")
     p_clog_list.add_argument("--project", "-P")
     p_clog_list.add_argument("--unreleased", "-u", action="store_true")
+    _add_branch_filters(p_clog_list)
 
     p_clog_count = p_clog_sub.add_parser("count", help="Count unreleased entries")
     p_clog_count.add_argument("--project", "-P")
+    _add_branch_filters(p_clog_count)
 
-    p_clog_release = p_clog_sub.add_parser("release", help="Release: bump version and stamp changelog")
-    p_clog_release.add_argument("version", nargs="?")
+    p_clog_release = p_clog_sub.add_parser(
+        "release",
+        help="Release (alias of `release apply` without --plan-digest; needs the approved "
+             "--proposal-digest): stamp, changelog, version files, commit, tag, push")
+    p_clog_release.add_argument(
+        "version", nargs="?", help="X.Y or X.Y.Z (a leading v is dropped)")
     p_clog_release.add_argument("--project", "-P")
     p_clog_bump = p_clog_release.add_mutually_exclusive_group()
     p_clog_bump.add_argument("--patch", dest="bump", action="store_const", const="patch")
     p_clog_bump.add_argument("--minor", dest="bump", action="store_const", const="minor")
     p_clog_bump.add_argument("--major", dest="bump", action="store_const", const="major")
+    p_clog_sel = p_clog_release.add_mutually_exclusive_group()
+    p_clog_sel.add_argument(
+        "--entries", help="Comma-separated entry ids to stamp (default: all unreleased)")
+    p_clog_sel.add_argument(
+        "--no-entries", action="store_true",
+        help="Version-only release: stamp no entries, only set the version")
+    p_clog_release.add_argument(
+        "--proposal-digest",
+        help="Required for a new release: the proposal_sha256 of the approved `dct release "
+             "prepare` — prepared for exactly the plan this command derives (same version "
+             "and selection)")
+    p_clog_release.add_argument(
+        "--confirm-version-files", action="store_true", help=argparse.SUPPRESS)
+    p_clog_release.add_argument(
+        "--confirm", action="store_true",
+        help="Required: it stamps, writes, commits, tags and pushes (K-96 D1)")
+    _add_push_flags(p_clog_release)
+    p_clog_release.add_argument("--json", action="store_true", help="Stable JSON document")
+    p_clog_release.epilog = (
+        "Alias of `dct release apply` (needs --confirm like apply) that derives the plan "
+        "itself instead of taking --plan-digest: stamp, changelog file, the approved version "
+        "files, release commit (through the repository's hooks) and tag, pushed to the push "
+        "target, each verified. It never runs the version sync and never approves a "
+        "proposal: run `dct release plan --version V --json` and `dct release prepare "
+        "--version V (--entries … | --no-entries) --plan-digest D` first, review the "
+        "proposed files and pass its proposal_sha256 as --proposal-digest — the proposal must "
+        "be bound to exactly the plan this command derives. Refuses — instead of guessing — "
+        "when the owner must decide: no approved proposal, entries without proof, a proof "
+        "range not starting at v<current_version>, a push target that is not the complete "
+        "approved one (--push-remote, --push-branch, --push-url). " + RELEASE_PUSH_EPILOG)
+
+    p_clog_rstatus = p_clog_sub.add_parser(
+        "release-status",
+        help="Show a release record (default: the latest unfinished release)")
+    p_clog_rstatus.add_argument("--version", help="The release to show (X.Y or X.Y.Z)")
+    p_clog_rstatus.add_argument("--project", "-P")
+
+    p_clog_radv = p_clog_sub.add_parser(
+        "release-advance",
+        help="Move a release record forward after a verified step "
+             "(stamped → files_written → committed → tagged → pushed → completed)")
+    p_clog_radv.add_argument("version", help="The release (X.Y or X.Y.Z)")
+    p_clog_radv.add_argument("status", choices=RELEASE_FLOW)
+    p_clog_radv.add_argument("--project", "-P")
+    p_clog_radv.add_argument(
+        "--release-commit-sha",
+        help="The verified release commit — recorded once, from 'committed' on "
+             "(the candidate commit is immutable)")
+    p_clog_radv.add_argument(
+        "--tag-proof", metavar="JSON",
+        help="The tag as you verified it: {\"name\", \"object\" (git rev-parse "
+             "refs/tags/<name>), \"commit\" (git rev-parse <name>^{commit}), "
+             "\"annotated\": true|false} — required for tagged / pushed / completed of a "
+             "release with git; recorded once")
+    p_clog_radv.add_argument(
+        "--push-proof", metavar="JSON",
+        help="The push as you verified it: {\"target\": {\"remote\", \"url\", "
+             "\"branch\", \"tag\"}, \"tag_commit\", \"branch_tip\"} — required for "
+             "pushed (and for completed when the release's consent approved a push)")
+    p_clog_radv.add_argument("--json", action="store_true", help="Stable JSON document")
+    p_clog_radv.epilog = (
+        "The ledger path for a release dct does NOT execute — a project's own release tool "
+        "(release executor 'own') or a record stamped outside `dct release apply`: report "
+        "only what you verified. A status is never proof: a release with git reaches tagged "
+        "/ pushed / completed only with --tag-proof (full commit ids; its commit must be the "
+        "release commit), and pushed only with --push-proof. A release dct executes is "
+        "refused (`dct release resume` records its progress). " + RELEASE_LOCK_EPILOG)
+
+    p_clog_rabandon = p_clog_sub.add_parser(
+        "release-abandon",
+        help="End an unfinished release as abandoned (keeps the record, stamps and "
+             "current_version)")
+    p_clog_rabandon.add_argument("version", help="The release (X.Y or X.Y.Z)")
+    p_clog_rabandon.add_argument("--reason", required=True, help="Why (stored on the record)")
+    p_clog_rabandon.add_argument(
+        "--confirm", action="store_true",
+        help="Required: the version stays taken by the abandoned record")
+    p_clog_rabandon.add_argument("--project", "-P")
+    p_clog_rabandon.add_argument("--json", action="store_true", help="Stable JSON document")
+    p_clog_rabandon.epilog = (
+        "Alias of `dct release abandon` (same rules, same operation lock). "
+        + RELEASE_LOCK_EPILOG)
+
+    p_clog_cand = p_clog_sub.add_parser(
+        "candidates",
+        help="Changelog candidates for the commit being prepared (read-only, K-53)")
+    p_clog_cand.add_argument("--project", "-P")
+    p_clog_cand.add_argument("--json", action="store_true", help="Stable JSON document")
+
+    p_clog_update = p_clog_sub.add_parser(
+        "update",
+        help="Amend an unreleased changelog entry (\"\" clears a field, --item-id 0 unlinks)")
+    p_clog_update.add_argument("id", type=int)
+    p_clog_update.add_argument("--project", "-P")
+    p_clog_update.add_argument("--entry")
+    p_clog_update.add_argument(
+        "--category", choices=["added", "changed", "fixed", "removed"])
+    p_clog_update.add_argument("--component", "-c")
+    p_clog_update.add_argument("--source-file", "-f")
+    p_clog_update.add_argument("--source-lines")
+    p_clog_update.add_argument("--item-id", type=int)
+    p_clog_update.add_argument("--branch")
+    p_clog_update.add_argument("--worktree")
+
+    p_clog_delete = p_clog_sub.add_parser(
+        "delete", help="Soft-delete an unreleased changelog entry")
+    p_clog_delete.add_argument("id", type=int)
+    p_clog_delete.add_argument("--project", "-P")
 
     p_clog_export = p_clog_sub.add_parser("export", help="Export to Keep a Changelog markdown")
     p_clog_export.add_argument("--project", "-P")
     p_clog_export.add_argument("--output", "-o")
+
+    # release (the release workflow, K-72): plan = layer 1 (read-only proof),
+    # attest / prepare / apply / resume / abandon / reconstruct = layer 3 (effects)
+    p_release = sub.add_parser(
+        "release", help="Release workflow: plan (read-only), attest, prepare, apply, resume, "
+                        "abandon, reconstruct, takeover, version-files, status")
+    p_release_sub = p_release.add_subparsers(dest="release_command")
+    p_rel_plan = p_release_sub.add_parser(
+        "plan", help="Show the release plan of the current checkout — no side effects")
+    p_rel_plan.add_argument("--project", "-P")
+    p_rel_plan_v = p_rel_plan.add_mutually_exclusive_group()
+    p_rel_plan_v.add_argument("--version", help="Target version (X.Y or X.Y.Z)")
+    p_rel_plan_v.add_argument("--patch", dest="bump", action="store_const", const="patch")
+    p_rel_plan_v.add_argument("--minor", dest="bump", action="store_const", const="minor")
+    p_rel_plan_v.add_argument("--major", dest="bump", action="store_const", const="major")
+    p_rel_plan_sel = p_rel_plan.add_mutually_exclusive_group()
+    p_rel_plan_sel.add_argument(
+        "--entries", help="Comma-separated entry ids the snapshot binds (default: every "
+                          "proven id)")
+    p_rel_plan_sel.add_argument(
+        "--no-entries", action="store_true", help="Bind a version-only release")
+    p_rel_plan.add_argument("--json", action="store_true", help="Stable JSON document")
+    p_rel_status = p_release_sub.add_parser(
+        "status", help="Show a release record (alias of `clog release-status`)")
+    p_rel_status.add_argument("--version", help="The release to show (X.Y or X.Y.Z)")
+    p_rel_status.add_argument("--project", "-P")
+    p_rel_status.add_argument("--json", action="store_true", help="Stable JSON document")
+
+    p_rel_attest = p_release_sub.add_parser(
+        "attest", help="Create the empty attestation commit for unproven entries")
+    p_rel_attest.epilog = (
+        "The empty commit `chore: attest changelog entries` with the trailer `Changelog: "
+        "<ids>` on the current HEAD (needs git >= 2.36). The repository's commit hooks run; "
+        "the commit is created on the pinned HEAD and checked BEFORE it is published: it "
+        "must prove EXACTLY the given ids (a hook that adds, drops or duplicates an id, or "
+        "stages content, is refused with nothing published), then the branch HEAD names "
+        "moves by compare-and-swap. " + RELEASE_LOCK_EPILOG)
+    p_rel_attest.add_argument("--entries", required=True,
+                              help="Comma-separated ids the plan lists as unproven")
+    p_rel_attest.add_argument("--confirm", action="store_true",
+                              help="Required: the owner confirms the changes are in HEAD")
+    p_rel_attest.add_argument("--project", "-P")
+    p_rel_attest.add_argument("--json", action="store_true", help="Stable JSON document")
+
+    p_rel_apply = p_release_sub.add_parser(
+        "apply", help="Release: stamp, changelog file, the approved version files, commit, "
+                      "tag, push (verified)")
+    p_rel_apply.add_argument("--project", "-P")
+    p_rel_apply_v = p_rel_apply.add_mutually_exclusive_group()
+    p_rel_apply_v.add_argument("--version", help="Target version (X.Y or X.Y.Z)")
+    p_rel_apply_v.add_argument("--patch", dest="bump", action="store_const", const="patch")
+    p_rel_apply_v.add_argument("--minor", dest="bump", action="store_const", const="minor")
+    p_rel_apply_v.add_argument("--major", dest="bump", action="store_const", const="major")
+    p_rel_apply_sel = p_rel_apply.add_mutually_exclusive_group(required=True)
+    p_rel_apply_sel.add_argument(
+        "--entries", help="Comma-separated entry ids — each proven by the plan")
+    p_rel_apply_sel.add_argument(
+        "--no-entries", action="store_true", help="Version-only release")
+    p_rel_apply.add_argument("--confirm", action="store_true", help="Required")
+    p_rel_apply.add_argument(
+        "--plan-digest", required=True,
+        help="Required: the snapshot_digest of the approved `dct release plan --version V "
+             "--entries … --json` (the release is refused when the re-derived plan differs)")
+    p_rel_apply.add_argument(
+        "--proposal-digest",
+        help="Required for a new release: the proposal_sha256 of the approved `dct release "
+             "prepare` (same version, selection and plan digest)")
+    p_rel_apply.add_argument(
+        "--confirm-version-files", action="store_true", help=argparse.SUPPRESS)
+    _add_push_flags(p_rel_apply)
+    p_rel_apply.add_argument("--json", action="store_true", help="Stable JSON document")
+    p_rel_apply.epilog = RELEASE_PUSH_EPILOG
+
+    p_rel_prepare = p_release_sub.add_parser(
+        "prepare", help="Run the version sync isolated and store the version-file proposal "
+                        "for approval (before the stamp; nothing stamped)")
+    p_rel_prepare.add_argument("--project", "-P")
+    p_rel_prepare_v = p_rel_prepare.add_mutually_exclusive_group()
+    p_rel_prepare_v.add_argument("--version", help="Target version (X.Y or X.Y.Z)")
+    p_rel_prepare_v.add_argument("--patch", dest="bump", action="store_const", const="patch")
+    p_rel_prepare_v.add_argument("--minor", dest="bump", action="store_const", const="minor")
+    p_rel_prepare_v.add_argument("--major", dest="bump", action="store_const", const="major")
+    p_rel_prepare_sel = p_rel_prepare.add_mutually_exclusive_group(required=True)
+    p_rel_prepare_sel.add_argument(
+        "--entries", help="Comma-separated entry ids — each proven by the plan")
+    p_rel_prepare_sel.add_argument(
+        "--no-entries", action="store_true", help="Version-only release")
+    p_rel_prepare.add_argument(
+        "--plan-digest", required=True,
+        help="Required: the snapshot_digest of the approved `dct release plan` (same version "
+             "and selection)")
+    p_rel_prepare.add_argument("--json", action="store_true", help="Stable JSON document")
+    p_rel_prepare.epilog = (
+        "Effects: runs scripts/dct-version-sync.sh (or scripts/version-sync.sh) of the "
+        "candidate ONCE with V in a temporary detached worktree (a project outside git: in a "
+        "temporary copy of its directory) — never in your checkout, which is verified "
+        "unchanged afterwards; writes the expected blobs into the repository's object "
+        "database, pinned by the ref refs/dct/release-proposals/<project>/<proposal id> "
+        "until the release is completed or abandoned or a new prepare replaces the proposal "
+        "(outside git: dct's release blob store, same lifetime), and the pending proposal "
+        "into the database. Nothing is stamped, committed or tagged. Environment of the "
+        "script: only the files of the candidate (no untracked or ignored file of your "
+        "checkout — virtualenvs, node_modules, build output — and no submodule content), "
+        "stdin closed, no terminal, GIT_* repository variables dropped, a timeout; a script "
+        "that needs anything else fails with that contract — dct never runs it in your "
+        "checkout instead. " + RELEASE_LOCK_EPILOG + RELEASE_EXECUTOR_EPILOG)
+
+    p_rel_resume = p_release_sub.add_parser(
+        "resume", help="Finish the unfinished release (verifies every effect first; executes "
+                       "the consent stored at apply — no --confirm)")
+    p_rel_resume.add_argument("--project", "-P")
+    p_rel_resume.add_argument(
+        "--confirm-version-files", action="store_true", help=argparse.SUPPRESS)
+    p_rel_resume.add_argument("--json", action="store_true", help="Stable JSON document")
+    p_rel_resume.epilog = RELEASE_EXECUTOR_EPILOG + RELEASE_LOCK_EPILOG + (
+        "The push goes to the URL approved at apply (it must still be a push URL of its "
+        "remote; URLs added since receive nothing). "
+        "A record stamped outside `dct release apply` (MCP release_changelog, an own tool, a "
+        "partial reconstruction) is refused: hand it to dct with `dct release takeover` (its "
+        "verified artifacts become the consent; resume then performs only the missing "
+        "effects), finish it with `dct clog release-advance` after verifying its effects "
+        "yourself, or abandon it.")
+
+    p_rel_abandon = p_release_sub.add_parser(
+        "abandon", help="End an unfinished release as abandoned (all effects stay)")
+    p_rel_abandon.add_argument("--version", required=True, help="The release (X.Y or X.Y.Z)")
+    p_rel_abandon.add_argument("--reason", required=True, help="Why (stored on the record)")
+    p_rel_abandon.add_argument("--confirm", action="store_true", help="Required")
+    p_rel_abandon.add_argument("--project", "-P")
+    p_rel_abandon.add_argument("--json", action="store_true", help="Stable JSON document")
+    p_rel_abandon.epilog = (
+        "The record ends 'abandoned'; every effect stays and nothing is reset. The ref "
+        "pinning its proposal's blobs is removed. " + RELEASE_LOCK_EPILOG)
+
+    p_rel_recon = p_release_sub.add_parser(
+        "reconstruct", help="Record a legacy release made before release records existed")
+    p_rel_recon.add_argument("--version", required=True, help="The release (X.Y or X.Y.Z)")
+    p_rel_recon.add_argument("--confirm", action="store_true",
+                             help="Write the record (without: show the evidence only)")
+    p_rel_recon_how = p_rel_recon.add_mutually_exclusive_group()
+    p_rel_recon_how.add_argument(
+        "--release-commit",
+        help="Choose ONE of several verified release commits (no tag; the refusal lists them)")
+    p_rel_recon_how.add_argument(
+        "--evidence",
+        help="For a project whose release executor is 'own': a JSON file with the evidence "
+             "its tool supplies — {release_commit_sha, candidate_sha, status (committed | "
+             "tagged | completed), tag, artifacts: [{path, sha256}]}")
+    p_rel_recon.add_argument("--project", "-P")
+    p_rel_recon.add_argument("--json", action="store_true", help="Stable JSON document")
+    p_rel_recon.epilog = (
+        "The version spelling is resolved first (the stored one: a request for 1.1.0 of a "
+        "release stored as 1.1 records 1.1). Commits titled `release: v<V>` are candidates, "
+        "each verified (one parent, the version-file contract, the changelog section, the "
+        "version fields, and the WHOLE older changelog history against the parent: a release "
+        "commit that removed or edited an older section — also a typo fix — is shown as a "
+        "diff and never verified); a tag of V → completed, a single verified release commit "
+        "without a tag → committed (the output names how to finish it: `dct release "
+        "takeover`, or the ledger path), several → all listed, choose with --release-commit. "
+        "The version-file contract is shown as UNKNOWN or confirmed; outside git an unknown "
+        "one refuses — confirm it with `dct release version-files`. A project whose release "
+        "executor is 'own' is not parsed by these rules: pass --evidence (its tool's own "
+        "format; dct verifies the commit, the candidate, each artifact's hash at the commit "
+        "and the tag). Any contradiction is refused; nothing is re-stamped and nothing in "
+        "the repository is modified. The executor shown is assigned to the record now — it "
+        "is not who made the release.")
+
+    p_rel_take = p_release_sub.add_parser(
+        "takeover", help="Hand an existing release record without a consent to dct, from its "
+                         "verified artifacts (then `resume` performs only the missing effects)")
+    p_rel_take.add_argument("--version", required=True, help="The release (X.Y or X.Y.Z)")
+    _add_push_flags(p_rel_take)
+    p_rel_take.add_argument(
+        "--takeover-digest",
+        help="Required with --confirm: the takeover_digest the preview printed")
+    p_rel_take.add_argument("--confirm", action="store_true",
+                            help="Record the takeover (without: show what would be recorded)")
+    p_rel_take.add_argument("--project", "-P")
+    p_rel_take.add_argument("--json", action="store_true", help="Stable JSON document")
+    p_rel_take.epilog = (
+        "For a record dct did not stamp with the owner's consent — a reconstruction that "
+        "ended at 'committed', a record stamped through MCP release_changelog, an older "
+        "record — whose release commit EXISTS. dct verifies the artifacts again (the release "
+        "commit, its single parent, the changelog section and the older history, the version "
+        "files) and compares them with the record; then it shows the consent it would record "
+        "(version, entries, candidate, release commit, tree, artifact hashes, the push target "
+        "or --no-push) and its takeover_digest. With --takeover-digest D --confirm it records "
+        "the consent and the proposal derived from those artifacts. No new bump, no re-stamp, "
+        "no file, commit, tag or push, and nothing recorded is changed; afterwards `dct "
+        "release resume` performs only what is missing (the tag, the push). Refused for an "
+        "'own' record, a record that already has a consent, a terminal record, and when no "
+        "release commit verifies or the artifacts contradict the record — the ledger path "
+        "(`dct clog release-advance`) stays. " + RELEASE_LOCK_EPILOG)
+
+    p_rel_vf = p_release_sub.add_parser(
+        "version-files", help="Show / confirm the project's version-file contract (which "
+                              "files every release changes)")
+    p_rel_vf_set = p_rel_vf.add_mutually_exclusive_group()
+    p_rel_vf_set.add_argument("--set", metavar="PATHS",
+                              help="Comma-separated repo-relative paths to confirm")
+    p_rel_vf_set.add_argument("--none", action="store_true",
+                              help="Confirm that the project has NO version files")
+    p_rel_vf.add_argument("--confirm", action="store_true",
+                          help="Write the contract (without: show the proposal only)")
+    p_rel_vf.add_argument("--project", "-P")
+    p_rel_vf.add_argument("--json", action="store_true", help="Stable JSON document")
+    p_rel_vf.epilog = (
+        "Without flags: shows the contract — UNKNOWN (never confirmed) is not the same as a "
+        "confirmed empty one. --set / --none without --confirm show the proposal; with "
+        "--confirm the contract is stored (the earlier one goes to its history). A release "
+        "made with `dct release prepare` / `apply` learns the contract from its approved "
+        "proposal — this command is for a project that needs one without such a release (a "
+        "reconstruction outside git refuses an unknown contract). " + RELEASE_LOCK_EPILOG)
 
     # _task-mirror (internal: worker for hooks/dct-task-mirror.sh)
     p_tm = sub.add_parser(
@@ -2017,6 +3280,15 @@ def build_parser() -> argparse.ArgumentParser:
     p_tm.add_argument("--turn-id", default="")
     p_tm.add_argument("--session-id", default="")
     p_tm.add_argument("--project", default="")
+
+    # db (K-84: the explicit bootstrap read-only commands point to)
+    p_db = sub.add_parser("db", help="Database schema maintenance")
+    p_db_sub = p_db.add_subparsers(dest="db_command")
+    p_db_sub.add_parser(
+        "upgrade",
+        help="Create the database or upgrade its schema (what every write command "
+             "runs implicitly; read-only commands never do)",
+    )
 
     # config
     p_config = sub.add_parser("config", help="Inspect dct configuration")
@@ -2218,6 +3490,10 @@ def cmd_migrate_home(args):
         print(message)
 
 
+DB_COMMAND_MAP = {
+    "upgrade": cmd_db_upgrade,
+}
+
 COMMAND_MAP = {
     "integrate": cmd_integrate,
     "doctor": cmd_doctor,
@@ -2251,6 +3527,8 @@ PROJECT_COMMAND_MAP = {
     "changelog": cmd_project_changelog,
     "manages-changelog": cmd_project_manages_changelog,
     "changelog-path": cmd_project_changelog_path,
+    "release-executor": cmd_project_release_executor,
+    "changelog-pr-refs": cmd_project_changelog_pr_refs,
 }
 
 PLAN_COMMAND_MAP = {
@@ -2262,7 +3540,26 @@ CLOG_COMMAND_MAP = {
     "list": cmd_clog_list,
     "count": cmd_clog_count,
     "release": cmd_clog_release,
+    "release-status": cmd_clog_release_status,
+    "release-advance": cmd_clog_release_advance,
+    "release-abandon": cmd_clog_release_abandon,
+    "candidates": cmd_clog_candidates,
+    "update": cmd_clog_update,
+    "delete": cmd_clog_delete,
     "export": cmd_clog_export,
+}
+
+RELEASE_COMMAND_MAP = {
+    "plan": cmd_release_plan,
+    "status": cmd_clog_release_status,
+    "attest": cmd_release_attest,
+    "apply": cmd_release_apply,
+    "prepare": cmd_release_prepare,
+    "resume": cmd_release_resume,
+    "abandon": cmd_release_abandon,
+    "reconstruct": cmd_release_reconstruct,
+    "takeover": cmd_release_takeover,
+    "version-files": cmd_release_version_files,
 }
 
 CONFIG_COMMAND_MAP = {
@@ -2412,6 +3709,12 @@ def main():
             parser.parse_args(["clog", "--help"])
             return
         handler(args)
+    elif args.command == "release":
+        handler = RELEASE_COMMAND_MAP.get(args.release_command)
+        if not handler:
+            parser.parse_args(["release", "--help"])
+            return
+        handler(args)
     elif args.command in ("checkpoint", "cp"):
         handler = CHECKPOINT_COMMAND_MAP.get(args.checkpoint_command)
         if not handler:
@@ -2440,6 +3743,12 @@ def main():
         handler = PLAN_COMMAND_MAP.get(args.plan_command)
         if not handler:
             parser.parse_args(["plan", "--help"])
+            return
+        handler(args)
+    elif args.command == "db":
+        handler = DB_COMMAND_MAP.get(args.db_command)
+        if not handler:
+            parser.parse_args(["db", "--help"])
             return
         handler(args)
     elif args.command == "config":

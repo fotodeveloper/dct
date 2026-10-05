@@ -2,7 +2,13 @@
 
 import pytest
 
-from dct.core.changelog import add_entry, count_unreleased, delete_entry, list_entries
+from dct.core.changelog import (
+    add_entry,
+    count_unreleased,
+    delete_entry,
+    import_released_entry,
+    list_entries,
+)
 from dct.core.items import (
     add_note,
     create_item,
@@ -241,7 +247,7 @@ class TestSoftDeleteIntegrity:
     def test_deleted_changelog_not_counted(self, engine):
         create_project(engine, slug="p", name="P")
         e = add_entry(engine, "p", "added", "Feature")
-        delete_entry(engine, e["id"])
+        delete_entry(engine, "p", e["id"])
         assert count_unreleased(engine, "p") == 0
 
 
@@ -393,10 +399,13 @@ class TestChangelogEdgeCases:
         create_project(engine, slug="p", name="P")
         count = count_unreleased(engine, "p")
         assert count == 0
-        # Release with nothing unreleased should return 0
+        # K-62: a NEW release with nothing unreleased is refused unless the
+        # version-only intent is explicit (entry_ids=[]).
         from dct.core.changelog import release_entries
-        released = release_entries(engine, "p", "1.0")
-        assert released == 0
+        with pytest.raises(ValueError, match="must be explicit"):
+            release_entries(engine, "p", "1.0")
+        released = release_entries(engine, "p", "1.0", entry_ids=[])
+        assert released["released"] == 0
 
     def test_multiple_releases(self, engine):
         create_project(engine, slug="p", name="P")
@@ -417,14 +426,16 @@ class TestChangelogEdgeCases:
         """If unreleased_only=True, version parameter is silently ignored."""
         create_project(engine, slug="p", name="P")
         add_entry(engine, "p", "added", "Unreleased")
-        add_entry(engine, "p", "added", "Released", version="1.0")
+        import_released_entry(engine, "p", "added", "Released", "1.0")
         # Even with version="1.0", unreleased_only should only return unreleased
         entries = list_entries(engine, "p", version="1.0", unreleased_only=True)
         assert len(entries) == 1
         assert entries[0]["version"] is None
 
     def test_delete_nonexistent_entry(self, engine):
-        assert delete_entry(engine, 99999) is False
+        create_project(engine, slug="p", name="P")
+        with pytest.raises(ValueError, match="not found"):
+            delete_entry(engine, "p", 99999)
 
 
 # ── MCP tool-call markup guard (#240) ─────────────────────────────────────────

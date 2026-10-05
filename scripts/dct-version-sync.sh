@@ -5,7 +5,8 @@
 # Copy this template to your project's scripts/ directory and customize
 # the SYNC TARGETS section for your project's file layout.
 #
-# Called automatically by `dct clog release` when found at:
+# Run by `dct release prepare` (once, in an isolated checkout of the release
+# candidate — it must be committed there) when found at:
 #   scripts/dct-version-sync.sh  OR  scripts/version-sync.sh
 #
 # Usage: ./scripts/dct-version-sync.sh <new_version>

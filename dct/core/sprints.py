@@ -33,6 +33,7 @@ import sqlalchemy as sa
 
 from dct.core.items import TERMINAL_STATUSES, _item_to_dict, _membership_count_exprs
 from dct.core.projects import resolve_project_id
+from dct.core.records import validate_project_rows
 from dct.core.tags import tags_for_items_conn
 from dct.db import item_sprints, items, project_transaction, row_to_dict, sprints
 
@@ -561,27 +562,11 @@ def ensure_current_sprint(
 def _validate_project_items_conn(
     conn: sa.Connection, project_id: int, ids: list[int]
 ) -> set[int]:
-    """STRICT id validation (K-8, #413): return the set of ids that are live
-    items of this project; raise ValueError listing any that are not
-    (foreign, unknown, soft-deleted)."""
-    if not ids:
-        return set()
-    valid = set(
-        conn.execute(
-            sa.select(items.c.id).where(
-                items.c.project_id == project_id,
-                items.c.id.in_(ids),
-                items.c.deleted_at.is_(None),
-            )
-        ).scalars()
+    """STRICT item-id validation for sprint membership writes (K-8, #413)."""
+    return validate_project_rows(
+        conn, items, project_id, ids, "item",
+        "sprint membership unchanged. Pass only live items of the project.",
     )
-    unknown = set(ids) - valid
-    if unknown:
-        raise ValueError(
-            f"Unknown item id(s) for this project: {sorted(unknown)} — "
-            f"sprint membership unchanged. Pass only live items of the project."
-        )
-    return valid
 
 
 def _validate_target_sprint_conn(

@@ -11,7 +11,13 @@ the schema (no create_tables, only SELECTs).
 import sqlalchemy as sa
 
 from dct.config import load_config
-from dct.db import create_tables, ensure_sqlite_dir, get_engine
+from dct.db import (
+    check_schema_ready,
+    create_tables,
+    ensure_sqlite_dir,
+    get_engine,
+    get_readonly_engine,
+)
 
 
 def bootstrap_engine(create: bool = True) -> sa.Engine:
@@ -33,4 +39,24 @@ def bootstrap_engine(create: bool = True) -> sa.Engine:
     if create:
         ensure_sqlite_dir(cfg.database_url)
         create_tables(engine)  # idempotent
+    return engine
+
+
+def readonly_engine() -> sa.Engine:
+    """The genuinely read-only engine of the configured database (K-84).
+
+    Shared by every command that promises "no side effects" (release plan /
+    status, clog candidates, the reconstruct preview): db.get_readonly_engine
+    (never creates the file or its directory, no DDL, no journal-mode change;
+    PostgreSQL READ ONLY transactions) + db.check_schema_ready. Raises
+    db.SchemaNotReady — naming the explicit upgrade command — for a missing
+    database or an older schema; nothing is created or migrated.
+    """
+    cfg = load_config()
+    engine = get_readonly_engine(cfg.database_url)
+    try:
+        check_schema_ready(engine)
+    except BaseException:
+        engine.dispose()
+        raise
     return engine

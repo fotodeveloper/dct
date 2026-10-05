@@ -140,7 +140,9 @@ def derive(repo: Path) -> dict[str, str]:
         "tests": match.group(1),
         "tools": str(len(asyncio.run(mcp.list_tools()))),
         "skills": str(sum(1 for p in (repo / "dct/skills").iterdir() if p.is_dir())),
-        "hooks": str(len(list((repo / "dct/hooks").glob("*.sh")))),
+        # A sourced *.lib.sh (K-48) sits beside the hooks but is not one.
+        "hooks": str(sum(1 for p in (repo / "dct/hooks").glob("*.sh")
+                         if not p.name.endswith(".lib.sh"))),
     }
 
 

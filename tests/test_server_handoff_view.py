@@ -59,14 +59,17 @@ def test_get_handoff_soft_deleted_is_not_found(srv):
 #
 # Contract (K-35, #413): the documented "200-char preview" is a hard CEILING —
 # the ellipsis is counted, so len(preview) <= 200 always. The server and the
-# snapshot share ONE implementation (dct.workflows.session._preview).
+# snapshot share ONE implementation (dct.core.text.preview, re-exported by
+# dct.workflows.session).
 
 
 def test_server_preview_is_the_workflows_one(srv):
     """K-35: no second copy — the two names must be the same object."""
-    from dct.workflows.session import _preview as canonical
+    from dct.core import text
+    from dct.workflows.session import preview as canonical
 
-    assert srv._preview is canonical
+    assert srv.preview is canonical
+    assert canonical is text.preview
 
 
 def test_preview_exactly_200_chars_unchanged(srv):
@@ -90,10 +93,10 @@ def test_preview_201_chars_truncated_with_marker(srv):
 
 def test_preview_never_exceeds_200_for_any_length(srv):
     """Property: whatever the input length, the preview fits the budget."""
-    from dct.workflows.session import _preview
+    from dct.core.text import preview
 
     for n in (0, 1, 199, 200, 201, 1000, 100_000):
-        got = _preview("q" * n)
+        got = preview("q" * n)
         assert len(got) <= 200
         assert got.endswith("…") is (n > 200)
 

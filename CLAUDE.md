@@ -20,6 +20,8 @@ Deep-dives live in `docs/` and are read on demand — keep this file lean:
 ```bash
 # Development
 .venv/bin/pytest -v                    # Run tests (in-memory SQLite)
+# No env vars needed: conftest's `_suite_isolation` fixture points DCT_* at a
+# throwaway SQLite file + config for the suite AND its subprocesses (#822).
 
 # PG test lane (#426) — the same suite against a real PostgreSQL server.
 # DCT_TEST_DATABASE_URL switches the `engine` fixture; isolation is a per-test
@@ -53,19 +55,52 @@ uv run --no-project --with 'mcp' --with sqlalchemy --with 'psycopg[binary]' \
 dct/config.py            — Config loading (platform config dir + legacy
                            ~/.claude fallback + env vars; ADR #52)
 dct/paths.py             — Platform-neutral config/data/cache/state dirs
-                           (XDG on POSIX, platformdirs on Windows)
+                           (XDG on POSIX, platformdirs on Windows); the ONE
+                           SQLite URL builder / parser (sqlite_url,
+                           sqlite_database_path — K-99: never concatenate or
+                           slice "sqlite:///", SQLAlchemy 2.0 and 2.1 parse
+                           the path differently)
 dct/migrate.py           — dct migrate-home (legacy → platform-neutral home)
 dct/db.py                — SQLAlchemy Core tables + engine factory + migrations
 dct/core/projects.py     — Projects CRUD (+ realpath-canonical CWD detection)
 dct/core/items.py        — Items / notes / checkpoints CRUD
-dct/core/changelog.py    — Changelog entries CRUD + release stamping
+dct/core/changelog.py    — Changelog entries CRUD + release stamping (the stamp
+                           is the ONLY writer of versions, K-102: add_entry
+                           refuses one; import_released_entry = old history)
+dct/core/releases.py     — Release ledger (K-41/K-60/K-61): records written with
+                           the stamp, one state machine (TRANSITIONS; advance,
+                           abandon), immutable candidate, write-once release
+                           commit / manifest / proof, legacy reconstruction
+                           (its verification scope recorded, K-110), the
+                           controlled takeover of a record without consent
+                           (take_over_release, K-119 M3 — the only way a
+                           record becomes dct's after its stamp), the
+                           project's version-file contract (K-73); the
+                           verified release_mode, executor and write-once
+                           consent / proposal / render; K-115: tag_proof /
+                           push_proof (a status is never proof), mutual
+                           consistency of a record's fields, duplicates of
+                           one version refuse writes; every mutation checks
+                           its actor (docs/release-workflow.md)
 dct/core/sprint.py       — Current-sprint ops; delegates to item_sprints
 dct/core/sprints.py      — First-class sprints (single source of truth)
 dct/core/handoff.py      — Session handoffs (cross-session prompt ledger)
 dct/core/decisions.py    — ADR / sprint-amendment / open-question records
 dct/core/tags.py         — Global tag dictionary + item_tags links (similarity
                            guard, merge)
-dct/core/version.py      — Version bump + project-file autodetect
+dct/core/version.py      — Version contract (parse / normalize / compare / bump,
+                           X.Y | X.Y.Z, leading v dropped) + project-file autodetect
+dct/core/gitinfo.py      — Git readers (toplevel / branch / common dir) +
+                           resolve_checkout: same-repo checkout of a project
+                           (repo root vs project root), best-effort; the
+                           STRICT verify_release_checkout (confirmed repo /
+                           confirmed non-repo / error) gates the CLI release
+dct/core/procs.py        — Supervised process runner (K-108/K-113): own process
+                           group, TERM→KILL + reap on timeout / interruption /
+                           exception, bounded or complete-or-refuse capture,
+                           streamed lines; used by every strict git command
+                           and the release workflow's sync script
+dct/core/records.py      — Shared STRICT project-row id validator
 dct/core/checkpoints.py  — Item checkpoint helpers
 dct/core/ids.py          — ULID generation
 dct/core/plans/          — Plans subsystem: parser.py (pure MD parser),
@@ -74,7 +109,7 @@ dct/services/            — Service layer (reserved for future shared app ops)
 dct/workflows/session.py — G1 composed ops: get_context_snapshot /
                            pickup_work / handoff_work (one impl for MCP,
                            CLI and skills; single transaction each)
-dct/mcp/server.py        — MCP server, SDK 2.2 MCPServer (55 tools);
+dct/mcp/server.py        — MCP server, SDK 2.2 MCPServer (60 tools);
                            dct/server.py is a compat shim
 dct/cli.py               — argparse CLI entry point
 dct/export.py            — Keep a Changelog MD export
@@ -84,6 +119,17 @@ dct/integrations/claude.py — Claude Code adapter: MCP registration, skill/hook
 dct/integrations/codex.py — Codex MCP, workflow skills and managed AGENTS.md
 dct/integrations/codex_hooks.py — Native event bridge over shared hook policies
 dct/workflows/task_mirror.py — Append-only client plan/task observations
+dct/workflows/release/   — Release workflow (K-72): proof layer, read-only —
+                           proof.py (trailer / revert / squash rules),
+                           plan.py (`dct release plan`, `dct clog candidates`);
+                           effects layer — effects.py (`dct release attest /
+                           prepare / apply / resume / abandon / reconstruct /
+                           takeover / version-files`,
+                           alias `clog release`: the version sync runs once,
+                           isolated, in prepare; commits through the repo's
+                           hooks, tag, push; every effect verified before
+                           the ledger records it; schema: docs/release-workflow.md);
+                           oplock.py (the per-repository operation lock, K-96 D7)
 dct/integrations/base.py — Shared contract and conservative file ownership
 dct/integrations/doctor.py — Read-only per-runtime dependency diagnostics
 dct/assets/              — Indirection for packaged asset dirs (physical
@@ -130,7 +176,11 @@ operation. The five rules — full versions with code samples in
 4. Exit codes carry meaning: `0` pass-through, `2` block with structured reason.
 5. Strip `-m "message"` content before inspecting commit flags.
 
-Reference implementation: `dct/hooks/check-changelog.sh`.
+Reference implementation: `dct/hooks/check-changelog.sh`. Logic shared by
+several hooks lives in a sourced `dct/hooks/*.lib.sh` (never wired; installed
+beside the hooks — `HOOK_LIBS` in `dct/integrations/claude.py`), while each
+hook keeps its own failure policy; commands a hook prints for pasting quote
+every interpolated argument with `printf %q`.
 
 ## MCP tool conventions
 

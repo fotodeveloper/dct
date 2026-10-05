@@ -74,7 +74,8 @@ The decoder and transactional mirror are covered by isolated event/worker tests.
 
 ## Claude Code hooks
 
-`dct init` installs four hooks as symlinks in `~/.claude/hooks/` and (with your
+`dct init` installs four hooks (plus the shared library the changelog hooks
+source, see below) as symlinks in `~/.claude/hooks/` and (with your
 consent) wires them into `~/.claude/settings.json`. This page is the manual
 reference for that wiring — useful when you skipped the automatic step, manage
 `settings.json` yourself, or want to relocate a hook.
@@ -103,7 +104,7 @@ Properties of the merge:
 
 | Hook | Event / matcher | Purpose |
 |---|---|---|
-| `dct-check-changelog.sh` | `PreToolUse` / `Bash` | blocks `git commit` when app code changed but no unreleased changelog entry exists; **on by default** per project once wired (`dct project changelog <slug> off` opts a project out); bypasses `release:` commits and doc-only changes |
+| `dct-check-changelog.sh` | `PreToolUse` / `Bash` | blocks `git commit` when app code changed but no unreleased changelog entry exists for the current branch (unbranched entries count; see below); **on by default** per project once wired (`dct project changelog <slug> off` opts a project out); bypasses `release:` commits and doc-only changes |
 | `dct-check-changelog-on-stop.sh` | `Stop` | session-end reminder if unreleased entries are pending (same per-project gate) |
 | `dct-plan-autoscan.sh` | `PostToolUse` / `Edit\|Write\|MultiEdit` | background rescan of plan-like markdown (plans, specs, ADRs, roadmaps); fire-and-forget, never blocks |
 | `dct-task-mirror.sh` | `PreToolUse` / `TodoWrite\|TaskCreate` | mirrors Claude Code tasks into dct as non-blocking `cc-task` checkpoints |
@@ -201,6 +202,71 @@ Ordering is cheapest-first:
 Measured fast paths (`time bash …`): no-changes / exempt-only / changelog-touched
 all ~40–50 ms (shell + git forks, no Python); the verdict path drops from
 ~415 ms on a cache miss (two Python starts) to ~50 ms on a cache hit.
+
+## Per-branch changelog count (#801)
+
+Changelog entries record the git branch they were written on, so both
+changelog hooks count only the entries that can belong to the current commit.
+The logic lives in ONE place — the shared library
+`dct/hooks/dct-changelog-count.lib.sh` (K-48), sourced by both hooks; it is
+not a hook and is never wired into `settings.json`:
+
+```bash
+dct_changelog_count "$project"   # sets DCT_CL_BRANCH, DCT_CL_COUNT, DCT_CL_FALLBACK
+# per-branch:  dct clog count --project="$project" --branch="$b" --include-unbranched
+# fallback:    dct clog count --project="$project"          (DCT_CL_FALLBACK=1)
+dct_changelog_guidance           # the deny / reminder text for the path taken
+```
+
+- **This branch plus uncertain entries.** Entries of other branches describe
+  code the commit does not contain and do not satisfy the gate. Entries with
+  no recorded branch (written before branch tracking, or outside git) still
+  count, and so do entries whose branch was only **server-detected**
+  (`branch_source='server'`, K-36): that value is the MCP server process's
+  checkout, not proof of where the client worked, so `--include-unbranched`
+  treats it as uncertain like a missing branch (the contract lives in core).
+  The count is only a gate — it never proves that an entry describes the
+  staged change; `/commit` still picks its trailer set from the final staged
+  diff.
+- **One `--branch=<value>` word, never an empty `--branch`.** Git allows a
+  branch named `-x` (`git update-ref refs/heads/-x`); passed as a separate
+  word it would be parsed as an option. On a detached HEAD the hook skips
+  straight to the project-wide count.
+- **Version skew.** An older `dct` rejects `--branch` (non-integer output) →
+  the hook falls back to the project-wide count and sets the fallback flag.
+- **Guidance follows the path taken (K-33).** Only the per-branch path
+  mentions other branches and offers moving an entry — and only an entry that
+  describes THIS specific change; otherwise the text points to `/clog` (add a
+  new entry). The fallback text says the project-wide count was used (older
+  CLI, or no branch checked out) and never mentions other branches.
+- **Paste-safe command.** Agents copy the guidance into a shell, and Git
+  allows `;`, `$(...)` and backticks in branch names (`feat/x;true`,
+  `feat/$(id)`). The offered `dct clog update <ENTRY_ID> --branch=<b>` is a
+  template: the text says to replace `<ENTRY_ID>` with the entry's number
+  first (pasted unedited, bash refuses the `<` redirection and runs nothing).
+  The branch argument is quoted WHOLE with `printf %q`, so the edited line
+  runs nothing but `dct`. The deny JSON itself is built by `jq --arg`.
+- **Own failure.** When even the fallback yields no integer (dct or its
+  database is broken), or the lib cannot be found, the two hooks deliberately
+  differ — the lib only reports, each hook applies its own policy:
+  - `check-changelog.sh` (blocking) **fails open** — `exit 0`, the commit
+    goes through. A hook must never block the host operation because of its
+    own failure.
+  - `check-changelog-on-stop.sh` (non-blocking) **keeps reminding** — the
+    generic "Use /clog" reminder, since erring towards a reminder costs
+    nothing. A missing `dct` still exits silently in both hooks.
+
+### Where the hooks find the lib
+
+`install_hook` installs the lib into `~/.claude/hooks/` under its own name next
+to the hooks (symlink, or a copy where symlinks are unavailable), and
+`dct doctor` reports it under `hook_assets`. Each hook looks for the lib next
+to its REAL path first — a portable `readlink` walk (no GNU `readlink -f`)
+follows a symlinked hook into the package directory — then next to the path
+it was invoked by, which is where a copied install keeps its copied lib.
+Native Codex hooks run the scripts straight from the package directory, where
+the lib sits beside them. Keep the scripts bash 3.2 compatible (macOS
+`/bin/bash`: no associative arrays, `${var,,}` or `mapfile`).
 
 ## The five rules every dct hook follows
 

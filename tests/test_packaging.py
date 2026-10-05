@@ -34,7 +34,16 @@ def test_skills_dir_lives_inside_the_package():
 
 def test_hooks_dir_lives_inside_the_package():
     assert HOOKS_DIR == PKG_ROOT / "hooks"
-    assert sorted(p.name for p in HOOKS_DIR.glob("*.sh")) == EXPECTED_HOOKS
+    hooks = sorted(p.name for p in HOOKS_DIR.glob("*.sh") if not p.name.endswith(".lib.sh"))
+    assert hooks == EXPECTED_HOOKS
+
+
+def test_every_packaged_hook_lib_is_installed():
+    """A sourced lib the installer does not know about would be missing
+    beside a COPIED hook (K-48) — HOOK_LIBS must list every *.lib.sh."""
+    from dct.integrations.claude import HOOK_LIBS
+    assert sorted(p.name for p in HOOKS_DIR.glob("*.lib.sh")) == sorted(HOOK_LIBS)
+    assert HOOK_LIBS, "the changelog hooks source dct-changelog-count.lib.sh"
 
 
 def test_skill_discovery_matches_directory_contents():

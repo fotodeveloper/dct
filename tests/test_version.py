@@ -145,3 +145,59 @@ class TestDetectVersion:
         (tmp_path / "package.json").write_text('{"version": 1}')
         (tmp_path / "Cargo.toml").write_text('[package]\nversion = "3.3.3"\n')
         assert detect_version(tmp_path) == ("3.3.3", "Cargo.toml")
+
+
+# ── K-44: one version contract (parse / normalize / compare / bump) ──────────
+
+
+class TestVersionContract:
+    @pytest.mark.parametrize("raw,expected", [
+        ("1.6.0", "1.6.0"), ("v1.6.0", "1.6.0"), ("V1.6", "1.6"),
+        (" 0.18 ", "0.18"), ("v0.18.1\n", "0.18.1"), ("01.2.03", "1.2.3"),
+    ])
+    def test_normalize_strips_v_prefix_and_whitespace(self, raw, expected):
+        from dct.core.version import normalize_version
+        assert normalize_version(raw) == expected
+
+    @pytest.mark.parametrize("bad", [
+        "", "  ", "v", "1", "1.", ".1", "1.2.3.4", "1.2.3rc1", "1.2-beta",
+        "2026-rc", "vv1.2", "1..2", "x.y.z", "1.2.3 4", "-1.2", "+1.2",
+        "١.٢",  # Unicode digits are not ASCII release numbers
+    ])
+    def test_unsupported_formats_are_refused_explicitly(self, bad):
+        from dct.core.version import normalize_version
+        with pytest.raises(ValueError, match="Unsupported version"):
+            normalize_version(bad)
+        with pytest.raises(ValueError, match="Unsupported version"):
+            parse_version(bad)
+
+    def test_parse_accepts_v_prefix(self):
+        assert parse_version("v1.6.0") == (1, 6, 0)
+
+    @pytest.mark.parametrize("a,b,expected", [
+        ("1.5", "1.5.0", 0), ("v1.5.0", "1.5", 0), ("1.4.0", "1.5.0", -1),
+        ("1.10", "1.9.9", 1), ("2.0", "1.99.99", 1), ("0.18.1", "0.18", 1),
+    ])
+    def test_compare_drops_trailing_zeros(self, a, b, expected):
+        from dct.core.version import compare_versions
+        assert compare_versions(a, b) == expected
+        assert compare_versions(b, a) == -expected
+
+    def test_compare_refuses_unsupported(self):
+        from dct.core.version import compare_versions
+        with pytest.raises(ValueError, match="Unsupported version"):
+            compare_versions("1.2.3rc1", "1.2.3")
+
+    @pytest.mark.parametrize("current,bump_type,expected", [
+        ("v1.6.0", "patch", "1.6.1"), ("v0.18", "patch", "0.18.1"),
+        ("V2.0", "major", "3.0"),
+    ])
+    def test_bump_of_v_prefixed_current_gives_a_normalized_version(
+        self, current, bump_type, expected
+    ):
+        assert bump(current, bump_type) == expected
+
+    @pytest.mark.parametrize("bad", ["1", "1.2.3.4", "2026-rc"])
+    def test_bump_refuses_unsupported_current(self, bad):
+        with pytest.raises(ValueError, match="Unsupported version"):
+            bump(bad, "patch")

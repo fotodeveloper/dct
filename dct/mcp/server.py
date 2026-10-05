@@ -20,11 +20,11 @@ from mcp.server import MCPServer
 from dct.core.engine import bootstrap_engine
 
 # ONE preview implementation for the whole product (K-35, #413): the MCP list
-# views and the snapshot share dct.workflows.session._preview, so the
-# documented "200-char preview" means the same ceiling everywhere — 200 chars
-# INCLUDING the trailing ellipsis. (mcp → workflows is the sanctioned import
-# direction; workflows never imports the server.)
-from dct.workflows.session import _preview
+# views and the snapshot share dct.core.text.preview (re-exported by
+# dct.workflows.session), so the documented "200-char preview" means the same
+# ceiling everywhere — 200 chars INCLUDING the trailing ellipsis. CLEAR is the
+# one free-text clear sentinel ('__clear__', K-48).
+from dct.core.text import CLEAR, preview
 
 _INSTRUCTIONS = (
         "Deterministic Context Tracker — cross-project work tracking.\n\n"
@@ -40,8 +40,10 @@ _INSTRUCTIONS = (
         "- list_* return {cols:[...], rows:[[...]]}: cols names the fields once, rows are\n"
         "  value arrays in that order (short fields first, long free-text last). Legends —\n"
         "  item: id, item_type, priority, status, in_current_sprint, cp=[done,total],\n"
-        "  component, tags (list[str]), created_at, title, description; changelog: id, version,\n"
-        "  category, component, related_item_id, created_at, released_at, entry;\n"
+        "  component, tags (list[str]), created_at, short_title (2-4 word label, may be\n"
+        "  null), title — list_items(view='full') appends description; changelog: id, version,\n"
+        "  category, component, branch, branch_source, related_item_id,\n"
+        "  item_short_title, created_at, released_at, worktree, entry;\n"
         "  checkpoint: id, status, sort_order, text; handoff: id, scope, created_by,\n"
         "  created_at, consumed_at, prompt (200-char preview). format='markdown' (lossy)\n"
         "  or 'dict' (full-key dicts) opt in.\n\n"
@@ -311,13 +313,18 @@ def _format_list(rows: list[dict], cols: list[str], format: str):
 
 
 # Column sets — short/fixed-width fields first, long free-text last.
-ITEM_COLS_DEFAULT = [
+# list_items defaults to the BRIEF view (#817): descriptions dominate the
+# payload of a large project's backlog, so they are opt-in via view='full'.
+ITEM_COLS_BRIEF = [
     "id", "item_type", "priority", "status", "in_current_sprint",
-    "cp", "component", "tags", "created_at", "title", "description",
+    "cp", "component", "tags", "created_at", "short_title", "title",
 ]
+ITEM_COLS_FULL = ITEM_COLS_BRIEF + ["description"]
+ITEM_VIEWS = {"brief": ITEM_COLS_BRIEF, "full": ITEM_COLS_FULL}
 CHANGELOG_COLS = [
-    "id", "version", "category", "component", "related_item_id",
-    "created_at", "released_at", "entry",
+    "id", "version", "category", "component", "branch", "branch_source",
+    "related_item_id", "item_short_title", "created_at", "released_at",
+    "worktree", "entry",
 ]
 CHECKPOINT_COLS = ["id", "status", "sort_order", "text"]
 TAG_COLS = ["id", "name", "item_count", "created_at", "description"]
@@ -359,7 +366,11 @@ def list_projects(format: str = "structured"):
     Returns: table of all non-deleted projects with {id, slug, current_version,
         name, path, changelog_path}, shaped per `format`. changelog_path (#225)
         is the changelog file location relative to the project root (default
-        'changelog.md'); /release resolves {path}/{changelog_path}.
+        'changelog.md'). /release resolves it against the project root of
+        the checkout the release RUNS in — that checkout's toplevel plus the
+        project's path relative to its own repository toplevel (a monorepo
+        subdirectory maps to the same subdirectory of a linked worktree) —
+        not against `path`, which names the main checkout.
     """
     from dct.core.projects import list_projects as _list
     rows = _list(_get_engine())
@@ -374,6 +385,7 @@ def create_item(
     item_type: str,
     title: str,
     project: str = "",
+    short_title: str = "",
     description: str = "",
     priority: str = "P2",
     component: str = "",
@@ -399,28 +411,38 @@ def create_item(
         title: Short title — hard limit 500 chars (≤ 80 recommended);
             longer titles are refused, never truncated.
         project: Project slug. Empty = auto-detect from CWD.
+        short_title: 2-4 word English noun phrase naming what the item is
+            about (e.g. 'Windows hook paths'); ≤ 50 chars, refused not
+            truncated; always pass it. Surrounding whitespace is stripped
+            (blank = no label).
+            Shown next to the item number in every list and snapshot.
         description: Prose context (no checkbox lists — use add_checkpoint instead).
         priority: P1 (blocker) / P2 (important, default) / P3 (backlog) / future.
-        component: Component or module name.
-        source_file: Relative file path.
-        source_lines: Line range (e.g. "42-58").
+        component: Component or module name (≤ 100 chars).
+        source_file: Relative file path (≤ 500 chars).
+        source_lines: Line range (e.g. "42-58", ≤ 100 chars).
         tags: List of tag strings. Pass as a JSON array, e.g. ["oss","tests"].
             Names are normalized (trimmed, lowercased) and registered in the
             GLOBAL tag dictionary. A name confusable with an existing tag is
             REFUSED and the whole call rolls back (no orphan item) — reuse the
             suggested name, or register yours first with add_tag(force=true).
 
-    Returns: slim ack {id, project, item_type, priority, status, title} —
-        `project` is the resolved slug (auto-detect safety echo). NOT the full
+    Returns: slim ack {id, project, item_type, priority, status, title,
+        short_title} — `project` is the resolved slug (auto-detect safety echo);
+        `short_title` echoes the STORED label (null when none was passed) — a
+        missing key means the server predates the field and ignored it. NOT the full
         item dict (no description/tags echo); call get_item for the rest.
-        {"error": "..."} on invalid enum, markup, a refused tag name, or an
-        unresolvable project.
+        {"error": "..."} on invalid enum, markup, a refused tag name, an
+        over-long field (refused, never truncated), or an unresolvable project.
     """
-    if (err := _reject_toolcall_markup(title=title, description=description, tags=tags)):
+    if (err := _reject_toolcall_markup(
+        title=title, short_title=short_title, description=description, tags=tags
+    )):
         return err
     from dct.core.items import create_item as _create
 
     kwargs: dict = {}
+    if short_title: kwargs["short_title"] = short_title
     if description: kwargs["description"] = description
     if component: kwargs["component"] = component
     if source_file: kwargs["source_file"] = source_file
@@ -434,6 +456,7 @@ def create_item(
         return {
             "id": d["id"], "project": project_slug, "item_type": d["item_type"],
             "priority": d["priority"], "status": d["status"], "title": d["title"],
+            "short_title": d["short_title"],
         }
     except Exception as e:
         return {"error": str(e)}
@@ -451,11 +474,19 @@ def list_items(
     tag: str = "",
     limit: int = 50,
     format: str = "structured",
+    view: str = "brief",
 ):
     """List tracked items in compact {cols,rows} form.
 
     Each row carries a `cp` field with [done, total] checkpoint progress
-    computed in a single SQL query (no N+1), and a `tags` list[str] (name-ASC).
+    computed in a single SQL query (no N+1), a `tags` list[str] (name-ASC) and
+    `short_title` (the item's 2-4 word label, may be null).
+
+    VIEWS — default 'brief' because descriptions dominate the payload of a
+    large project's backlog; call get_item(id) or view='full' for them:
+      - 'brief' (default): id, item_type, priority, status, in_current_sprint,
+        cp, component, tags, created_at, short_title, title.
+      - 'full': the brief columns + description.
 
     Args:
         project: slug; empty = CWD auto-detect, unregistered CWD = cross-project
@@ -465,7 +496,8 @@ def list_items(
         priority: P1 / P2 / P3 / future.
         component: Filter by component name.
         in_current_sprint: '' (any, default), 'true' (only sprint), 'false' (non-sprint).
-        search: Substring in title + description.
+        search: Substring in title + description — matched server-side in
+            EVERY view, so a brief row may match on a description it omits.
         tag: ONE tag name (normalized — trimmed, lowercased); keeps only items
             carrying it. The dictionary is CLOSED: an unknown name returns
             {"error": ...} naming the closest known tags (up to 3, plus a count
@@ -475,13 +507,19 @@ def list_items(
             project-scoped). Use list_tags to see what exists.
         limit: Max rows (default 50). 0 = no limit.
         format: 'structured' (default, {cols,rows}), 'markdown', 'dict'.
+        view: 'brief' (default) | 'full' — see VIEWS. With format='dict',
+            'brief' projects each dict onto the brief columns; 'full' returns
+            the full item dicts (project_id, source_*, resolution, timestamps…).
 
     Returns: {"cols": [...], "rows": [[...]]} by default, list[dict] for
         format="dict", or markdown str for format="markdown".
-        {"error": "..."} on an unknown tag.
+        {"error": "..."} on an unknown tag or an unknown view.
     """
     from dct.core.items import list_items as _list
 
+    cols = ITEM_VIEWS.get(view)
+    if cols is None:
+        return {"error": f"Unknown view {view!r} — valid: {', '.join(ITEM_VIEWS)}"}
     kwargs: dict = {"limit": limit}
     detected = _resolve_project(project, required=False)
     if detected: kwargs["project_slug"] = detected
@@ -497,7 +535,9 @@ def list_items(
 
     try:
         rows = _list(_get_engine(), **kwargs)
-        return _format_list(rows, ITEM_COLS_DEFAULT, format)
+        if format == "dict" and view == "brief":
+            rows = [{c: r.get(c) for c in cols} for r in rows]
+        return _format_list(rows, cols, format)
     except Exception as e:
         return {"error": str(e)}
 
@@ -523,6 +563,7 @@ def get_item(item_id: int) -> dict:
 def update_item(
     item_id: int,
     title: str = "",
+    short_title: str = "",
     status: str = "",
     priority: str = "",
     component: str = "",
@@ -542,10 +583,16 @@ def update_item(
 
     Args:
         item_id: Target item.
-        title: New title (non-empty, ≤ 500 chars — ≤ 80 recommended).
+        title: New title (non-empty, ≤ 500 chars — ≤ 80 recommended; blank or
+            '__clear__' is refused).
+        short_title: Optional new 2-4 word label (≤ 50 chars counted BEFORE
+            stripping, refused not truncated; surrounding whitespace is
+            stripped). Omit (or "") = keep the current label — do NOT re-send
+            one when changing other fields; a whitespace-only value strips to
+            empty and CLEARS the label (null), as does '__clear__'.
         status: open / in_progress / resolved / wont_fix.
         priority: P1 / P2 / P3 / future.
-        component: Component or module name.
+        component: Component or module name (≤ 100 chars).
         resolution: Resolution / rationale note.
         description: Prose context.
         tags: FULL REPLACE of the item's tag set — the list you pass becomes the
@@ -559,32 +606,41 @@ def update_item(
             the tag is resolved.
 
     Clearing a field — pass literal '__clear__' to null a NULLABLE field
-    (component, resolution, description). NOT for title/status/priority: title
-    would blank out and status/priority would fail enum validation. Tags use
+    (short_title, component, resolution, description). NOT for title/status/priority: all
+    three are refused (title cannot be empty; status/priority fail enum
+    validation). Tags use
     their own convention above ([], not '__clear__').
 
     Returns: slim POST-state ack {id, item_type, status, priority, title,
-        component, in_current_sprint, resolved_at, progress} — scalars reflect
-        the row AFTER the update (a '__clear__'ed component shows null here);
+        short_title, component, in_current_sprint, resolved_at, progress} —
+        scalars reflect the row AFTER the update (a '__clear__'ed component
+        shows null here; a missing short_title key means the server predates
+        the field and ignored it);
         progress is {done, pending, active}. NOT the full item dict (no
         notes/checkpoints/tags/description echo) — call get_item to read the
         resulting tag list back. {"error": "..."} on unknown id, a refused tag
-        name, or markup.
+        name, a blank title, an over-long field (refused, never truncated), or
+        markup.
     """
     if (err := _reject_toolcall_markup(
-        title=title, description=description, resolution=resolution, tags=tags
+        title=title, short_title=short_title, description=description,
+        resolution=resolution, tags=tags,
     )):
         return err
     from dct.core.items import update_item as _update
 
     kwargs: dict = {}
     for field, value in [
-        ("title", title), ("status", status), ("priority", priority),
-        ("component", component), ("resolution", resolution), ("description", description),
+        ("title", title), ("short_title", short_title), ("status", status),
+        ("priority", priority), ("component", component),
+        ("resolution", resolution), ("description", description),
     ]:
-        if value == "__clear__":
+        if value == CLEAR:
             kwargs[field] = ""
         elif value:
+            # Any NON-EMPTY string is explicit input (K-56) — a whitespace-only
+            # short_title too: core's normalize_short_title checks the raw
+            # length, strips, and stores NULL for an empty result.
             kwargs[field] = value
     # Sentinel (K-16): only an explicit list reaches core — None means "leave
     # the tags alone", so it must NOT be passed through as a kwarg.
@@ -598,7 +654,8 @@ def update_item(
         return {
             "id": result["id"], "item_type": result["item_type"],
             "status": result["status"], "priority": result["priority"],
-            "title": result["title"], "component": result["component"],
+            "title": result["title"], "short_title": result["short_title"],
+            "component": result["component"],
             "in_current_sprint": result["in_current_sprint"],
             "resolved_at": result["resolved_at"],
             "progress": _slim_progress(result["progress"]),
@@ -940,6 +997,8 @@ def add_changelog(
     source_file: str = "",
     source_lines: str = "",
     related_item_id: int = 0,
+    branch: str = "",
+    worktree: str = "",
 ) -> dict:
     """Add an unreleased changelog entry (version stays NULL until release_changelog stamps it).
 
@@ -952,17 +1011,49 @@ def add_changelog(
         component: Optional area/module tag; appended as " (component)" to the bullet on export.
         source_file: Optional relative path of the file the change touched.
         source_lines: Optional line range (e.g. "42-58").
-        related_item_id: Tracked-item id to link (0 = none).
+        related_item_id: Tracked-item id to link (0 = none) — must be a live
+            item of the SAME project (unknown / another project's / deleted
+            → error, nothing written).
+        branch: Git branch the change was made on (`git branch --show-current`),
+            ≤ 255 chars. PASS IT: this server's cwd is the directory the session
+            STARTED in and does not follow a mid-session `cd` into another
+            worktree, so its own detection can name the wrong branch.
+        worktree: Toplevel of the checkout the change was made in
+            (`git rev-parse --show-toplevel`), ≤ 500 chars; must be an
+            ABSOLUTE path in the client's own syntax — POSIX `/...`, Windows
+            `C:\\...` / `C:/...` or UNC `\\\\server\\share\\...` (relative,
+            `~`, drive-relative `C:x` or rooted `\\x` → refused). Stored after
+            a purely textual normalization by that syntax (posixpath /
+            ntpath normpath, no trailing separator) — never resolved against
+            this server's filesystem.
+            Either given → both stored as passed (a missing one stays null),
+            branch_source='client'; an over-long value is REFUSED, never
+            truncated. Neither given → detected from this server's cwd, kept
+            only when that cwd is a checkout of the SAME git repository as the
+            project's registered path (main checkout or any linked worktree;
+            never a nested foreign repo or a submodule) — worktree = that
+            checkout's toplevel, branch_source='server'; otherwise, outside
+            git, or a deleted cwd → null; detached HEAD → branch null only.
 
-    Returns: slim ack {id, project, category, component} — `project` is the
-        resolved slug, `component` may be null. NOT the entry text echo (nor the
-        full row). {"error": "..."} on failure — empty/whitespace entry, invalid
-        category, literal tool-call markup in `entry`, or an unresolvable project
-        (explicit slug not found, or empty `project` with an unregistered CWD).
+    Returns: slim ack {id, project, category, component, branch, branch_source}
+        — `project` is the resolved slug; component / branch / branch_source may
+        be null. Plus `warning` when branch_source='server': the values are
+        this MCP server's own checkout, not one you confirmed — such a row
+        counts as UNCERTAIN (like an unbranched one) in include_unbranched
+        filters; confirm or correct it with update_changelog(branch=...,
+        worktree=...). NOT the entry text echo (nor the full row).
+        {"error": "..."} on failure — empty/whitespace entry, invalid category,
+        literal tool-call markup in a free-text field, an over-long or
+        relative branch/worktree, an invalid related_item_id, or an
+        unresolvable project (explicit slug not found, or empty `project` with
+        an unregistered CWD).
     """
-    if (err := _reject_toolcall_markup(entry=entry)):
+    if (err := _reject_toolcall_markup(
+        entry=entry, component=component, source_file=source_file,
+        source_lines=source_lines, branch=branch, worktree=worktree,
+    )):
         return err
-    from dct.core.changelog import add_entry
+    from dct.core.changelog import add_entry, resolve_branch_fields
 
     kwargs: dict = {}
     if component: kwargs["component"] = component
@@ -971,10 +1062,27 @@ def add_changelog(
     if related_item_id: kwargs["related_item_id"] = related_item_id
 
     try:
+        engine = _get_engine()
         project_slug = _resolve_project(project, required=True)
         assert project_slug is not None
-        row = add_entry(_get_engine(), project_slug, category, entry, **kwargs)
-        return {"id": row["id"], "project": project_slug, "category": row["category"], "component": row["component"]}
+        kwargs.update(resolve_branch_fields(
+            engine, project_slug, branch=branch or None, worktree=worktree or None,
+            use_process_cwd=True, detected_source="server",
+        ))
+        row = add_entry(engine, project_slug, category, entry, **kwargs)
+        ack = {
+            "id": row["id"], "project": project_slug, "category": row["category"],
+            "component": row["component"], "branch": row["branch"],
+            "branch_source": row["branch_source"],
+        }
+        if row["branch_source"] == "server":
+            ack["warning"] = (
+                f"branch/worktree were detected from the MCP server's own checkout "
+                f"({row['branch'] or 'detached HEAD'} @ {row['worktree']}), not "
+                f"confirmed by you; the entry counts as uncertain. Confirm or "
+                f"correct it: update_changelog({row['id']}, branch=..., worktree=...)."
+            )
+        return ack
     except Exception as e:
         return {"error": str(e)}
 
@@ -984,87 +1092,651 @@ def list_changelog(
     project: str = "",
     unreleased_only: bool = True,
     format: str = "structured",
+    branch: str = "",
+    worktree: str = "",
+    include_unbranched: bool = False,
 ):
-    """List changelog entries for a project.
+    """List changelog entries for a project, newest first.
 
     Args:
         project: Slug. Empty = CWD auto-detect.
         unreleased_only: True (default) → only entries without a version; False → all.
         format: 'structured' (default, {cols,rows}) | 'markdown' | 'dict'.
+        branch: Only entries whose STORED branch equals this exactly, whatever
+            its branch_source. Empty (default) = no branch filter — every
+            entry, exactly as before branch tracking.
+        worktree: Only entries whose worktree equals this ABSOLUTE path after
+            the same normalization as on write (normpath, no trailing
+            separator; relative → error). Combinable with branch. Empty = no
+            worktree filter.
+        include_unbranched: With `branch`: also every UNCERTAIN entry — branch
+            null (pre-tracking or undetected) or branch_source='server' (the
+            server's own checkout, whatever branch it stores); such rows keep
+            their stored branch/worktree/source. Ignored without `branch`.
 
-    Returns: {cols, rows} by default, list[dict] for 'dict', markdown str for 'markdown'.
+    Returns: {cols, rows} by default — cols = [id, version, category, component,
+        branch, branch_source, related_item_id, item_short_title, created_at,
+        released_at, worktree, entry]; item_short_title is the related item's
+        short_title (or its title compacted to 50 chars) when it is a live item
+        of this project, else null (no link, or a deleted / foreign historical
+        id — related_item_id is kept as stored). list[dict] for 'dict',
+        markdown str for 'markdown'. {"error": "..."} on an unresolvable
+        project or a relative worktree.
     """
     from dct.core.changelog import list_entries
     try:
         project_slug = _resolve_project(project, required=True)
         assert project_slug is not None
-        rows = list_entries(_get_engine(), project_slug, unreleased_only=unreleased_only)
+        rows = list_entries(
+            _get_engine(), project_slug, unreleased_only=unreleased_only,
+            branch=branch or None, worktree=worktree or None,
+            include_unbranched=include_unbranched,
+        )
         return _format_list(rows, CHANGELOG_COLS, format)
     except Exception as e:
         return {"error": str(e)}
 
 
 @mcp.tool(structured_output=False)
-def count_unreleased_changelog(project: str = "") -> dict:
+def count_unreleased_changelog(
+    project: str = "",
+    branch: str = "",
+    worktree: str = "",
+    include_unbranched: bool = False,
+) -> dict:
     """Count unreleased changelog entries (version=NULL) for a project.
 
     Args:
         project: Slug. Empty = auto-detect from CWD.
+        branch: Count only entries whose STORED branch equals this exactly,
+            whatever its branch_source. Empty (default) = the whole project,
+            exactly as before branch tracking.
+        worktree: Count only entries of this ABSOLUTE worktree path, normalized
+            as on write (relative → error). Combinable.
+        include_unbranched: With `branch`: also count every UNCERTAIN entry —
+            branch null or branch_source='server' (any stored branch). Ignored
+            without `branch`.
 
     Returns: {"count": <int>} on success, {"error": "..."} on failure.
-    Typical use: gate before /release (stop if count == 0).
+    Typical use: the /commit changelog gate (are there entries at all?) — a
+    gate only, never proof that an entry belongs to a commit. Zero does NOT
+    block a release: an explicit version-only release (entry_ids=[]) or the
+    resume of an unfinished release (get_release) proceeds without entries.
     """
     from dct.core.changelog import count_unreleased
     try:
         project_slug = _resolve_project(project, required=True)
         assert project_slug is not None
-        return {"count": count_unreleased(_get_engine(), project_slug)}
+        return {"count": count_unreleased(
+            _get_engine(), project_slug, branch=branch or None,
+            worktree=worktree or None, include_unbranched=include_unbranched,
+        )}
     except Exception as e:
         return {"error": str(e)}
 
 
 @mcp.tool(structured_output=False)
-def release_changelog(project: str = "", version: str = "", bump_type: str = "") -> dict:
-    """Stamp every unreleased entry (version=NULL) with a version AND set the
-    project's current_version to that version.
+def release_changelog(
+    project: str = "",
+    version: str = "",
+    bump_type: str = "",
+    entry_ids: list[int] | None = None,
+    candidate_sha: str = "",
+    checkout_root: str = "",
+    proof: dict | None = None,
+    expected_executor: str = "",
+) -> dict:
+    """Stamp changelog entries with a version, set the project's current_version
+    to it AND write the durable release record — one locked transaction (a
+    stamp never exists without its record, nor a record without its stamp).
 
-    Provide either an explicit version OR a bump_type — explicit version wins.
+    Provide either an explicit version OR a bump_type — explicit version wins
+    (bump_type is then ignored). The bumped version is computed INSIDE the
+    transaction and returned. Each field below is a SEPARATE top-level parameter.
 
     Args:
         project: Slug. Empty = auto-detect from CWD.
-        version: Explicit version like "0.2.0". Takes precedence over bump_type.
+        version: Explicit version like "0.2.0" — X.Y or X.Y.Z; a leading "v"
+            is accepted and normalized away before comparing and storing
+            ("v0.2.0" is stored as "0.2.0"); any other format is refused.
+            Takes precedence over bump_type. Pass it explicitly when RETRYING
+            or RESUMING a release (a retried bump would bump again).
         bump_type: patch / minor / major — bumped from the project's current_version.
+        entry_ids: JSON array of changelog entry ids (e.g. [12, 15]) — NOT a CSV
+            string. Omitted/null (default) = every unreleased entry of the
+            project (mode 'all'); with NOTHING unreleased a NEW version is
+            refused ("No unreleased entries ... must be explicit") — pass []
+            for that (changed: older servers silently set the version).
+            [] = stamp nothing, only set the version (mode 'version_only' —
+            states the intent; a human's consent is still the caller's job).
+            A list = exactly those entries (mode 'selected'); STRICT — an
+            unknown, foreign or deleted id, or one already released in
+            ANOTHER version, fails the whole call. Duplicates are ignored.
+        candidate_sha: The commit the release is cut from (`git rev-parse
+            HEAD` of the release checkout), hex, 7-64 chars, stored
+            lowercased. Empty (default) = not pinned. Recommended for
+            /release: it lets a resumed run prove which commit it was
+            releasing. IMMUTABLE once recorded — nothing re-pins it (the
+            release commit is recorded separately by advance_release).
+        checkout_root: ABSOLUTE path of the checkout the release runs in (its
+            `git rev-parse --show-toplevel`), POSIX or Windows syntax,
+            normalized textually like a changelog worktree (trailing
+            separator dropped; relative → error; never resolved on this
+            server).
+            Empty (default) = not recorded. Recommended for /release: a
+            resume must run in the same checkout. Both are pinned only when
+            the call writes a NEW record; a re-run never re-pins them.
+        proof: Optional proof map for the audit trail — JSON object
+            {"<entry id>": ["<proving commit sha>", ...]} or
+            {"<entry id>": {"commits": [...], "merge_commit": "<sha>" | null,
+            "pr": <int> | null}} — plus, as `dct release plan` emits them,
+            the optional "source" ("own_merge" | "introducing_merge" | null),
+            "ambiguous" (bool; true → merge_commit and pr must be null) and
+            "associations" ([{merge_commit, pr, source, certain}] — at most
+            50, a longer list is an error, never cut; a "subject_suffix"
+            one is never certain). `pr` is
+            the PR linked to the entry — the changelog renders it as `(#N)`
+            when the project's changelog_pr_refs was on at stamp time — never
+            a heuristic `(#N)` subject suffix; every named entry must be in
+            the release set. A `pr` given HERE is YOUR declaration (a client
+            attestation — this server reads no repository and asks no
+            hosting service): it is stored and shown as "pr_source":
+            "client", whatever "pr_source" the map states (also a map copied
+            from `dct release plan`, which marks its own recognitions
+            "git"); only `dct release apply` records "git". "pr_source"
+            with a null `pr`, or a value other than "git" / "client", is an
+            error. Stored in a NEW record only and immutable: a re-run
+            returning an existing record with a DIFFERENT map (origin
+            included) — or with a
+            map when the record has none — is an error, the identical map
+            is the no-op. Entries without a commit proof are simply absent.
+            Null/omitted (default) = none.
+        expected_executor: "dct" | "own" — the release executor the caller's
+            plan was made for (a project's own tool passes "own"). Compared
+            INSIDE the stamp transaction with the project's CURRENT
+            release_executor (the setter takes the same project lock): a
+            mismatch — the setting changed since the plan — is an error
+            BEFORE any write. For a version that already has a record it is
+            compared with that RECORD's executor (immutable). Empty
+            (default) = not bound.
 
-    Side effect: also stamps released_at on every entry it versions, and writes
-    current_version onto the project row. current_version is bumped even when
-    there are zero unreleased entries (released = 0).
+    Release record + re-runs: the call's resolved set is the given ids
+    ('selected'), [] ('version_only') or the entries already carrying the
+    version plus every unreleased entry ('all'). If the version already has
+    a record: the SAME set → whole-operation no-op returning that record
+    (resume an interrupted release — also for a version lower than
+    current_version and for a version-only release; an 'abandoned' record is
+    returned as it is and never resumed) — provided the live entries
+    carrying the version are still EXACTLY the record's set (else an error:
+    the record is never extended); a DIFFERENT set → error ("version V was
+    released with a different set: …"; for an abandoned record the error
+    says so). This tool stamps without a release_mode (the record then
+    needs its release commit to complete), with the project's
+    release_executor and changelog_pr_refs render setting. Without a record
+    (a legacy release): a NEW record must hold EVERY entry already carrying
+    the version — in 'selected' / 'version_only' an omitted legacy entry of
+    that version is refused ("missing from the requested set"), never
+    silently added. When nothing is left to stamp — every selected entry
+    already carries the version ('selected'), current_version already equals
+    it ('version_only'), or nothing is unreleased and the version is the
+    current one or one live entries already carry ('all', a historical
+    retry) — the call is a no-op, writes nothing and returns release=null;
+    after a historical no-op the returned current_version differs from
+    version. Never rewinds: an unrecorded version lower than current_version
+    is refused (1.5 == 1.5.0); a stored current_version outside the version
+    contract (e.g. "2.0.0-rc1") refuses every new stamp — fix it with
+    `dct project set-version`. The version must fit every version column
+    (≤ 50 chars, refused never truncated). Stamping
+    sets version + released_at and creates the record with status 'stamped'
+    — the workflow then moves it forward with advance_release.
 
-    Returns: {"released": <count>, "version": "<version>", "project": "<slug>"}
-        on success (released = number of changelog entries stamped; the project
-        row update is not counted). On failure returns {"error": "..."}, e.g.:
-        neither version nor bump_type given; bump_type set but the project has no
-        current_version to bump from; an invalid bump_type (not patch/minor/major);
-        or the project can't be resolved (empty project + unregistered CWD, or an
-        unknown slug).
+    Who performs the effects (K-85, J4): a record stamped HERE carries no
+    consent and no approved version-file proposal, so `dct release resume`
+    never performs or adopts its effects — the caller's own tool (the
+    project's release_executor "own" is the explicit setting for it)
+    performs and verifies them and reports each with advance_release, or
+    the record is ended with abandon_release. dct's own effects (changelog
+    file, version files, release commit, tag, push) start from `dct release
+    plan` / `prepare` / `apply`, never from this tool. A record stamped
+    here whose release commit already EXISTS can be handed to dct by the
+    owner with the local `dct release takeover --version V` (K-119 M3: its
+    verified artifacts become the consent — no re-stamp; `dct release
+    resume` then performs only the missing effects).
+
+    Returns: {"project", "version" (requested, normalized), "current_version"
+        (after the call), "mode":
+        "all"|"selected"|"version_only", "entry_ids" (the selected ids — in mode
+        'all' the ones stamped), "released" (count newly stamped),
+        "already_released" (selected ids that already had this version),
+        "release" (the record, as get_release returns it — or null for a
+        legacy no-op)} plus "warning" in mode 'all' when the stamped entries span
+        several branches (null branch counted as its own). {"error": "..."}
+        on failure — neither version nor bump_type; bump_type with no
+        current_version; an invalid bump_type; an unsupported version format
+        (requested) or a stored current_version outside the contract; a
+        version too long for its columns; an unrecorded version lower than
+        current_version; mode 'all' with nothing unreleased for a new
+        version; a recorded version with a different set, a contradicting
+        proof, or live entries no longer matching its set; a new record that
+        would omit an entry already carrying the version; a malformed proof
+        or one naming entries outside the set; an invalid entry id; an
+        expected_executor other than the project's current one (or the
+        record's), or an invalid one; a ledger holding several live records
+        of the version (ambiguous — never picked); an
+        invalid candidate_sha; a
+        relative or over-long (> 500) checkout_root; tool-call markup in
+        candidate_sha / checkout_root; or an unresolvable project. Nothing is
+        written on error.
     """
+    if (err := _reject_toolcall_markup(
+        candidate_sha=candidate_sha, checkout_root=checkout_root,
+        expected_executor=expected_executor,
+    )):
+        return err
     from dct.core.changelog import release_entries
-    from dct.core.projects import get_project
-    from dct.core.version import bump
 
     try:
-        engine = _get_engine()
         project_slug = _resolve_project(project, required=True)
         assert project_slug is not None
-        if not version:
-            if not bump_type:
-                return {"error": "Provide version or bump_type (patch/minor/major)"}
-            proj = get_project(engine, project_slug)
-            if not proj or not proj.get("current_version"):
-                return {"error": f"No current version for '{project_slug}'. Provide explicit version."}
-            version = bump(proj["current_version"], bump_type)
+        if not version and not bump_type:
+            return {"error": "Provide version or bump_type (patch/minor/major)"}
+        result = release_entries(
+            _get_engine(), project_slug, version or None,
+            bump_type=None if version else bump_type, entry_ids=entry_ids,
+            candidate_sha=candidate_sha or None, checkout_root=checkout_root or None,
+            proof=proof, expected_executor=expected_executor or None,
+        )
+        return {
+            "project": project_slug, **result,
+            "release": _release_record_json(result["release"]),
+        }
+    except Exception as e:
+        return {"error": str(e)}
 
-        count = release_entries(engine, project_slug, version)
-        return {"released": count, "version": version, "project": project_slug}
+
+def _release_record_json(record: dict | None) -> dict | None:
+    """A core release record with JSON-native values (ISO datetimes)."""
+    if record is None:
+        return None
+    return {k: _serialize_value(v) for k, v in record.items()}
+
+
+@mcp.tool(structured_output=False)
+def get_release(project: str = "", version: str = "") -> dict:
+    """Read a release record — to resume an interrupted release, or to check
+    one before re-running it.
+
+    Every release_changelog that stamps a version writes ONE record (one live
+    record per project + version). Its status follows one state machine:
+    stamped (DB stamped) → files_written (changelog file / version files
+    written) → committed (release commit made) → tagged (tag created) →
+    pushed (commit and tag pushed) → completed; 'abandoned'
+    (abandon_release) is reachable from every unfinished status.
+    'completed' and 'abandoned' are terminal. Read-only.
+
+    Args:
+        project: Slug. Empty = auto-detect from CWD.
+        version: The release to read — X.Y or X.Y.Z, leading "v" accepted,
+            1.5 == 1.5.0 — returned WHATEVER its status (also completed or
+            abandoned). Empty (default) = the MOST RECENT record whose status
+            is not terminal (neither 'completed' nor 'abandoned') — an
+            unfinished release — if any.
+
+    Returns: {"release": {id, version (normalized), mode
+        ("all"|"selected"|"version_only"|"reconstructed" — a record added
+        later for a release made before records existed), entry_ids (the
+        exact stamped set — [] for a version-only release), candidate_sha
+        (the commit the release was cut from — immutable — or null),
+        checkout_root (absolute path or null), release_commit_sha (the
+        verified release commit, or null before 'committed'), manifest
+        (object of the verified artifacts with content hashes, or null),
+        proof (object entry id → {commits, merge_commit, pr[, pr_source
+        ("git" = the release plan recognised the PR in the repository |
+        "client" = a caller declared it; present when pr is set), source,
+        ambiguous, associations]}, or null),
+        status, created_at, updated_at, completed_at, abandoned_at (ISO
+        datetimes or null), abandon_reason (text or null), release_mode
+        ("git" | "without_git" — the verified mode; only "without_git"
+        completes without a release commit — or null = unverified, recorded
+        before the field), executor ("dct" | "own" — who performs the
+        effects, copied from the project's release_executor at stamp time,
+        immutable; null on older records), consent (object — what the owner
+        approved: {version, entry_ids, candidate_sha, proposal_sha256,
+        render, push_target} plus, when recorded, executor and takeover
+        ({release_commit_sha, tree, artifacts_sha256} — the release was
+        handed to dct with `dct release takeover`, from those verified
+        artifacts) — or null), proposal (object — the approved
+        version-file proposal {paths, base_blobs, expected_blobs, script,
+        candidate_sha, version, plan_digest, release_mode, changelog} — or
+        null), render (object — this release's
+        changelog render settings {"pr_refs": bool} — or null), tag_proof
+        (object — the VERIFIED identity of the release tag {name, object
+        (what the tag ref resolves to), commit (the release commit it
+        targets), annotated, recorded_at} — or null = not proven: no tag
+        yet, or a record from before the field), push_proof (object — the
+        VERIFIED push {target: {remote, url, branch, tag}, tag_commit,
+        branch_tip, recorded_at} — or null); a proof describes the state
+        when it was recorded, not a guarantee about later}} or
+        {"release": null} when there is no such record (no record for that
+        version, or no unfinished release). A release made before records
+        existed has no record. On an AMBIGUOUS ledger — several live
+        records of the same version (1.1 and 1.1.0) — the oldest one is
+        returned with the extra key "duplicates" ([{id, version, status}]
+        of all of them); the key is absent otherwise, and every write tool
+        refuses such a version. {"error": "..."} on an unsupported version
+        format or an unresolvable project.
+    """
+    if (err := _reject_toolcall_markup(version=version)):
+        return err
+    from dct.core.releases import get_release as core_get_release
+
+    try:
+        project_slug = _resolve_project(project, required=True)
+        assert project_slug is not None
+        record = core_get_release(_get_engine(), project_slug, version or None)
+        return {"release": _release_record_json(record)}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def _release_ack(project_slug: str, out: dict) -> dict:
+    record = out["release"]
+    return {
+        "project": project_slug,
+        "version": record["version"],
+        "status": record["status"],
+        "updated": out["updated"],
+    }
+
+
+@mcp.tool(structured_output=False)
+def advance_release(
+    version: str,
+    status: str,
+    project: str = "",
+    release_commit_sha: str = "",
+    manifest: dict | None = None,
+    tag_proof: dict | None = None,
+    push_proof: dict | None = None,
+) -> dict:
+    """Record verified progress of a release — move its record FORWARD and/or
+    record the effects the workflow verified. The server never checks files
+    or git: the caller reports what IT verified. This is the ledger path of
+    a project's OWN release tool and of records stamped outside `dct
+    release apply` (release_changelog): a release dct executes — executor
+    "dct" AND a recorded consent (stamped by `dct release apply`, or taken
+    over with `dct release takeover`) — is refused here; `dct release
+    resume` records its progress after verifying each effect (K-85).
+
+    Call it after each release step is DONE and verified (also when a resumed
+    run finds the effect already present): files_written after the changelog
+    file and version files are written, committed after the release commit,
+    tagged after the tag (WITH tag_proof), pushed after the verified push
+    (WITH push_proof), completed at the end. A status alone is never proof:
+    a record with git cannot reach tagged / pushed / completed without the
+    tag proof. Each field below is a SEPARATE top-level parameter.
+
+    Args:
+        version: The release (X.Y or X.Y.Z, leading "v" accepted); it must
+            have a record (written by release_changelog).
+        status: Target status, one of (in order) stamped / files_written /
+            committed / tagged / pushed / completed. Forward jumps of several steps are
+            allowed; the CURRENT status again is an idempotent no-op; a lower
+            one is refused; 'abandoned' is refused here (use
+            abandon_release); a record that is 'completed' or 'abandoned'
+            accepts nothing new. 'completed' stamps completed_at.
+        project: Slug. Empty = auto-detect from CWD.
+        release_commit_sha: The verified release commit (hex, 7-64 chars,
+            stored lowercased) — recorded ONCE, on the move to 'committed'
+            or later (refused below it); the stored value again is accepted,
+            a different one is refused. Every record cannot reach
+            'committed' or later — 'completed' included — without it, unless
+            its release_mode is "without_git" (a NULL candidate_sha does NOT
+            mean no git); a "without_git" record refuses it and the statuses
+            committed / tagged / pushed, and completes only with a manifest.
+            Empty (default) = not passed. The candidate_sha is immutable and
+            not accepted here.
+        manifest: JSON object of the artifacts the caller produced and
+            verified, e.g. {"changelog": {"path", "sha256", "section_date"},
+            "version_files": [{"path", "sha256"}], "tree": "<git tree sha>"}
+            — merged WRITE-ONCE per top-level key: a new key is added, an
+            already recorded key must carry the same value (confirmation), a
+            different value is refused. Keys non-empty strings (≤ 64 chars),
+            no null values; the MERGED manifest ≤ 65536 bytes of canonical
+            JSON (sorted keys, compact, UTF-8). Null/omitted (default) = not
+            passed.
+        tag_proof: JSON object — the identity of the release tag as YOU
+            verified it in the repository: {"name": "<tag name as `git tag`
+            lists it>", "object": "<full sha `git rev-parse
+            refs/tags/<name>` prints>", "commit": "<full sha of `git
+            rev-parse <name>^{commit}`>", "annotated": true|false} — all four
+            required; lightweight → object == commit, annotated → object !=
+            commit. `commit` must be the record's release commit. REQUIRED
+            (now or already recorded) for every move into tagged / pushed /
+            completed unless the record's release_mode is "without_git"
+            (which refuses it). Accepted from 'tagged' on; recorded ONCE
+            (stored with the server's recorded_at) — the same value again
+            is a confirmation, a different one is refused. Null/omitted
+            (default) = not passed.
+        push_proof: JSON object — the push as YOU verified it on the remote:
+            {"target": {"remote": "<name>" (required), "url": "<push url>" |
+            null, "branch": "<branch>" | null, "tag": "<tag name>"
+            (required)}, "tag_commit": "<full sha the remote tag resolves
+            to>" (required), "branch_tip": "<full sha of the remote branch>"
+            | null}. `tag_commit` must be the release commit; when the
+            record carries a consent, `target` must equal its push_target
+            exactly (and a consent that approved no push takes none).
+            REQUIRED for 'pushed'; for 'completed' only when the consent
+            approved a push — a release without a push completes from
+            'tagged'. Accepted from 'pushed' on; recorded ONCE like
+            tag_proof. Null/omitted (default) = not passed.
+
+    Returns: slim ack {project, version (normalized), status (after the call),
+        updated} — `updated` false when nothing changed (idempotent repeat).
+        Fetch the full record with get_release. {"error": "..."} on an
+        unknown status, 'abandoned', a version without a record, a backwards
+        move, a move out of a terminal status, a changed or premature
+        release_commit_sha, 'committed'+ without a release commit (or with
+        one / a git-only status on a "without_git" record), a
+        manifest key recorded with a different value or a malformed
+        manifest, a missing / premature / changed / malformed tag_proof or
+        push_proof (or one that does not match the release commit or the
+        approved push target), a record whose entry set no longer equals
+        the live entries carrying its version (also for a repeat — never
+        extended to fit), a record whose consent / proposal / render /
+        proofs contradict each other, a ledger holding several live records
+        of the version, a record dct executes (executor "dct" with a consent —
+        "… recorded only by `dct release resume` …"), an invalid SHA, an
+        unsupported version format, tool-call markup, or an unresolvable
+        project. Nothing is written on error.
+    """
+    if (err := _reject_toolcall_markup(
+        version=version, status=status, release_commit_sha=release_commit_sha,
+    )):
+        return err
+    from dct.core.releases import advance_release as core_advance_release
+
+    try:
+        project_slug = _resolve_project(project, required=True)
+        assert project_slug is not None
+        out = core_advance_release(
+            _get_engine(), project_slug, version, status,
+            release_commit_sha=release_commit_sha or None, manifest=manifest,
+            tag_proof=tag_proof, push_proof=push_proof, actor="ledger",
+        )
+        return _release_ack(project_slug, out)
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@mcp.tool(structured_output=False)
+def abandon_release(
+    version: str,
+    reason: str,
+    confirm: bool = False,
+    project: str = "",
+) -> dict:
+    """End an unfinished release as 'abandoned' — a terminal status, ledger
+    only (no file, git or version effect). Each field below is a SEPARATE
+    top-level parameter.
+
+    Everything already done STAYS: current_version is not rewound, no entry
+    is unstamped or unlinked, and the record keeps the version: re-running
+    release_changelog for it with the same set returns this abandoned record
+    (no-op), a different set is refused. Release the work again under a NEW
+    version. A 'completed' release is never reclassified as abandoned.
+    Abandoning again with the SAME reason is a no-op (updated false); a
+    DIFFERENT reason is an error — the first reason stays.
+
+    NOT for a release dct's effects layer executes (executor "dct" AND a
+    recorded consent — stamped by `dct release apply`, or taken over with
+    `dct release takeover`): this server does
+    not know the checkout and cannot take that release's operation lock, so
+    an abandon from here could not stop a running `dct release apply` /
+    `resume`. Such a record is REFUSED — abandon it locally, in the
+    project's checkout: `dct release abandon --version V --reason "…"
+    --confirm` (it holds the lock; afterwards resume finds nothing to
+    continue). Records of the ledger path — a project's own release tool,
+    or stamped by release_changelog — are abandoned here.
+
+    Args:
+        version: The release (X.Y or X.Y.Z, leading "v" accepted); it must
+            have a record.
+        reason: Why it is abandoned — REQUIRED, non-empty after stripping,
+            ≤ 2000 chars; stored on the record.
+        confirm: Must be true — the human's explicit confirmation (ask
+            first). Default false = refused.
+        project: Slug. Empty = auto-detect from CWD.
+
+    Returns: slim ack {project, version (normalized), status ('abandoned'),
+        updated} — `updated` false when the record was already abandoned
+        with the same reason (the first reason and time are kept). Fetch the
+        full record with get_release. {"error": "..."} without confirm, with
+        an empty or over-long reason, for an already abandoned record with a
+        different reason, a version without a record, a completed release,
+        a release dct's effects layer executes ("… abandoned only by the
+        local command … `dct release abandon` …"), a ledger holding several
+        live records of the version, an unsupported version format,
+        tool-call markup, or an unresolvable project. Nothing is written
+        on error.
+    """
+    if (err := _reject_toolcall_markup(version=version, reason=reason)):
+        return err
+    from dct.core.releases import abandon_release as core_abandon_release
+
+    try:
+        project_slug = _resolve_project(project, required=True)
+        assert project_slug is not None
+        out = core_abandon_release(
+            _get_engine(), project_slug, version, reason, confirm=confirm,
+            actor="ledger",  # K-119 M6: no operation lock here
+        )
+        return _release_ack(project_slug, out)
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@mcp.tool(structured_output=False)
+def update_changelog(
+    entry_id: int,
+    project: str = "",
+    entry: str = "",
+    category: str = "",
+    component: str = "",
+    source_file: str = "",
+    source_lines: str = "",
+    related_item_id: int = 0,
+    branch: str = "",
+    worktree: str = "",
+) -> dict:
+    """Amend an UNRELEASED changelog entry in place (released entries are history).
+
+    Each field below is a SEPARATE top-level parameter. Only non-empty args are
+    applied; omit a field to leave it unchanged.
+
+    Args:
+        entry_id: The entry to change (id from list_changelog / add_changelog).
+        project: Slug the entry must belong to. Empty = auto-detect from CWD.
+        entry: New changelog line (cannot be blanked; '__clear__' is refused).
+        category: added / changed / fixed / removed.
+        component: New component; '__clear__' = null.
+        source_file: New source path, ≤ 500 chars; '__clear__' = null.
+        source_lines: New line range, ≤ 100 chars; '__clear__' = null.
+        related_item_id: New linked item id — a live item of the SAME project;
+            0 (default) = unchanged, -1 = unlink; any other negative → error.
+        branch: Move the entry to this branch, ≤ 255 chars; '__clear__' = null.
+        worktree: New worktree path — ABSOLUTE, ≤ 500 chars, normalized as on
+            add (relative → error); '__clear__' = null.
+            The branch/worktree you pass are stored with branch_source='client'.
+            A field you omit is kept — EXCEPT on a server-detected entry, whose
+            unconfirmed other field is cleared (pass both to confirm both);
+            both null afterwards → branch_source null.
+
+    Returns: slim ack {id, project, updated_fields} — `updated_fields` lists the
+        applied field names. {"error": "..."} when no field is given, the entry
+        is unknown / another project's / deleted, it is already released, the
+        category is invalid, entry is '__clear__', related_item_id is < -1 or
+        not a live item of the project, a value is too long, the worktree is
+        relative, or a free-text field carries tool-call markup. Nothing is
+        written on error.
+    """
+    if (err := _reject_toolcall_markup(
+        entry=entry, component=component, source_file=source_file,
+        source_lines=source_lines, branch=branch, worktree=worktree,
+    )):
+        return err
+    from dct.core.changelog import update_entry
+
+    if entry == CLEAR:
+        return {"error": "entry cannot be cleared — pass the new changelog line"}
+    if related_item_id < -1:
+        return {"error": (
+            f"Invalid related_item_id {related_item_id}: 0 = unchanged, "
+            f"-1 = unlink, otherwise a positive item id"
+        )}
+    fields: dict = {}
+    if entry:
+        fields["entry"] = entry
+    if category:
+        fields["category"] = category
+    for name, value in (
+        ("component", component), ("source_file", source_file),
+        ("source_lines", source_lines), ("branch", branch), ("worktree", worktree),
+    ):
+        if value:
+            fields[name] = None if value == CLEAR else value
+    if related_item_id:
+        fields["related_item_id"] = None if related_item_id == -1 else related_item_id
+
+    try:
+        project_slug = _resolve_project(project, required=True)
+        assert project_slug is not None
+        row = update_entry(_get_engine(), project_slug, entry_id, **fields)
+        return {"id": row["id"], "project": project_slug, "updated_fields": list(fields)}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@mcp.tool(structured_output=False)
+def delete_changelog(entry_id: int, project: str = "") -> dict:
+    """Soft-delete an UNRELEASED changelog entry (the row stays as ledger history).
+
+    Args:
+        entry_id: The entry to delete.
+        project: Slug the entry must belong to. Empty = auto-detect from CWD.
+
+    Returns: {"deleted": true, "id": <entry_id>} on success; {"error": "..."}
+        when the entry is unknown / another project's / already deleted, or
+        already released (released entries are history), or the project cannot
+        be resolved.
+    """
+    from dct.core.changelog import delete_entry
+
+    try:
+        project_slug = _resolve_project(project, required=True)
+        assert project_slug is not None
+        delete_entry(_get_engine(), project_slug, entry_id)
+        return {"deleted": True, "id": entry_id}
     except Exception as e:
         return {"error": str(e)}
 
@@ -1089,7 +1761,11 @@ def export_changelog(project: str = "", include_unreleased: bool = True, version
             top. Ignored when `version` is set (single-version render never
             includes Unreleased).
         version: When non-empty, render only that version's `## [version]`
-            section, headerless, for the append-only prepend flow.
+            section, headerless, for the append-only prepend flow. Matched
+            semantically (1.1 == 1.1.0 == v1.1): every entry of an equal
+            version lands in ONE section, headed by the release record's
+            version (else the stored spelling of a legacy release) — the
+            same grouping as the full export.
 
     Returns: markdown str on success, {"error": "..."} dict on failure —
         aligned with every other MCP tool in this server. Callers should
@@ -1193,7 +1869,9 @@ def review_sprint(project: str = "", since: str = "last_release") -> dict:
         unconsumed_handoffs, summary. in_sprint / stale_in_progress /
         unconsumed_handoffs are {cols, rows} tables; recent_activity is a dict
         {items_changed: {cols,rows}, checkpoints_completed: int,
-        changelog_added: int}; summary is a scalar dict. NOTE the two sprint
+        changelog_added: int}; summary is a scalar dict. Every item table
+        (in_sprint, items_changed, stale_in_progress) carries a `short_title`
+        column (the item's label, may be null) before `title`. NOTE the two sprint
         numbers measure different sets: `in_sprint` lists only the OPEN members
         (current work) while `summary.sprint_size` / `sprint_completion` count
         ALL members including terminal ones (resolved work stays linked as the
@@ -1230,16 +1908,18 @@ def create_handoff(
 
     Args:
         prompt: Free-form "for next session: ..." text. Must be non-empty.
-        created_by: REQUIRED, non-empty — self-identify (e.g.
+        created_by: REQUIRED, non-empty, ≤ 200 chars — self-identify (e.g.
             "claude-opus-4-7 @ 2026-04-17T14:30Z").
         project: Empty = auto-detect from CWD.
-        scope: Optional tag like "sprint-v0.2" or "refactor-auth".
+        scope: Optional tag like "sprint-v0.2" or "refactor-auth" (≤ 100 chars).
         context_summary: Optional snapshot of state at handoff time.
+
+    Over-long created_by/scope is refused, never truncated.
 
     Returns: slim ack {id, project, scope, created_at} — `project` is the
         resolved slug, `scope` may be null. NO prompt/context_summary echo.
         Error cases: {"error": "..."} when prompt is empty, created_by is empty,
-        or project slug does not resolve.
+        created_by/scope exceeds its limit, or project slug does not resolve.
     """
     if (err := _reject_toolcall_markup(prompt=prompt, context_summary=context_summary)):
         return err
@@ -1287,7 +1967,7 @@ def list_handoffs(
         project_slug = _resolve_project(project, required=False)
         rows = _list(_get_engine(), project_slug, unconsumed_only=unconsumed_only)
         for r in rows:
-            r["prompt"] = _preview(r.get("prompt"))
+            r["prompt"] = preview(r.get("prompt"))
         return _format_list(rows, HANDOFF_COLS, format)
     except Exception as e:
         return {"error": str(e)}
@@ -1321,12 +2001,13 @@ def consume_handoff(handoff_id: int, consumed_by: str = "") -> dict:
 
     Args:
         handoff_id: id returned by create_handoff / list_handoffs.
-        consumed_by: optional — self-identify the consuming session (mirrors
-            create_handoff's `created_by` format).
+        consumed_by: optional, ≤ 200 chars (refused, never truncated) —
+            self-identify the consuming session (mirrors create_handoff's
+            `created_by` format).
 
     Returns: slim ack {id, consumed_at} — the consumed timestamp only. NO
         prompt echo. {"error": "..."} if the handoff is missing / already
-        consumed.
+        consumed, or consumed_by exceeds 200 chars (nothing is written).
     """
     from dct.core.handoff import consume_handoff as _consume
     try:
@@ -1375,13 +2056,15 @@ def update_handoff(
     Args:
         handoff_id: id returned by create_handoff / list_handoffs.
         prompt: New prompt text (omit/empty = unchanged; cannot be blanked).
-        scope: New scope tag (omit/empty = unchanged).
+        scope: New scope tag, ≤ 100 chars — refused, never truncated
+            (omit/empty = unchanged).
         context_summary: New context snapshot (omit/empty = unchanged).
 
     Returns: slim ack {id, updated_fields} — `updated_fields` lists the applied
         field names (subset of prompt / scope / context_summary). NO prompt
         echo. {"error": "..."} if the handoff is missing / consumed / deleted,
-        or if no field was supplied.
+        if no field was supplied, or scope exceeds 100 chars (nothing is
+        written).
     """
     if (err := _reject_toolcall_markup(prompt=prompt, context_summary=context_summary)):
         return err
@@ -1447,7 +2130,11 @@ def get_context_snapshot(
         stale_in_progress}, handoff {latest (FULL prompt), others (200-char
         previews), pending_count}, gates / decisions ({cols,rows}),
         recent_changes {items_changed, checkpoints_completed, changelog_added}.
-        COUNTING: an item in TWO active sprints counts once per sprint in
+        LABELS: rows that ARE an item (sprint.items, sprint.stale_in_progress,
+        recent_changes.items_changed) carry `short_title` (may be null); rows
+        that REFERENCE an item (gates, sprint.checkpoints) carry
+        `item_short_title` = the item's short_title, else its title compacted
+        to 50 chars (never null for a titled item). COUNTING: an item in TWO active sprints counts once per sprint in
         active_sprints[].size/done, but only ONCE (DISTINCT) in
         summary.sprint_size — the per-sprint sizes are not expected to sum to
         it. CAPS: sprint.items (100), sprint.checkpoints (500),
@@ -1500,14 +2187,17 @@ def pickup_work(
             consume. 'false' = pure read (contradictory with handoff_id).
         consumed_by: REQUIRED whenever consumption is possible (consume ''
             or 'true') — self-identify like create_handoff's created_by
-            ("claude-opus-4-7 @ 2026-04-17T14:30Z"). Empty errors.
+            ("claude-opus-4-7 @ 2026-04-17T14:30Z"). Validated whenever
+            consumption is POSSIBLE, even when nothing ends up consumed (0 or
+            several candidates): empty errors, > 200 chars is refused (never
+            truncated).
         handoff_id: Consume this exact handoff (0 = none given). WINS over
             scope, which is then ignored EVERYWHERE — candidate selection AND
             the returned handoff.latest. An id from another project reads as
             "not found or already consumed" — no cross-project consume.
-        scope: Narrow candidates to one workstream tag (empty = any); also makes
-            the returned handoff section scope-coherent and adds
-            handoff.scope_matched.
+        scope: Narrow candidates to one workstream tag (empty = any; stored
+            tags are ≤ 100 chars); also makes the returned handoff section
+            scope-coherent and adds handoff.scope_matched.
         since: recent_changes anchor — same vocabulary as get_context_snapshot.
         include: Comma-separated sections to keep; empty = all; 'none' = none.
 
@@ -1520,7 +2210,9 @@ def pickup_work(
         handoffs of that scope remain AFTER the write, so 0 ("nothing for this
         workstream") is distinguishable from "several pending, pick one"; the
         key is absent when no scope was given. {"error": "..."} on an invalid consume token (nothing
-        is read or written), empty consumed_by while consumption is possible,
+        is read or written), an empty or > 200-char consumed_by while
+        consumption is possible (consume '' or 'true' — nothing is read or
+        written),
         handoff_id with consume='false', an unknown/already-consumed handoff_id,
         consume='true' with no candidate, an unknown section, or an unresolvable
         project.
@@ -1587,7 +2279,7 @@ def handoff_work(
 
     Args:
         prompt: Free-form "for next session: ..." text (required, non-empty).
-        created_by: REQUIRED, non-empty — self-identify (e.g.
+        created_by: REQUIRED, non-empty, ≤ 200 chars — self-identify (e.g.
             "claude-opus-4-7 @ 2026-04-17T14:30Z").
         item_ids: REPLACE mode. '__keep__' (DEFAULT) = do NOT touch the sprint;
             '22,21,6' = replace the sprint's OPEN membership with exactly those
@@ -1607,8 +2299,12 @@ def handoff_work(
             no-op). Empty = the only active sprint, or auto-created when none
             is active (replace/add paths); several active and no selector →
             error listing the candidates.
-        scope: Optional workstream tag ("sprint-v0.2") — pickup_work filters on it.
+        scope: Optional workstream tag ("sprint-v0.2", ≤ 100 chars) —
+            pickup_work filters on it.
         context_summary: Optional state snapshot stored next to the prompt.
+
+    Over-long created_by/scope is refused, never truncated, and rolls the
+    membership writes back.
 
     Returns: slim ack {handoff_id, project, scope, created_at, sprint} — `sprint`
         is {sprint_id, code, open_size, items} (OPEN membership after the
@@ -1616,7 +2312,8 @@ def handoff_work(
         history instead) or
         null (null ⇔ no membership change requested). NO prompt /
         context_summary echo (fetch with get_handoff). {"error": "..."} on
-        empty prompt or created_by, malformed/empty id lists, replace combined
+        empty prompt or created_by, created_by/scope over its limit,
+        malformed/empty id lists, replace combined
         with add/remove, unknown/foreign item ids, removing a terminal member,
         an ambiguous or non-active sprint selector, a selector without a
         membership change, literal tool-call markup in a free-text field, or
@@ -1863,12 +2560,21 @@ def reject_plan_checkpoint(checkpoint_id: int) -> dict:
     return {"id": row["id"], "plan_section_id": row["plan_section_id"], "status": row["status"], "sort_order": row["sort_order"]}
 
 
+def _promote_ack(d: dict) -> dict:
+    """Slim ack shared by both promote-to-item tools (K-47)."""
+    return {
+        "id": d["id"], "item_type": d["item_type"], "priority": d["priority"],
+        "status": d["status"], "title": d["title"], "short_title": d["short_title"],
+    }
+
+
 @mcp.tool(structured_output=False)
 def promote_section_to_item(
     section_id: int,
     item_type: str,
     priority: str = "P2",
     title: str = "",
+    short_title: str = "",
 ) -> dict:
     """Convert a plan_section into a standalone items row with back-link.
 
@@ -1881,18 +2587,30 @@ def promote_section_to_item(
         item_type: issue | todo | feature | idea | improvement (required).
         priority: P1 | P2 | P3 | future (default P2).
         title: Override item title. Empty → use the section heading.
+        short_title: 2-4 word English noun phrase naming what the item is
+            about (e.g. 'Windows hook paths'); ≤ 50 chars, refused not
+            truncated; always pass it. Surrounding whitespace is stripped;
+            empty = no label.
 
-    Returns: slim ack {id, item_type, priority, status, title} (the new item) —
-        NOT the full item dict (no description echo). {"error": "..."} on failure.
+    Returns: slim ack {id, item_type, priority, status, title, short_title}
+        (the new item) — `short_title` echoes the STORED label (null when none);
+        a missing key means the server predates the field and ignored it (an
+        unsupported contract — do not retry the promotion, it would create a
+        second item). NOT the full item dict (no description echo).
+        {"error": "..."} on failure — tool-call markup in title/short_title, an
+        over-long field, an invalid enum, an unknown source; no item and no
+        back-link are written then.
     """
+    if (err := _reject_toolcall_markup(title=title, short_title=short_title)):
+        return err
     from dct.core.plans.crud import promote_section_to_item as _promote
     try:
         d = _promote(
             _get_engine(), section_id,
             item_type=item_type, priority=priority,
-            title=title or None,
+            title=title or None, short_title=short_title or None,
         )
-        return {"id": d["id"], "item_type": d["item_type"], "priority": d["priority"], "status": d["status"], "title": d["title"]}
+        return _promote_ack(d)
     except Exception as e:
         return {"error": str(e)}
 
@@ -1903,6 +2621,7 @@ def promote_checkpoint_to_item(
     item_type: str,
     priority: str = "P2",
     title: str = "",
+    short_title: str = "",
 ) -> dict:
     """Convert a plan_checkpoint into a standalone items row with back-link.
 
@@ -1915,18 +2634,30 @@ def promote_checkpoint_to_item(
         priority: P1 | P2 | P3 | future (default P2).
         title: Override item title. Empty → use the checkpoint text
             (truncated to 500 chars).
+        short_title: 2-4 word English noun phrase naming what the item is
+            about (e.g. 'Windows hook paths'); ≤ 50 chars, refused not
+            truncated; always pass it. Surrounding whitespace is stripped;
+            empty = no label.
 
-    Returns: slim ack {id, item_type, priority, status, title} (the new item) —
-        NOT the full item dict (no description echo). {"error": "..."} on failure.
+    Returns: slim ack {id, item_type, priority, status, title, short_title}
+        (the new item) — `short_title` echoes the STORED label (null when none);
+        a missing key means the server predates the field and ignored it (an
+        unsupported contract — do not retry the promotion, it would create a
+        second item). NOT the full item dict (no description echo).
+        {"error": "..."} on failure — tool-call markup in title/short_title, an
+        over-long field, an invalid enum, an unknown source; no item and no
+        back-link are written then.
     """
+    if (err := _reject_toolcall_markup(title=title, short_title=short_title)):
+        return err
     from dct.core.plans.crud import promote_checkpoint_to_item as _promote
     try:
         d = _promote(
             _get_engine(), checkpoint_id,
             item_type=item_type, priority=priority,
-            title=title or None,
+            title=title or None, short_title=short_title or None,
         )
-        return {"id": d["id"], "item_type": d["item_type"], "priority": d["priority"], "status": d["status"], "title": d["title"]}
+        return _promote_ack(d)
     except Exception as e:
         return {"error": str(e)}
 
@@ -2156,14 +2887,14 @@ def list_items_in_sprint(sprint_id: int, include_removed: bool = False, format: 
         include_removed: False (default) -> only active members; True also
             includes soft-removed links (the sprint's historical membership).
         format: 'structured' (default) -> {cols, rows} with cols = [id,
-            item_type, priority, status, title]; 'dict' -> list of full item
-            dicts.
+            item_type, priority, status, short_title, title] (short_title may
+            be null); 'dict' -> list of full item dicts.
     """
     from dct.core.sprints import list_items_in_sprint as _list
     rows = _list(_get_engine(), sprint_id=sprint_id, include_removed=include_removed)
     if format == "dict":
         return rows
-    cols = ["id", "item_type", "priority", "status", "title"]
+    cols = ["id", "item_type", "priority", "status", "short_title", "title"]
     return {"cols": cols, "rows": [[r[c] for c in cols] for r in rows]}
 
 

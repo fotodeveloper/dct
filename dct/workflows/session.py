@@ -43,6 +43,7 @@ from dct.core.checkpoints import (
 )
 from dct.core.decisions import _query_recent_decisions
 from dct.core.handoff import _query_unconsumed_handoffs
+from dct.core.limits import ensure_fits
 from dct.core.sprint import (
     _json_safe,
     _parse_since_conn,
@@ -53,7 +54,13 @@ from dct.core.sprint import (
     _query_total_open,
     _to_cols_rows,
 )
-from dct.db import project_transaction
+from dct.core.text import PREVIEW_CHARS, preview  # noqa: F401 — re-exported (K-35)
+from dct.db import (
+    SerializationConflict,
+    is_serialization_failure,
+    project_transaction,
+    session_handoffs,
+)
 
 SNAPSHOT_SECTIONS = ("sprint", "handoff", "gates", "decisions", "recent_changes")
 
@@ -67,23 +74,6 @@ SNAPSHOT_CAPS = {
     "handoff_others": 20,
     "stale_in_progress": 50,
 }
-
-PREVIEW_CHARS = 200
-
-
-def _preview(text: str | None, limit: int = PREVIEW_CHARS) -> str | None:
-    """Compact free text to at most `limit` chars, ELLIPSIS INCLUDED.
-
-    The documented "200-char preview" is a hard ceiling: a string of exactly
-    `limit` chars comes back untouched (no marker), a longer one becomes
-    `limit - 1` chars plus '…' — so len(result) <= limit always. Non-str input
-    (None) passes through. Single implementation, shared by the snapshot
-    (handoff.others, decision summaries) and the MCP list views (K-35).
-    """
-    if not isinstance(text, str):
-        return text
-    return text if len(text) <= limit else text[: limit - 1] + "…"
-
 
 def parse_sections(include: str | list[str] | None) -> list[str] | None:
     """Normalize an `include` argument from ANY surface into the list form the
@@ -138,7 +128,7 @@ def _handoff_brief(row: dict) -> dict:
         "scope": row.get("scope"),
         "created_by": row.get("created_by"),
         "created_at": row.get("created_at"),
-        "prompt": _preview(row.get("prompt")),
+        "prompt": preview(row.get("prompt")),
     }
 
 
@@ -203,17 +193,17 @@ def _build_snapshot(
             ],
             "items": _to_cols_rows(
                 _query_sprint_items_with_cp(conn, project_id),
-                ["id", "sprint_id", "priority", "status", "cp", "title"],
+                ["id", "sprint_id", "priority", "status", "cp", "short_title", "title"],
                 cap=SNAPSHOT_CAPS["sprint_items"],
             ),
             "checkpoints": _to_cols_rows(
                 _query_sprint_item_checkpoints(conn, project_id),
-                ["item_id", "id", "status", "kind", "sort_order", "text"],
+                ["item_id", "id", "status", "kind", "sort_order", "item_short_title", "text"],
                 cap=SNAPSHOT_CAPS["sprint_checkpoints"],
             ),
             "stale_in_progress": _to_cols_rows(
                 stale,
-                ["id", "updated_at", "title"],
+                ["id", "updated_at", "short_title", "title"],
                 cap=SNAPSHOT_CAPS["stale_in_progress"],
             ),
         }
@@ -241,7 +231,7 @@ def _build_snapshot(
     if "gates" in sections:
         snap["gates"] = _to_cols_rows(
             gates,
-            ["item_id", "checkpoint_id", "kind", "priority", "item_title", "text"],
+            ["item_id", "checkpoint_id", "kind", "priority", "item_short_title", "item_title", "text"],
             cap=SNAPSHOT_CAPS["gates"],
         )
 
@@ -256,7 +246,7 @@ def _build_snapshot(
                     "ref_code": d.get("ref_code"),
                     "created_at": d.get("created_at"),
                     "title": d.get("title"),
-                    "decision_preview": _preview(d.get("decision")),
+                    "decision_preview": preview(d.get("decision")),
                 }
                 for d in decisions
             ],
@@ -269,7 +259,7 @@ def _build_snapshot(
         )
         snap["recent_changes"] = {
             "items_changed": _to_cols_rows(
-                changed_rows, ["id", "status", "updated_at", "title"]
+                changed_rows, ["id", "status", "updated_at", "short_title", "title"]
             ),
             "checkpoints_completed": checkpoints_done,
             "changelog_added": changelog_added,
@@ -361,7 +351,8 @@ def pickup_work(
     transaction; the whole return is json.dumps-able (K-36).
 
     A PostgreSQL serialization conflict with a standalone consumer rolls back
-    the attempt. A server-selected target then degrades to ONE fresh pure read
+    the attempt (recognised by db.is_serialization_failure — the driver's
+    SQLSTATE 40001 and project_transaction's SerializationConflict alike). A server-selected target then degrades to ONE fresh pure read
     (never consumes a different handoff); an explicit id keeps its not-found
     error. Other database errors propagate unchanged.
     """
@@ -370,9 +361,8 @@ def pickup_work(
             engine, project_slug, consume=consume, handoff_id=handoff_id,
             scope=scope, consumed_by=consumed_by, since=since, include=include,
         )
-    except sa.exc.DBAPIError as exc:
-        state = getattr(exc.orig, "sqlstate", None) or getattr(exc.orig, "pgcode", None)
-        if state != "40001" or consume is False:
+    except (sa.exc.DBAPIError, SerializationConflict) as exc:
+        if not is_serialization_failure(exc) or consume is False:
             raise
         if handoff_id is not None:
             raise ValueError(_HANDOFF_NOT_FOUND.format(id=handoff_id)) from exc
@@ -408,6 +398,10 @@ def _pickup_work_once(
             "(consume auto/true) — identify the session (model + timestamp), "
             "or pass consume=false for a pure read."
         )
+    if may_consume:
+        # The limit is part of the argument contract, not of the consume path:
+        # refuse it even when 0 or several candidates mean nothing is consumed.
+        ensure_fits(session_handoffs, {"consumed_by": consumed_by})
 
     sections = _resolve_sections(include)
     with project_transaction(engine, project_slug, write=may_consume) as (conn, project_id):

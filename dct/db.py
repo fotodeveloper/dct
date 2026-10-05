@@ -6,6 +6,7 @@ Uses Core (not ORM) for portability between PostgreSQL and SQLite.
 
 import contextlib
 import json
+import re
 import sys
 import time
 from collections import Counter
@@ -33,6 +34,7 @@ PROVENANCE_TABLES = (
     "decisions",
     "plans",
     "tags",
+    "releases",
 )
 
 
@@ -70,6 +72,29 @@ projects = sa.Table(
     # /release resolves {path}/{changelog_path}. Constrained to the project root
     # by set_changelog_path (leading '/' stripped, '..' escape rejected).
     sa.Column("changelog_path", sa.String(500), nullable=False, server_default="changelog.md"),
+    # K-73: the project's version-file contract — JSON array of repo-relative
+    # paths the release's version sync must change (NULL = not learned yet,
+    # [] = learned: none). Set only with explicit confirmation
+    # (core/releases.set_version_files); every replaced contract is appended
+    # to version_files_history (JSON array of {version_files, confirmed_at,
+    # replaced_at}) — the ledger of earlier contracts.
+    sa.Column("version_files", sa.Text),
+    sa.Column("version_files_confirmed_at", sa.DateTime),
+    sa.Column("version_files_history", sa.Text),
+    # K-85: who performs a release's effects — 'dct' (the effects layer,
+    # default) or 'own' (the project's own release tool). Copied onto each
+    # release record at stamp time (releases.executor); changing it never
+    # takes over an unfinished release. `dct project release-executor`.
+    sa.Column("release_executor", sa.String(8), nullable=False, server_default="dct"),
+    # K-90: render `(#N)` PR references in the changelog (opt-in, default
+    # off); persisted per release in releases.render at stamp time.
+    sa.Column("changelog_pr_refs", sa.Boolean, nullable=False, server_default=sa.false()),
+    # K-76: the project's PENDING version-file proposal — canonical JSON of
+    # core.releases.validate_proposal, written by `dct release prepare`
+    # (set_pending_proposal; a new prepare replaces it), consumed and cleared
+    # by the stamp that approves it (release_entries consume_proposal) — it
+    # then lives on as releases.proposal. NULL = nothing prepared.
+    sa.Column("release_proposal", sa.Text),
     sa.Column("created_at", sa.DateTime, nullable=False, server_default=sa.text("CURRENT_TIMESTAMP")),
     sa.Column("updated_at", sa.DateTime, nullable=False, server_default=sa.text("CURRENT_TIMESTAMP")),
     sa.Column("deleted_at", sa.DateTime),
@@ -82,6 +107,10 @@ items = sa.Table(
     sa.Column("project_id", sa.Integer, sa.ForeignKey("projects.id"), nullable=False),
     sa.Column("item_type", sa.String(20), nullable=False),
     sa.Column("title", sa.String(500), nullable=False),
+    # #817: 2-4 word label shown next to the item number wherever an item is
+    # listed or referenced. Nullable — rows that reference an item fall back
+    # to a compacted title (dct.core.text.item_label).
+    sa.Column("short_title", sa.String(50)),
     sa.Column("description", sa.Text),
     sa.Column("priority", sa.String(10), nullable=False, server_default="P2"),
     sa.Column("status", sa.String(20), nullable=False, server_default="open"),
@@ -149,6 +178,15 @@ changelog_entries = sa.Table(
     sa.Column("source_file", sa.String(500)),
     sa.Column("source_lines", sa.String(100)),
     sa.Column("related_item_id", sa.Integer, sa.ForeignKey("items.id")),
+    # #801: the branch / worktree the entry was written on, so a release can
+    # tell entries of other branches apart. `branch_source` records who
+    # supplied them: 'client' (the caller passed them, or the CLI detected
+    # them in the caller's directory) or 'server' (the MCP server detected
+    # them in its own cwd). All nullable — NULL = unknown (not a repo,
+    # detached HEAD for `branch`, or a pre-#801 row).
+    sa.Column("branch", sa.String(255)),
+    sa.Column("worktree", sa.String(500)),
+    sa.Column("branch_source", sa.String(16)),
     sa.Column("created_at", sa.DateTime, nullable=False, server_default=sa.text("CURRENT_TIMESTAMP")),
     sa.Column("updated_at", sa.DateTime, nullable=False, server_default=sa.text("CURRENT_TIMESTAMP")),
     sa.Column("released_at", sa.DateTime),
@@ -314,6 +352,55 @@ decisions = sa.Table(
 )
 
 
+# ── K-41: durable release records ─────────────────────────────────────────────
+# One row per release of a project version, written in the SAME transaction as
+# the changelog stamp (core/changelog.release_entries) and advanced
+# forward-only by the release workflow (core/releases.advance_release):
+# stamped → files_written → committed → tagged → completed, or ended by an
+# explicit abandon_release (status 'abandoned', K-60) — the state machine lives
+# in core/releases.TRANSITIONS. `entry_ids` is the JSON array of the release's
+# exact entry set ([] for a version-only release). K-61: `candidate_sha` is
+# immutable once written; `release_commit_sha` is set once. `manifest` (JSON
+# object: the expected artifacts and their content hashes) and `proof` (JSON
+# object: entry id → proving commits) are write-once per key.
+# K-94 B1 / K-85 / K-97 / K-76 / K-90: `release_mode` (git | without_git, the
+# verified mode), `executor` (dct | own, copied from the project at stamp
+# time), `consent` / `proposal` / `render` (JSON objects) — immutable once
+# written; field contracts in core/releases.py and docs/release-workflow.md.
+releases = sa.Table(
+    "releases",
+    metadata,
+    sa.Column("id", sa.Integer, primary_key=True, autoincrement=True),
+    sa.Column("project_id", sa.Integer, sa.ForeignKey("projects.id"), nullable=False),
+    sa.Column("version", sa.String(50), nullable=False),  # normalized (core/version.py)
+    sa.Column("mode", sa.String(16), nullable=False),  # all|selected|version_only
+    sa.Column("entry_ids", sa.Text, nullable=False),  # JSON array of ints
+    sa.Column("candidate_sha", sa.String(64)),
+    sa.Column("checkout_root", sa.String(500)),  # normalize_worktree
+    sa.Column("release_commit_sha", sa.String(64)),
+    sa.Column("manifest", sa.Text),  # JSON object, NULL = no effect recorded yet
+    sa.Column("proof", sa.Text),  # JSON {entry id: {commits, merge_commit, pr[, source, ambiguous, associations]}}
+    sa.Column("status", sa.String(16), nullable=False),
+    sa.Column("created_at", sa.DateTime, nullable=False, server_default=sa.text("CURRENT_TIMESTAMP")),
+    sa.Column("updated_at", sa.DateTime, nullable=False, server_default=sa.text("CURRENT_TIMESTAMP")),
+    sa.Column("completed_at", sa.DateTime),
+    sa.Column("abandoned_at", sa.DateTime),
+    sa.Column("abandon_reason", sa.Text),
+    sa.Column("release_mode", sa.String(16)),  # git | without_git; NULL = unverified (legacy)
+    sa.Column("executor", sa.String(8)),  # dct | own; NULL = recorded before the field
+    sa.Column("consent", sa.Text),  # JSON object: what the owner approved
+    sa.Column("proposal", sa.Text),  # JSON object: the approved version-file proposal
+    sa.Column("render", sa.Text),  # JSON object: changelog render settings
+    # K-115 G4: the VERIFIED tag identity {name, object, commit, annotated,
+    # recorded_at} and push {target, tag_commit, branch_tip, recorded_at} —
+    # write-once; NULL = not proven (older record / no tag or push yet).
+    sa.Column("tag_proof", sa.Text),
+    sa.Column("push_proof", sa.Text),
+    sa.Column("deleted_at", sa.DateTime),
+    *_provenance_columns(),
+)
+
+
 sa.Index(
     "ix_projects_slug_active",
     projects.c.slug,
@@ -410,6 +497,18 @@ sa.Index(
     postgresql_where=item_tags.c.removed_at.is_(None),
 )
 
+# K-41: at most one LIVE release record per (project, version). Core also
+# enforces it under the project write lock (comparing under the version
+# contract, so 1.5 and 1.5.0 collide there too); this index is the last guard.
+sa.Index(
+    "ix_releases_project_version_live",
+    releases.c.project_id,
+    releases.c.version,
+    unique=True,
+    sqlite_where=releases.c.deleted_at.is_(None),
+    postgresql_where=releases.c.deleted_at.is_(None),
+)
+
 
 def _set_sqlite_wal(dbapi_connection, _connection_record):
     cursor = dbapi_connection.cursor()
@@ -428,12 +527,11 @@ def ensure_sqlite_dir(database_url: str) -> None:
     file with a raw OperationalError instead of creating it (#360). No-op for
     non-sqlite dialects and for memory URLs ('sqlite://', 'sqlite:///:memory:').
     """
-    url = sa.engine.make_url(database_url)
-    if url.get_backend_name() != "sqlite":
-        return
-    if not url.database or url.database == ":memory:":
-        return
-    Path(url.database).parent.mkdir(parents=True, exist_ok=True)
+    from dct.paths import sqlite_database_path
+
+    database = sqlite_database_path(database_url)  # the ONE parser (K-99)
+    if database is not None:
+        Path(database).parent.mkdir(parents=True, exist_ok=True)
 
 
 def get_engine(database_url: str) -> sa.Engine:
@@ -455,6 +553,130 @@ def get_engine(database_url: str) -> sa.Engine:
     return engine
 
 
+# ── K-84: the read-only engine path ──────────────────────────────────────────
+# Read-only commands (release plan / status, clog candidates, the reconstruct
+# preview) must not change the database in any way: get_engine() + the
+# bootstrap would create the file and its directory, every table and index,
+# run migrations and switch SQLite to WAL. They use get_readonly_engine() +
+# check_schema_ready() instead and refuse a missing or older schema with a
+# message naming the explicit upgrade.
+
+UPGRADE_COMMAND = "dct db upgrade"
+
+
+class SchemaNotReady(RuntimeError):
+    """The database a read-only command opened is missing or has an older
+    schema — the read-only path never creates or upgrades it."""
+
+
+def _sqlite_readonly_pragmas(dbapi_connection, _connection_record):
+    cursor = dbapi_connection.cursor()
+    # query_only: a second guard behind mode=ro. No journal_mode here — a
+    # read-only connection never changes the database's journal mode.
+    cursor.execute("PRAGMA query_only=ON")
+    cursor.close()
+
+
+def get_readonly_engine(database_url: str) -> sa.Engine:
+    """An Engine that cannot change the database (K-84).
+
+    - SQLite file: the file must exist (SchemaNotReady otherwise — nothing is
+      created, not even the parent directory); it is opened through a URI
+      with `mode=ro` (the path percent-encoded, so `?`/`#` in a name stay
+      part of the path) plus `PRAGMA query_only`, and no connect hook sets
+      the journal mode. On a database already in WAL mode SQLite itself may
+      create its `-wal`/`-shm` sidecar files, as for any reader; the database
+      file is never written.
+    - SQLite in-memory: SchemaNotReady (an in-memory database has no schema).
+    - PostgreSQL: every session starts with `default_transaction_read_only =
+      on` (libpq `options`), so every transaction is READ ONLY — a write
+      fails with "cannot execute ... in a read-only transaction".
+
+    No DDL runs; pair it with check_schema_ready before reading.
+    """
+    from dct.paths import sqlite_database_path
+
+    url = sa.engine.make_url(database_url)
+    if url.get_backend_name() == "sqlite":
+        # K-99: the path the NORMAL engine opens for this URL (one parser).
+        database = sqlite_database_path(database_url)
+        if database is None:
+            raise SchemaNotReady(
+                "an in-memory SQLite database has no schema — a read-only command "
+                "needs an existing database file"
+            )
+        path = Path(database).expanduser().absolute()
+        if not path.is_file():
+            raise SchemaNotReady(
+                f"the database {path} does not exist — this read-only command never "
+                f"creates it; run `{UPGRADE_COMMAND}` to create the schema first"
+            )
+        from urllib.parse import quote
+
+        target = f"file:{quote(str(path))}?mode=ro"
+
+        def _connect():
+            import sqlite3
+
+            return sqlite3.connect(target, uri=True, check_same_thread=False)
+
+        engine = sa.create_engine("sqlite://", creator=_connect, poolclass=sa.pool.NullPool)
+        event.listen(engine, "connect", _sqlite_readonly_pragmas)
+        return engine
+    options = url.query.get("options")
+    flag = "-c default_transaction_read_only=on"
+    if isinstance(options, tuple):
+        options = " ".join(options)
+    url = url.update_query_dict({"options": f"{options} {flag}" if options else flag})
+    return sa.create_engine(url)
+
+
+def check_schema_ready(engine: sa.Engine) -> None:
+    """Refuse (SchemaNotReady) unless every table of the current metadata
+    exists with every column — the schema the read paths SELECT from.
+    Indexes are not required for reading. Pure catalog reads (inspector)."""
+    inspector = sa.inspect(engine)
+    present = set(inspector.get_table_names())
+    missing: list[str] = []
+    for table in metadata.sorted_tables:
+        if table.name not in present:
+            missing.append(f"{table.name} (table)")
+            continue
+        columns = {c["name"] for c in inspector.get_columns(table.name)}
+        missing.extend(
+            f"{table.name}.{column.name}" for column in table.columns
+            if column.name not in columns
+        )
+    if missing:
+        raise SchemaNotReady(
+            f"the database schema is older than this dct (missing: "
+            f"{', '.join(missing)}) — this read-only command never migrates it; "
+            f"run `{UPGRADE_COMMAND}` to upgrade the schema first"
+        )
+
+
+class SerializationConflict(RuntimeError):
+    """A project transaction lost a serialization race (SQLSTATE 40001) and
+    was rolled back — nothing written; the caller may re-run it."""
+
+
+def is_serialization_failure(exc: BaseException) -> bool:
+    """The ONE detector of a lost serialization race (K-74) — True for:
+
+    - the domain SerializationConflict (what project_transaction raises), and
+    - a driver error carrying SQLSTATE 40001 (psycopg's SerializationFailure;
+      `sqlstate` on psycopg 3, `pgcode` on psycopg2), bare or wrapped in a
+      SQLAlchemy DBAPIError (`.orig`).
+
+    Classified by type and SQLSTATE only, never by message text. Every
+    caller that recovers from a serialization race asks this function."""
+    if isinstance(exc, SerializationConflict):
+        return True
+    orig = getattr(exc, "orig", exc)
+    code = getattr(orig, "sqlstate", None) or getattr(orig, "pgcode", None)
+    return code == "40001"
+
+
 @contextlib.contextmanager
 def project_transaction(engine: sa.Engine, project_slug: str, *, write: bool = False):
     """A consistent project snapshot, optionally serializing composed writers.
@@ -469,6 +691,12 @@ def project_transaction(engine: sa.Engine, project_slug: str, *, write: bool = F
     writers still follow their own concurrency contracts. The database's
     global isolation policy is unchanged. Lock waits are bounded to five
     seconds, matching SQLite's default connection timeout.
+
+    The lock protects only its participants: a writer that does not take it
+    can still make a REPEATABLE READ transaction here fail with a
+    serialization failure (SQLSTATE 40001). That is never retried
+    automatically; it surfaces as SerializationConflict — a controlled
+    refusal after the rollback (nothing written), safe to re-run.
     """
     # Local import: projects uses the table definitions in this module.
     from dct.core.projects import resolve_project_id
@@ -500,11 +728,20 @@ def project_transaction(engine: sa.Engine, project_slug: str, *, write: bool = F
                     conn.rollback()  # end SQLAlchemy's autocommit bookkeeping
                 conn.execution_options(isolation_level="REPEATABLE READ")
 
-            with conn.begin():
-                if conn.dialect.name == "sqlite":
-                    conn.exec_driver_sql("BEGIN IMMEDIATE" if write else "BEGIN")
-                project_id = resolve_project_id(conn, project_slug)
-                yield conn, project_id
+            try:
+                with conn.begin():
+                    if conn.dialect.name == "sqlite":
+                        conn.exec_driver_sql("BEGIN IMMEDIATE" if write else "BEGIN")
+                    project_id = resolve_project_id(conn, project_slug)
+                    yield conn, project_id
+            except sa.exc.DBAPIError as exc:
+                if not is_serialization_failure(exc):
+                    raise
+                raise SerializationConflict(
+                    f"A concurrent transaction changed the data of project "
+                    f"'{project_slug}' (serialization failure, SQLSTATE 40001) — "
+                    f"rolled back, nothing was written; re-run the operation."
+                ) from exc
         finally:
             if locked_project is not None:
                 try:
@@ -520,8 +757,209 @@ def project_transaction(engine: sa.Engine, project_slug: str, *, write: bool = F
 
 
 def create_tables(engine: sa.Engine) -> None:
-    metadata.create_all(engine)
+    _create_missing_tables(engine)
     _apply_schema_updates(engine)
+
+
+# Bounded attempts for the concurrent-creation race (K-59): each retry
+# follows a conflict another bootstrap caused by creating the same object.
+SCHEMA_CREATE_ATTEMPTS = 3
+
+# PostgreSQL: duplicate_table (42P07 — tables AND indexes, "relation already
+# exists") and duplicate_object (42710). A CREATE racing an uncommitted
+# CREATE of the same name fails on the catalog's unique index instead
+# (23505 on pg_type / pg_class name indexes) — only those count.
+_PG_DUPLICATE_SQLSTATES = {"42P07", "42710"}
+_PG_CATALOG_NAME_INDEXES = ("pg_type_typname_nsp_index", "pg_class_relname_nsp_index")
+_SQLITE_DUPLICATE = re.compile(r"\b(table|index) \S+ already exists\b", re.IGNORECASE)
+
+
+def _is_concurrent_creation_conflict(engine: sa.Engine, exc: sa.exc.DBAPIError) -> bool:
+    """True only for "the object I am creating was just created by someone
+    else" — never for any other error (those propagate unchanged)."""
+    orig = getattr(exc, "orig", None)
+    if engine.dialect.name == "postgresql":
+        code = getattr(orig, "sqlstate", None) or getattr(orig, "pgcode", None)
+        if code in _PG_DUPLICATE_SQLSTATES:
+            return True
+        return code == "23505" and any(name in str(orig) for name in _PG_CATALOG_NAME_INDEXES)
+    return isinstance(exc, sa.exc.OperationalError) and bool(_SQLITE_DUPLICATE.search(str(orig)))
+
+
+def _create_table_objects(engine: sa.Engine, table: sa.Table) -> None:
+    """Create `table` if absent plus every metadata index of it that is absent,
+    in ONE transaction (atomic on PostgreSQL; SQLite's driver commits DDL
+    statement by statement). Re-reads the live schema first, so a retry only
+    finishes what is still missing."""
+    inspector = sa.inspect(engine)
+    exists = inspector.has_table(table.name)
+    present = {ix["name"] for ix in inspector.get_indexes(table.name)} if exists else set()
+    missing = sorted((ix for ix in table.indexes if ix.name not in present), key=lambda ix: ix.name)
+    if exists and not missing:
+        return
+    with engine.begin() as conn:
+        if not exists:
+            conn.execute(sa.schema.CreateTable(table))
+        for index in missing:
+            conn.execute(sa.schema.CreateIndex(index))
+
+
+def _create_missing_tables(engine: sa.Engine) -> None:
+    """Create every metadata table this database lacks, WITH its indexes —
+    safe against a concurrent bootstrap creating the same objects (K-59).
+
+    Scope: the tables missing at the first look. Their whole required schema
+    (table + every index) is completed — a table that exists does not prove
+    its unique index exists. Tables that predate this bootstrap are left to
+    _apply_schema_updates' explicit blocks (no silent index retrofit on an
+    old database) — except the release-ledger tables (INDEX_HEALED_TABLES,
+    K-93 A2), whose missing required indexes _heal_required_indexes
+    completes on every bootstrap. A concurrent-creation conflict (duplicate table / index /
+    relation, see _is_concurrent_creation_conflict) rolls the attempt back
+    and re-checks the whole set; any other error propagates; at most
+    SCHEMA_CREATE_ATTEMPTS attempts. No missing table → no DDL at all.
+    """
+    existing = set(sa.inspect(engine).get_table_names())
+    pending = [table for table in metadata.sorted_tables if table.name not in existing]
+    for attempt in range(1, SCHEMA_CREATE_ATTEMPTS + 1):
+        if not pending:
+            break
+        try:
+            for table in pending:  # FK order
+                _create_table_objects(engine, table)
+            break
+        except sa.exc.DBAPIError as exc:
+            if attempt == SCHEMA_CREATE_ATTEMPTS or not _is_concurrent_creation_conflict(engine, exc):
+                raise
+    _heal_required_indexes(engine, existing)
+
+
+# K-93 A2: tables of the release-ledger feature whose REQUIRED indexes every
+# bootstrap completes even when the table already exists — SQLite commits
+# CREATE TABLE and CREATE INDEX separately, so a crash in between leaves the
+# table without its unique guard. Tables of older features keep the "no
+# silent retrofit" rule of _create_missing_tables.
+INDEX_HEALED_TABLES = ("releases",)
+
+
+def _heal_required_indexes(engine: sa.Engine, existed: set[str]) -> None:
+    """Create the metadata indexes missing on an INDEX_HEALED_TABLES table
+    that already existed before this bootstrap (one inspector read per table
+    when nothing is missing — bootstraps 2-3 issue no DDL and print nothing).
+
+    Race-safe like _create_missing_tables (a concurrent creation is retried,
+    bounded). A unique index refused by the DATA (duplicate live rows — an
+    IntegrityError that is not a concurrent creation) never bricks the
+    bootstrap: one stderr warning names the index, the rows stay untouched
+    for a manual fix, and the core keeps enforcing the rule under the
+    project lock. Any other error propagates."""
+    for table in metadata.sorted_tables:
+        if table.name not in INDEX_HEALED_TABLES or table.name not in existed:
+            continue
+        present = {ix["name"] for ix in sa.inspect(engine).get_indexes(table.name)}
+        missing = sorted(ix.name for ix in table.indexes if ix.name not in present)
+        if not missing:
+            continue
+        for attempt in range(1, SCHEMA_CREATE_ATTEMPTS + 1):
+            try:
+                _create_table_objects(engine, table)
+                break
+            except sa.exc.DBAPIError as exc:
+                if attempt < SCHEMA_CREATE_ATTEMPTS and _is_concurrent_creation_conflict(engine, exc):
+                    continue
+                if isinstance(exc, sa.exc.IntegrityError) and not _is_concurrent_creation_conflict(
+                    engine, exc
+                ):
+                    print(
+                        f"WARNING: dct could not create the required index(es) "
+                        f"{', '.join(missing)} on {table.name}: the existing rows violate "
+                        f"it ({exc.orig}). Nothing was changed — remove the duplicate "
+                        f"live rows manually; the next bootstrap creates the index.",
+                        file=sys.stderr,
+                    )
+                    break
+                raise
+
+
+def _column_exists(engine: sa.Engine, table: str, column: str) -> bool:
+    """Fresh inspector read (never a cached one): does `table.column` exist?"""
+    return column in {c["name"] for c in sa.inspect(engine).get_columns(table)}
+
+
+def _add_column_if_missing(
+    engine: sa.Engine, table: str, column: str, ddl_type: str
+) -> bool:
+    """Add `table.column` of `ddl_type` unless it exists; duplicate-safe (K-25).
+
+    Two processes bootstrapping at once (a hook and the MCP server) must not
+    crash each other on the same ADD COLUMN:
+    - PostgreSQL: `ADD COLUMN IF NOT EXISTS`, inside a transaction that first
+      sets `lock_timeout` so a stuck lock fails fast instead of hanging every
+      hook behind the ACCESS EXCLUSIVE lock the ALTER needs.
+    - SQLite: inspector check, then ALTER; a "duplicate column" error is
+      treated as success once a re-check confirms the column now exists (the
+      other process won the race).
+
+    `table`, `column` and `ddl_type` are code constants, never user input.
+    Returns True when DDL was issued (on PostgreSQL: whenever the inspector saw
+    the column missing), False when the column was already there.
+    """
+    if _column_exists(engine, table, column):
+        return False
+    if engine.dialect.name == "postgresql":
+        with engine.begin() as conn:
+            conn.execute(sa.text("SET LOCAL lock_timeout = '5s'"))
+            conn.execute(sa.text(
+                f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {column} {ddl_type}"
+            ))
+        return True
+    try:
+        with engine.begin() as conn:
+            conn.execute(sa.text(f"ALTER TABLE {table} ADD COLUMN {column} {ddl_type}"))
+    except sa.exc.OperationalError as exc:
+        if "duplicate column" not in str(exc).lower() or not _column_exists(
+            engine, table, column
+        ):
+            raise
+    return True
+
+
+# Columns _apply_schema_updates heals onto an existing database (K-60, K-61,
+# K-73, K-85, K-90, K-94, K-76, K-97, K-115) — table → [(column, DDL type)].
+# TIMESTAMP is portable (SQLite stores the value as SQLAlchemy's DateTime
+# would). `{false}` is the dialect's BOOLEAN false literal (PostgreSQL is
+# strict: FALSE; SQLite: 0) — keep it in sync with the column's
+# server_default.
+RELEASE_LEDGER_COLUMNS: dict[str, tuple[tuple[str, str], ...]] = {
+    "releases": (
+        ("release_commit_sha", "VARCHAR(64)"),
+        ("manifest", "TEXT"),
+        ("proof", "TEXT"),
+        ("abandoned_at", "TIMESTAMP"),
+        ("abandon_reason", "TEXT"),
+        ("release_mode", "VARCHAR(16)"),
+        ("executor", "VARCHAR(8)"),
+        ("consent", "TEXT"),
+        ("proposal", "TEXT"),
+        ("render", "TEXT"),
+        ("tag_proof", "TEXT"),
+        ("push_proof", "TEXT"),
+    ),
+    "projects": (
+        ("version_files", "TEXT"),
+        ("version_files_confirmed_at", "TIMESTAMP"),
+        ("version_files_history", "TEXT"),
+        ("release_executor", "VARCHAR(8) NOT NULL DEFAULT 'dct'"),
+        ("changelog_pr_refs", "BOOLEAN NOT NULL DEFAULT {false}"),
+        ("release_proposal", "TEXT"),
+    ),
+}
+
+
+def _ddl_type(engine: sa.Engine, ddl_type: str) -> str:
+    """Fill the dialect placeholders of a RELEASE_LEDGER_COLUMNS DDL type."""
+    false = "FALSE" if engine.dialect.name == "postgresql" else "0"
+    return ddl_type.replace("{false}", false)
 
 
 def _apply_schema_updates(engine: sa.Engine) -> None:
@@ -546,6 +984,39 @@ def _apply_schema_updates(engine: sa.Engine) -> None:
         return
 
     col_names = {c["name"] for c in inspector.get_columns("items")}
+
+    # #817: items.short_title (nullable label, no backfill). Duplicate-safe
+    # helper — two processes may bootstrap the same old database at once.
+    if "short_title" not in col_names:
+        _add_column_if_missing(engine, "items", "short_title", "VARCHAR(50)")
+
+    # #801: changelog_entries.branch / worktree / branch_source (nullable, no
+    # backfill — pre-#801 entries stay "unbranched"). Each column is healed
+    # independently by the duplicate-safe helper.
+    if "changelog_entries" in inspector.get_table_names():
+        cl_cols = {c["name"] for c in inspector.get_columns("changelog_entries")}
+        for column, ddl_type in (
+            ("branch", "VARCHAR(255)"),
+            ("worktree", "VARCHAR(500)"),
+            ("branch_source", "VARCHAR(16)"),
+        ):
+            if column not in cl_cols:
+                _add_column_if_missing(engine, "changelog_entries", column, ddl_type)
+
+    # K-60/K-61: release-record columns added after the `releases` table
+    # first shipped on development databases, and K-73: the project's
+    # version-file contract. Nullable, no backfill (an older record simply has
+    # no release commit / manifest / proof yet). Each column is healed
+    # independently by the duplicate-safe helper; the inspector check keeps
+    # bootstraps 2-3 free of DDL.
+    tables_now = set(inspector.get_table_names())
+    for table, additions in RELEASE_LEDGER_COLUMNS.items():
+        if table not in tables_now:
+            continue
+        present = {c["name"] for c in inspector.get_columns(table)}
+        for column, ddl_type in additions:
+            if column not in present:
+                _add_column_if_missing(engine, table, column, _ddl_type(engine, ddl_type))
 
     # #222: opt-in changelog enforcement. Add projects.manages_changelog and,
     # on first add, backfill — a project KEEPS enforcement only if it already

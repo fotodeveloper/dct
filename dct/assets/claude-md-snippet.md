@@ -25,8 +25,8 @@ prefix and trigger in any language:
 - `/track-update` — edit fields, status, priority, sprint membership
 - `/track-resolve` — close (resolved / wont_fix)
 - `/clog` — add changelog entry
-- `/commit` — conventional commit with `(vX.Y.Z)` suffix, changelog-aware
-- `/release` — stamp version, export Keep-a-Changelog MD, release commit
+- `/commit` — conventional commit with `(vX.Y.Z)` suffix; `Changelog:` trailer from `dct clog candidates --json`
+- `/release` — one workflow over `dct release plan / attest / prepare / apply / resume` (the workflow stamps, writes, commits, tags and pushes, verified)
 - `/pickup` — start-of-session: read handoff, show sprint, propose first action
 - `/handoff` — end-of-session: flag sprint + write prompt for next session
 - `/plan-status` — cross-plan progress dashboard
@@ -54,11 +54,19 @@ Rules of thumb:
 - `idea` = exploratory, not yet decided to build
 - `improvement` = existing thing works but could be better (refactor, UX polish, perf)
 
-**MCP tools** — 55 total; most important:
+Every new item gets a `short_title` label: a 2-4 word English noun phrase
+naming what it is about (≤ 50 chars, no item number, no project name — e.g.
+"Windows hook paths"). The `create_item` ack echoes the stored `short_title`
+(null when none); a missing key means an outdated MCP server contract — report
+it and restart the server, but never retry the create (the item exists). On
+`update_item` the label is optional: omit it to keep the stored one.
+
+**MCP tools** — 60 total; most important:
 - `pickup_work`, `handoff_work`, `get_context_snapshot` — composed session-edge ops; prefer them over chaining the granular tools below
 - `list_projects`, `list_items`, `get_item`, `create_item`, `update_item`, `resolve_item`, `add_note`
 - `add_checkpoint`, `list_checkpoints`, `complete_checkpoint`, `reject_checkpoint`, `reopen_checkpoint`
-- `add_changelog`, `list_changelog`, `count_unreleased_changelog`, `release_changelog`, `export_changelog`
+- `add_changelog`, `list_changelog`, `count_unreleased_changelog`, `release_changelog`, `update_changelog`, `delete_changelog`, `export_changelog`
+- `get_release`, `advance_release`, `abandon_release` — durable release record, the ledger path of a project's own release tool: read an unfinished release, record verified progress, abandon one explicitly (a release dct executes is continued and abandoned only by `dct release resume` / `dct release abandon` — these tools refuse it; deferred; load via ToolSearch)
 - `set_sprint`, `clear_sprint`, `review_sprint`, `list_sprints`, `update_sprint`
 - `create_handoff`, `list_handoffs`, `get_handoff`, `consume_handoff`, `delete_handoff`
 - `add_tag`, `list_tags`, `merge_tag` — global tag dictionary admin (deferred; load via ToolSearch)
@@ -82,11 +90,21 @@ Sketch the work breakdown BEFORE starting code.
 → `reject_checkpoint(id)` (ledger-preserving); never delete.
 
 **Committing** — "commit" / "save this" / "commit this"
-→ `/commit` (parallel pre-flight probe, changelog guard, HEREDOC message with `(vX.Y.Z)`).
+→ `/commit` (parallel pre-flight probe, per-branch changelog guard, HEREDOC message with `(vX.Y.Z)`).
+Order: stage the chosen paths first (a deliberate partial staging stays as it
+is), THEN pick the trailer from the complete `git diff --cached`, THEN
+`git commit` without another `git add`; any later index change means picking
+again. The message ends with a `Changelog: <id>, <id>` trailer (ids ascending,
+before `Co-Authored-By:`) naming the `dct clog candidates --json` entries
+whose text matches the staged diff — `uncertain` ones (server-detected, no
+provenance, detached HEAD) only after the owner confirms them and
+`update_changelog` sets the real branch/worktree; `/release` stamps only
+entries proven that way. Reverts keep git's standard `Revert "…"` message.
+`/clog` records `branch` / `worktree` from the agent's own working directory.
 If pre-commit hook rejects: fix underlying issue, re-stage, **NEW commit** (never `--amend`, never `--no-verify`).
 
 **Releasing** — "release" / "bump version" / "ship it"
-→ `/release` (dirty-tree hard stop → stamp DB → export MD → commit `release: vX.Y.Z`).
+→ `/release` — ONE workflow over the local CLI: `dct release plan --json` (range, proof per entry, unproven entries, collective attestation proposals — and who releases, routed from that ONE result: an unfinished release by its record, `executor.record` — dct's own continues with `dct release resume` on the stored consent, without asking again; an `own` record stays with its own tool; a record without consent → `dct release takeover --version V …` (a new consent the owner approves) or the ledger path — and only a NEW release by the project's setting, `executor.project`: `own` → its own tool releases) → work in progress committed inside the workflow on the owner's consent (the `/commit` procedure, then re-plan) → the owner decides attest / correct / withdraw / keep and the version → `dct release attest` / `dct release plan --version V --entries … --json` (the snapshot the owner approves) → `dct release prepare --version V --entries … --plan-digest <snapshot_digest>` (the version sync runs isolated; the owner approves the file list and the push target) → `dct release apply --version V --entries … --plan-digest <snapshot_digest> --proposal-digest <proposal_sha256> --push-remote <remote> --push-branch <branch> --push-url <url> --confirm` (the three push values of the target the owner approved at prepare — apply never selects one itself — or `--no-push` for an explicit local release: stamp, changelog section, version files, `release: vX.Y.Z` commit through the hooks, tag, push — each verified and recorded by the workflow; an interrupted release → `dct release resume`, which executes the stored consent with no new approval; `dct release abandon --version V --reason "…" --confirm` only on the owner's explicit decision).
 
 **Session end** — "handoff" / "end session" / "wrap up" / "next session"
 → `/handoff` (flag sprint items, optionally write handoff prompt).
@@ -109,7 +127,9 @@ complete_checkpoint(7)
 
 **Write ops return a minimal ack**, not the full record — the created/updated `id`
 plus a few post-state scalars (e.g. `create_item` → `{id, project, item_type,
-priority, status, title}`; checkpoint ops → `{id, item_id, status, progress}`).
+priority, status, title, short_title}`; checkpoint ops → `{id, item_id, status,
+progress}`; `add_changelog` → `{id, project, category, component, branch,
+branch_source}` + `warning` when the server detected the branch).
 **Remember the `id`** for follow-up calls. Need full context? Fetch it deliberately:
 `get_item(id)` (fields, notes, checkpoints, progress) or `get_handoff(id)`
 (untruncated prompt + context_summary) — both return a full semantic dict.
@@ -119,11 +139,15 @@ priority, status, title}`; checkpoint ops → `{id, item_id, status, progress}`)
 - `rows` is an array of value arrays in the same order
 - short/fixed-width fields come first, long free text (title, description, entry, prompt) last
 - extract a field by `cols.indexOf("title")` → index into each row
+- `list_items` defaults to `view="brief"` (…, `short_title`, `title` — no
+  `description`); pass `view="full"` or call `get_item(id)` only when the
+  descriptions are needed
 - `list_handoffs` truncates `prompt` to a 200-char preview → `get_handoff(id)` for full text
 
 Opt-in formats on list-views:
 - `format="markdown"` → human-readable table (lossy — no description)
-- `format="dict"` → list of full-key dicts (legacy shape)
+- `format="dict"` → list of dicts (for `list_items` the keys follow `view`:
+  brief columns by default, full item rows with `view="full"`)
 
 ### ID normalization
 
@@ -134,9 +158,10 @@ whitespace-separated batch ids.
 ### Fallback workflows
 
 If a skill name renames or disappears in a future CC version, Claude can
-still drive dct via raw MCP calls. The `Skill fallback workflows` section
-in dct's own repo `CLAUDE.md` has step-by-step prose descriptions for
-`/release`, `/commit`, `/track`, `/clog`, `/track-resolve`.
+still drive dct via raw MCP calls. `docs/assistant-fallbacks.md` in dct's own
+repo has the authoritative step-by-step prose for `/release`, `/commit`,
+`/track`, `/clog`, `/track-resolve` — and the shared `Changelog:` trailer /
+release-range rules.
 
 ### Auto-detect project from CWD
 

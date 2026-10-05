@@ -19,7 +19,7 @@
       <td class="tags">
         {% for t in it.tags %}<a class="tag" href="{{ url_for('items.list', slug=slug, tag=t) }}">{{ t }}</a>{% endfor %}
       </td>
-      <td><a href="{{ url_for('items.detail', slug=slug, id=it.id) }}">{{ it.title }}</a></td>
+      <td><a href="{{ url_for('items.detail', slug=slug, id=it.id) }}">{{ it.title }}</a>{% if it.short_title|visible_label %} <span class="short-title">{{ it.short_title }}</span>{% endif %}</td>
     </tr>
     {% else %}
     <tr><td colspan="8" class="empty">No items match these filters.</td></tr>

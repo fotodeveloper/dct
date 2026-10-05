@@ -18,11 +18,18 @@ def create_project(
 ) -> dict:
     """Create (or undelete) a project row.
 
-    When `current_version` is not supplied and `path` is set, attempts best-effort
-    version detection from VERSION / pyproject.toml / package.json / Cargo.toml /
-    src-tauri/tauri.conf.json. The returned dict carries a transient
-    `_detected_source` key naming the file that produced the version — callers
-    (CLI) may surface it to the user; it is not persisted.
+    An explicit `current_version` passes the version write contract
+    (core.version.storable_version — normalized, refused with ValueError when
+    unsupported or too long; nothing is written then). When it is not
+    supplied and `path` is set, attempts best-effort version detection from
+    VERSION / pyproject.toml / package.json / Cargo.toml /
+    src-tauri/tauri.conf.json; a detected version is normalized the same way.
+    The returned dict carries a transient `_detected_source` key naming the
+    file that produced the stored version — callers (CLI) may surface it to
+    the user; it is not persisted. A DETECTED version the contract refuses
+    is never stored and never substituted: current_version stays NULL and
+    the transient `_detected_unsupported` = {version (raw), source, reason}
+    reports it, so the caller can say so explicitly.
     """
     if not slug or not slug.strip():
         raise ValueError("Project slug cannot be empty")
@@ -34,12 +41,23 @@ def create_project(
     if path is not None:
         path = os.path.realpath(path)
 
+    from dct.core.version import detect_version, storable_version
+
     detected_source: str | None = None
-    if current_version is None and path:
-        from dct.core.version import detect_version
+    detected_unsupported: dict | None = None
+    if current_version is not None:
+        current_version = storable_version(current_version)
+    elif path:
         detected_version, detected_source = detect_version(path)
         if detected_version:
-            current_version = detected_version
+            try:
+                current_version = storable_version(detected_version)
+            except ValueError as exc:
+                detected_unsupported = {
+                    "version": detected_version, "source": detected_source,
+                    "reason": str(exc),
+                }
+                detected_source = None
         else:
             detected_source = None  # no detection → nothing to report
 
@@ -61,10 +79,7 @@ def create_project(
             )
             row = conn.execute(sa.select(projects).where(projects.c.id == deleted._mapping["id"])).first()
             assert row is not None, "undelete must return its row"
-            result_dict = row_to_dict(row)
-            if detected_source:
-                result_dict["_detected_source"] = detected_source
-            return result_dict
+            return _with_detection(row_to_dict(row), detected_source, detected_unsupported)
 
         inserted = conn.execute(
             projects.insert()
@@ -72,10 +87,16 @@ def create_project(
             .returning(projects)
         ).first()
         assert inserted is not None, "INSERT RETURNING must return a row"
-        result_dict = row_to_dict(inserted)
-        if detected_source:
-            result_dict["_detected_source"] = detected_source
-        return result_dict
+        return _with_detection(row_to_dict(inserted), detected_source, detected_unsupported)
+
+
+def _with_detection(row: dict, source: str | None, unsupported: dict | None) -> dict:
+    """Attach the transient detection report keys (never persisted)."""
+    if source:
+        row["_detected_source"] = source
+    if unsupported:
+        row["_detected_unsupported"] = unsupported
+    return row
 
 
 def list_projects(engine: sa.Engine, include_deleted: bool = False) -> list[dict]:
@@ -149,6 +170,15 @@ def delete_project(engine: sa.Engine, slug: str) -> bool:
 
 
 def set_version(engine: sa.Engine, slug: str, version: str) -> dict | None:
+    """Set the project's current_version; returns the row, None if unknown.
+
+    The version passes the ONE write contract (core.version.storable_version,
+    K-54): `v1.6.0` is stored as `1.6.0`; an unsupported format or a value
+    wider than a version column raises ValueError and nothing is written.
+    """
+    from dct.core.version import storable_version
+
+    version = storable_version(version)
     with engine.begin() as conn:
         result = conn.execute(
             projects.update()
@@ -218,6 +248,57 @@ def set_changelog_path(engine: sa.Engine, slug: str, relpath: str) -> dict | Non
         if result.rowcount == 0:
             return None
     return get_project(engine, slug)
+
+
+def _set_project_value(engine: sa.Engine, slug: str, **values) -> dict | None:
+    with engine.begin() as conn:
+        result = conn.execute(
+            projects.update()
+            .where(projects.c.slug == slug, projects.c.deleted_at.is_(None))
+            .values(**values, updated_at=datetime.now(UTC))
+        )
+        if result.rowcount == 0:
+            return None
+    return get_project(engine, slug)
+
+
+def set_release_executor(engine: sa.Engine, slug: str, executor: str) -> dict | None:
+    """Set who performs the project's release effects (K-85): 'dct' (the
+    effects layer — the default) or 'own' (the project's own release tool).
+
+    Copied onto each NEW release record at stamp time (releases.executor);
+    an unfinished release keeps the executor it was stamped with. Written
+    inside project_transaction(write=True) — the SAME project lock as the
+    stamp (K-106): the stamp compares the executor its caller expects with
+    this setting in its own transaction, so a change here either precedes
+    that comparison (the stamp refuses) or waits until the stamp committed
+    (the record keeps what the stamp saw). Returns the updated project row,
+    or None when the slug does not resolve to a live project. ValueError
+    for any other value."""
+    from dct.core.releases import validate_executor
+    from dct.db import project_transaction
+
+    value = validate_executor(executor)
+    if get_project(engine, slug) is None:
+        return None
+    try:
+        with project_transaction(engine, slug, write=True) as (conn, pid):
+            conn.execute(projects.update().where(projects.c.id == pid).values(
+                release_executor=value, updated_at=datetime.now(UTC)))
+    except ValueError:  # the project was deleted between the two reads
+        return None
+    return get_project(engine, slug)
+
+
+def set_changelog_pr_refs(engine: sa.Engine, slug: str, enabled: bool) -> dict | None:
+    """Opt the project's changelog render into `(#N)` PR references (K-90;
+    default off). Persisted per release at stamp time (releases.render), so
+    a change never alters a release already stamped. Returns the updated
+    project row, or None when the slug does not resolve to a live project.
+    TypeError unless `enabled` is a bool."""
+    if not isinstance(enabled, bool):
+        raise TypeError(f"changelog_pr_refs must be true or false, got {enabled!r}")
+    return _set_project_value(engine, slug, changelog_pr_refs=enabled)
 
 
 def resolve_changelog_path(project: dict) -> str | None:

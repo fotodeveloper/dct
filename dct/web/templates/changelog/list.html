@@ -11,7 +11,7 @@
       {% if e.component %}<span class="component">{{ e.component }}</span>{% endif %}
       <span class="entry">{{ e.entry }}</span>
       {% if e.related_item_id %}
-        <a class="rel" href="/p/{{ slug }}/items/{{ e.related_item_id }}">#{{ e.related_item_id }}</a>
+        <a class="rel" href="/p/{{ slug }}/items/{{ e.related_item_id }}">#{{ e.related_item_id }}{% if e.item_short_title %} · {{ e.item_short_title }}{% endif %}</a>
       {% endif %}
     </li>
     {% endfor %}

@@ -54,7 +54,6 @@ from pathlib import Path
 
 from dct import paths
 
-_SQLITE_PREFIX = "sqlite:///"
 _SQLITE_MAGIC = b"SQLite format 3\x00"
 _DB_SIDECAR_SUFFIXES = ("-wal", "-shm")
 
@@ -98,9 +97,12 @@ def _legacy_db_path(config_file: Path) -> Path | None:
     """The sqlite db referenced by a config, when that db lives under
     ~/.claude. Anything else (postgres, sqlite elsewhere) → None."""
     url = _config_url(config_file)
-    if not url or not url.startswith(_SQLITE_PREFIX):
+    # K-99: parsed as the engine parses it (paths.sqlite_database_path) —
+    # never by slicing the prefix (SQLAlchemy 2.1 percent-decodes the path).
+    database = paths.sqlite_database_path(url) if url else None
+    if database is None:
         return None
-    db = Path(url[len(_SQLITE_PREFIX):])
+    db = Path(database)
     if not paths.is_legacy(db):
         return None
     return db

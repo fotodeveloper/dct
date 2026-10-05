@@ -523,12 +523,15 @@ def promote_section_to_item(
     item_type: str,
     priority: str = "P2",
     title: str | None = None,
+    short_title: str | None = None,
 ) -> dict:
     """Create an `items` row from a plan_section and back-link via converted_to_item_id.
 
     Used when a section deserves its own lifecycle (e.g. "Sprint 3" becomes
     a tracked sprint-feature). The section remains in the plan as a
     read-only pointer — `converted_to_item_id` marks the promotion.
+    `short_title` is passed through to create_item (≤ 50 chars, refused not
+    truncated; None/"" = no label).
     """
     from dct.core.items import MAX_TITLE_LENGTH, create_item
     section = get_plan_section(engine, section_id)
@@ -552,7 +555,7 @@ def promote_section_to_item(
     effective_title = title or section["heading"][:MAX_TITLE_LENGTH]
     item = create_item(
         engine, project_slug, item_type, effective_title,
-        priority=priority,
+        priority=priority, short_title=short_title,
     )
     now = datetime.now(UTC)
     with engine.begin() as conn:
@@ -628,8 +631,13 @@ def promote_checkpoint_to_item(
     item_type: str,
     priority: str = "P2",
     title: str | None = None,
+    short_title: str | None = None,
 ) -> dict:
-    """Create an items row from a plan_checkpoint and back-link."""
+    """Create an items row from a plan_checkpoint and back-link.
+
+    `short_title` is passed through to create_item (≤ 50 chars, refused not
+    truncated; None/"" = no label).
+    """
     from dct.core.items import MAX_TITLE_LENGTH, create_item
     with engine.begin() as conn:
         cp_row = conn.execute(
@@ -662,7 +670,7 @@ def promote_checkpoint_to_item(
     effective_title = title or cp["text"][:MAX_TITLE_LENGTH]
     item = create_item(
         engine, project_slug, item_type, effective_title,
-        priority=priority,
+        priority=priority, short_title=short_title,
     )
     now = datetime.now(UTC)
     with engine.begin() as conn:

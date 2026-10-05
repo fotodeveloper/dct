@@ -21,6 +21,14 @@ from dct.db import item_checkpoints, item_notes, items, project_transaction
 
 _MARKER = 'DCT task mirror snapshot v1\n'
 
+# Fixed item labels (#817): a mirror item IS one client's task list for one
+# session, so its short_title names that kind of record instead of repeating
+# the session-specific title. Constants, always within the 50-char column.
+MIRROR_SHORT_TITLES = {
+    'claude': 'Claude Code task list mirror',
+    'codex': 'Codex task list mirror',
+}
+
 
 @contextlib.contextmanager
 def _mirror_actor(values: dict):
@@ -127,7 +135,8 @@ def mirror_tasks(engine: sa.Engine, payload: dict, *, client: str, project: str 
             # Fixed mirror metadata uses the same Core defaults/provenance and
             # shared tag writer as create_item, inside this composed transaction.
             item_id = conn.execute(items.insert().values(
-                project_id=project_id, item_type='todo', title=title, **owned,
+                project_id=project_id, item_type='todo', title=title,
+                short_title=MIRROR_SHORT_TITLES[client], **owned,
             ).returning(items.c.id)).scalar_one()
             set_item_tags_conn(conn, item_id, ['codex-task-list' if client == 'codex' else 'cc-task-list', 'auto'], force=True)
         if client == 'codex':

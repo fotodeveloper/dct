@@ -13,9 +13,16 @@ provided. Select `item_type` from intent: bug → issue, task → todo, new capa
 → feature, proposal → idea, refactor → improvement. Use todo when neutral.
 
 Create via `create_item` with separate top-level fields; never embed tool-call
-wrappers in descriptions. Preserve returned integer IDs. Update existing items
-instead of duplicating them. For accepted non-trivial implementation add 3–7
-checkpoints before coding, complete each as verified, reject abandoned checkpoints
+wrappers in descriptions. Always pass `short_title`: a 2–4 word English noun
+phrase naming what the item is about (≤ 50 chars, no item number or project
+name). The create ack echoes the stored `short_title` (null when none); if the
+key is missing, report an unsupported (outdated) DCT MCP server contract that
+needs a restart or upgrade — do not retry the create (the item exists) and do
+not claim the label was saved. Preserve returned integer IDs. Update existing
+items instead of duplicating them; on `update_item` `short_title` is optional —
+omit it (or pass `""`) to keep the stored label, pass it only to change the
+label (`'__clear__'` removes it; a whitespace-only value also clears it).
+For accepted non-trivial implementation add 3–7 checkpoints before coding, complete each as verified, reject abandoned checkpoints
 rather than deleting them. Include a user-validation gate for user-facing features
 when project conventions require one. Do not claim completion without evidence or
 silently bypass pending gates. Use `resolve_item` for closing and report returned

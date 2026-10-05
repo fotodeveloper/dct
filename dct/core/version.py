@@ -1,24 +1,122 @@
-"""Version bump + autodetect logic — supports X.Y and X.Y.Z formats."""
+"""Version contract + autodetect logic (K-44).
+
+ONE contract for every version dct stores or computes: `X.Y` or `X.Y.Z` with
+ASCII decimal components, optionally prefixed by `v`/`V` and surrounded by
+whitespace. `normalize_version` strips the prefix and whitespace (and leading
+zeros of each component) — callers store the NORMALIZED form, so a later bump
+and a `v$CUR` tag never see `vv1.6.0`. Anything else is refused with
+ValueError("Unsupported version ...") — never silently skipped.
+
+`storable_version` is the ONE gate of every version WRITE (K-54, K-58):
+normalize, then check the width of EVERY version column the value can land
+in (ensure_version_fits — limits read from the schema, never typed in).
+Release, `project set-version`, `project add` and auto-detection all pass
+through it; prerelease / build suffixes are refused, not interpreted.
+
+`detect_version` is separate: it reports whatever a project file says (raw)
+and never raises; create_project runs its result through storable_version
+and REPORTS an unsupported one instead of storing a substitute.
+"""
 
 import json
+import re
 import tomllib
 from pathlib import Path
 
+_VERSION_RE = re.compile(r"[vV]?([0-9]+)\.([0-9]+)(?:\.([0-9]+))?", re.ASCII)
+SUPPORTED_FORMATS = "X.Y or X.Y.Z (optional leading 'v')"
+
 
 def parse_version(version: str) -> tuple[int, ...]:
-    parts = version.strip().split(".")
-    return tuple(int(p) for p in parts)
+    """`(X, Y)` or `(X, Y, Z)` for a supported version; ValueError otherwise.
+
+    Surrounding whitespace and one leading `v`/`V` are accepted.
+    """
+    match = _VERSION_RE.fullmatch(version.strip()) if isinstance(version, str) else None
+    if match is None:
+        raise ValueError(f"Unsupported version {version!r} — expected {SUPPORTED_FORMATS}")
+    return tuple(int(part) for part in match.groups() if part is not None)
 
 
 def format_version(parts: tuple[int, ...]) -> str:
     return ".".join(str(p) for p in parts)
 
 
-def bump(current: str, bump_type: str) -> str:
-    """Bump version string by type (patch/minor/major).
+def normalize_version(version: str) -> str:
+    """The canonical stored form: `v1.6.0` → `1.6.0`, ` 0.18 ` → `0.18`.
 
-    Supports both X.Y (two-part) and X.Y.Z (three-part) formats.
-    Two-part versions get a patch level on patch bump: 0.18 → 0.18.1
+    Raises ValueError for an unsupported format (see module docstring).
+    """
+    return format_version(parse_version(version))
+
+
+def ensure_version_fits(version: str) -> None:
+    """ValueError ("version too long ...") unless `version` fits every column
+    a version is stored in: projects.current_version,
+    changelog_entries.version and releases.version (widths read from the
+    schema, so widening or narrowing a column moves the guard)."""
+    from dct.core.limits import ensure_fits
+    from dct.db import changelog_entries, projects, releases
+
+    for table, column in (
+        (projects, "current_version"),
+        (changelog_entries, "version"),
+        (releases, "version"),
+    ):
+        ensure_fits(table, {column: version}, {column: "version"})
+
+
+def storable_version(version: str) -> str:
+    """The form a write stores: normalize_version + ensure_version_fits.
+
+    Raises ValueError ("Unsupported version ..." / "version too long ...").
+    """
+    normalized = normalize_version(version)
+    ensure_version_fits(normalized)
+    return normalized
+
+
+def version_key(version: str) -> tuple[int, ...]:
+    """Comparable form: trailing zero components dropped, so 1.5 == 1.5.0.
+
+    Raises ValueError for an unsupported format.
+    """
+    parts = list(parse_version(version))
+    while len(parts) > 1 and parts[-1] == 0:
+        parts.pop()
+    return tuple(parts)
+
+
+def compare_versions(a: str, b: str) -> int:
+    """-1 / 0 / 1 as `a` is lower / equal / higher than `b` (1.5 == 1.5.0).
+
+    Raises ValueError when either side is unsupported.
+    """
+    ka, kb = version_key(a), version_key(b)
+    return (ka > kb) - (ka < kb)
+
+
+def same_version(a: str | None, b: str | None) -> bool:
+    """Equal under the contract (1.5 == 1.5.0 == v1.5); never raises.
+
+    When either side is not a supported version (a legacy stored value), falls
+    back to exact string equality; None equals only None.
+    """
+    if a is None or b is None:
+        return a is b
+    try:
+        return version_key(a) == version_key(b)
+    except ValueError:
+        return a == b
+
+
+def bump(current: str, bump_type: str) -> str:
+    """Bump version string by type (patch/minor/major); result is normalized.
+
+    Supports both X.Y (two-part) and X.Y.Z (three-part) formats, with an
+    optional leading `v` on `current` (dropped from the result).
+    Two-part versions get a patch level on patch bump: 0.18 → 0.18.1.
+    Raises ValueError on an invalid bump type or an unsupported `current`.
     """
     if bump_type not in ("patch", "minor", "major"):
         raise ValueError(f"Invalid bump type: '{bump_type}'. Valid: patch, minor, major")
@@ -36,10 +134,71 @@ def bump(current: str, bump_type: str) -> str:
             return format_version((parts[0], parts[1], 1))
 
 
+def _read_version_file(data: bytes) -> str | None:
+    value = data.decode("utf-8").strip()
+    return value or None
+
+
+def _read_pyproject(data: bytes) -> str | None:
+    return (tomllib.loads(data.decode("utf-8")).get("project") or {}).get("version")
+
+
+def _read_package_json(data: bytes) -> str | None:
+    return json.loads(data.decode("utf-8")).get("version")
+
+
+def _read_cargo(data: bytes) -> str | None:
+    return (tomllib.loads(data.decode("utf-8")).get("package") or {}).get("version")
+
+
+def _read_tauri(data: bytes) -> str | None:
+    loaded = json.loads(data.decode("utf-8"))
+    return loaded.get("version") or (loaded.get("package") or {}).get("version")
+
+
+# The project-file version readers, by file NAME — the ONE implementation
+# behind detect_version (autodetect) and the release effects layer's
+# version-field check (K-96 D9). Each takes the file's bytes and returns its
+# version field (raw — any JSON / TOML value; callers accept only a
+# non-empty str) or None when the file has no such field; malformed content
+# raises (UnicodeDecodeError, tomllib.TOMLDecodeError, json.JSONDecodeError,
+# AttributeError for a non-object document).
+VERSION_FIELD_READERS = {
+    "VERSION": _read_version_file,               # raw single line, stripped
+    "pyproject.toml": _read_pyproject,           # [project].version (PEP 621)
+    "package.json": _read_package_json,          # .version (npm / yarn)
+    "Cargo.toml": _read_cargo,                   # [package].version (rust)
+    "tauri.conf.json": _read_tauri,              # .version (v2) / .package.version (v1)
+}
+# TOMLDecodeError, JSONDecodeError and UnicodeDecodeError are ValueErrors.
+VERSION_FIELD_ERRORS = (ValueError, AttributeError)
+
+
+def version_field_reader(path: str):
+    """The VERSION_FIELD_READERS entry for a (repo-relative or absolute)
+    path, chosen by its file name, or None when dct has no reader for it."""
+    return VERSION_FIELD_READERS.get(Path(path).name)
+
+
+def read_version_field(path: str, data: bytes) -> str | None:
+    """The version field of `data` read as the project file `path`
+    (version_field_reader): a non-empty str, or None when the file holds no
+    such field. Raises ValueError when dct has no reader for the file name
+    or the content is malformed."""
+    reader = version_field_reader(path)
+    if reader is None:
+        raise ValueError(f"no version-field reader for {Path(path).name}")
+    try:
+        value = reader(data)
+    except VERSION_FIELD_ERRORS as exc:
+        raise ValueError(f"{path} cannot be read as {Path(path).name}: {exc}") from None
+    return value if isinstance(value, str) and value else None
+
+
 def detect_version(path: str | Path) -> tuple[str | None, str | None]:
     """Best-effort version detection from common project files.
 
-    Tries in order and returns the first hit:
+    Tries in order and returns the first hit (VERSION_FIELD_READERS):
       1. <path>/VERSION                     — raw single line, stripped
       2. <path>/pyproject.toml              — [project].version (PEP 621)
       3. <path>/package.json                — .version (npm/yarn)
@@ -54,63 +213,15 @@ def detect_version(path: str | Path) -> tuple[str | None, str | None]:
     base = Path(path)
     if not base.is_dir():
         return None, None
-
-    # 1. VERSION (raw text)
-    vf = base / "VERSION"
-    if vf.is_file():
+    for rel in ("VERSION", "pyproject.toml", "package.json", "Cargo.toml",
+                "src-tauri/tauri.conf.json"):
+        candidate = base / rel
+        if not candidate.is_file():
+            continue
         try:
-            v = vf.read_text(encoding="utf-8").strip()
-            if v:
-                return v, "VERSION"
-        except (OSError, UnicodeDecodeError):
-            pass
-
-    # 2. pyproject.toml ([project].version)
-    pp = base / "pyproject.toml"
-    if pp.is_file():
-        try:
-            with open(pp, "rb") as f:
-                data = tomllib.load(f)
-            v = (data.get("project") or {}).get("version")
-            if isinstance(v, str) and v:
-                return v, "pyproject.toml"
-        except (OSError, tomllib.TOMLDecodeError):
-            pass
-
-    # 3. package.json (.version)
-    pj = base / "package.json"
-    if pj.is_file():
-        try:
-            with open(pj, encoding="utf-8") as f:
-                data = json.load(f)
-            v = data.get("version")
-            if isinstance(v, str) and v:
-                return v, "package.json"
-        except (OSError, json.JSONDecodeError, UnicodeDecodeError):
-            pass
-
-    # 4. Cargo.toml ([package].version)
-    ct = base / "Cargo.toml"
-    if ct.is_file():
-        try:
-            with open(ct, "rb") as f:
-                data = tomllib.load(f)
-            v = (data.get("package") or {}).get("version")
-            if isinstance(v, str) and v:
-                return v, "Cargo.toml"
-        except (OSError, tomllib.TOMLDecodeError):
-            pass
-
-    # 5. Tauri — v2 puts version at top level, v1 under .package.version
-    tc = base / "src-tauri" / "tauri.conf.json"
-    if tc.is_file():
-        try:
-            with open(tc, encoding="utf-8") as f:
-                data = json.load(f)
-            v = data.get("version") or (data.get("package") or {}).get("version")
-            if isinstance(v, str) and v:
-                return v, "src-tauri/tauri.conf.json"
-        except (OSError, json.JSONDecodeError, UnicodeDecodeError):
-            pass
-
+            value = read_version_field(rel, candidate.read_bytes())
+        except (OSError, ValueError):
+            continue
+        if value:
+            return value, rel
     return None, None

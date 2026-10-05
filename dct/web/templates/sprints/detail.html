@@ -23,6 +23,7 @@
       <span class="badge pri-{{ row.item.priority }}">{{ row.item.priority }}</span>
       <span class="badge status-{{ row.item.status }}">{{ row.item.status }}</span>
       <a class="member-title" href="{{ url_for('items.detail', slug=slug, id=row.item.id) }}">{{ row.item.title }}</a>
+      {% if row.item.short_title|visible_label %}<span class="short-title">{{ row.item.short_title }}</span>{% endif %}
     </div>
     {% if row.checkpoints %}
     <details class="steps" open>

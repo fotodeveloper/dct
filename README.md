@@ -5,7 +5,7 @@
 [![CI](https://github.com/fotodeveloper/dct/actions/workflows/ci.yml/badge.svg)](https://github.com/fotodeveloper/dct/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://github.com/fotodeveloper/dct/blob/main/LICENSE)
 
-dct makes your work state queryable: what is open, which checkpoints block completion, what was decided, and where the next session should resume. One user-scoped database connects issues, todos, changelog entries, plans, sprints, decisions, and session handoffs across your projects. Assistants and scripts retrieve that state through 55 MCP tools or the CLI instead of reconstructing it from a conversation.
+dct makes your work state queryable: what is open, which checkpoints block completion, what was decided, and where the next session should resume. One user-scoped database connects issues, todos, changelog entries, plans, sprints, decisions, and session handoffs across your projects. Assistants and scripts retrieve that state through 60 MCP tools or the CLI instead of reconstructing it from a conversation.
 
 [Claude Code](https://claude.com/claude-code) has the established integration, with 13 slash-command skills and 4 automation hooks. This development checkout also includes Codex workflow skills and experimental native hooks; availability and limits differ by client. See the [capability matrix](https://github.com/fotodeveloper/dct/blob/main/docs/integrations.md#capability-matrix).
 
@@ -142,13 +142,13 @@ structured work state, not token savings. See the [acceptance evidence](https://
 
 ### Other MCP clients: manual setup
 
-The 13 Claude Code skills, 4 Claude hooks and four development-version Codex skills are host integrations. The 55 MCP tools and CLI provide the common tracking surface. Other clients use **generic MCP support with manual setup**; no client-specific skills, hook parity or acceptance test is implied. Register `dct server` as a stdio server using the configuration format required by your client. A common JSON shape is:
+The 13 Claude Code skills, 4 Claude hooks and four development-version Codex skills are host integrations. The 60 MCP tools and CLI provide the common tracking surface. Other clients use **generic MCP support with manual setup**; no client-specific skills, hook parity or acceptance test is implied. Register `dct server` as a stdio server using the configuration format required by your client. A common JSON shape is:
 
 ```json
 { "mcpServers": { "dct": { "command": "dct", "args": ["server"] } } }
 ```
 
-Provide workflow instructions for your assistant to select and combine these tools. Relevant starting points: `/track` → `create_item`, `/track-list` → `list_items`, `/pickup` → `pickup_work`, `/handoff` → `handoff_work`, `/clog` → `add_changelog`, `/release` → `release_changelog`. These tool mappings are not substitutes for complete commit/release workflows. To teach your assistant *when* to reach for them, adapt the [CLAUDE.md snippet](https://github.com/fotodeveloper/dct/blob/main/dct/assets/claude-md-snippet.md) to your client's rules file.
+Provide workflow instructions for your assistant to select and combine these tools. Relevant starting points: `/track` → `create_item`, `/track-list` → `list_items`, `/pickup` → `pickup_work`, `/handoff` → `handoff_work`, `/clog` → `add_changelog`, `/release` → the local `dct release` workflow (the ledger tools `release_changelog` / `advance_release` serve a project's own release tool). These tool mappings are not substitutes for complete commit/release workflows. To teach your assistant *when* to reach for them, adapt the [CLAUDE.md snippet](https://github.com/fotodeveloper/dct/blob/main/dct/assets/claude-md-snippet.md) to your client's rules file.
 
 ### Troubleshooting
 
@@ -232,13 +232,15 @@ changelog is already written:
 
 ```text
 > /release
-15 unreleased entries → stamped as 1.4.0
-changelog.md regenerated (Keep a Changelog format)
-release: v1.4.0 committed, project version bumped
+15 unreleased entries proven by commit trailers → plan approved as 1.4.0
+version files prepared (pyproject.toml) → approved, push target origin/main
+stamped · changelog.md section · version files · release: v1.4.0 · tag · pushed
 ```
 
-One command stamps the version, exports [Keep a Changelog](https://keepachangelog.com)
-markdown, and makes the release commit.
+One workflow plans the release from commit proof, shows the version files and
+the push target for approval, then stamps the version, writes the
+[Keep a Changelog](https://keepachangelog.com) section, makes the release
+commit and the tag and pushes them — each step verified and resumable.
 
 ## Plans: your markdown, indexed
 
@@ -267,7 +269,7 @@ and promotion to items/sprints: **[docs/plans.md](https://github.com/fotodevelop
 - **Decision records** — ADRs, sprint amendments, inline plan decisions with multi-anchor linkage
 - **Plan classification** — deterministic heading rules; optional command enrichment (development builds default to rules, while PyPI 1.5.0 uses the legacy Claude command setting)
 - **Passive autoscan hook** — Claude Code PostToolUse hook re-scans plan-like files in background on every edit
-- **MCP server** — 55 tools over stdio via the official MCP SDK 2.x; client configuration and supported workflow features vary
+- **MCP server** — 60 tools over stdio via the official MCP SDK 2.x; client configuration and supported workflow features vary
 - **CLI** — fast `dct` command for hooks and scripts
 - **Skills** — Claude Code slash commands (`/track`, `/clog`, `/dct-import`, `/plan-status`, …); four Codex workflows in development builds
 - **Soft deletes** — ledger pattern, nothing is ever hard-deleted
@@ -298,8 +300,24 @@ dct tags merge test tests             # Fold "test" into "tests"
 dct clog add added "New Python parser support" --project myproj
 dct clog list --project myproj --unreleased
 dct clog count --project myproj       # Used by hooks
-dct clog release 1.1 --project myproj # Stamp unreleased → 1.1
+dct clog count --branch feat/x --include-unbranched   # This branch + unbranched/server-detected
+dct clog release 1.1 --project myproj --proposal-digest <p> --push-remote origin --push-branch main --push-url <url> --confirm  # Alias of `dct release apply` that derives the plan itself (after `dct release prepare`): commit, tag, push to the approved target (run from a checkout)
+dct clog release --patch --entries 12,15 --proposal-digest <p> --confirm --no-push   # Only these (proven) entries; a local release
+dct clog update 12 --branch feat/x    # Amend an unreleased entry
+dct clog delete 12                    # Soft-delete an unreleased entry
 dct clog export --project myproj --output changelog.md
+
+# Release workflow (each subcommand also takes --json)
+dct release plan --patch              # Read-only: proven / unproven entries, range, index state
+dct release attest --entries 16 --confirm             # Empty attestation commit for unproven entries
+dct release plan --patch --entries 12,15 --json       # The snapshot to approve (snapshot_digest)
+dct release prepare --patch --entries 12,15 --plan-digest <digest>         # Isolated version sync → the file list and the push target to approve
+dct release apply --patch --entries 12,15 --plan-digest <digest> --proposal-digest <p> --push-remote origin --push-branch main --push-url <url> --confirm  # Stamp, changelog, files, commit, tag, push to the approved target (or --no-push: local)
+dct release resume                    # Finish an interrupted release (verifies every effect; the stored consent, no new approval)
+dct release abandon --version 1.1 --reason "broken build" --confirm
+dct release reconstruct --version 1.0 --confirm       # Record a release made before release records
+dct release takeover --version 1.0 --no-push          # Preview: hand a record without consent to dct (then --takeover-digest <d> --confirm, resume)
+dct release version-files                             # Show the version-file contract (--set a,b | --none, --confirm)
 
 # Projects
 dct project add myproj /path/to/myproj --name "My Project"    # Version auto-detected
@@ -341,7 +359,7 @@ dct config path                       # Show resolved config/data locations
 
 ## MCP Tools
 
-dct ships **55 MCP tools**. Zero-arg calls auto-detect the project from the session's working directory; pass `project=<slug>` to override. Write ops return a minimal ack (id + a few post-state fields); fetch full context with `get_item(id)` / `get_handoff(id)`. In Claude Code the tools register at user scope (callable as `mcp__dct__<name>`), with thirteen daily drivers always loaded and the rest fetched on demand; other clients control tool discovery and loading according to their own MCP implementation. Whatever the client, start with `create_item`, `list_items`, `pickup_work`, and `handoff_work`:
+dct ships **60 MCP tools**. Zero-arg calls auto-detect the project from the session's working directory; pass `project=<slug>` to override. Write ops return a minimal ack (id + a few post-state fields); fetch full context with `get_item(id)` / `get_handoff(id)`. In Claude Code the tools register at user scope (callable as `mcp__dct__<name>`), with thirteen daily drivers always loaded and the rest fetched on demand; other clients control tool discovery and loading according to their own MCP implementation. Whatever the client, start with `create_item`, `list_items`, `pickup_work`, and `handoff_work`:
 
 | Tool | Purpose |
 |---|---|
@@ -388,7 +406,7 @@ Claude Code has the established packaged integration. `dct init` offers to attac
 | `/track-resolve` | Resolve/close items |
 | `/clog` | Add changelog entry |
 | `/commit` | Conventional commit with version suffix + changelog gate |
-| `/release` | Stamp changelog + bump version + generate `changelog.md` |
+| `/release` | One workflow: proof plan → version files + push target approved → stamp, `changelog.md` section, version bump, commit, tag, push |
 | `/pickup` | Session start — read handoff, show sprint, propose first action |
 | `/handoff` | Session end — flag sprint items, write handoff prompt |
 | `/dct-import` | Discover + multi-select + ingest plan-like markdown files |

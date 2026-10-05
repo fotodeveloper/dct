@@ -29,7 +29,15 @@ For each id, call `mcp__dct__get_item(item_id)` to fetch current state.
 ## Step 2: Determine changes
 
 From user request, identify which fields to change:
-- `title`, `status`, `priority`, `component`, `description`, `resolution`
+- `title`, `short_title`, `status`, `priority`, `component`, `description`, `resolution`
+
+`short_title` is the item's label: a 2-4 word English noun phrase (≤ 50 chars,
+no item number, no project name — longer is refused). It is OPTIONAL on
+update: omit it (or pass `""`) to keep the stored label — pass it only when
+the user asks to change the label, never re-send or invent one on a status /
+priority / field update. Pass `'__clear__'` to clear it (same convention as
+`component` / `description` / `resolution`); a whitespace-only value is not
+"omitted" — it strips to empty and clears the label too.
 
 `update_item` does NOT change sprint membership — `in_current_sprint` is a
 derived, read-only field. Sprint changes go through dedicated tools
@@ -74,7 +82,7 @@ This is the audit trail — future /pickup will read these notes via `get_item`.
 
 ### When add_note is OPTIONAL
 
-Title, component, description, tags edits — notes welcome but not required.
+Title, short_title, component, description, tags edits — notes welcome but not required.
 
 ### Editing tags
 

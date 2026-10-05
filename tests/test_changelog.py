@@ -4,6 +4,7 @@ from dct.core.changelog import (
     add_entry,
     count_unreleased,
     delete_entry,
+    import_released_entry,
     list_entries,
     release_entries,
 )
@@ -33,7 +34,7 @@ def test_invalid_category_raises(engine, project):
 def test_unreleased_filter(engine, project):
     add_entry(engine, "proj-a", "added", "Feature A")
     add_entry(engine, "proj-a", "fixed", "Bug B")
-    add_entry(engine, "proj-a", "added", "Feature C", version="0.9")
+    import_released_entry(engine, "proj-a", "added", "Feature C", "0.9")
 
     assert count_unreleased(engine, "proj-a") == 2
     unreleased = list_entries(engine, "proj-a", unreleased_only=True)
@@ -45,8 +46,8 @@ def test_release_entries(engine, project):
     add_entry(engine, "proj-a", "added", "Feature A")
     add_entry(engine, "proj-a", "fixed", "Bug B")
 
-    released_count = release_entries(engine, "proj-a", "1.0")
-    assert released_count == 2
+    released = release_entries(engine, "proj-a", "1.0")
+    assert released["released"] == 2
     assert count_unreleased(engine, "proj-a") == 0
 
     entries = list_entries(engine, "proj-a", version="1.0")
@@ -56,7 +57,7 @@ def test_release_entries(engine, project):
 
 
 def test_release_does_not_touch_already_released(engine, project):
-    add_entry(engine, "proj-a", "added", "Old", version="0.9")
+    import_released_entry(engine, "proj-a", "added", "Old", "0.9")
     add_entry(engine, "proj-a", "added", "New")
 
     release_entries(engine, "proj-a", "1.0")
@@ -67,7 +68,7 @@ def test_release_does_not_touch_already_released(engine, project):
 
 def test_soft_delete(engine, project):
     e = add_entry(engine, "proj-a", "added", "Deletable")
-    assert delete_entry(engine, e["id"]) is True
+    assert delete_entry(engine, "proj-a", e["id"]) is True
     assert count_unreleased(engine, "proj-a") == 0
     assert len(list_entries(engine, "proj-a")) == 0
 

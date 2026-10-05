@@ -4,12 +4,14 @@ from datetime import UTC, datetime
 
 import sqlalchemy as sa
 
+from dct.core.limits import ensure_fits
 from dct.core.projects import resolve_project_id
 from dct.core.tags import (
     set_item_tags_conn,
     tag_id_for_name_conn,
     tags_for_items_conn,
 )
+from dct.core.text import is_blank_label
 from dct.db import (
     item_checkpoints,
     item_notes,
@@ -100,16 +102,43 @@ def _validate_enum(value: str, valid: set[str] | tuple[str, ...], field_name: st
     return value
 
 
+_ITEM_LABELS = {"title": "Item title"}
+
+
 def _validate_title_length(title: str) -> str:
     """Refuse a title the items.title column cannot hold — never truncate.
 
     Silent truncation would lose the tail of a title on PostgreSQL-vs-SQLite
     terms nobody controls; a loud ValueError lets the caller shorten it."""
-    if len(title) > MAX_TITLE_LENGTH:
-        raise ValueError(
-            f"Item title too long: {len(title)} chars, max {MAX_TITLE_LENGTH}"
-        )
+    ensure_fits(items, {"title": title}, _ITEM_LABELS)
     return title
+
+
+def _validate_title(title: str) -> str:
+    """Refuse an empty/blank title or an overlong one. ONE rule for
+    create_item AND update_item (K-12: update used to store "")."""
+    if not title or not title.strip():
+        raise ValueError("Item title cannot be empty")
+    return _validate_title_length(title)
+
+
+def normalize_short_title(short_title: str | None) -> str | None:
+    """The ONE short_title write rule (#817, K-43) — create, update, promote.
+
+    FIRST the raw value is length-checked against items.short_title (> 50
+    chars → ValueError, refused, never truncated — surrounding spaces count),
+    THEN a blank value (text.is_blank_label: only whitespace and Unicode
+    format characters, K-64) is NULL and anything else is stripped of
+    surrounding whitespace — format characters inside a visible label are
+    kept. None → None. A caller that omits the field never reaches here, so
+    omission never clears a label.
+    """
+    if short_title is None:
+        return None
+    ensure_fits(items, {"short_title": short_title})
+    if is_blank_label(short_title):
+        return None
+    return short_title.strip()
 
 
 def _has_tag_exists(tag_id: int):
@@ -190,15 +219,20 @@ def create_item(
     tags: list[str] | None = None,
     *,
     force_tags: bool = False,
+    short_title: str | None = None,
 ) -> dict:
     """Create an item. `tags` is list[str] (CSV splitting stays at the CLI
     boundary, #31); names are normalized and registered in the global tag
     dictionary. A name the similarity guard refuses rolls the WHOLE call back —
     no orphan item, no dictionary row. `force_tags=True` bypasses that guard
-    for machine callers (not exposed over MCP)."""
-    if not title or not title.strip():
-        raise ValueError("Item title cannot be empty")
-    _validate_title_length(title)
+    for machine callers (not exposed over MCP). `short_title` (#817) is the
+    item's 2-4 word label, normalized by normalize_short_title (length
+    checked on the raw value, then stripped; empty → NULL)."""
+    _validate_title(title)
+    short_title = normalize_short_title(short_title)
+    ensure_fits(items, {
+        "component": component, "source_file": source_file, "source_lines": source_lines,
+    })
     _validate_enum(item_type, VALID_TYPES, "item_type")
     _validate_enum(priority, VALID_PRIORITIES, "priority")
     _validate_enum(status, VALID_STATUSES, "status")
@@ -211,6 +245,7 @@ def create_item(
                 project_id=project_id,
                 item_type=item_type,
                 title=title,
+                short_title=short_title,
                 description=description,
                 priority=priority,
                 status=status,
@@ -350,7 +385,7 @@ def update_item(engine: sa.Engine, item_id: int, **kwargs) -> dict | None:
     tags = kwargs.pop("tags", None)
     force_tags = kwargs.pop("force_tags", False)
 
-    allowed = {"title", "description", "priority", "status", "component", "source_file", "source_lines", "resolution", "item_type"}
+    allowed = {"title", "short_title", "description", "priority", "status", "component", "source_file", "source_lines", "resolution", "item_type"}
     values = {}
     for k, v in kwargs.items():
         if k not in allowed or v is None:
@@ -362,13 +397,21 @@ def update_item(engine: sa.Engine, item_id: int, **kwargs) -> dict | None:
         elif k == "item_type":
             _validate_enum(v, VALID_TYPES, "item_type")
         elif k == "title":
-            _validate_title_length(v)
-        if v == "" and k in {"component", "source_file", "source_lines", "resolution", "description"}:
+            _validate_title(v)
+        if k == "short_title":
+            # K-43: an explicit value (even all-blank) is normalized; an
+            # empty result clears the label. Omitting the key keeps it.
+            values[k] = normalize_short_title(v)
+            continue
+        if v == "" and k in {
+            "component", "source_file", "source_lines", "resolution", "description",
+        }:
             v = None
         values[k] = v
 
     if not values and tags is None:
         raise ValueError("No valid fields to update")
+    ensure_fits(items, values, _ITEM_LABELS)
 
     now = datetime.now(UTC)
     values["updated_at"] = now

@@ -54,6 +54,26 @@ def test_plan_empty_on_fresh_system(fake_home):
     assert migrate.plan_migration() == []
 
 
+def test_plan_finds_a_legacy_db_whose_path_needs_url_escaping(tmp_path, monkeypatch):
+    """K-99: the config URL is parsed by SQLAlchemy (as the engine does), not
+    by slicing the "sqlite:///" prefix — a home directory with '#', '%' or a
+    space must still resolve to the real database file."""
+    home = tmp_path / "ho#me %20x"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    for var in ("XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "XDG_STATE_HOME",
+                "DCT_CONFIG_PATH", "DCT_DATA_DIR", "DCT_DATABASE_URL"):
+        monkeypatch.delenv(var, raising=False)
+    legacy = home / ".claude"
+    legacy.mkdir()
+    db = legacy / "dct.db"
+    db.write_text("sqlite-bytes")
+    (legacy / "dct.toml").write_text(f'[database]\nurl = "{paths.sqlite_url(db)}"\n')
+    assert migrate._legacy_db_path(legacy / "dct.toml") == db
+    steps = migrate.plan_migration()
+    assert [(s.kind, s.src) for s in steps if s.kind == "database"] == [("database", db)]
+
+
 def test_plan_moves_config_only_for_pg_install(fake_home):
     _legacy_install(fake_home, url="postgresql://localhost:5432/dct")
     steps = migrate.plan_migration()

@@ -95,9 +95,13 @@ Each decision is recorded; at the end of Step 2.5, print a short summary:
 
 ### Step 2.6: Probe version-sync script integration
 
-dct's `/release` Step 6 runs `./scripts/dct-version-sync.sh <version>` if
-present. We want every registered project to have a version-sync script so
-`/release` can bump project files automatically.
+dct's release workflow (`dct release prepare`, behind `/release`) runs the
+committed `./scripts/dct-version-sync.sh <version>` (else
+`./scripts/version-sync.sh`) if present — once, in an isolated temporary
+worktree — and the owner approves the files it changes as the project's
+version-file contract at the first release (`docs/release-workflow.md`). We want every
+registered project to have a version-sync script so `/release` can bump
+project files automatically.
 
 Probe in order (first-match wins for the existence check):
 
@@ -116,7 +120,7 @@ Based on probe result, use `AskUserQuestion`:
   options:
     - "Wrap — generate scripts/dct-version-sync.sh that delegates to <script> $1 (recommended)"
     - "Replace — overwrite with dct template (backup original to .bak)"
-    - "Keep standalone — /release will skip Step 6; user runs script manually"
+    - "Keep standalone — the release workflow bumps no files; the project releases those files with its own tool"
     - "Skip for now"
 
   On "wrap": write minimal shim:
@@ -136,7 +140,7 @@ Based on probe result, use `AskUserQuestion`:
   header: "Version sync"
   options:
     - "Wrap — generate scripts/dct-version-sync.sh that calls `{tool} {target} $1` (recommended)"
-    - "Skip — /release will skip Step 6; user runs {tool} {target} manually"
+    - "Skip — the release workflow bumps no files; the project releases those files with its own tool"
 
 **Case 4 — no script detected**:
   question: "No version-sync script found. Generate template?"

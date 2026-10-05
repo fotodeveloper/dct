@@ -27,13 +27,47 @@ from dct.mcp import server as S
 
 def test_create_item_ack_shape(srv):
     out = srv.create_item("todo", "My task", project="test", description="a long body", tags=["x"])
-    assert set(out) == {"id", "project", "item_type", "priority", "status", "title"}
+    assert set(out) == {
+        "id", "project", "item_type", "priority", "status", "title", "short_title",
+    }
+    assert out["short_title"] is None  # none passed → stored NULL, echoed
     assert out["project"] == "test"  # resolved slug echo
     assert out["item_type"] == "todo"
     assert out["title"] == "My task"
     assert out["status"] == "open"
     for stripped in ("description", "notes", "checkpoints", "tags", "component", "progress"):
         assert stripped not in out
+
+
+def test_create_item_ack_echoes_stored_short_title(srv):
+    """#817: the echo is how a caller proves the label reached a server that
+    knows the field (an old server silently drops unknown args)."""
+    out = srv.create_item("todo", "Long title", project="test", short_title="Hook paths")
+    assert out["short_title"] == "Hook paths"
+    assert srv.get_item(out["id"])["short_title"] == "Hook paths"
+
+
+def test_create_item_short_title_51_chars_refused_nothing_written(srv):
+    before = srv.list_items(project="test", status="")["rows"]
+    out = srv.create_item("todo", "T", project="test", short_title="s" * 51)
+    assert set(out) == {"error"}
+    assert "short_title" in out["error"] and "51" in out["error"]
+    assert srv.list_items(project="test", status="")["rows"] == before
+
+
+def test_create_item_short_title_exactly_50_chars_stored_untruncated(srv):
+    out = srv.create_item("todo", "T", project="test", short_title="s" * 50)
+    assert out["short_title"] == "s" * 50
+
+
+def test_create_item_short_title_markup_rejected_before_db(monkeypatch):
+    def unexpected_db_access():
+        pytest.fail("Malformed tool calls must be rejected before DB access")
+
+    monkeypatch.setattr(S, "_get_engine", unexpected_db_access)
+    out = S.create_item("todo", "clean", project="test", short_title="<parameter name=x>")
+    assert set(out) == {"error"}
+    assert "field 'short_title'" in out["error"]
 
 
 def test_create_item_error_path_unchanged(srv):
@@ -157,9 +191,10 @@ def test_update_item_ack_shape_and_post_state(srv):
     iid = item["id"]
     out = srv.update_item(iid, priority="P1", status="in_progress")
     assert set(out) == {
-        "id", "item_type", "status", "priority", "title",
+        "id", "item_type", "status", "priority", "title", "short_title",
         "component", "in_current_sprint", "resolved_at", "progress",
     }
+    assert out["short_title"] is None
     assert out["priority"] == "P1"
     assert out["status"] == "in_progress"
     assert out["component"] == "core"
@@ -177,6 +212,33 @@ def test_update_item_clear_shows_null_in_header(srv):
     assert out["component"] is None
 
 
+def test_update_item_short_title_set_keep_and_clear(srv):
+    item = srv.create_item("todo", "T", project="test")
+    iid = item["id"]
+    assert srv.update_item(iid, short_title="Label one")["short_title"] == "Label one"
+    # An update that omits short_title leaves it untouched.
+    assert srv.update_item(iid, priority="P1")["short_title"] == "Label one"
+    out = srv.update_item(iid, short_title="__clear__")
+    assert out["short_title"] is None
+    assert srv.get_item(iid)["short_title"] is None
+
+
+def test_update_item_short_title_too_long_refused_row_unchanged(srv):
+    item = srv.create_item("todo", "T", project="test", short_title="Keep")
+    out = srv.update_item(item["id"], short_title="x" * 51, priority="P1")
+    assert set(out) == {"error"}
+    assert "short_title" in out["error"]
+    got = srv.get_item(item["id"])
+    assert got["short_title"] == "Keep"
+    assert got["priority"] == "P2"  # the whole update was refused
+
+
+def test_update_item_short_title_markup_rejected(srv):
+    item = srv.create_item("todo", "T", project="test")
+    out = srv.update_item(item["id"], short_title="</parameter>")
+    assert "error" in out and "field 'short_title'" in out["error"]
+
+
 def test_update_item_unknown_id_error_unchanged(srv):
     out = srv.update_item(424242, priority="P1")
     assert out == {"error": "Item #424242 not found"}
@@ -186,6 +248,14 @@ def test_update_item_markup_rejected(srv):
     item = srv.create_item("todo", "T", project="test")
     out = srv.update_item(item["id"], description="</parameter> leak")
     assert "error" in out and "Malformed MCP tool call" in out["error"]
+
+
+def test_update_item_clear_title_refused_and_title_unchanged(srv):
+    """K-12: '__clear__' on title maps to "" — core must refuse it, not store it."""
+    item = srv.create_item("todo", "Keep me", project="test")
+    out = srv.update_item(item["id"], title="__clear__")
+    assert out == {"error": "Item title cannot be empty"}
+    assert srv.get_item(item["id"])["title"] == "Keep me"
 
 
 # ── resolve_item ──────────────────────────────────────────────────────────────
@@ -221,8 +291,11 @@ def test_resolve_item_unknown_id_error_unchanged(srv):
 
 
 def test_add_changelog_ack_shape(srv):
-    out = srv.add_changelog("added", "shipped a slim ack layer", project="test", component="server")
-    assert set(out) == {"id", "project", "category", "component"}
+    out = srv.add_changelog("added", "shipped a slim ack layer", project="test", component="server",
+                            branch="feat/x", worktree="/tmp/test")
+    assert set(out) == {"id", "project", "category", "component", "branch", "branch_source"}
+    assert out["branch"] == "feat/x"
+    assert out["branch_source"] == "client"
     assert out["project"] == "test"
     assert out["category"] == "added"
     assert out["component"] == "server"
@@ -231,13 +304,54 @@ def test_add_changelog_ack_shape(srv):
 
 def test_add_changelog_component_may_be_null(srv):
     out = srv.add_changelog("fixed", "a bug", project="test")
-    assert set(out) == {"id", "project", "category", "component"}
+    assert set(out) == {"id", "project", "category", "component", "branch", "branch_source"}
     assert out["component"] is None
+    # /tmp/test is not a checkout containing the test process cwd → unknown.
+    assert out["branch"] is None and out["branch_source"] is None
 
 
 def test_add_changelog_markup_rejected(srv):
     out = srv.add_changelog("added", "<invoke name=x> broken", project="test")
     assert "error" in out and "Malformed MCP tool call" in out["error"]
+
+
+# ── release / update / delete changelog (#801, #359) ─────────────────────────
+
+
+_RELEASE_KEYS = {"project", "version", "current_version", "mode", "entry_ids",
+                 "released", "already_released", "release"}
+
+
+def test_release_changelog_return_shape_selected(srv):
+    a = srv.add_changelog("added", "a", project="test")["id"]
+    out = srv.release_changelog(project="test", version="1.0.0", entry_ids=[a])
+    assert set(out) == _RELEASE_KEYS
+    release = out.pop("release")
+    assert out == {"project": "test", "version": "1.0.0", "current_version": "1.0.0",
+                   "mode": "selected", "entry_ids": [a], "released": 1,
+                   "already_released": []}
+    assert set(release) == {"id", "version", "mode", "entry_ids", "candidate_sha",
+                            "checkout_root", "release_commit_sha", "manifest", "proof",
+                            "status", "created_at", "updated_at", "completed_at",
+                            "abandoned_at", "abandon_reason", "release_mode",
+                            "executor", "consent", "proposal", "render",
+                            "tag_proof", "push_proof"}
+    assert (release["version"], release["entry_ids"], release["status"]) == (
+        "1.0.0", [a], "stamped")
+
+
+def test_update_changelog_ack_shape(srv):
+    eid = srv.add_changelog("added", "old", project="test")["id"]
+    out = srv.update_changelog(eid, project="test", entry="new body text", category="fixed")
+    assert out == {"id": eid, "project": "test", "updated_fields": ["entry", "category"]}
+    assert "entry" not in out
+
+
+def test_delete_changelog_ack(srv):
+    eid = srv.add_changelog("added", "x", project="test")["id"]
+    assert srv.delete_changelog(eid, project="test") == {"deleted": True, "id": eid}
+    assert srv.count_unreleased_changelog(project="test") == {"count": 0}
+    assert set(srv.delete_changelog(eid, project="test")) == {"error"}
 
 
 # ── handoff tools ─────────────────────────────────────────────────────────────
@@ -398,7 +512,8 @@ def test_promote_section_to_item_ack_shape(srv):
     plan = srv.create_plan("plan-2", "Plan", "plan", project="test")
     section = core_add_section(srv._get_engine(), plan_id=plan["id"], heading="Chunk", depth=2)
     out = srv.promote_section_to_item(section["id"], "todo")
-    assert set(out) == {"id", "item_type", "priority", "status", "title"}
+    assert set(out) == {"id", "item_type", "priority", "status", "title", "short_title"}
+    assert out["short_title"] is None  # K-47: the STORED label, also when null
     assert out["item_type"] == "todo"
     assert out["title"] == "Chunk"
     assert "description" not in out
@@ -410,9 +525,35 @@ def test_promote_checkpoint_to_item_ack_shape(srv):
     section = core_add_section(eng, plan_id=plan["id"], heading="S", depth=2)
     cp = add_plan_checkpoint(eng, section["id"], "promote me to an item")
     out = srv.promote_checkpoint_to_item(cp["id"], "todo")
-    assert set(out) == {"id", "item_type", "priority", "status", "title"}
+    assert set(out) == {"id", "item_type", "priority", "status", "title", "short_title"}
+    assert out["short_title"] is None
     assert out["item_type"] == "todo"
     assert "description" not in out
+
+
+def test_promote_tools_pass_short_title_through(srv):
+    """#817: both promotion paths hand short_title to create_item; K-47: the
+    acks echo the STORED (normalized) label."""
+    eng = srv._get_engine()
+    plan = core_create_plan(eng, "test", slug="p-short", title="P", kind="plan")
+    section = core_add_section(eng, plan_id=plan["id"], heading="Section", depth=2)
+    cp = add_plan_checkpoint(eng, section["id"], "checkpoint text")
+    from_section = srv.promote_section_to_item(section["id"], "todo", short_title="Section label")
+    from_cp = srv.promote_checkpoint_to_item(cp["id"], "todo", short_title="Checkpoint label")
+    assert srv.get_item(from_section["id"])["short_title"] == "Section label"
+    assert srv.get_item(from_cp["id"])["short_title"] == "Checkpoint label"
+    assert from_section["short_title"] == "Section label"
+    assert from_cp["short_title"] == "Checkpoint label"
+
+
+def test_promote_section_short_title_too_long_refused_no_backlink(srv):
+    eng = srv._get_engine()
+    plan = core_create_plan(eng, "test", slug="p-long", title="P", kind="plan")
+    section = core_add_section(eng, plan_id=plan["id"], heading="Section", depth=2)
+    out = srv.promote_section_to_item(section["id"], "todo", short_title="x" * 51)
+    assert set(out) == {"error"}
+    from dct.core.plans.crud import get_plan_section
+    assert get_plan_section(eng, section["id"])["converted_to_item_id"] is None
 
 
 def test_promote_section_to_sprint_ack_strips_goal(srv):

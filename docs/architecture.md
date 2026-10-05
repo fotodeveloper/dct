@@ -22,12 +22,13 @@ Register dct once and it is available in every Claude Code session. Opening a ne
 SQLAlchemy Core tables (not the ORM) with a `deleted_at` column for soft deletes (ledger pattern — nothing is ever hard-deleted). 14 tables:
 
 **Core**:
-- `projects` — slug, name, path, current_version, manages_changelog, changelog_path
-- `items` — project_id, type, title, priority, status, component, source_file, source_lines, resolution, tags (**DEPRECATED** — see below). Sprint membership is **not** a column: `in_current_sprint` is derived at read time from `item_sprints` (#216 dropped the legacy boolean).
+- `projects` — slug, name, path, current_version, manages_changelog, changelog_path, version_files / version_files_confirmed_at / version_files_history (K-73: the owner-confirmed JSON list of repo-relative files a release must change; NULL = not learned; every replaced list is appended to the history), release_executor (K-85: `dct` default \| `own`; `dct project release-executor`), changelog_pr_refs (K-90: render `(#N)` PR references, default off; `dct project changelog-pr-refs`), release_proposal (K-76: the PENDING version-file proposal of `dct release prepare` — canonical JSON, replaced by a new prepare, consumed and cleared by the stamp that approves it; NULL = nothing prepared)
+- `items` — project_id, type, title, short_title (nullable 50-char label, #817), priority, status, component, source_file, source_lines, resolution, tags (**DEPRECATED** — see below). Sprint membership is **not** a column: `in_current_sprint` is derived at read time from `item_sprints` (#216 dropped the legacy boolean).
 - `item_notes` — item_id, note (append-only)
 - `item_checkpoints` — item_id, text, status, kind, sort_order
-- `changelog_entries` — project_id, version, category, entry, component, source_file, related_item_id
+- `changelog_entries` — project_id, version, category, entry, component, source_file, source_lines, related_item_id, branch / worktree / branch_source (nullable git context the entry was written on, #801; `branch_source` = `client` or `server`). `version` is written ONLY by the release stamp (`release_entries`, K-102): `add_entry` refuses a version and runs under the project lock; old released history is imported with `import_released_entry` (refused for a version that has a release record)
 - `session_handoffs` — project_id, prompt, context_summary, scope, created_by, consumed_at, consumed_by
+- `releases` — durable release records (K-41): project_id, version (normalized), mode, entry_ids (JSON array of the exact set, `[]` = version-only), candidate_sha (immutable), checkout_root, release_commit_sha (set once), manifest (JSON object of verified artifacts, write-once per key), proof (JSON map entry id → proving commits / merge commit / PR), status (one state machine, `core/releases.TRANSITIONS`: stamped → files_written → committed → tagged → pushed → completed, plus terminal `abandoned` from any unfinished status), completed_at, abandoned_at, abandon_reason, release_mode (git \| without_git, the verified mode), executor (dct \| own, from the project at stamp time — the stamp compares it with the executor its caller expects, K-106), consent / proposal / render (write-once JSON — [release-workflow.md](release-workflow.md#the-release-ledger-record-fields)), tag_proof / push_proof (K-115 G4: the VERIFIED tag identity `{name, object, commit, annotated, recorded_at}` and push `{target, tag_commit, branch_tip, recorded_at}`, write-once JSON; NULL = not proven — a record with git cannot be `tagged` / `pushed` / `completed` without them, see [proofs](release-workflow.md#proof-of-the-tag-and-of-the-push-k-115)); one live record per (project, version) — a ledger that still holds several live records of one semantic version refuses every write of it and names them on read (K-115 G6). Written in the same transaction as the stamp (`release_entries`) — or, for a release older than records, by `reconstruct_release` without re-stamping — advanced by `core/releases.advance_release`, ended by `abandon_release`.
 
 **Plans / sprints / decisions**:
 - `plans` — ulid, project_id, slug, title, kind, source_file, source_hash, status, sprint_id, imported_at
@@ -52,14 +53,25 @@ Full DDL lives in:
 - `migrations/002_sprint_and_handoff.sql`
 - `migrations/003_plans_sprints_decisions.sql`
 - `migrations/004_tags.sql`
+- `migrations/005_items_short_title.sql`
+- `migrations/006_changelog_branch.sql`
+- `migrations/007_releases.sql`
+- `migrations/008_release_ledger.sql`
+- `migrations/009_release_ledger_fields.sql`
+- `migrations/010_release_pending_proposal.sql`
+- `migrations/011_release_tag_push_proof.sql`
 
-At runtime, the engine applies schema via `metadata.create_all()` plus an idempotent `_apply_schema_updates()` that:
-- adds later columns in place (e.g. `item_checkpoints.kind` for gate checkpoints),
+At runtime, the engine creates every MISSING table with all its indexes (`_create_missing_tables` — race-safe against a concurrent bootstrap: a duplicate table / index / relation error rolls the attempt back, the whole schema of those tables is re-checked and finished, at most `SCHEMA_CREATE_ATTEMPTS` tries, any other error propagates; tables that already exist are left to the explicit blocks below — except the release-ledger tables (`INDEX_HEALED_TABLES`, K-93 A2), whose missing required indexes every bootstrap completes, warning once instead of failing when existing rows violate a unique index) plus an idempotent `_apply_schema_updates()` that:
+- adds later columns in place (e.g. `item_checkpoints.kind` for gate checkpoints; new columns go through the duplicate-safe `_add_column_if_missing` — `ADD COLUMN IF NOT EXISTS` under a 5 s `lock_timeout` on PostgreSQL, a re-checked "duplicate column" error on SQLite),
 - handles dialect-specific bool literals (PostgreSQL strict, SQLite permissive), and
 - auto-migrates legacy `items.in_current_sprint=TRUE` flags into the new `item_sprints` table as a per-project "legacy sprint" (then drops the column), and
 - backfills `tags` / `item_tags` from the frozen `items.tags` JSON column (`_backfill_item_tags`): tolerant parse (bad JSON is dropped with a stderr note, never raised), per-item anti-join guard so re-tagged items are never re-seeded, and a one-shot stderr similarity report suggesting `dct tags merge` for near-duplicates — a suggestion, never a block.
 
 Schema updates run on the first engine bootstrap of a new-code session — verify destructive changes against a throwaway database and keep each step idempotent.
+
+Read-only commands (`dct release plan` / `status`, `dct clog candidates`, the previews of `dct release reconstruct` / `takeover` / `version-files`) never bootstrap (K-84): they open the database read-only (`core.engine.readonly_engine` — SQLite `mode=ro` without a journal-mode change or file creation, PostgreSQL READ ONLY transactions), check that every table and column of the current schema exists (`db.check_schema_ready`) and otherwise refuse with a message naming `dct db upgrade`, the explicit bootstrap. Caveat: on a SQLite database already in WAL mode SQLite itself may create the `-wal` / `-shm` sidecar files for any reader, also a read-only one — the database file, its schema and its data stay unchanged.
+
+SQLite URLs are built and parsed in ONE place (K-99): `dct.paths.sqlite_url(path)` renders through SQLAlchemy's own URL object and `dct.paths.sqlite_database_path(url)` parses with `make_url` — never by concatenating or slicing `sqlite:///`. SQLAlchemy 2.1 percent-decodes the database part of a URL and 2.0 does not, so a hand-built URL names another file on 2.1 as soon as the path holds a `%`; the helpers behave the same on both (the supported floor stays `sqlalchemy>=2.0.52`). A path the installed SQLAlchemy cannot express (a `?` on the 2.0 line) is refused instead of silently opening another file. A URL you write by hand into `dct.toml` follows the rules of the SQLAlchemy you run.
 
 ## Configuration
 
