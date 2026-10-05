@@ -4,6 +4,7 @@ from datetime import UTC, datetime
 
 import sqlalchemy as sa
 
+from dct.core.limits import ensure_fits
 from dct.core.projects import resolve_project_id
 from dct.core.tags import (
     set_item_tags_conn,
@@ -100,16 +101,24 @@ def _validate_enum(value: str, valid: set[str] | tuple[str, ...], field_name: st
     return value
 
 
+_ITEM_LABELS = {"title": "Item title"}
+
+
 def _validate_title_length(title: str) -> str:
     """Refuse a title the items.title column cannot hold — never truncate.
 
     Silent truncation would lose the tail of a title on PostgreSQL-vs-SQLite
     terms nobody controls; a loud ValueError lets the caller shorten it."""
-    if len(title) > MAX_TITLE_LENGTH:
-        raise ValueError(
-            f"Item title too long: {len(title)} chars, max {MAX_TITLE_LENGTH}"
-        )
+    ensure_fits(items, {"title": title}, _ITEM_LABELS)
     return title
+
+
+def _validate_title(title: str) -> str:
+    """Refuse an empty/blank title or an overlong one. ONE rule for
+    create_item AND update_item (K-12: update used to store "")."""
+    if not title or not title.strip():
+        raise ValueError("Item title cannot be empty")
+    return _validate_title_length(title)
 
 
 def _has_tag_exists(tag_id: int):
@@ -196,9 +205,10 @@ def create_item(
     dictionary. A name the similarity guard refuses rolls the WHOLE call back —
     no orphan item, no dictionary row. `force_tags=True` bypasses that guard
     for machine callers (not exposed over MCP)."""
-    if not title or not title.strip():
-        raise ValueError("Item title cannot be empty")
-    _validate_title_length(title)
+    _validate_title(title)
+    ensure_fits(items, {
+        "component": component, "source_file": source_file, "source_lines": source_lines,
+    })
     _validate_enum(item_type, VALID_TYPES, "item_type")
     _validate_enum(priority, VALID_PRIORITIES, "priority")
     _validate_enum(status, VALID_STATUSES, "status")
@@ -362,13 +372,14 @@ def update_item(engine: sa.Engine, item_id: int, **kwargs) -> dict | None:
         elif k == "item_type":
             _validate_enum(v, VALID_TYPES, "item_type")
         elif k == "title":
-            _validate_title_length(v)
+            _validate_title(v)
         if v == "" and k in {"component", "source_file", "source_lines", "resolution", "description"}:
             v = None
         values[k] = v
 
     if not values and tags is None:
         raise ValueError("No valid fields to update")
+    ensure_fits(items, values, _ITEM_LABELS)
 
     now = datetime.now(UTC)
     values["updated_at"] = now

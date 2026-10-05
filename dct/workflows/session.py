@@ -43,6 +43,7 @@ from dct.core.checkpoints import (
 )
 from dct.core.decisions import _query_recent_decisions
 from dct.core.handoff import _query_unconsumed_handoffs
+from dct.core.limits import ensure_fits
 from dct.core.sprint import (
     _json_safe,
     _parse_since_conn,
@@ -53,7 +54,7 @@ from dct.core.sprint import (
     _query_total_open,
     _to_cols_rows,
 )
-from dct.db import project_transaction
+from dct.db import project_transaction, session_handoffs
 
 SNAPSHOT_SECTIONS = ("sprint", "handoff", "gates", "decisions", "recent_changes")
 
@@ -408,6 +409,10 @@ def _pickup_work_once(
             "(consume auto/true) — identify the session (model + timestamp), "
             "or pass consume=false for a pure read."
         )
+    if may_consume:
+        # The limit is part of the argument contract, not of the consume path:
+        # refuse it even when 0 or several candidates mean nothing is consumed.
+        ensure_fits(session_handoffs, {"consumed_by": consumed_by})
 
     sections = _resolve_sections(include)
     with project_transaction(engine, project_slug, write=may_consume) as (conn, project_id):

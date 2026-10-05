@@ -9,6 +9,7 @@ from datetime import UTC, datetime
 
 import sqlalchemy as sa
 
+from dct.core.limits import ensure_fits
 from dct.core.projects import resolve_project_id
 from dct.db import row_to_dict, session_handoffs
 
@@ -29,6 +30,7 @@ def _create_handoff_conn(
         raise ValueError("Handoff prompt cannot be empty")
     if not created_by or not created_by.strip():
         raise ValueError("created_by cannot be empty — identify the session (model + timestamp)")
+    ensure_fits(session_handoffs, {"created_by": created_by, "scope": scope})
 
     row = conn.execute(
         session_handoffs.insert()
@@ -120,6 +122,7 @@ def _consume_handoff_conn(
     transaction and re-fetched in a second — a concurrent soft-delete between
     them made a SUCCESSFUL consume return None. Single-connection collapse
     closes that window and lets composed ops consume inside their own txn."""
+    ensure_fits(session_handoffs, {"consumed_by": consumed_by})
     now = datetime.now(UTC)
     result = conn.execute(
         session_handoffs.update()
@@ -191,6 +194,7 @@ def update_handoff(
         values["context_summary"] = context_summary
     if not values:
         raise ValueError("Nothing to update — pass prompt, scope, or context_summary")
+    ensure_fits(session_handoffs, values)
 
     with engine.begin() as conn:
         result = conn.execute(

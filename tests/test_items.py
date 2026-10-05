@@ -376,6 +376,16 @@ def test_update_item_rejects_title_one_over_max(engine, project):
     assert get_item(engine, item["id"])["title"] == "Short"
 
 
+@pytest.mark.parametrize("blank", ["", "   ", "\t\n"])
+def test_update_item_rejects_blank_title(engine, project, blank):
+    """K-12: update_item must hold the same non-empty contract as create_item."""
+    item = create_item(engine, "proj-a", "todo", "Short")
+    with pytest.raises(ValueError, match="^Item title cannot be empty$"):
+        update_item(engine, item["id"], title=blank, priority="P1")
+    after = get_item(engine, item["id"])
+    assert (after["title"], after["priority"]) == ("Short", "P2")
+
+
 def test_max_title_length_matches_the_column(engine):
     """Single source of truth: the guard is derived from items.title, so a
     column widening cannot leave the validator behind."""

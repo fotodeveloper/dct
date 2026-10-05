@@ -401,9 +401,9 @@ def create_item(
         project: Project slug. Empty = auto-detect from CWD.
         description: Prose context (no checkbox lists — use add_checkpoint instead).
         priority: P1 (blocker) / P2 (important, default) / P3 (backlog) / future.
-        component: Component or module name.
-        source_file: Relative file path.
-        source_lines: Line range (e.g. "42-58").
+        component: Component or module name (≤ 100 chars).
+        source_file: Relative file path (≤ 500 chars).
+        source_lines: Line range (e.g. "42-58", ≤ 100 chars).
         tags: List of tag strings. Pass as a JSON array, e.g. ["oss","tests"].
             Names are normalized (trimmed, lowercased) and registered in the
             GLOBAL tag dictionary. A name confusable with an existing tag is
@@ -413,8 +413,8 @@ def create_item(
     Returns: slim ack {id, project, item_type, priority, status, title} —
         `project` is the resolved slug (auto-detect safety echo). NOT the full
         item dict (no description/tags echo); call get_item for the rest.
-        {"error": "..."} on invalid enum, markup, a refused tag name, or an
-        unresolvable project.
+        {"error": "..."} on invalid enum, markup, a refused tag name, an
+        over-long field (refused, never truncated), or an unresolvable project.
     """
     if (err := _reject_toolcall_markup(title=title, description=description, tags=tags)):
         return err
@@ -542,10 +542,11 @@ def update_item(
 
     Args:
         item_id: Target item.
-        title: New title (non-empty, ≤ 500 chars — ≤ 80 recommended).
+        title: New title (non-empty, ≤ 500 chars — ≤ 80 recommended; blank or
+            '__clear__' is refused).
         status: open / in_progress / resolved / wont_fix.
         priority: P1 / P2 / P3 / future.
-        component: Component or module name.
+        component: Component or module name (≤ 100 chars).
         resolution: Resolution / rationale note.
         description: Prose context.
         tags: FULL REPLACE of the item's tag set — the list you pass becomes the
@@ -559,8 +560,9 @@ def update_item(
             the tag is resolved.
 
     Clearing a field — pass literal '__clear__' to null a NULLABLE field
-    (component, resolution, description). NOT for title/status/priority: title
-    would blank out and status/priority would fail enum validation. Tags use
+    (component, resolution, description). NOT for title/status/priority: all
+    three are refused (title cannot be empty; status/priority fail enum
+    validation). Tags use
     their own convention above ([], not '__clear__').
 
     Returns: slim POST-state ack {id, item_type, status, priority, title,
@@ -569,7 +571,8 @@ def update_item(
         progress is {done, pending, active}. NOT the full item dict (no
         notes/checkpoints/tags/description echo) — call get_item to read the
         resulting tag list back. {"error": "..."} on unknown id, a refused tag
-        name, or markup.
+        name, a blank title, an over-long field (refused, never truncated), or
+        markup.
     """
     if (err := _reject_toolcall_markup(
         title=title, description=description, resolution=resolution, tags=tags
@@ -1230,16 +1233,18 @@ def create_handoff(
 
     Args:
         prompt: Free-form "for next session: ..." text. Must be non-empty.
-        created_by: REQUIRED, non-empty — self-identify (e.g.
+        created_by: REQUIRED, non-empty, ≤ 200 chars — self-identify (e.g.
             "claude-opus-4-7 @ 2026-04-17T14:30Z").
         project: Empty = auto-detect from CWD.
-        scope: Optional tag like "sprint-v0.2" or "refactor-auth".
+        scope: Optional tag like "sprint-v0.2" or "refactor-auth" (≤ 100 chars).
         context_summary: Optional snapshot of state at handoff time.
+
+    Over-long created_by/scope is refused, never truncated.
 
     Returns: slim ack {id, project, scope, created_at} — `project` is the
         resolved slug, `scope` may be null. NO prompt/context_summary echo.
         Error cases: {"error": "..."} when prompt is empty, created_by is empty,
-        or project slug does not resolve.
+        created_by/scope exceeds its limit, or project slug does not resolve.
     """
     if (err := _reject_toolcall_markup(prompt=prompt, context_summary=context_summary)):
         return err
@@ -1321,12 +1326,13 @@ def consume_handoff(handoff_id: int, consumed_by: str = "") -> dict:
 
     Args:
         handoff_id: id returned by create_handoff / list_handoffs.
-        consumed_by: optional — self-identify the consuming session (mirrors
-            create_handoff's `created_by` format).
+        consumed_by: optional, ≤ 200 chars (refused, never truncated) —
+            self-identify the consuming session (mirrors create_handoff's
+            `created_by` format).
 
     Returns: slim ack {id, consumed_at} — the consumed timestamp only. NO
         prompt echo. {"error": "..."} if the handoff is missing / already
-        consumed.
+        consumed, or consumed_by exceeds 200 chars (nothing is written).
     """
     from dct.core.handoff import consume_handoff as _consume
     try:
@@ -1375,13 +1381,15 @@ def update_handoff(
     Args:
         handoff_id: id returned by create_handoff / list_handoffs.
         prompt: New prompt text (omit/empty = unchanged; cannot be blanked).
-        scope: New scope tag (omit/empty = unchanged).
+        scope: New scope tag, ≤ 100 chars — refused, never truncated
+            (omit/empty = unchanged).
         context_summary: New context snapshot (omit/empty = unchanged).
 
     Returns: slim ack {id, updated_fields} — `updated_fields` lists the applied
         field names (subset of prompt / scope / context_summary). NO prompt
         echo. {"error": "..."} if the handoff is missing / consumed / deleted,
-        or if no field was supplied.
+        if no field was supplied, or scope exceeds 100 chars (nothing is
+        written).
     """
     if (err := _reject_toolcall_markup(prompt=prompt, context_summary=context_summary)):
         return err
@@ -1500,14 +1508,15 @@ def pickup_work(
             consume. 'false' = pure read (contradictory with handoff_id).
         consumed_by: REQUIRED whenever consumption is possible (consume ''
             or 'true') — self-identify like create_handoff's created_by
-            ("claude-opus-4-7 @ 2026-04-17T14:30Z"). Empty errors.
+            ("claude-opus-4-7 @ 2026-04-17T14:30Z"). Empty errors; > 200
+            chars is refused (never truncated) when a consume happens.
         handoff_id: Consume this exact handoff (0 = none given). WINS over
             scope, which is then ignored EVERYWHERE — candidate selection AND
             the returned handoff.latest. An id from another project reads as
             "not found or already consumed" — no cross-project consume.
-        scope: Narrow candidates to one workstream tag (empty = any); also makes
-            the returned handoff section scope-coherent and adds
-            handoff.scope_matched.
+        scope: Narrow candidates to one workstream tag (empty = any; stored
+            tags are ≤ 100 chars); also makes the returned handoff section
+            scope-coherent and adds handoff.scope_matched.
         since: recent_changes anchor — same vocabulary as get_context_snapshot.
         include: Comma-separated sections to keep; empty = all; 'none' = none.
 
@@ -1521,6 +1530,7 @@ def pickup_work(
         workstream") is distinguishable from "several pending, pick one"; the
         key is absent when no scope was given. {"error": "..."} on an invalid consume token (nothing
         is read or written), empty consumed_by while consumption is possible,
+        a > 200-char consumed_by on a consume (nothing is written),
         handoff_id with consume='false', an unknown/already-consumed handoff_id,
         consume='true' with no candidate, an unknown section, or an unresolvable
         project.
@@ -1587,7 +1597,7 @@ def handoff_work(
 
     Args:
         prompt: Free-form "for next session: ..." text (required, non-empty).
-        created_by: REQUIRED, non-empty — self-identify (e.g.
+        created_by: REQUIRED, non-empty, ≤ 200 chars — self-identify (e.g.
             "claude-opus-4-7 @ 2026-04-17T14:30Z").
         item_ids: REPLACE mode. '__keep__' (DEFAULT) = do NOT touch the sprint;
             '22,21,6' = replace the sprint's OPEN membership with exactly those
@@ -1607,8 +1617,12 @@ def handoff_work(
             no-op). Empty = the only active sprint, or auto-created when none
             is active (replace/add paths); several active and no selector →
             error listing the candidates.
-        scope: Optional workstream tag ("sprint-v0.2") — pickup_work filters on it.
+        scope: Optional workstream tag ("sprint-v0.2", ≤ 100 chars) —
+            pickup_work filters on it.
         context_summary: Optional state snapshot stored next to the prompt.
+
+    Over-long created_by/scope is refused, never truncated, and rolls the
+    membership writes back.
 
     Returns: slim ack {handoff_id, project, scope, created_at, sprint} — `sprint`
         is {sprint_id, code, open_size, items} (OPEN membership after the
@@ -1616,7 +1630,8 @@ def handoff_work(
         history instead) or
         null (null ⇔ no membership change requested). NO prompt /
         context_summary echo (fetch with get_handoff). {"error": "..."} on
-        empty prompt or created_by, malformed/empty id lists, replace combined
+        empty prompt or created_by, created_by/scope over its limit,
+        malformed/empty id lists, replace combined
         with add/remove, unknown/foreign item ids, removing a terminal member,
         an ambiguous or non-active sprint selector, a selector without a
         membership change, literal tool-call markup in a free-text field, or

@@ -97,6 +97,8 @@ guessing a target — pick one explicitly with `assign_item_to_sprint` /
 
 `list_handoffs` truncates the `prompt` to a 200-char preview (with a trailing `…` when longer) across all formats; call `get_handoff(id)` for the full text.
 
+Length limits (every handoff tool, incl. `pickup_work` / `handoff_work`): `created_by` and `consumed_by` ≤ 200 chars, `scope` ≤ 100. A longer value is refused with `{"error": ...}` naming the field and limit — never truncated, nothing written.
+
 ## Workflow ops (3)
 
 Composed session-edge operations (#413) — ONE implementation in

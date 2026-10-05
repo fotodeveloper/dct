@@ -188,6 +188,14 @@ def test_update_item_markup_rejected(srv):
     assert "error" in out and "Malformed MCP tool call" in out["error"]
 
 
+def test_update_item_clear_title_refused_and_title_unchanged(srv):
+    """K-12: '__clear__' on title maps to "" — core must refuse it, not store it."""
+    item = srv.create_item("todo", "Keep me", project="test")
+    out = srv.update_item(item["id"], title="__clear__")
+    assert out == {"error": "Item title cannot be empty"}
+    assert srv.get_item(item["id"])["title"] == "Keep me"
+
+
 # ── resolve_item ──────────────────────────────────────────────────────────────
 
 
