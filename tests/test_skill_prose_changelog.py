@@ -12,6 +12,7 @@ import pytest
 
 from dct.assets import skills_dir
 from dct.integrations import codex
+from dct.workflows.release.proof import CHANGELOG_LINE_PATTERN
 
 FALLBACKS = Path(__file__).resolve().parent.parent / "docs" / "assistant-fallbacks.md"
 
@@ -29,10 +30,10 @@ def _fallbacks() -> str:
 
 
 def _trailer_regex() -> re.Pattern:
-    """The strict body-scan regex exactly as the authoritative doc states it."""
-    match = re.search(r"`(\^Changelog: [^`]+\$)`", _fallbacks())
-    assert match, "assistant-fallbacks.md lost the strict Changelog: regex"
-    return re.compile(match.group(1))
+    """The strict body-scan regex of the PRODUCTION proof layer — the doc
+    must state the very same pattern (asserted in
+    test_fallbacks_carry_the_shared_trailer_and_range_rules)."""
+    return re.compile(CHANGELOG_LINE_PATTERN)
 
 
 @pytest.mark.parametrize("text", [
@@ -118,9 +119,13 @@ def test_release_has_no_step_numbering_gaps_or_ghost_references():
 
 def test_fallbacks_carry_the_shared_trailer_and_range_rules():
     body = _fallbacks()
-    assert "`^Changelog: [0-9]+(, [0-9]+)*$`" in body
+    assert f"`{CHANGELOG_LINE_PATTERN}`" in body
     assert "%(trailers:key=Changelog,valueonly,separator=%x2C)" in body
-    assert 'git merge-base --is-ancestor "v$CUR"' in body
+    # K-71: the range starts at the NEAREST ancestor release tag (computed by
+    # `dct release plan`), confirmed when it is not v<current_version>.
+    flat = " ".join(body.split())
+    assert "nearest release tag that is an ancestor" in flat
+    assert "dct release plan" in flat and "dct clog candidates" in flat
     assert "chore: attest changelog entries" in body
     assert "entry_ids" in body and "short_title" in body
 

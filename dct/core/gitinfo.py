@@ -14,7 +14,11 @@ Composites:
 STRICT (raises instead of guessing — the mutating release path only, K-52):
   - verify_release_checkout(project_path, cwd) — a CONFIRMED checkout (with
     its full HEAD commit), a CONFIRMED non-repository (None), or a
-    CheckoutVerificationError. Used by the CLI release before it stamps.
+    CheckoutVerificationError. Used by the CLI release before it stamps
+    and by the release plan (dct.workflows.release).
+  - git_read(cwd, *args) / git_is_ancestor(cwd, a, b) — read-only history
+    reads of the proof layer (`--no-optional-locks`, bounded timeout);
+    any failure raises GitReadError, never a partial answer.
 
 The Codex hook bridge (autoscan ownership bound to the current worktree) uses
 git_toplevel alone — exactly one git process, no branch read.
@@ -238,28 +242,34 @@ def resolve_checkout(
 # ── strict resolver (K-52) ───────────────────────────────────────────────────
 
 
-def _strict_git(cwd: str, *args: str) -> subprocess.CompletedProcess:
-    """`git -C <cwd> <args>` with its exit code and stderr, or a
-    CheckoutVerificationError when git is missing, cannot be started or times
-    out. GIT_* variables are dropped (see _git) and the C locale is forced so
-    git's messages can be matched."""
+def _strict_git(
+    cwd: str, *args: str, timeout: float = GIT_TIMEOUT_SECONDS,
+    error: type[CheckoutVerificationError] = CheckoutVerificationError,
+    global_args: tuple[str, ...] = (),
+    decode_errors: str = "strict",
+) -> subprocess.CompletedProcess:
+    """`git <global_args> -C <cwd> <args>` with its exit code and stderr, or
+    `error` (a CheckoutVerificationError) when git is missing, cannot be
+    started or times out. GIT_* variables are dropped (see _git) and the C
+    locale is forced so git's messages can be matched. `decode_errors` is
+    the stdout/stderr decoding policy (an undecodable byte under "strict" is
+    reported as `error`)."""
     git = shutil.which("git")
     if not git:
-        raise CheckoutVerificationError("git is not on PATH — the checkout cannot be verified")
+        raise error("git is not on PATH — the checkout cannot be verified")
     env = {key: value for key, value in os.environ.items()
            if not key.startswith("GIT_") and key != "LANGUAGE"}
     env["LC_ALL"] = "C"
     try:
         return subprocess.run(
-            [git, "-C", cwd, *args],
-            env=env, capture_output=True, text=True,
-            timeout=GIT_TIMEOUT_SECONDS, check=False,
+            [git, *global_args, "-C", cwd, *args],
+            env=env, capture_output=True, encoding="utf-8", errors=decode_errors,
+            timeout=timeout, check=False,
         )
     except subprocess.TimeoutExpired as exc:
-        raise CheckoutVerificationError(
-            f"git timed out after {GIT_TIMEOUT_SECONDS}s in {cwd}") from exc
+        raise error(f"git timed out after {timeout}s in {cwd}") from exc
     except (OSError, subprocess.SubprocessError, ValueError) as exc:
-        raise CheckoutVerificationError(f"could not run git in {cwd}: {exc}") from exc
+        raise error(f"could not run git in {cwd}: {exc}") from exc
 
 
 def _git_entry_on_path(path: str) -> str | None:
@@ -350,3 +360,45 @@ def verify_release_checkout(
         "head": head,
         "git_common_dir": common,
     }
+
+
+# ── strict read-only readers (the release proof layer, K-72 layer 1) ────────
+
+# History reads (log over a release range, rev-list per merge) can take far
+# longer than the 2 s location probes; still bounded so a plan never hangs.
+GIT_READ_TIMEOUT_SECONDS = 60
+
+
+class GitReadError(CheckoutVerificationError):
+    """A read-only git command the release plan needs failed or timed out —
+    the plan is refused instead of being computed on partial history."""
+
+
+def git_read(
+    cwd: str | os.PathLike[str], *args: str,
+    ok_codes: tuple[int, ...] = (0,), timeout: float = GIT_READ_TIMEOUT_SECONDS,
+) -> tuple[int, str]:
+    """(exit code, stdout) of a READ-ONLY `git --no-optional-locks -C <cwd>
+    <args>` (no shell, GIT_* stripped, C locale). An exit code outside
+    `ok_codes`, git missing, or a timeout raises GitReadError with git's
+    stderr. stdout is returned verbatim (NUL / control separators kept;
+    bytes that are not UTF-8 — a legacy-encoded commit message — become
+    U+FFFD instead of failing the read).
+    Callers pass only read commands — this helper never writes, and
+    `--no-optional-locks` keeps git from refreshing the index on the way (a
+    plain `git status` may rewrite it to update its stat cache)."""
+    result = _strict_git(
+        os.fspath(cwd), *args, timeout=timeout, error=GitReadError,
+        global_args=("--no-optional-locks",), decode_errors="replace",
+    )
+    if result.returncode not in ok_codes:
+        detail = (result.stderr or "").strip() or f"exit code {result.returncode}"
+        raise GitReadError(f"`git {' '.join(args)}` failed in {os.fspath(cwd)}: {detail}")
+    return result.returncode, result.stdout
+
+
+def git_is_ancestor(cwd: str | os.PathLike[str], ancestor: str, descendant: str) -> bool:
+    """`git merge-base --is-ancestor`: True (exit 0) / False (exit 1); any
+    other outcome raises GitReadError."""
+    code, _ = git_read(cwd, "merge-base", "--is-ancestor", ancestor, descendant, ok_codes=(0, 1))
+    return code == 0

@@ -1299,6 +1299,126 @@ def cmd_clog_release_abandon(args):
           f"and current_version stay; release the work under a new version")
 
 
+def _proof_layer_error(e: Exception) -> None:
+    """Exit 1 with a one-line reason for a failed read-only plan / candidates."""
+    print(f"✗ Error: {e}", file=sys.stderr)
+    sys.exit(1)
+
+
+def _print_entry_line(entry: dict, extra: str = "") -> None:
+    where = f" @ {entry['branch']}" if entry.get("branch") else ""
+    flag = " [uncertain]" if entry.get("uncertain") else ""
+    print(f"  #{entry['id']} [{entry['category']}]{where}{flag} {entry['entry'][:60]}{extra}")
+
+
+def cmd_release_plan(args):
+    """`dct release plan` — the read-only proof layer (K-72 layer 1).
+
+    Prints the plan of the release cut from the CURRENT checkout (verified
+    strictly, K-52) — or, with --json, the stable JSON document
+    (dct.workflows.release.PLAN_KEYS; schema in docs/release-workflow.md).
+    Writes nothing: no database row, no ref, index or work-tree change.
+    """
+    import json
+
+    from dct.workflows.release import build_plan
+
+    engine = _get_engine()
+    project_slug = args.project or _detect_project(engine)
+    try:
+        plan = build_plan(engine, project_slug, version=args.version or None,
+                          bump_type=None if args.version else args.bump)
+    except Exception as e:
+        _proof_layer_error(e)
+    if args.json:
+        print(json.dumps(plan, indent=2, default=_json_default))
+        return
+    version = plan["version"]
+    print(f"Release plan for {plan['project']} ({plan['kind']}): "
+          f"{version['current'] or '-'} → {version['target'] or '(no target version given)'}")
+    if plan["unfinished_release"]:
+        rec = plan["unfinished_release"]
+        print(f"  unfinished release {rec['version']}: {rec['status']} — resume or abandon it")
+    checkout = plan["checkout"]
+    if not checkout["git"]:
+        print(f"  checkout: none ({checkout['reason']})")
+    else:
+        print(f"  candidate: {checkout['candidate_sha']} on "
+              f"{checkout['branch'] or '(detached HEAD)'} in {checkout['repo_root']}")
+        rng = plan["range"]
+        print(f"  range: {rng['display'] or '(empty)'} — {rng['commit_count']} commits"
+              f"{' [confirm the base]' if rng['confirm_required'] else ''}"
+              f"{' [approximate]' if rng['approximate'] else ''}")
+    proven, unproven = plan["entries"]["proven"], plan["entries"]["unproven"]
+    print(f"Proven ({len(proven)}):")
+    for entry in proven:
+        merge = f" via {entry['merge_commit'][:12]}" if entry["merge_commit"] else ""
+        pr = f" (#{entry['pr']})" if entry["pr"] else ""
+        _print_entry_line(entry, f" ← {', '.join(c[:12] for c in entry['commits'])}{merge}{pr}")
+    print(f"Unproven ({len(unproven)}):")
+    for entry in unproven:
+        _print_entry_line(entry, f" — {entry['reason']}")
+    for i, group in enumerate(plan["attestation_groups"]):
+        print(f"Attestation proposal {i} ({group['branch'] or 'unbranched'}): "
+              f"{', '.join(f'#{n}' for n in group['entry_ids'])} — "
+              f"squash {', '.join(c[:12] for c in group['squash_commits'])} "
+              f"[{', '.join(group['signals'])}]")
+    for cite in plan["foreign_citations"]:
+        print(f"  cited #{cite['id']}: {cite['reason']}"
+              f"{' (' + cite['version'] + ')' if cite['version'] else ''} — not stamped")
+    index = plan["index"]
+    if index is not None:
+        dirty = [a["path"] for a in index["release_artifacts"]
+                 if a["staged"] or a["unstaged"] or a["conflicted"]]
+        print(f"Index: {'clean' if index['clean'] else 'NOT clean'}"
+              f"{' — release artifacts changed: ' + ', '.join(dirty) if dirty else ''}")
+    files = (plan["version_files"] or {}).get("version_files")
+    print(f"Version files: {', '.join(files) if files else '(not learned yet)' if files is None else '(none)'}")
+    for warning in plan["warnings"]:
+        print(f"  ⚠ {warning}", file=sys.stderr)
+
+
+def cmd_clog_candidates(args):
+    """`dct clog candidates` — /commit's changelog candidates (K-53), read-only.
+
+    confirmed (client provenance of THIS checkout and branch) vs uncertain
+    (server / no provenance, or any entry on a detached HEAD — never
+    attached automatically), minus the ids the range already proves, plus
+    the staged file list. --json prints the stable document
+    (dct.workflows.release.CANDIDATE_KEYS).
+    """
+    import json
+
+    from dct.workflows.release import commit_candidates
+
+    engine = _get_engine()
+    project_slug = args.project or _detect_project(engine)
+    try:
+        result = commit_candidates(engine, project_slug)
+    except Exception as e:
+        _proof_layer_error(e)
+    if args.json:
+        print(json.dumps(result, indent=2, default=_json_default))
+        return
+    checkout = result["checkout"]
+    if checkout["git"]:
+        print(f"Checkout: {checkout['toplevel']} on "
+              f"{checkout['branch'] or '(detached HEAD)'} at {checkout['head'] or '-'}")
+    for title, key in (("Confirmed", "confirmed"), ("Uncertain — confirm before attaching",
+                                                    "uncertain"),
+                       ("Other branch in this worktree", "other_branch")):
+        print(f"{title} ({len(result[key])}):")
+        for entry in result[key]:
+            reason = entry.get("uncertain_reason")
+            _print_entry_line(entry, f" — {reason}" if reason else "")
+    if result["already_proven"]:
+        print(f"Already proven in the range: "
+              f"{', '.join(f'#{i}' for i in result['already_proven'])}")
+    print(f"Staged files ({len(result['staged_files'])}): {', '.join(result['staged_files'])}")
+    for warning in result["warnings"]:
+        print(f"  ⚠ {warning}", file=sys.stderr)
+
+
 def cmd_clog_update(args):
     from dct.core.changelog import update_entry
 
@@ -2387,6 +2507,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Required: the version stays taken by the abandoned record")
     p_clog_rabandon.add_argument("--project", "-P")
 
+    p_clog_cand = p_clog_sub.add_parser(
+        "candidates",
+        help="Changelog candidates for the commit being prepared (read-only, K-53)")
+    p_clog_cand.add_argument("--project", "-P")
+    p_clog_cand.add_argument("--json", action="store_true", help="Stable JSON document")
+
     p_clog_update = p_clog_sub.add_parser(
         "update",
         help="Amend an unreleased changelog entry (\"\" clears a field, --item-id 0 unlinks)")
@@ -2410,6 +2536,23 @@ def build_parser() -> argparse.ArgumentParser:
     p_clog_export = p_clog_sub.add_parser("export", help="Export to Keep a Changelog markdown")
     p_clog_export.add_argument("--project", "-P")
     p_clog_export.add_argument("--output", "-o")
+
+    # release (the release workflow, K-72) — layer 1: the read-only plan
+    p_release = sub.add_parser("release", help="Release workflow (plan: read-only proof layer)")
+    p_release_sub = p_release.add_subparsers(dest="release_command")
+    p_rel_plan = p_release_sub.add_parser(
+        "plan", help="Show the release plan of the current checkout — no side effects")
+    p_rel_plan.add_argument("--project", "-P")
+    p_rel_plan_v = p_rel_plan.add_mutually_exclusive_group()
+    p_rel_plan_v.add_argument("--version", help="Target version (X.Y or X.Y.Z)")
+    p_rel_plan_v.add_argument("--patch", dest="bump", action="store_const", const="patch")
+    p_rel_plan_v.add_argument("--minor", dest="bump", action="store_const", const="minor")
+    p_rel_plan_v.add_argument("--major", dest="bump", action="store_const", const="major")
+    p_rel_plan.add_argument("--json", action="store_true", help="Stable JSON document")
+    p_rel_status = p_release_sub.add_parser(
+        "status", help="Show a release record (alias of `clog release-status`)")
+    p_rel_status.add_argument("--version", help="The release to show (X.Y or X.Y.Z)")
+    p_rel_status.add_argument("--project", "-P")
 
     # _task-mirror (internal: worker for hooks/dct-task-mirror.sh)
     p_tm = sub.add_parser(
@@ -2668,9 +2811,15 @@ CLOG_COMMAND_MAP = {
     "release-status": cmd_clog_release_status,
     "release-advance": cmd_clog_release_advance,
     "release-abandon": cmd_clog_release_abandon,
+    "candidates": cmd_clog_candidates,
     "update": cmd_clog_update,
     "delete": cmd_clog_delete,
     "export": cmd_clog_export,
+}
+
+RELEASE_COMMAND_MAP = {
+    "plan": cmd_release_plan,
+    "status": cmd_clog_release_status,
 }
 
 CONFIG_COMMAND_MAP = {
@@ -2818,6 +2967,12 @@ def main():
         handler = CLOG_COMMAND_MAP.get(args.clog_command)
         if not handler:
             parser.parse_args(["clog", "--help"])
+            return
+        handler(args)
+    elif args.command == "release":
+        handler = RELEASE_COMMAND_MAP.get(args.release_command)
+        if not handler:
+            parser.parse_args(["release", "--help"])
             return
         handler(args)
     elif args.command in ("checkpoint", "cp"):

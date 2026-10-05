@@ -1,17 +1,20 @@
-"""Execution contracts for the changelog proof workflow (K-30 / K-45 / K-46).
+"""Execution contracts for the changelog proof workflow (K-30 / K-45 / K-46,
+K-57): the PRODUCTION proof layer (dct.workflows.release) runs on a real
+throwaway git repository, never a test re-implementation of the rules:
 
-The prose tests in test_skill_prose_changelog.py lock WORDS; these tests run
-the documented commands on a real throwaway git repository and lock what they
-DO:
-
-- the trailer-reading commands are extracted verbatim from the authoritative
-  docs/assistant-fallbacks.md and executed against commits that carry a
-  trailer block, body lines, quoted / bulleted prose, a squash-preserved body
-  and a local `git merge --squash` (whose indented messages must NOT count);
+- the trailer reads (git's trailer parser + the strict column-0 body scan,
+  dct.workflows.release.proof) against commits that carry a trailer block,
+  body lines, quoted / bulleted prose, a squash-preserved body and a local
+  `git merge --squash` (whose indented messages must NOT count);
+- the range (dct.workflows.release.plan.resolve_range);
 - the /commit sequence (stage → select from the final `git diff --cached` →
   commit without another `git add`) is replayed from the skill's own code
   blocks on a repository whose index and working tree DIFFER (deliberate
   partial staging): the trailer must describe exactly the committed hunk.
+
+docs/assistant-fallbacks.md must state the same strict regex and trailer
+format the code uses (asserted below), so the prose cannot drift from the
+implementation.
 """
 
 import os
@@ -23,6 +26,13 @@ from pathlib import Path
 import pytest
 
 from dct.assets import skills_dir
+from dct.workflows.release.plan import read_commits, resolve_range
+from dct.workflows.release.proof import (
+    CHANGELOG_LINE_PATTERN,
+    TRAILER_FORMAT,
+    ids_from_body,
+    ids_from_trailer_value,
+)
 
 pytestmark = pytest.mark.skipif(shutil.which("git") is None, reason="git not installed")
 
@@ -35,25 +45,6 @@ def _fallbacks() -> str:
 
 def _skill(name: str) -> str:
     return (skills_dir() / name / "SKILL.md").read_text(encoding="utf-8")
-
-
-def _doc_command(pattern: str) -> str:
-    """One backticked command from the authoritative doc, verbatim."""
-    match = re.search(pattern, _fallbacks())
-    assert match, f"assistant-fallbacks.md lost the command matching {pattern!r}"
-    return match.group(1)
-
-
-def _trailer_command() -> str:
-    return _doc_command(r"`(git log --format='%\(trailers:key=Changelog[^`]*?) R`")
-
-
-def _body_command() -> str:
-    return _doc_command(r"`(git log --format=%B) R`")
-
-
-def _strict_regex() -> re.Pattern:
-    return re.compile(_doc_command(r"`(\^Changelog: [^`]+\$)`"))
 
 
 def _env(**extra: str) -> dict:
@@ -91,21 +82,11 @@ def _commit(repo: Path, message: str, path: str = "f.txt") -> None:
     _git(repo, "commit", "-q", "-F", "-", input=message)
 
 
-def _proven_ids(repo: Path, rng: str) -> tuple[set[int], set[int]]:
-    """Run the doc's two reads for range `rng`; return (trailer ids, body ids)."""
-    trailer_out = _bash(repo, f"{_trailer_command()} {rng}")
-    assert trailer_out.returncode == 0, trailer_out.stderr
-    trailer_ids = {
-        int(part) for line in trailer_out.stdout.splitlines()
-        for part in (p.strip() for p in line.split(",")) if part
-    }
-    body_out = _bash(repo, f"{_body_command()} {rng}")
-    assert body_out.returncode == 0, body_out.stderr
-    regex = _strict_regex()
-    body_ids = {
-        int(part) for line in body_out.stdout.splitlines() if regex.match(line)
-        for part in line[len("Changelog: "):].split(", ")
-    }
+def _proven_ids(repo: Path, *revs: str) -> tuple[set[int], set[int]]:
+    """The production reads for `revs`: (trailer-parser ids, strict body ids)."""
+    commits = read_commits(str(repo), *revs)
+    trailer_ids = set().union(*(ids_from_trailer_value(c.trailer_value) for c in commits))
+    body_ids = set().union(*(ids_from_body(c.message) for c in commits))
     return trailer_ids, body_ids
 
 
@@ -145,16 +126,25 @@ def test_merge_squash_fixture_really_indents_the_original_trailer(proof_repo):
     assert "    Changelog: 10" in body  # the premise of the doc's squash rule
 
 
-def test_documented_range_commands_select_the_tag_range(proof_repo):
+def test_docs_state_the_rules_the_code_implements():
+    body = _fallbacks()
+    assert f"`{CHANGELOG_LINE_PATTERN}`" in body
+    assert TRAILER_FORMAT in body
+    assert "dct release plan" in body and "dct clog candidates" in body
+
+
+def test_range_starts_at_the_ancestor_release_tag(proof_repo):
     sha = _git(proof_repo, "rev-parse", "HEAD").strip()
-    verify = _doc_command(r'`(git rev-parse -q --verify "refs/tags/v\$CUR")`')
-    ancestor = _doc_command(r'`(git merge-base --is-ancestor "v\$CUR" "\$SHA")`')
-    assert _bash(proof_repo, verify, CUR="1.0").returncode == 0
-    assert _bash(proof_repo, ancestor, CUR="1.0", SHA=sha).returncode == 0
-    assert _bash(proof_repo, verify, CUR="2.0").returncode != 0
+    rng = resolve_range(str(proof_repo), sha, "1.0", None)
+    assert rng["base_tag"] == "v1.0" and rng["revs"] == [f"{rng['base_sha']}..{sha}"]
+    assert rng["confirm_required"] is False and rng["approximate"] is False
+    # A current_version without its tag: the nearest ancestor tag, confirmed.
+    rng = resolve_range(str(proof_repo), sha, "2.0", None)
+    assert rng["base_tag"] == "v1.0" and rng["confirm_required"] is True
+    assert rng["expected_tag"] == {"name": "v2.0", "exists": False, "ancestor": False}
 
 
-def test_documented_reads_prove_exactly_the_trailer_and_body_lines(proof_repo):
+def test_production_reads_prove_exactly_the_trailer_and_body_lines(proof_repo):
     sha = _git(proof_repo, "rev-parse", "HEAD").strip()
     trailer_ids, body_ids = _proven_ids(proof_repo, f"v1.0..{sha}")
     assert trailer_ids == {1, 2}

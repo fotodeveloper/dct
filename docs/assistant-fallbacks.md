@@ -72,35 +72,82 @@ The skill is preflight + dialogs + one atomic call. Without the skill:
 
 A changelog entry is **proven** for a release when a commit in the release
 range names its id in a `Changelog:` trailer. `/commit` writes the trailers,
-`/release` reads them; both use exactly these rules.
+`/release` reads them; both use exactly these rules. They are implemented
+ONCE in code — `dct/workflows/release/proof.py` (the rules) and
+`dct/workflows/release/plan.py` (range, reverts, squash, provenance) — and
+computed read-only by two commands (schemas:
+[release-workflow.md](release-workflow.md)):
+
+- `dct release plan [-P slug] [--version V | --patch|--minor|--major] --json`
+  — the release plan of the current checkout: range, proof and provenance
+  per entry, unproven entries with a reason, foreign citations, reverts,
+  squash proposals, index state, version-file contract. No side effects.
+- `dct clog candidates [-P slug] --json` — `/commit`'s candidates:
+  `confirmed` vs `uncertain`, minus the ids the range already proves, plus
+  the staged file list.
+
+The prose below describes what they compute; when a client cannot run the
+CLI, apply it by hand.
 
 **Trailer format (written by `/commit`).** One line `Changelog: <id>, <id>` —
 ids ascending, separated by comma + space — in the final trailer block of the
 message, before `Co-Authored-By:`. Release commits (`release: vX.Y.Z`) carry
 no `Changelog:` trailer.
 
-**Range `R` for a target commit `SHA`.** Let `CUR` = the project's
-`current_version` (from `list_projects`).
-- If the tag exists (`git rev-parse -q --verify "refs/tags/v$CUR"`) AND is an
-  ancestor of the target (`git merge-base --is-ancestor "v$CUR" "$SHA"`):
-  `R = v$CUR..$SHA`.
-- Otherwise: `R = --since=<oldest unreleased entry's created_at minus 1 day> $SHA`,
-  and WARN that the boundary is approximate.
+**Range `R` for a target commit `SHA` (K-71).** The base is the nearest
+release tag that is an ancestor of the target: among the tags reachable
+from `SHA` whose name follows the version contract (`v1.5.0`, `1.5`, …),
+the one with the HIGHEST version (ties: the exact `v<current_version>`,
+then a `v`-prefixed name). `R = <base>..$SHA`. When the base is not the tag
+of the project's `current_version` (e.g. a maintenance branch cut from an
+older release), the plan flags `confirm_required` — show the base and let
+the owner confirm it. Without any ancestor release tag:
+`R = --since=<oldest unreleased entry's created_at minus 1 day> $SHA`, and
+WARN that the boundary is approximate. Backports of a LOWER version stay
+refused by the never-rewind rule.
 
-**Reading proof for `R`** — the union of:
+**Reading proof for `R`** — per commit, the union of:
 1. git's trailer parser:
    `git log --format='%(trailers:key=Changelog,valueonly,separator=%x2C)' R`;
 2. a strict full-body scan: `git log --format=%B R`, keeping ONLY lines that
-   match `^Changelog: [0-9]+(, [0-9]+)*$` exactly. This covers squash merges
-   that keep the original commit messages inside the body; quoted or bulleted
-   prose (`> Changelog: 12`, `- Changelog: 12`) never counts.
+   match `^Changelog: [0-9]+(, [0-9]+)*$` exactly, in column 0. This covers
+   squash merges that keep the original commit messages inside the body;
+   quoted, bulleted or indented prose (`> Changelog: 12`, `- Changelog: 12`,
+   `    Changelog: 12`) never counts — and a column-0 line inside an example
+   DOES count, so quote examples.
+A cited id that is not an unreleased entry of the project (unknown, another
+project's, already released, deleted) is a foreign citation: reported,
+never stamped. An entry cited only BELOW the base tag is `below_range`.
 
-**Squash merges lose trailers.** A squash configured as "PR title and
+**Reverts (K-68).** A commit whose subject starts `Revert "` (or `Reapply "`,
+git's name for a revert of a revert) and that carries git's standard line
+`This reverts commit <sha>.` reverts `<sha>`: when `<sha>` is in `R`, the
+ids it proves lose that proof (reason `reverted`, with the revert SHA); a
+revert of a merge also removes the proof of the commits the merge brought
+in. A revert of the revert restores the proof (chains alternate). A revert
+whose target is outside `R` is reported, never guessed. `/commit` writes
+reverts with git's standard message (`git revert`) so this detection works.
+
+**Squash merges lose trailers (K-69).** A squash configured as "PR title and
 description" drops the commit bodies, and a LOCAL `git merge --squash` indents
 every original message by four spaces in the squash commit's body — neither
 read above sees an indented `    Changelog: 12`. Those entries end up WITHOUT
-proof: they need an explicit attestation (below), never an automatic
-assignment from the squashed history.
+proof. The plan detects squash-looking commits (subject ending `(#N)`,
+git's "Squashed commit of the following:" message, indented `Changelog:`
+lines) and groups the unproven entries linked to them — by an indented id,
+by the entry's client-confirmed branch named in the squash message, or by
+that branch's own proving commits being absent from the candidate's
+ancestry — into ONE proposed collective attestation per source branch
+(`attestation_groups`). A proposal only: they need an explicit attestation
+(below), never an automatic assignment from the squashed history.
+Recommended merge modes keep the proof: a merge commit, a rebase merge, or
+a hosted squash that keeps the commit messages.
+
+**Provenance (K-70).** For every proven entry the plan reports its branch
+metadata, the proving commit(s), the merge commit on the candidate's
+first-parent line that brought it in, and the PR number from a
+`Merge pull request #N …` or `… (#N)` subject — the `proof` map the release
+record stores.
 
 **Detached HEAD.** `git branch --show-current` prints nothing: there is no
 branch to filter on, and an empty `branch` filter means "every entry of every
