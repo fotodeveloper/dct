@@ -230,3 +230,14 @@ def test_fix_canonicalizes_an_approximation_the_check_tolerates(checker, tmp_pat
 
     assert problems == [], "~900 is within tolerance of 946"
     assert "~940 tests" in page.read_text(encoding="utf-8")
+
+
+def test_derived_hook_count_excludes_shared_hook_libs(checker):
+    """A sourced *.lib.sh beside the hooks (K-48) is not a hook: the advertised
+    hook count must equal the hooks the installer wires, not every *.sh file."""
+    repo = SCRIPT.parent.parent
+    hooks_dir = repo / "dct" / "hooks"
+    wired = [p for p in hooks_dir.glob("*.sh") if not p.name.endswith(".lib.sh")]
+    assert any(p.name.endswith(".lib.sh") for p in hooks_dir.glob("*.sh")), (
+        "precondition: a shared hook lib exists, otherwise this test proves nothing")
+    assert checker.derive(repo)["hooks"] == str(len(wired))
