@@ -285,11 +285,19 @@ dct clog add added "New Python parser support" --project myproj
 dct clog list --project myproj --unreleased
 dct clog count --project myproj       # Used by hooks
 dct clog count --branch feat/x --include-unbranched   # This branch + unbranched/server-detected
-dct clog release 1.1 --project myproj # Stamp unreleased → 1.1 (run from a checkout of the project)
-dct clog release --patch --entries 12,15              # Stamp only these entries
+dct clog release 1.1 --project myproj # Alias of `dct release apply` (run from a checkout of the project)
+dct clog release --patch --entries 12,15              # Release only these (proven) entries
 dct clog update 12 --branch feat/x    # Amend an unreleased entry
 dct clog delete 12                    # Soft-delete an unreleased entry
 dct clog export --project myproj --output changelog.md
+
+# Release workflow (each subcommand also takes --json)
+dct release plan --patch              # Read-only: proven / unproven entries, range, index state
+dct release attest --entries 16 --confirm             # Empty attestation commit for unproven entries
+dct release apply --patch --entries 12,15 --confirm   # Stamp, changelog, version sync, commit, tag
+dct release resume                    # Finish an interrupted release (verifies every effect)
+dct release abandon --version 1.1 --reason "broken build" --confirm
+dct release reconstruct --version 1.0 --confirm       # Record a release made before release records
 
 # Projects
 dct project add myproj /path/to/myproj --name "My Project"    # Version auto-detected

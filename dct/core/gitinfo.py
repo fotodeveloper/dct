@@ -16,9 +16,14 @@ STRICT (raises instead of guessing — the mutating release path only, K-52):
     its full HEAD commit), a CONFIRMED non-repository (None), or a
     CheckoutVerificationError. Used by the CLI release before it stamps
     and by the release plan (dct.workflows.release).
-  - git_read(cwd, *args) / git_is_ancestor(cwd, a, b) — read-only history
-    reads of the proof layer (`--no-optional-locks`, bounded timeout);
-    any failure raises GitReadError, never a partial answer.
+  - git_read(cwd, *args) / git_is_ancestor(cwd, a, b) / git_read_blob —
+    read-only history reads of the proof layer (`--no-optional-locks`,
+    bounded timeout); any failure raises GitReadError, never a partial
+    answer.
+WRITER (the release effects layer only, dct.workflows.release.effects):
+  - git_write(cwd, *args, index_file=None) — keeps the caller's identity /
+    config-location variables (WRITE_ENV_PASSTHROUGH), may target a
+    temporary index; any failure raises GitWriteError.
 
 The Codex hook bridge (autoscan ownership bound to the current worktree) uses
 git_toplevel alone — exactly one git process, no branch read.
@@ -247,24 +252,29 @@ def _strict_git(
     error: type[CheckoutVerificationError] = CheckoutVerificationError,
     global_args: tuple[str, ...] = (),
     decode_errors: str = "strict",
+    keep_env: frozenset[str] = frozenset(),
+    extra_env: dict[str, str] | None = None,
+    binary: bool = False,
 ) -> subprocess.CompletedProcess:
     """`git <global_args> -C <cwd> <args>` with its exit code and stderr, or
     `error` (a CheckoutVerificationError) when git is missing, cannot be
-    started or times out. GIT_* variables are dropped (see _git) and the C
-    locale is forced so git's messages can be matched. `decode_errors` is
-    the stdout/stderr decoding policy (an undecodable byte under "strict" is
-    reported as `error`)."""
+    started or times out. GIT_* variables are dropped (see _git) — except
+    the names in `keep_env` — then `extra_env` is added, and the C locale is
+    forced so git's messages can be matched. `decode_errors` is the
+    stdout/stderr decoding policy (an undecodable byte under "strict" is
+    reported as `error`); `binary` returns stdout / stderr as raw bytes."""
     git = shutil.which("git")
     if not git:
         raise error("git is not on PATH — the checkout cannot be verified")
     env = {key: value for key, value in os.environ.items()
-           if not key.startswith("GIT_") and key != "LANGUAGE"}
+           if (not key.startswith("GIT_") or key in keep_env) and key != "LANGUAGE"}
+    env.update(extra_env or {})
     env["LC_ALL"] = "C"
+    text = {} if binary else {"encoding": "utf-8", "errors": decode_errors}
     try:
         return subprocess.run(
             [git, *global_args, "-C", cwd, *args],
-            env=env, capture_output=True, encoding="utf-8", errors=decode_errors,
-            timeout=timeout, check=False,
+            env=env, capture_output=True, timeout=timeout, check=False, **text,
         )
     except subprocess.TimeoutExpired as exc:
         raise error(f"git timed out after {timeout}s in {cwd}") from exc
@@ -402,3 +412,66 @@ def git_is_ancestor(cwd: str | os.PathLike[str], ancestor: str, descendant: str)
     other outcome raises GitReadError."""
     code, _ = git_read(cwd, "merge-base", "--is-ancestor", ancestor, descendant, ok_codes=(0, 1))
     return code == 0
+
+
+def git_read_blob(cwd: str | os.PathLike[str], commit: str, path: str) -> bytes | None:
+    """The EXACT bytes of `path` (repo-root-relative, forward slashes) in
+    `commit`, or None when the commit's tree has no such file. Read-only
+    (`--no-optional-locks`); any other failure raises GitReadError."""
+    cwd = os.fspath(cwd)
+    _, out = git_read(cwd, "ls-tree", "-z", commit, "--", path)
+    entry = next((e for e in out.split("\0") if e), None)
+    if entry is None:
+        return None
+    meta, _, name = entry.partition("\t")
+    parts = meta.split()
+    if name != path or len(parts) != 3 or parts[1] != "blob":
+        raise GitReadError(f"{path} in {commit} is not a regular file ({meta!r})")
+    result = _strict_git(cwd, "cat-file", "blob", parts[2], error=GitReadError,
+                         timeout=GIT_READ_TIMEOUT_SECONDS,
+                         global_args=("--no-optional-locks",), binary=True)
+    if result.returncode != 0:
+        detail = result.stderr.decode("utf-8", "replace").strip()
+        raise GitReadError(f"`git cat-file blob {parts[2]}` failed in {cwd}: {detail}")
+    return result.stdout
+
+
+# ── the release EFFECTS layer's writer (K-72 layer 3) ────────────────────────
+
+# Identity / config-location variables a WRITE keeps: the commit the effects
+# layer creates carries the caller's identity (GIT_AUTHOR_* / GIT_COMMITTER_*)
+# and honours the caller's config location. Repository-location variables
+# (GIT_DIR, GIT_INDEX_FILE, GIT_WORK_TREE, …) are still dropped — a writer is
+# told explicitly which index it works on (`index_file`).
+WRITE_ENV_PASSTHROUGH = frozenset({
+    "GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "GIT_AUTHOR_DATE",
+    "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL", "GIT_COMMITTER_DATE",
+    "GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM", "GIT_CONFIG_NOSYSTEM",
+})
+
+
+class GitWriteError(CheckoutVerificationError):
+    """A git command of the release effects layer failed or timed out."""
+
+
+def git_write(
+    cwd: str | os.PathLike[str], *args: str,
+    ok_codes: tuple[int, ...] = (0,), timeout: float = GIT_READ_TIMEOUT_SECONDS,
+    index_file: str | None = None,
+) -> tuple[int, str]:
+    """(exit code, stdout) of a git command that MAY write (`git -C <cwd>
+    <args>`, no shell, C locale) — the release effects layer only
+    (dct.workflows.release.effects). GIT_* variables are dropped except
+    WRITE_ENV_PASSTHROUGH; `index_file` sets GIT_INDEX_FILE (a TEMPORARY
+    index — the user's index is never touched through it). An exit code
+    outside `ok_codes`, git missing, or a timeout raises GitWriteError with
+    git's stderr."""
+    extra = {"GIT_INDEX_FILE": index_file} if index_file else None
+    result = _strict_git(
+        os.fspath(cwd), *args, timeout=timeout, error=GitWriteError,
+        decode_errors="replace", keep_env=WRITE_ENV_PASSTHROUGH, extra_env=extra,
+    )
+    if result.returncode not in ok_codes:
+        detail = (result.stderr or "").strip() or f"exit code {result.returncode}"
+        raise GitWriteError(f"`git {' '.join(args)}` failed in {os.fspath(cwd)}: {detail}")
+    return result.returncode, result.stdout

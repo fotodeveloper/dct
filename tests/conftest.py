@@ -295,6 +295,32 @@ def git(repo, *args: str) -> str:
     return result.stdout.strip()
 
 
+@pytest.fixture
+def git_identity(monkeypatch, tmp_path_factory):
+    """Commits the release effects layer creates (dct.core.gitinfo.git_write)
+    carry a test identity and see no user / system git config (signing,
+    hooks) — set through the writer's passthrough variables, so the tests
+    do not depend on the machine's ~/.gitconfig (CI has none)."""
+    cfg = tmp_path_factory.mktemp("gitcfg") / "config"
+    cfg.write_text("")
+    for var in ("GIT_AUTHOR_NAME", "GIT_COMMITTER_NAME"):
+        monkeypatch.setenv(var, "t")
+    for var in ("GIT_AUTHOR_EMAIL", "GIT_COMMITTER_EMAIL"):
+        monkeypatch.setenv(var, "t@t")
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(cfg))
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+
+
+def git_commit_proving(repo, entry_id: int, path: str = "proof.txt") -> str:
+    """Commit a change carrying the `Changelog: <id>` trailer; return its SHA."""
+    target = os.path.join(str(repo), path)
+    with open(target, "a", encoding="utf-8") as fh:
+        fh.write(f"change for #{entry_id}\n")
+    git(repo, "add", "--", path)
+    git(repo, "commit", "-q", "-m", f"feat: change {entry_id}\n\nChangelog: {entry_id}")
+    return git(repo, "rev-parse", "HEAD")
+
+
 def make_git_repo(path, branch: str = "main"):
     """A git repo at `path` on `branch` with one commit; returns the realpath."""
     path.mkdir(parents=True, exist_ok=True)

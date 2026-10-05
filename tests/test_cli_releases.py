@@ -6,7 +6,7 @@ import shutil
 from pathlib import Path
 
 import pytest
-from conftest import git, make_git_repo, run_cli
+from conftest import git, git_commit_proving, make_git_repo, run_cli
 
 from dct.core.changelog import add_entry, list_entries, release_entries
 from dct.core.projects import create_project, get_project
@@ -29,36 +29,39 @@ def gitproj(cli_engine, tmp_path):
 
 
 @needs_git
-def test_release_pins_head_and_checkout_root(gitproj, monkeypatch, capsys):
+def test_release_pins_head_and_checkout_root(gitproj, monkeypatch, capsys, git_identity):
     engine, main = gitproj
-    add_entry(engine, "proj-g", "added", "a")
+    eid = add_entry(engine, "proj-g", "added", "a")["id"]
+    candidate = git_commit_proving(main, eid)
     sub = main / "src"
     sub.mkdir()
     monkeypatch.chdir(sub)
-    run_cli(monkeypatch, ["clog", "release", "-P", "proj-g", "1.1.0"])
+    run_cli(monkeypatch, ["clog", "release", "-P", "proj-g", "1.1.0",
+                          "--confirm-version-files"])
     rec = get_release(engine, "proj-g", "1.1.0")
-    assert rec["candidate_sha"] == git(main, "rev-parse", "HEAD")
+    assert rec["candidate_sha"] == candidate
     assert rec["checkout_root"] == str(main)
-    out = capsys.readouterr().out
-    assert "release record 1.1.0: stamped" in out
-    assert "not advanced" in out
+    assert git(main, "rev-parse", "HEAD^") == candidate
+    assert rec["release_commit_sha"] == git(main, "rev-parse", "HEAD")
+    assert "release record 1.1.0: completed" in capsys.readouterr().out
 
 
 @needs_git
-def test_release_from_a_linked_worktree_pins_that_checkout(gitproj, monkeypatch, tmp_path):
+def test_release_from_a_linked_worktree_pins_that_checkout(
+        gitproj, monkeypatch, tmp_path, git_identity):
     engine, main = gitproj
     wt = tmp_path / "wt"
     git(main, "worktree", "add", "-q", "-b", "feat/x", str(wt))
-    (wt / "f").write_text("x\n")
-    git(wt, "add", "f")
-    git(wt, "commit", "-q", "-m", "wt")
-    add_entry(engine, "proj-g", "added", "a")
+    eid = add_entry(engine, "proj-g", "added", "a")["id"]
+    candidate = git_commit_proving(wt, eid)
     monkeypatch.chdir(wt)
-    run_cli(monkeypatch, ["clog", "release", "-P", "proj-g", "1.1.0"])
+    run_cli(monkeypatch, ["clog", "release", "-P", "proj-g", "1.1.0",
+                          "--confirm-version-files"])
     rec = get_release(engine, "proj-g", "1.1.0")
-    assert rec["checkout_root"] == str(wt.resolve())
-    assert rec["candidate_sha"] == git(wt, "rev-parse", "HEAD")
+    assert rec["checkout_root"] == str(wt)
+    assert rec["candidate_sha"] == candidate
     assert rec["candidate_sha"] != git(main, "rev-parse", "HEAD")
+    assert git(wt, "rev-parse", "v1.1.0") == rec["release_commit_sha"]
 
 
 def test_release_of_a_project_without_path_pins_nothing(cli_engine, monkeypatch):
@@ -143,15 +146,24 @@ def test_release_of_a_project_whose_directory_is_gone_is_refused(
     _assert_nothing_released(cli_engine, "proj-p", eid)
 
 
-def test_release_rerun_reports_the_existing_record(cli_engine, monkeypatch, capsys):
+def test_release_with_an_unfinished_record_points_to_resume(cli_engine, monkeypatch, capsys):
     create_project(cli_engine, slug="proj-v", name="V", current_version="1.0.0")
     add_entry(cli_engine, "proj-v", "added", "a")
     release_entries(cli_engine, "proj-v", "1.1.0")
     advance_release(cli_engine, "proj-v", "1.1.0", "committed")
-    run_cli(monkeypatch, ["clog", "release", "-P", "proj-v", "1.1.0"])
+    assert _exit_code(monkeypatch, ["clog", "release", "-P", "proj-v", "1.1.0"]) == 1
+    err = capsys.readouterr().err
+    assert "release 1.1.0 is unfinished (committed)" in err and "dct release resume" in err
+
+
+def test_release_rerun_of_a_completed_release_is_a_noop(cli_engine, monkeypatch, capsys):
+    create_project(cli_engine, slug="proj-v", name="V", current_version="1.0.0")
+    a = add_entry(cli_engine, "proj-v", "added", "a")["id"]
+    release_entries(cli_engine, "proj-v", "1.1.0")
+    advance_release(cli_engine, "proj-v", "1.1.0", "completed")
+    run_cli(monkeypatch, ["clog", "release", "-P", "proj-v", "1.1.0", "--entries", str(a)])
     out = capsys.readouterr().out
-    assert "already released" in out
-    assert "release record 1.1.0: committed" in out
+    assert "already released" in out and "release record 1.1.0: completed" in out
 
 
 def test_release_rerun_with_a_different_set_exits_nonzero(cli_engine, monkeypatch, capsys):
@@ -159,6 +171,7 @@ def test_release_rerun_with_a_different_set_exits_nonzero(cli_engine, monkeypatc
     a = add_entry(cli_engine, "proj-v", "added", "a")["id"]
     add_entry(cli_engine, "proj-v", "added", "b")
     release_entries(cli_engine, "proj-v", "1.1.0", entry_ids=[a])
+    advance_release(cli_engine, "proj-v", "1.1.0", "completed")
     assert _exit_code(monkeypatch, ["clog", "release", "-P", "proj-v", "1.1.0"]) == 1
     assert "different set" in capsys.readouterr().err
 

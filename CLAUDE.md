@@ -98,10 +98,13 @@ dct/integrations/claude.py — Claude Code adapter: MCP registration, skill/hook
 dct/integrations/codex.py — Codex MCP, workflow skills and managed AGENTS.md
 dct/integrations/codex_hooks.py — Native event bridge over shared hook policies
 dct/workflows/task_mirror.py — Append-only client plan/task observations
-dct/workflows/release/   — Release proof layer (K-72 layer 1, read-only):
+dct/workflows/release/   — Release workflow (K-72): proof layer, read-only —
                            proof.py (trailer / revert / squash rules),
-                           plan.py (`dct release plan`, `dct clog candidates`;
-                           schema: docs/release-workflow.md)
+                           plan.py (`dct release plan`, `dct clog candidates`);
+                           effects layer — effects.py (`dct release attest /
+                           apply / resume / abandon / reconstruct`, alias
+                           `clog release`: every effect verified before the
+                           ledger records it; schema: docs/release-workflow.md)
 dct/integrations/base.py — Shared contract and conservative file ownership
 dct/integrations/doctor.py — Read-only per-runtime dependency diagnostics
 dct/assets/              — Indirection for packaged asset dirs (physical
