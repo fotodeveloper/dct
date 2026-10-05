@@ -15,6 +15,7 @@ from dct import __version__, migrate, paths
 from dct.config import Config, load_config, save_config
 from dct.core.engine import bootstrap_engine
 from dct.core.items import TERMINAL_STATUSES
+from dct.core.releases import RELEASE_STATUSES
 from dct.db import create_tables, get_engine
 
 # Windows-policy seam (tests flip it): dispatches the daemonization,
@@ -1022,26 +1023,30 @@ def cmd_clog_count(args):
 _VERSION_SYNC_SCRIPTS = ("scripts/dct-version-sync.sh", "scripts/version-sync.sh")
 
 
-def _release_project_root(project: dict) -> str | None:
-    """Directory the version-sync script is looked up in and RUN FROM (K-34).
+def _release_project_root(project: dict) -> tuple[str | None, str | None]:
+    """(project root, checkout root) of the release (K-34, K-41).
 
+    The project root is the directory the version-sync script is looked up
+    in and RUN FROM; the checkout root (git toplevel of the current checkout)
+    is pinned in the release record together with its HEAD.
     - Registered path inside git: the caller's cwd must be a checkout of the
       SAME repository (gitinfo.resolve_checkout — main checkout or any linked
       worktree, never a nested foreign repo or a submodule); the result is
       that checkout's `project_root` (a monorepo subproject maps to the same
-      subdirectory of the current worktree). Not a checkout, or the cwd no
-      longer exists → SystemExit(1) BEFORE anything is stamped: a mutating
-      release never silently switches to the main checkout.
-    - Registered path outside git: the registered path (legacy behaviour).
-    - No registered path: None (no version-sync).
+      subdirectory of the current worktree) and `repo_root`. Not a checkout,
+      or the cwd no longer exists → SystemExit(1) BEFORE anything is
+      stamped: a mutating release never silently switches to the main
+      checkout.
+    - Registered path outside git: (registered path, None) — legacy behaviour.
+    - No registered path: (None, None) — no version-sync, nothing pinned.
     """
     from dct.core.gitinfo import git_toplevel, resolve_checkout
 
     path = project.get("path")
     if not path:
-        return None
+        return None, None
     if git_toplevel(path) is None:
-        return path
+        return path, None
     checkout = resolve_checkout(path)
     if checkout is None:
         print(
@@ -1051,7 +1056,7 @@ def _release_project_root(project: dict) -> str | None:
             file=sys.stderr,
         )
         sys.exit(1)
-    return checkout["project_root"]
+    return checkout["project_root"], checkout["repo_root"]
 
 
 def _run_version_sync(root: str, version: str) -> None:
@@ -1087,13 +1092,18 @@ def cmd_clog_release(args):
     a released version is a no-op there. The only CLI-side consent rule is
     `require_entries` — mode 'all' with nothing unreleased refuses unless the
     call is a no-op; a version-only release needs `--no-entries`. The
-    checkout is verified BEFORE stamping (_release_project_root). Version-sync
-    runs only when the project's current_version equals the requested version
-    after the call — a real release, a version-only release, or an explicit
-    resume of the current version (released=0) — never for a historical no-op
-    (requested version != current_version).
+    checkout is verified BEFORE stamping (_release_project_root); its HEAD
+    (gitinfo.git_head) and root are pinned in the release record (K-41) as
+    candidate_sha / checkout_root. Version-sync runs only when the project's
+    current_version equals the requested version after the call — a real
+    release, a version-only release, or an explicit resume of the current
+    version (released=0) — never for a historical no-op (requested version
+    != current_version). The record is NOT advanced here: the changelog
+    file, commit and tag steps belong to the /release workflow
+    (`dct clog release-advance`).
     """
     from dct.core.changelog import release_entries
+    from dct.core.gitinfo import git_head
     from dct.core.projects import get_project
     from dct.core.version import same_version
 
@@ -1113,13 +1123,15 @@ def cmd_clog_release(args):
     if not project:
         print(f"✗ Project '{project_slug}' not found", file=sys.stderr)
         sys.exit(1)
-    root = _release_project_root(project)
+    root, checkout_root = _release_project_root(project)
 
     try:
         result = release_entries(
             engine, project_slug, args.version or None,
             bump_type=None if args.version else args.bump, entry_ids=entry_ids,
             require_entries=entry_ids is None,
+            candidate_sha=git_head(checkout_root) if checkout_root else None,
+            checkout_root=checkout_root,
         )
     except Exception as e:
         print(f"✗ Error: {e}", file=sys.stderr)
@@ -1140,12 +1152,74 @@ def cmd_clog_release(args):
               f"({', '.join(f'#{i}' for i in result['already_released'])})")
     if result.get("warning"):
         print(f"  ⚠ {result['warning']}", file=sys.stderr)
+    record = result.get("release")
+    if record:
+        print(f"  release record {record['version']}: {record['status']} — not advanced "
+              f"by this command (finish with /release or `dct clog release-advance`)")
 
     if not same_version(current, version):
         print(f"  version-sync skipped: {version} is not the current version ({current})")
         return
     if root:
         _run_version_sync(root, version)
+
+
+def _print_release_record(record: dict) -> None:
+    ids = ", ".join(f"#{i}" for i in record["entry_ids"]) or "(none — version only)"
+    print(f"Release {record['version']}: {record['status']} (mode: {record['mode']})")
+    print(f"  entries:       {ids}")
+    print(f"  candidate sha: {record['candidate_sha'] or '-'}")
+    print(f"  checkout root: {record['checkout_root'] or '-'}")
+    print(f"  created:       {_fmt_date(record['created_at'])}")
+    print(f"  updated:       {_fmt_date(record['updated_at'])}")
+    if record["completed_at"]:
+        print(f"  completed:     {_fmt_date(record['completed_at'])}")
+
+
+def cmd_clog_release_status(args):
+    """`dct clog release-status` — read a release record (read-only, K-41).
+
+    --version V → that release's record; without it → the latest unfinished
+    (not completed) record. Mirrors the get_release MCP tool.
+    """
+    from dct.core.releases import get_release
+
+    engine = _get_engine()
+    project_slug = args.project or _detect_project(engine)
+    try:
+        record = get_release(engine, project_slug, args.version or None)
+    except Exception as e:
+        print(f"✗ Error: {e}", file=sys.stderr)
+        sys.exit(1)
+    if record is None:
+        print(f"No release record for {args.version}" if args.version
+              else "No unfinished release")
+        return
+    _print_release_record(record)
+
+
+def cmd_clog_release_advance(args):
+    """`dct clog release-advance V STATUS` — move a release record forward
+    (K-41); mirrors the advance_release MCP tool. Errors exit 1."""
+    from dct.core.releases import advance_release, get_release
+
+    engine = _get_engine()
+    project_slug = args.project or _detect_project(engine)
+    try:
+        before = get_release(engine, project_slug, args.version)
+        out = advance_release(
+            engine, project_slug, args.version, args.status,
+            candidate_sha=args.candidate_sha or None,
+        )
+    except Exception as e:
+        print(f"✗ Error: {e}", file=sys.stderr)
+        sys.exit(1)
+    record = out["release"]
+    if not out["updated"]:
+        print(f"✓ Release {record['version']} unchanged: {record['status']}")
+        return
+    previous = before["status"] if before else "?"
+    print(f"✓ Release {record['version']}: {previous} → {record['status']}")
 
 
 def cmd_clog_update(args):
@@ -2201,6 +2275,28 @@ def build_parser() -> argparse.ArgumentParser:
     p_clog_sel.add_argument(
         "--no-entries", action="store_true",
         help="Version-only release: stamp no entries, only set the version")
+    p_clog_release.epilog = (
+        "Writes the durable release record (status 'stamped', pinned HEAD and "
+        "checkout root) with the stamp. The changelog file, commit and tag steps "
+        "are NOT done here and do not advance the record: /release does them "
+        "(or `dct clog release-advance`).")
+
+    p_clog_rstatus = p_clog_sub.add_parser(
+        "release-status",
+        help="Show a release record (default: the latest unfinished release)")
+    p_clog_rstatus.add_argument("--version", help="The release to show (X.Y or X.Y.Z)")
+    p_clog_rstatus.add_argument("--project", "-P")
+
+    p_clog_radv = p_clog_sub.add_parser(
+        "release-advance",
+        help="Move a release record forward after a verified step "
+             "(stamped → files_written → committed → tagged → completed)")
+    p_clog_radv.add_argument("version", help="The release (X.Y or X.Y.Z)")
+    p_clog_radv.add_argument("status", choices=RELEASE_STATUSES)
+    p_clog_radv.add_argument("--project", "-P")
+    p_clog_radv.add_argument(
+        "--candidate-sha",
+        help="Re-pin the candidate commit (allowed while the record is below 'committed')")
 
     p_clog_update = p_clog_sub.add_parser(
         "update",
@@ -2480,6 +2576,8 @@ CLOG_COMMAND_MAP = {
     "list": cmd_clog_list,
     "count": cmd_clog_count,
     "release": cmd_clog_release,
+    "release-status": cmd_clog_release_status,
+    "release-advance": cmd_clog_release_advance,
     "update": cmd_clog_update,
     "delete": cmd_clog_delete,
     "export": cmd_clog_export,

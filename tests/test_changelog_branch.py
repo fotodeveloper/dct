@@ -415,13 +415,17 @@ def test_release_retry_after_a_later_release_is_noop_not_rewind(mixed):
     assert out["already_released"] == [ids["x1"]]
 
 
-def test_release_partial_retry_stamps_only_the_rest(mixed):
+def test_release_partial_retry_of_a_recorded_version_is_refused(mixed):
+    """K-41: a recorded release is history — a retry with a DIFFERENT set is
+    refused (the unrecorded legacy variant still stamps the rest:
+    tests/test_releases.py::test_legacy_partial_retry_stamps_the_rest_and_records_the_set)."""
     engine, ids = mixed
     release_entries(engine, "proj-a", "1.1.0", entry_ids=[ids["x1"]])
-    out = release_entries(engine, "proj-a", "1.1.0", entry_ids=[ids["x1"], ids["x2"]])
-    assert out["released"] == 1
-    assert out["already_released"] == [ids["x1"]]
-    assert _ids(list_entries(engine, "proj-a", version="1.1.0")) == {ids["x1"], ids["x2"]}
+    before = _snapshot(engine)
+    with pytest.raises(ValueError, match="released with a different set"):
+        release_entries(engine, "proj-a", "1.1.0", entry_ids=[ids["x1"], ids["x2"]])
+    assert _snapshot(engine) == before
+    assert _ids(list_entries(engine, "proj-a", version="1.1.0")) == {ids["x1"]}
 
 
 @pytest.mark.parametrize("entry_ids", [None, [], "selected"])

@@ -376,8 +376,11 @@ def release_entries(
     bump_type: str | None = None,
     entry_ids: Iterable[int] | None = None,
     require_entries: bool = False,
+    candidate_sha: str | None = None,
+    checkout_root: str | None = None,
 ) -> dict:
-    """Stamp changelog entries with a version and set the project's current_version.
+    """Stamp changelog entries with a version, set the project's current_version
+    and write the durable release record (K-41) — ONE transaction.
 
     Exactly one of `version` / `bump_type` (patch | minor | major, bumped from
     current_version INSIDE the project write transaction). Versions follow the
@@ -395,30 +398,49 @@ def release_entries(
     nothing is unreleased and the call is not a no-op, raise ValueError
     instead of silently performing a version-only release (that one needs
     entry_ids=[] explicitly).
+    `candidate_sha` (hex commit id, 7-64 chars, stored lowercased) and
+    `checkout_root` (ABSOLUTE path, normalize_worktree) are pinned in the
+    record; both are validated BEFORE any read or write (ValueError).
 
-    Order of checks (K-20): (1) nothing left to stamp → no-op, NO write at
-    all: every selected entry already carries V ('selected'); current_version
-    already V ('version_only'); nothing unreleased AND V is current_version or
-    a version live entries of the project already carry — a historical retry
-    ('all'). A historical no-op leaves current_version untouched, so the
-    result's `current_version` differs from `version`. (2) V lower than
-    current_version → refused, releases never rewind (applied whenever
-    current_version parses; a legacy unparseable current_version is not
-    compared). (3) stamp the not-yet-stamped entries (version, released_at,
-    updated_at) and set current_version = V. Versions are equal when their
-    components match after dropping trailing zeros (1.5 == 1.5.0).
+    The call's RESOLVED SET: 'selected' → the given ids; 'version_only' → [];
+    'all' → the live entries already carrying V plus every unreleased entry.
+
+    Order of checks: (0) V has a live release record (core.releases): the
+    resolved set equal to the record's → whole-operation no-op that RETURNS
+    the record (resume — also when V is lower than current_version, also for
+    a version-only release; the record is not re-pinned); a different set →
+    ValueError "version V was released with a different set: ..." and
+    nothing is written. Without a record (an unrecorded legacy release, or
+    none yet) — K-20: (1) nothing left to stamp → no-op, NO write at all:
+    every selected entry already carries V ('selected'); current_version
+    already V ('version_only'); nothing unreleased AND V is current_version
+    or a version live entries of the project already carry — a historical
+    retry ('all'); `release` is None then. A historical no-op leaves
+    current_version untouched, so the result's `current_version` differs
+    from `version`. (2) V lower than current_version → refused, releases
+    never rewind (applied whenever current_version parses; a legacy
+    unparseable current_version is not compared). (3) stamp the
+    not-yet-stamped entries (version, released_at, updated_at), set
+    current_version = V and insert the record (status 'stamped', entry_ids =
+    the resolved set). Versions are equal when their components match after
+    dropping trailing zeros (1.5 == 1.5.0).
 
     Returns {version (requested, normalized), current_version (after the
     call), mode, entry_ids, released (count newly stamped), already_released
-    (selected ids that already had V)}, plus `warning` in mode 'all' when the
-    stamped entries span several branches (NULL counts as its own value).
+    (selected ids that already had V), release (the record — see
+    core.releases.RECORD_FIELDS — or None for a legacy no-op)}, plus
+    `warning` in mode 'all' when the stamped entries span several branches
+    (NULL counts as its own value).
     """
-    from dct.core import records
+    from dct.core import releases as release_records
 
     if bool(version) == bool(bump_type):
         raise ValueError("Provide exactly one of version or bump_type (patch/minor/major)")
     if version:
         version = normalize_version(version)
+    sha = release_records.validate_candidate_sha(candidate_sha)
+    root = normalize_worktree(checkout_root)
+    ensure_fits(release_records.releases, {"checkout_root": root})
     ids = None if entry_ids is None else _dedupe_ids(entry_ids)
     mode = "all" if ids is None else ("version_only" if not ids else "selected")
     c = changelog_entries.c
@@ -435,6 +457,7 @@ def release_entries(
             version = bump(current, bump_type)
         assert version is not None
         is_current = same_version(current, version)
+        record = release_records.find_record(conn, pid, version)
 
         already: list[int] = []
         branches: set[str | None] = set()
@@ -447,17 +470,11 @@ def release_entries(
             to_stamp = [r.id for r in rows]
             branches = {r.branch for r in rows}
             selected = to_stamp
-            nothing_to_do = not to_stamp and (
-                is_current or _version_was_released(conn, pid, version)
-            )
-            if not to_stamp and not nothing_to_do and require_entries:
-                raise ValueError(
-                    f"No unreleased entries for '{project_slug}' — a version-only "
-                    f"release of {version} must be explicit (entry_ids=[] / "
-                    f"--no-entries); nothing released."
-                )
+            carrying = _entries_of_version(conn, pid, version)
+            resolved = sorted(set(carrying) | set(to_stamp))
+            nothing_to_do = not to_stamp and (is_current or bool(carrying))
         elif mode == "version_only":
-            to_stamp, selected = [], []
+            to_stamp, selected, resolved = [], [], []
             nothing_to_do = is_current
         else:
             records.validate_project_rows(
@@ -479,6 +496,7 @@ def release_entries(
             already = [i for i in ids if stamped[i] is not None]
             to_stamp = [i for i in ids if stamped[i] is None]
             selected = ids
+            resolved = sorted(ids)
             nothing_to_do = not to_stamp
 
         result = {
@@ -488,9 +506,27 @@ def release_entries(
             "entry_ids": list(selected),
             "released": 0,
             "already_released": already,
+            "release": None,
         }
+        if record is not None:
+            recorded = release_records.record_to_dict(record)
+            if set(resolved) != set(recorded["entry_ids"]):
+                raise ValueError(
+                    f"version {recorded['version']} was released with a different set: "
+                    f"recorded {recorded['entry_ids']} ({recorded['mode']}), requested "
+                    f"{resolved} ({mode}) — a released version is history; "
+                    f"nothing released."
+                )
+            result["release"] = recorded
+            return result
         if nothing_to_do:
             return result
+        if mode == "all" and not to_stamp and require_entries:
+            raise ValueError(
+                f"No unreleased entries for '{project_slug}' — a version-only "
+                f"release of {version} must be explicit (entry_ids=[] / "
+                f"--no-entries); nothing released."
+            )
 
         if current and _parses(current) and compare_versions(version, current) < 0:
             raise ValueError(
@@ -516,6 +552,10 @@ def release_entries(
             .where(projects.c.id == pid)
             .values(current_version=version, updated_at=now)
         )
+        result["release"] = release_records.insert_record(
+            conn, pid, version=version, mode=mode, entry_ids=resolved,
+            candidate_sha=sha, checkout_root=root, now=now,
+        )
         result["released"] = released
         result["current_version"] = version
         if mode == "all" and len(branches) > 1:
@@ -535,16 +575,23 @@ def _parses(version: str) -> bool:
     return True
 
 
-def _version_was_released(conn: sa.Connection, project_id: int, version: str) -> bool:
-    """Whether a live entry of the project already carries `version` (under
-    the version contract — a legacy `v1.1.0` row matches `1.1.0`)."""
+def _entries_of_version(conn: sa.Connection, project_id: int, version: str) -> list[int]:
+    """Ids of the live entries of the project that already carry `version`
+    (under the version contract — a legacy `v1.1.0` row matches `1.1.0`)."""
     c = changelog_entries.c
-    released = conn.execute(
+    stored = conn.execute(
         sa.select(c.version).distinct().where(
             c.project_id == project_id, c.version.is_not(None), c.deleted_at.is_(None)
         )
     ).scalars()
-    return any(same_version(v, version) for v in released)
+    matching = [v for v in stored if same_version(v, version)]
+    if not matching:
+        return []
+    return list(conn.execute(
+        sa.select(c.id).where(
+            c.project_id == project_id, c.version.in_(matching), c.deleted_at.is_(None)
+        ).order_by(c.id)
+    ).scalars())
 
 
 def _entry_state_error(conn: sa.Connection, project_id: int, entry_id: int) -> ValueError:

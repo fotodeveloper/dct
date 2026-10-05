@@ -28,6 +28,7 @@ SQLAlchemy Core tables (not the ORM) with a `deleted_at` column for soft deletes
 - `item_checkpoints` — item_id, text, status, kind, sort_order
 - `changelog_entries` — project_id, version, category, entry, component, source_file, source_lines, related_item_id, branch / worktree / branch_source (nullable git context the entry was written on, #801; `branch_source` = `client` or `server`)
 - `session_handoffs` — project_id, prompt, context_summary, scope, created_by, consumed_at, consumed_by
+- `releases` — durable release records (K-41): project_id, version (normalized), mode, entry_ids (JSON array of the exact set, `[]` = version-only), candidate_sha, checkout_root, status (forward only: stamped → files_written → committed → tagged → completed), completed_at; one live record per (project, version). Written in the same transaction as the stamp (`release_entries`), advanced by `core/releases.advance_release`.
 
 **Plans / sprints / decisions**:
 - `plans` — ulid, project_id, slug, title, kind, source_file, source_hash, status, sprint_id, imported_at
@@ -54,6 +55,7 @@ Full DDL lives in:
 - `migrations/004_tags.sql`
 - `migrations/005_items_short_title.sql`
 - `migrations/006_changelog_branch.sql`
+- `migrations/007_releases.sql`
 
 At runtime, the engine applies schema via `metadata.create_all()` plus an idempotent `_apply_schema_updates()` that:
 - adds later columns in place (e.g. `item_checkpoints.kind` for gate checkpoints; new columns go through the duplicate-safe `_add_column_if_missing` — `ADD COLUMN IF NOT EXISTS` under a 5 s `lock_timeout` on PostgreSQL, a re-checked "duplicate column" error on SQLite),

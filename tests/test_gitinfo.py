@@ -299,3 +299,28 @@ def test_git_common_dir_is_absolute_from_a_subdirectory(tmp_path):
     assert gitinfo.git_common_dir(sub) == expected
     assert gitinfo.git_common_dir(linked) == expected
     assert gitinfo.git_common_dir(tmp_path) is None
+
+
+# ── git_head (K-41: the release candidate commit) ─────────────────────────────
+
+
+def test_git_head_is_the_full_commit_id_from_any_subdirectory(tmp_path):
+    root = make_git_repo(tmp_path / "repo")
+    sub = tmp_path / "repo" / "pkg"
+    sub.mkdir()
+    head = gitinfo.git_head(sub)
+    assert head == git(root, "rev-parse", "HEAD")
+    assert len(head) in (40, 64) and head == head.lower()
+
+
+def test_git_head_of_a_repo_without_commits_is_none(tmp_path):
+    repo = tmp_path / "empty"
+    repo.mkdir()
+    git(repo, "init", "-q", "-b", "main")
+    assert gitinfo.git_head(repo) is None
+
+
+def test_git_head_outside_git_or_missing_dir_is_none(tmp_path):
+    assert gitinfo.git_head(tmp_path) is None
+    assert gitinfo.git_head(tmp_path / "missing") is None
+    assert gitinfo.git_head(None) is None

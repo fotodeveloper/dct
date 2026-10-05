@@ -3,7 +3,8 @@
 Readers (each one git process, never raising — failure means "unknown"):
   - git_toplevel(cwd)   — realpath of the checkout containing `cwd` (K-35);
   - git_branch(cwd)     — current branch, None on a detached HEAD or failure;
-  - git_common_dir(cwd) — realpath of the repository's shared git dir.
+  - git_common_dir(cwd) — realpath of the repository's shared git dir;
+  - git_head(cwd)       — full commit id of HEAD (the release candidate, K-41).
 Composites:
   - git_context(cwd)    — {branch, worktree}: changelog branch metadata;
   - resolve_checkout(project_path, cwd) — whether `cwd` is a checkout of the
@@ -103,6 +104,19 @@ def git_common_dir(cwd: str | os.PathLike[str]) -> str | None:
         return None
     common = _git(*resolved, "rev-parse", "--git-common-dir")
     return _absolute_git_path(resolved[1], common) if common else None
+
+
+def git_head(cwd: str | os.PathLike[str]) -> str | None:
+    """`git rev-parse --verify -q HEAD` for `cwd` (full lowercase hex), or None.
+
+    None when `cwd` is not in a work tree, the repository has no commit yet,
+    git is missing, or the call fails / times out — never an error.
+    """
+    resolved = _git_and_target(cwd)
+    if resolved is None:
+        return None
+    head = _git(*resolved, "rev-parse", "--verify", "-q", "HEAD")
+    return head.lower() if head else None
 
 
 def _toplevel_and_common_dir(cwd: str) -> tuple[str, str] | None:

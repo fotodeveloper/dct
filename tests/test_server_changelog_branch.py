@@ -101,7 +101,7 @@ def test_list_and_count_branch_filters(srv):
 
 
 _RELEASE_KEYS = {"project", "version", "current_version", "mode", "entry_ids",
-                 "released", "already_released"}
+                 "released", "already_released", "release"}
 
 
 def test_release_changelog_all_mode_adds_warning_on_mixed_branches(srv):

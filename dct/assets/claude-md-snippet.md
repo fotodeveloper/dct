@@ -59,11 +59,12 @@ naming what it is about (≤ 50 chars, no item number, no project name — e.g.
 "Windows hook paths"). The `create_item` ack echoes it; if it does not, the
 MCP server is outdated — restart it.
 
-**MCP tools** — 57 total; most important:
+**MCP tools** — 59 total; most important:
 - `pickup_work`, `handoff_work`, `get_context_snapshot` — composed session-edge ops; prefer them over chaining the granular tools below
 - `list_projects`, `list_items`, `get_item`, `create_item`, `update_item`, `resolve_item`, `add_note`
 - `add_checkpoint`, `list_checkpoints`, `complete_checkpoint`, `reject_checkpoint`, `reopen_checkpoint`
 - `add_changelog`, `list_changelog`, `count_unreleased_changelog`, `release_changelog`, `update_changelog`, `delete_changelog`, `export_changelog`
+- `get_release`, `advance_release` — durable release record: resume an unfinished release, record verified progress (deferred; load via ToolSearch)
 - `set_sprint`, `clear_sprint`, `review_sprint`, `list_sprints`, `update_sprint`
 - `create_handoff`, `list_handoffs`, `get_handoff`, `consume_handoff`, `delete_handoff`
 - `add_tag`, `list_tags`, `merge_tag` — global tag dictionary admin (deferred; load via ToolSearch)

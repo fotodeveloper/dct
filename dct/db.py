@@ -33,6 +33,7 @@ PROVENANCE_TABLES = (
     "decisions",
     "plans",
     "tags",
+    "releases",
 )
 
 
@@ -327,6 +328,31 @@ decisions = sa.Table(
 )
 
 
+# ── K-41: durable release records ─────────────────────────────────────────────
+# One row per release of a project version, written in the SAME transaction as
+# the changelog stamp (core/changelog.release_entries) and advanced
+# forward-only by the release workflow (core/releases.advance_release):
+# stamped → files_written → committed → tagged → completed. `entry_ids` is the
+# JSON array of the release's exact entry set ([] for a version-only release).
+releases = sa.Table(
+    "releases",
+    metadata,
+    sa.Column("id", sa.Integer, primary_key=True, autoincrement=True),
+    sa.Column("project_id", sa.Integer, sa.ForeignKey("projects.id"), nullable=False),
+    sa.Column("version", sa.String(50), nullable=False),  # normalized (core/version.py)
+    sa.Column("mode", sa.String(16), nullable=False),  # all|selected|version_only
+    sa.Column("entry_ids", sa.Text, nullable=False),  # JSON array of ints
+    sa.Column("candidate_sha", sa.String(64)),
+    sa.Column("checkout_root", sa.String(500)),  # normalize_worktree
+    sa.Column("status", sa.String(16), nullable=False),
+    sa.Column("created_at", sa.DateTime, nullable=False, server_default=sa.text("CURRENT_TIMESTAMP")),
+    sa.Column("updated_at", sa.DateTime, nullable=False, server_default=sa.text("CURRENT_TIMESTAMP")),
+    sa.Column("completed_at", sa.DateTime),
+    sa.Column("deleted_at", sa.DateTime),
+    *_provenance_columns(),
+)
+
+
 sa.Index(
     "ix_projects_slug_active",
     projects.c.slug,
@@ -421,6 +447,18 @@ sa.Index(
     item_tags.c.tag_id,
     sqlite_where=item_tags.c.removed_at.is_(None),
     postgresql_where=item_tags.c.removed_at.is_(None),
+)
+
+# K-41: at most one LIVE release record per (project, version). Core also
+# enforces it under the project write lock (comparing under the version
+# contract, so 1.5 and 1.5.0 collide there too); this index is the last guard.
+sa.Index(
+    "ix_releases_project_version_live",
+    releases.c.project_id,
+    releases.c.version,
+    unique=True,
+    sqlite_where=releases.c.deleted_at.is_(None),
+    postgresql_where=releases.c.deleted_at.is_(None),
 )
 
 

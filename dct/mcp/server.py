@@ -1177,13 +1177,16 @@ def release_changelog(
     version: str = "",
     bump_type: str = "",
     entry_ids: list[int] | None = None,
+    candidate_sha: str = "",
+    checkout_root: str = "",
 ) -> dict:
-    """Stamp changelog entries with a version AND set the project's
-    current_version to that version — one locked transaction.
+    """Stamp changelog entries with a version, set the project's current_version
+    to it AND write the durable release record — one locked transaction (a
+    stamp never exists without its record, nor a record without its stamp).
 
     Provide either an explicit version OR a bump_type — explicit version wins
     (bump_type is then ignored). The bumped version is computed INSIDE the
-    transaction and returned.
+    transaction and returned. Each field below is a SEPARATE top-level parameter.
 
     Args:
         project: Slug. Empty = auto-detect from CWD.
@@ -1191,7 +1194,7 @@ def release_changelog(
             is accepted and normalized away before comparing and storing
             ("v0.2.0" is stored as "0.2.0"); any other format is refused.
             Takes precedence over bump_type. Pass it explicitly when RETRYING
-            a release (a retried bump would bump again).
+            or RESUMING a release (a retried bump would bump again).
         bump_type: patch / minor / major — bumped from the project's current_version.
         entry_ids: JSON array of changelog entry ids (e.g. [12, 15]) — NOT a CSV
             string. Omitted/null (default) = every unreleased entry of the
@@ -1200,29 +1203,59 @@ def release_changelog(
             'selected'); STRICT — an unknown, foreign or deleted id, or one
             already released in ANOTHER version, fails the whole call.
             Duplicates are ignored.
+        candidate_sha: The commit the release is cut from (`git rev-parse
+            HEAD` of the release checkout), hex, 7-64 chars, stored
+            lowercased. Empty (default) = not pinned. Recommended for
+            /release: it lets a resumed run prove which commit it was
+            releasing; advance_release may re-pin it until 'committed'.
+        checkout_root: ABSOLUTE path of the checkout the release runs in (its
+            `git rev-parse --show-toplevel`), normalized textually (trailing
+            "/" dropped; relative → error; never resolved on this server).
+            Empty (default) = not recorded. Recommended for /release: a
+            resume must run in the same checkout. Both are pinned only when
+            the call writes a NEW record; a re-run never re-pins them.
 
-    Idempotent: when nothing is left to stamp — every selected entry already
-    carries the version ('selected'), current_version already equals it
-    ('version_only'), or nothing is unreleased and the version is the current
-    one or one live entries already carry ('all', a historical retry) — the
-    call is a no-op and writes nothing; after a historical no-op the returned
-    current_version differs from version. Never rewinds: a version lower than
-    current_version is refused (whenever current_version parses; 1.5 ==
-    1.5.0). Stamping sets version + released_at.
+    Release record + re-runs: the call's resolved set is the given ids
+    ('selected'), [] ('version_only') or the entries already carrying the
+    version plus every unreleased entry ('all'). If the version already has
+    a record: the SAME set → whole-operation no-op returning that record
+    (resume an interrupted release — also for a version lower than
+    current_version and for a version-only release); a DIFFERENT set → error
+    ("version V was released with a different set: …"). Without a record
+    (a legacy release): when nothing is left to stamp — every selected entry
+    already carries the version ('selected'), current_version already equals
+    it ('version_only'), or nothing is unreleased and the version is the
+    current one or one live entries already carry ('all', a historical
+    retry) — the call is a no-op, writes nothing and returns release=null;
+    after a historical no-op the returned current_version differs from
+    version. Never rewinds: an unrecorded version lower than current_version
+    is refused (whenever current_version parses; 1.5 == 1.5.0). Stamping
+    sets version + released_at and creates the record with status 'stamped'
+    — the workflow then moves it forward with advance_release.
 
     Returns: {"project", "version" (requested, normalized), "current_version"
         (after the call), "mode":
         "all"|"selected"|"version_only", "entry_ids" (the selected ids — in mode
         'all' the ones stamped), "released" (count newly stamped),
-        "already_released" (selected ids that already had this version)} plus
-        "warning" in mode 'all' when the stamped entries span several branches
-        (null branch counted as its own). {"error": "..."} on failure — neither
-        version nor bump_type; bump_type with no current_version; an invalid
-        bump_type; an unsupported version format (requested, or the
-        current_version a bump starts from); a version lower than
-        current_version; an invalid entry id;
-        or an unresolvable project. Nothing is written on error.
+        "already_released" (selected ids that already had this version),
+        "release" (the record — {id, version, mode, entry_ids (the exact set),
+        candidate_sha, checkout_root, status, created_at, updated_at,
+        completed_at}, as get_release returns it — or null for a legacy
+        no-op)} plus "warning" in mode 'all' when the stamped entries span
+        several branches (null branch counted as its own). {"error": "..."}
+        on failure — neither version nor bump_type; bump_type with no
+        current_version; an invalid bump_type; an unsupported version format
+        (requested, or the current_version a bump starts from); an unrecorded
+        version lower than current_version; a recorded version with a
+        different set; an invalid entry id; an invalid candidate_sha; a
+        relative or over-long (> 500) checkout_root; tool-call markup in
+        candidate_sha / checkout_root; or an unresolvable project. Nothing is
+        written on error.
     """
+    if (err := _reject_toolcall_markup(
+        candidate_sha=candidate_sha, checkout_root=checkout_root,
+    )):
+        return err
     from dct.core.changelog import release_entries
 
     try:
@@ -1233,8 +1266,119 @@ def release_changelog(
         result = release_entries(
             _get_engine(), project_slug, version or None,
             bump_type=None if version else bump_type, entry_ids=entry_ids,
+            candidate_sha=candidate_sha or None, checkout_root=checkout_root or None,
         )
-        return {"project": project_slug, **result}
+        return {
+            "project": project_slug, **result,
+            "release": _release_record_json(result["release"]),
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def _release_record_json(record: dict | None) -> dict | None:
+    """A core release record with JSON-native values (ISO datetimes)."""
+    if record is None:
+        return None
+    return {k: _serialize_value(v) for k, v in record.items()}
+
+
+@mcp.tool(structured_output=False)
+def get_release(project: str = "", version: str = "") -> dict:
+    """Read a release record — to resume an interrupted release, or to check
+    one before re-running it.
+
+    Every release_changelog that stamps a version writes ONE record (one live
+    record per project + version) whose status moves forward only:
+    stamped (DB stamped) → files_written (changelog file / version files
+    written) → committed (release commit made) → tagged (tag created) →
+    completed. Read-only.
+
+    Args:
+        project: Slug. Empty = auto-detect from CWD.
+        version: The release to read — X.Y or X.Y.Z, leading "v" accepted,
+            1.5 == 1.5.0. Empty (default) = the MOST RECENT record whose
+            status is not 'completed' (an unfinished release), if any.
+
+    Returns: {"release": {id, version (normalized), mode
+        ("all"|"selected"|"version_only"), entry_ids (the exact stamped set —
+        [] for a version-only release), candidate_sha (pinned commit or
+        null), checkout_root (absolute path or null), status, created_at,
+        updated_at, completed_at (ISO datetimes; completed_at null until
+        'completed')}} or {"release": null} when there is no such record
+        (no record for that version, or no unfinished release). A release
+        made before records existed has no record. {"error": "..."} on an
+        unsupported version format or an unresolvable project.
+    """
+    if (err := _reject_toolcall_markup(version=version)):
+        return err
+    from dct.core.releases import get_release as core_get_release
+
+    try:
+        project_slug = _resolve_project(project, required=True)
+        assert project_slug is not None
+        record = core_get_release(_get_engine(), project_slug, version or None)
+        return {"release": _release_record_json(record)}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@mcp.tool(structured_output=False)
+def advance_release(
+    version: str,
+    status: str,
+    project: str = "",
+    candidate_sha: str = "",
+) -> dict:
+    """Record verified progress of a release — move its record FORWARD.
+
+    Call it after each release step is DONE and verified (also when a resumed
+    run finds the effect already present): files_written after the changelog
+    file and version files are written, committed after the release commit,
+    tagged after the tag, completed at the end. Each field below is a
+    SEPARATE top-level parameter.
+
+    Args:
+        version: The release (X.Y or X.Y.Z, leading "v" accepted); it must
+            have a record (written by release_changelog).
+        status: Target status, one of (in order) stamped / files_written /
+            committed / tagged / completed. Forward jumps of several steps are
+            allowed; the CURRENT status again is an idempotent no-op; a lower
+            one is refused. 'completed' stamps completed_at.
+        project: Slug. Empty = auto-detect from CWD.
+        candidate_sha: Optional re-pin of the candidate commit (hex, 7-64
+            chars) — allowed while the record's status is below 'committed'
+            (e.g. pass the release commit's SHA on the move to 'committed');
+            once the record is 'committed' or later a DIFFERENT SHA is refused
+            (the stored one is accepted). Empty (default) = unchanged.
+
+    Returns: slim ack {project, version (normalized), status (after the call),
+        updated} — `updated` false when nothing changed (idempotent repeat).
+        Fetch the full record with get_release. {"error": "..."} on an
+        unknown status, a version without a record, a backwards move, a
+        candidate_sha change after 'committed' or an invalid candidate_sha,
+        an unsupported version format, tool-call markup, or an unresolvable
+        project. Nothing is written on error.
+    """
+    if (err := _reject_toolcall_markup(
+        version=version, status=status, candidate_sha=candidate_sha,
+    )):
+        return err
+    from dct.core.releases import advance_release as core_advance_release
+
+    try:
+        project_slug = _resolve_project(project, required=True)
+        assert project_slug is not None
+        out = core_advance_release(
+            _get_engine(), project_slug, version, status,
+            candidate_sha=candidate_sha or None,
+        )
+        return {
+            "project": project_slug,
+            "version": out["release"]["version"],
+            "status": out["release"]["status"],
+            "updated": out["updated"],
+        }
     except Exception as e:
         return {"error": str(e)}
 

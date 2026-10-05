@@ -319,16 +319,22 @@ def test_add_changelog_markup_rejected(srv):
 
 
 _RELEASE_KEYS = {"project", "version", "current_version", "mode", "entry_ids",
-                 "released", "already_released"}
+                 "released", "already_released", "release"}
 
 
 def test_release_changelog_return_shape_selected(srv):
     a = srv.add_changelog("added", "a", project="test")["id"]
     out = srv.release_changelog(project="test", version="1.0.0", entry_ids=[a])
     assert set(out) == _RELEASE_KEYS
+    release = out.pop("release")
     assert out == {"project": "test", "version": "1.0.0", "current_version": "1.0.0",
                    "mode": "selected", "entry_ids": [a], "released": 1,
                    "already_released": []}
+    assert set(release) == {"id", "version", "mode", "entry_ids", "candidate_sha",
+                            "checkout_root", "status", "created_at", "updated_at",
+                            "completed_at"}
+    assert (release["version"], release["entry_ids"], release["status"]) == (
+        "1.0.0", [a], "stamped")
 
 
 def test_update_changelog_ack_shape(srv):

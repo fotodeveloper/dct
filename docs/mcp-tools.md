@@ -1,6 +1,6 @@
 # dct — MCP Tools Reference
 
-Complete catalogue of the **57 MCP tools** the dct server exposes to Claude Code, grouped by domain. ← back to the [README](../README.md).
+Complete catalogue of the **59 MCP tools** the dct server exposes to Claude Code, grouped by domain. ← back to the [README](../README.md).
 
 The dct MCP server is registered at **user scope** (`~/.claude.json`), so every tool below is callable from any Claude Code session as `mcp__dct__<name>`. Most list/create tools accept an empty `project=""` and auto-detect the project from the session's working directory (longest-prefix match); pass `project=<slug>` to override.
 
@@ -45,7 +45,7 @@ Project registration, rename, version, and changelog-location changes are **CLI-
 | `reopen_checkpoint` | Revert a checkpoint back to pending, typically from done. |
 | `list_checkpoints` | List checkpoints for an item in sort order. |
 
-## Changelog (7)
+## Changelog (9)
 
 Entries carry the git `branch` / `worktree` they were written on (`branch_source`
 = `client` when the caller supplied them, `server` when the MCP server detected
@@ -66,7 +66,9 @@ path); historical rows are not rewritten.
 | `add_changelog` | Add an unreleased changelog entry (version stays NULL until release); pass `branch` / `worktree` (absolute path, normalized textually — never resolved on the server). `related_item_id` must be a live item of the same project. A server-detected branch (`branch_source='server'`) adds a `warning` to the ack: confirm or correct it with `update_changelog`. |
 | `list_changelog` | List changelog entries for a project; optional `branch` / `worktree` / `include_unbranched` filters. Plain `branch` = exact match on the stored branch (any source); `include_unbranched` adds every uncertain row (branch null or `branch_source='server'`). Rows carry `item_short_title` — the related item's label when it is a live item of the project, else null. |
 | `count_unreleased_changelog` | Count unreleased entries (used by the commit gate); same optional filters. |
-| `release_changelog` | Stamp all unreleased entries, an explicit `entry_ids` set, or none (`[]`, version only) and set `current_version` — idempotent, never rewinds. |
+| `release_changelog` | Stamp all unreleased entries, an explicit `entry_ids` set, or none (`[]`, version only), set `current_version` and write the durable release record (exact entry set, pinned `candidate_sha`, `checkout_root`, status `stamped`) in ONE transaction. A re-run of a recorded version with the same set returns the record (resume — also below `current_version`); a different set is refused. An unrecorded version never rewinds. |
+| `get_release` | Read a release record by `version`, or — without one — the latest unfinished (not `completed`) release; `{"release": record \| null}`. Read-only. Deferred. |
+| `advance_release` | Move a release record forward after a verified step: `stamped → files_written → committed → tagged → completed` (multi-step jumps allowed, same status = idempotent no-op, backwards refused; `completed` stamps `completed_at`). Optional `candidate_sha` re-pin while below `committed`. Deferred. |
 | `update_changelog` | Amend an unreleased entry (text, category, component, source, related item, branch, worktree). An omitted branch field is kept, except on a server-detected row, whose unconfirmed other field is cleared; both null → `branch_source` null. Serialized with `release_changelog` on the project lock. Deferred. |
 | `delete_changelog` | Soft-delete an unreleased entry. Deferred. |
 | `export_changelog` | Export changelog as Keep a Changelog markdown. |
@@ -196,7 +198,8 @@ Write ops return a minimal ack, not the full record. `get_item` / `get_handoff` 
 | `add_changelog` | `{id, project, category, component, branch, branch_source}` (+ `warning` when `branch_source='server'`) |
 | `update_changelog` | `{id, project, updated_fields}` |
 | `delete_changelog` | `{deleted, id}` |
-| `release_changelog` | `{project, version, current_version, mode, entry_ids, released, already_released}` (+ `warning`) |
+| `release_changelog` | `{project, version, current_version, mode, entry_ids, released, already_released, release: record \| null}` (+ `warning`) — `release` = `{id, version, mode, entry_ids, candidate_sha, checkout_root, status, created_at, updated_at, completed_at}` |
+| `advance_release` | `{project, version, status, updated}` (`updated` is `false` for an idempotent repeat) |
 | `create_handoff` | `{id, project, scope, created_at}` |
 | `handoff_work` | `{handoff_id, project, scope, created_at, sprint: {sprint_id, code, open_size, items} \| null}` — no prompt echo |
 | `pickup_work` | snapshot + `{picked_up: full handoff \| null, consumed: bool}` (read-heavy op — not a slim ack) |
@@ -215,4 +218,4 @@ Write ops return a minimal ack, not the full record. `get_item` / `get_handoff` 
 
 ---
 
-**Total: 57 tools.** This list is generated from `dct/mcp/server.py`; if it drifts, `dct server` prints the live set.
+**Total: 59 tools.** This list is generated from `dct/mcp/server.py`; if it drifts, `dct server` prints the live set.
