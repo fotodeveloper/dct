@@ -137,7 +137,7 @@ The 13 Claude Code skills, 4 Claude hooks and four Codex skills are host integra
 { "mcpServers": { "dct": { "command": "dct", "args": ["server"] } } }
 ```
 
-Then talk to your assistant as usual ("track this", "what's open?") — it drives the same tools. Slash-command equivalents: `/track` → `create_item`, `/track-list` → `list_items`, `/pickup` → `pickup_work`, `/handoff` → `handoff_work`, `/clog` → `add_changelog`, `/release` → `release_changelog`. To teach your assistant *when* to reach for them, adapt the [CLAUDE.md snippet](https://github.com/fotodeveloper/dct/blob/main/dct/assets/claude-md-snippet.md) to your client's rules file.
+Then talk to your assistant as usual ("track this", "what's open?") — it drives the same tools. Slash-command equivalents: `/track` → `create_item`, `/track-list` → `list_items`, `/pickup` → `pickup_work`, `/handoff` → `handoff_work`, `/clog` → `add_changelog`, `/release` → the local `dct release` workflow (the ledger tools `release_changelog` / `advance_release` serve a project's own release tool). To teach your assistant *when* to reach for them, adapt the [CLAUDE.md snippet](https://github.com/fotodeveloper/dct/blob/main/dct/assets/claude-md-snippet.md) to your client's rules file.
 
 ### Troubleshooting
 
@@ -220,13 +220,15 @@ changelog is already written:
 
 ```text
 > /release
-15 unreleased entries → stamped as 1.4.0
-changelog.md regenerated (Keep a Changelog format)
-release: v1.4.0 committed, project version bumped
+15 unreleased entries proven by commit trailers → plan approved as 1.4.0
+version files prepared (pyproject.toml) → approved, push target origin/main
+stamped · changelog.md section · version files · release: v1.4.0 · tag · pushed
 ```
 
-One command stamps the version, exports [Keep a Changelog](https://keepachangelog.com)
-markdown, and makes the release commit.
+One workflow plans the release from commit proof, shows the version files and
+the push target for approval, then stamps the version, writes the
+[Keep a Changelog](https://keepachangelog.com) section, makes the release
+commit and the tag and pushes them — each step verified and resumable.
 
 ## Plans: your markdown, indexed
 
@@ -296,8 +298,8 @@ dct release plan --patch              # Read-only: proven / unproven entries, ra
 dct release attest --entries 16 --confirm             # Empty attestation commit for unproven entries
 dct release plan --patch --entries 12,15 --json       # The snapshot to approve (snapshot_digest)
 dct release prepare --patch --entries 12,15 --plan-digest <digest>         # Isolated version sync → the file list to approve
-dct release apply --patch --entries 12,15 --plan-digest <digest> --proposal-digest <p> --confirm  # Stamp, changelog, files, commit, tag
-dct release resume                    # Finish an interrupted release (verifies every effect)
+dct release apply --patch --entries 12,15 --plan-digest <digest> --proposal-digest <p> --confirm  # Stamp, changelog, files, commit, tag, push (--no-push: local)
+dct release resume                    # Finish an interrupted release (verifies every effect; the stored consent, no new approval)
 dct release abandon --version 1.1 --reason "broken build" --confirm
 dct release reconstruct --version 1.0 --confirm       # Record a release made before release records
 
@@ -388,7 +390,7 @@ Claude Code is where dct runs deepest. `dct init` offers to attach the ready-mad
 | `/track-resolve` | Resolve/close items |
 | `/clog` | Add changelog entry |
 | `/commit` | Conventional commit with version suffix + changelog gate |
-| `/release` | Stamp changelog + bump version + generate `changelog.md` |
+| `/release` | One workflow: proof plan → version files + push target approved → stamp, `changelog.md` section, version bump, commit, tag, push |
 | `/pickup` | Session start — read handoff, show sprint, propose first action |
 | `/handoff` | Session end — flag sprint items, write handoff prompt |
 | `/dct-import` | Discover + multi-select + ingest plan-like markdown files |

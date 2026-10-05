@@ -282,6 +282,168 @@ def test_release_documented_keys_exist_in_the_workflow_schemas():
         assert outcome in OUTCOMES and f"`{outcome}`" in flat, outcome
 
 
+# ── /release: ONE executable workflow, skill = fallback (K-97, K-76, K-85) ──
+
+
+RELEASE_DIALOGS = [
+    pytest.param(lambda: _skill("release"), id="skill"),
+    pytest.param(_release_fallback, id="fallback"),
+]
+
+
+@pytest.mark.parametrize("text", RELEASE_DIALOGS)
+def test_release_dialog_runs_plan_prepare_apply_with_the_push_choice(text):
+    """K-76 / K-97 F2 / F3: plan → prepare (the file list approved before the
+    stamp) → apply with BOTH digests and the owner's push choice; the
+    workflow pushes, so no "never pushes" survives; H4: the owner's selection
+    is re-planned and THAT snapshot_digest is passed."""
+    body = text()
+    flat = " ".join(body.split())
+    calls = [(sub, flags) for group, sub, flags in _commands(body) if group == "release"]
+    for flag in ("--plan-digest", "--proposal-digest"):
+        assert any(flag in flags for sub, flags in calls if sub == "apply"), flag
+    assert any("--plan-digest" in flags for sub, flags in calls if sub == "prepare")
+    applies = [set(flags) for sub, flags in calls if sub == "apply" and len(flags) > 1]
+    assert any("--no-push" in f for f in applies), "no apply with --no-push"
+    assert any({"--push-remote", "--push-branch"} <= f for f in applies), \
+        "no apply with --push-remote / --push-branch"
+    assert "details.push_target" in flat
+    # H4: the owner's selection is bound by a NEW plan with --entries / --no-entries.
+    assert re.search(r"dct release plan --version \S+ --entries \S+ --json", body)
+    assert re.search(r"dct release plan --version \S+ --no-entries --json", body)
+    lowered = flat.lower()
+    for stale in ("never pushes", "never pushed", "--confirm-version-files"):
+        assert stale not in lowered, stale
+    for key in ("details.proposal.paths", "details.checks", "details.contract",
+                "details.sync", "output_dropped_bytes"):
+        assert key in flat, key
+
+
+@pytest.mark.parametrize("text", RELEASE_DIALOGS)
+def test_release_dialog_commits_work_in_progress_inline(text):
+    """K-97 F1: local uncommitted changes are committed IN this workflow on
+    the owner's consent (the /commit procedure: stage, trailers from the
+    final staged diff, hooks respected), then re-planned — never "run /commit
+    yourself", never a split workflow."""
+    flat = " ".join(text().split())
+    assert re.search(r"work in progress", flat, re.IGNORECASE)
+    assert "dct clog candidates --json" in flat  # the trailer selection of that commit
+    assert "Changelog: <ids>" in flat
+    assert "--no-verify" in flat  # named as forbidden
+    assert re.search(r"in this (same )?workflow", flat, re.IGNORECASE)
+    assert not re.search(r"(run|with|use|invoke) (the )?`?/commit`?( dialog| flow)? "
+                         r"(first|yourself)", flat, re.IGNORECASE), "WIP sent out of the workflow"
+    assert not re.search(r"/commit` flow \(its own commit\)", flat)
+
+
+@pytest.mark.parametrize("text", RELEASE_DIALOGS)
+def test_release_dialog_respects_the_executor_and_the_stored_consent(text):
+    """K-85: the executor is read first (`own` → hand over, nothing run);
+    K-97 F4: resume executes the stored consent without a new approval;
+    K-88: a conflict (exit 75) is shown, never retried by the dialog."""
+    flat = " ".join(text().split())
+    assert "dct project release-executor" in flat and "`own`" in flat
+    assert re.search(r"no new approval", flat, re.IGNORECASE)
+    assert "dct release resume --json" in flat
+    assert "`conflict`" in flat and "75" in flat and "details.observed_effects" in flat
+    assert "details.lock" in flat and "never loop" in flat
+
+
+_ALIAS_RE = re.compile(r"clog release(?![-\w])([^`\n]*)")
+
+
+@pytest.mark.parametrize("text", [
+    *RELEASE_DIALOGS,
+    pytest.param(_snippet, id="claude-md-snippet"),
+    pytest.param(lambda: (ROOT / "README.md").read_text(encoding="utf-8"), id="readme"),
+])
+def test_every_clog_release_mention_carries_confirm(text):
+    """K-96 D1: the alias commits, tags and pushes — every mention of it
+    shows `--confirm`; F6: the release dialogs use apply, never the alias."""
+    body = text()
+    for rest in _ALIAS_RE.findall(body):
+        assert "--confirm" in rest, f"clog release{rest}"
+    assert "never pushed automatically" not in " ".join(body.split()).lower()
+
+
+def test_release_dialogs_never_run_the_alias():
+    for body in (_skill("release"), _release_fallback()):
+        assert ("clog", "release") not in {(g, s) for g, s, _ in _commands(body)}
+
+
+def _effects_detail_keys() -> set[str]:
+    """Every key the effects layer can put into a result's `details`: the
+    keyword arguments of its refusals and the string keys of its dict
+    literals (refusal details, prepare / apply / conflict details)."""
+    import ast
+
+    from dct.workflows.release import effects
+
+    tree = ast.parse(Path(effects.__file__).read_text(encoding="utf-8"))
+    keys = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            func = node.func
+            name = getattr(func, "attr", None) or getattr(func, "id", "")
+            if "refuse" in name.lower() or name == "ReleaseRefused":
+                keys |= {k.arg for k in node.keywords if k.arg}
+        elif isinstance(node, ast.Dict):
+            keys |= {k.value for k in node.keys
+                     if isinstance(k, ast.Constant) and isinstance(k.value, str)}
+        elif isinstance(node, ast.Subscript) and isinstance(node.slice, ast.Constant) \
+                and getattr(node.value, "id", None) == "details":
+            keys.add(node.slice.value)
+    # The CLI adds the refusal's message as `details.error` (cli.py, the
+    # release result boundary) — it is part of every refusal.
+    return (keys - {"details", "steps", "release"}) | {"error"}
+
+
+def _refusal_table_keys(body: str) -> set[str]:
+    """The `details.<key>` names in the first column of the dialog's
+    refusal table (the rows after its `| details` header)."""
+    table = _section(body, "| details", "\n\n")
+    first_columns = [row.split("|")[1] for row in table.splitlines()[2:] if row.startswith("|")]
+    return {key for col in first_columns for key in re.findall(r"`details\.(\w+)", col)}
+
+
+REFUSAL_KEYS = {
+    "error", "executor", "consent", "staged", "unstaged", "conflicted", "in_progress",
+    "untracked", "unfinished", "unproven", "approved_digest", "derived_digest", "mismatch",
+    "pending", "approved_script", "changed", "missing_blobs", "checkout_changed", "sync",
+    "contract", "proposal", "foreign", "foreign_paths", "foreign_content", "git_error",
+    "commit", "head", "tree", "expected_tree", "foreign_staged", "index_lock",
+    "push_target", "remote_tags", "remote_branch", "outside_consent", "url_now", "lock",
+    "holder", "conflict", "observed_effects", "record_state", "recorded",
+}
+
+
+def test_release_refusal_table_is_the_same_in_skill_and_fallback_and_from_the_code():
+    """One refusal table (F6 / F7): the same `details` keys in the skill and
+    the authoritative fallback, every one a key the effects layer really
+    produces, covering the refusal families of R7c."""
+    skill, fallback = (_refusal_table_keys(_skill("release")),
+                       _refusal_table_keys(_release_fallback()))
+    assert skill == fallback, sorted(skill ^ fallback)
+    code = _effects_detail_keys()
+    assert skill <= code, sorted(skill - code)
+    assert REFUSAL_KEYS <= skill, sorted(REFUSAL_KEYS - skill)
+    assert REFUSAL_KEYS <= code, sorted(REFUSAL_KEYS - code)
+
+
+def test_release_skill_and_fallback_keep_the_same_step_order():
+    """F6 / F7: the skill and the fallback walk the SAME steps in the same
+    order — probe, executor, inline WIP commit, attest, the bound plan,
+    prepare, apply, resume."""
+    markers = ("dct release plan --json", "dct project release-executor",
+               "dct clog candidates --json", "dct release attest --entries",
+               "dct release prepare --version", "dct release apply --version",
+               "dct release resume --json", "dct release abandon --version",
+               "dct release reconstruct --version")
+    for body in (_skill("release"), _release_fallback()):
+        _in_order(body, *markers)
+        assert re.search(r"dct release plan --version \S+ --entries", body)
+
+
 # ── /commit: candidates from the workflow, K-30 order, K-53 / K-66 / K-68 ──
 
 

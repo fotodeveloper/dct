@@ -26,7 +26,7 @@ prefix and trigger in any language:
 - `/track-resolve` — close (resolved / wont_fix)
 - `/clog` — add changelog entry
 - `/commit` — conventional commit with `(vX.Y.Z)` suffix; `Changelog:` trailer from `dct clog candidates --json`
-- `/release` — dialog over `dct release plan / attest / apply / resume` (the workflow stamps, writes, commits and tags, verified)
+- `/release` — one workflow over `dct release plan / attest / prepare / apply / resume` (the workflow stamps, writes, commits, tags and pushes, verified)
 - `/pickup` — start-of-session: read handoff, show sprint, propose first action
 - `/handoff` — end-of-session: flag sprint + write prompt for next session
 - `/plan-status` — cross-plan progress dashboard
@@ -104,7 +104,7 @@ entries proven that way. Reverts keep git's standard `Revert "…"` message.
 If pre-commit hook rejects: fix underlying issue, re-stage, **NEW commit** (never `--amend`, never `--no-verify`).
 
 **Releasing** — "release" / "bump version" / "ship it"
-→ `/release` — a dialog over the local workflow: `dct release plan --json` (range, proof per entry, unproven entries, collective attestation proposals) → the owner decides attest / correct / withdraw / keep and the version → `dct release attest` / `dct release plan --version V --entries … --json` (the snapshot the owner approves) → `dct release prepare --version V --entries … --plan-digest <snapshot_digest>` (the version sync runs isolated; the owner approves the file list) → `dct release apply --version V --entries … --plan-digest <snapshot_digest> --proposal-digest <proposal_sha256> --confirm` (stamp, changelog section, version files, `release: vX.Y.Z` commit, tag — each verified and recorded by the workflow; an unfinished release → `dct release resume` or `abandon`). Never pushed automatically.
+→ `/release` — ONE workflow over the local CLI: `dct release plan --json` (range, proof per entry, unproven entries, collective attestation proposals) → the project's executor (`dct project release-executor <slug>`; `own` → its own tool releases) → work in progress committed inside the workflow on the owner's consent (the `/commit` procedure, then re-plan) → the owner decides attest / correct / withdraw / keep and the version → `dct release attest` / `dct release plan --version V --entries … --json` (the snapshot the owner approves) → `dct release prepare --version V --entries … --plan-digest <snapshot_digest>` (the version sync runs isolated; the owner approves the file list and the push target) → `dct release apply --version V --entries … --plan-digest <snapshot_digest> --proposal-digest <proposal_sha256> --confirm` (+ `--push-remote … --push-branch …` or `--no-push`: stamp, changelog section, version files, `release: vX.Y.Z` commit through the hooks, tag, push — each verified and recorded by the workflow; an unfinished release → `dct release resume`, which executes the stored consent, or `abandon`).
 
 **Session end** — "handoff" / "end session" / "wrap up" / "next session"
 → `/handoff` (flag sprint items, optionally write handoff prompt).
