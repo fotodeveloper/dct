@@ -27,7 +27,14 @@ WRITER (the release effects layer only, dct.workflows.release.effects):
   - git_write(cwd, *args, index_file=None, network=False) — keeps the
     caller's identity / config-location variables (WRITE_ENV_PASSTHROUGH;
     with `network` also the transport ones), may target a temporary index;
-    any failure raises GitWriteError.
+    any failure raises GitWriteError; `env` adds variables (what `git
+    commit` exports to its hooks), `stdin` feeds a data file;
+  - git_update_ref_cas(cwd, ref, new, old, message=, no_deref=, verify=) —
+    ONE ref transaction (`git update-ref --stdin`): a real compare-and-swap
+    of `ref`, with `verify` run while the transaction is prepared (K-103);
+    GitRefRaceError / GitRefVerifyError when nothing was updated;
+  - release_lock_location(project_path) — the repository whose release
+    operation lock a registered path uses (K-118 L8), strict.
 
 PROCESSES (K-108, K-113): every STRICT command and both release-layer
 helpers run through the supervised runner (dct.core.procs) — git in its own
@@ -41,7 +48,7 @@ drained into bounded memory. What a command PRINTS is one of two things:
     (64 MiB) — never a cut result; git_read_lines streams line by line
     instead (any size; one line over GIT_LINE_MAX_BYTES is an error);
   - DIAGNOSTIC text (stderr of every command; stdout of git_write(...,
-    diagnostic=True) — `git commit` / `git push`, i.e. hook and transport
+    diagnostic=True) — `git hook run` / `git push`, i.e. hook and transport
     chatter): the first and the last GIT_DIAGNOSTIC_MAX_BYTES / 2 bytes,
     the rest counted and dropped.
 The best-effort readers at the top (_git: 2 s location probes for changelog
@@ -54,11 +61,12 @@ git_toplevel alone — exactly one git process, no branch read.
 
 from __future__ import annotations
 
+import contextlib
 import os
 import re
 import shutil
 import subprocess
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 
 from dct.core import procs
@@ -317,6 +325,7 @@ def _strict_git(
     extra_env: dict[str, str] | None = None,
     binary: bool = False,
     diagnostic: bool = False,
+    stdin: int | None = None,
 ) -> GitResult:
     """`git <global_args> -C <cwd> <args>` through the supervised runner
     (dct.core.procs.run — module docstring, PROCESSES) → its GitResult, or
@@ -328,7 +337,9 @@ def _strict_git(
     `decode_errors` is the stdout decoding policy (an undecodable byte
     under "strict" is reported as `error`); `binary` returns stdout as raw
     bytes; `diagnostic` marks stdout as diagnostic text (bounded, the
-    middle dropped) instead of data. stderr is always bounded text."""
+    middle dropped) instead of data. stderr is always bounded text. `stdin`
+    is a readable descriptor of DATA git reads (`stripspace`); closed by
+    default."""
     git = shutil.which("git")
     if not git:
         raise error("git is not on PATH — the checkout cannot be verified")
@@ -339,7 +350,7 @@ def _strict_git(
         done = procs.run(
             [git, *global_args, "-C", cwd, *args], env=_git_env(keep_env, extra_env),
             timeout=timeout, stdout=_diagnostic() if diagnostic else procs.complete(limit),
-            stderr=_diagnostic())
+            stderr=_diagnostic(), stdin=stdin)
     except procs.TimedOut as exc:
         raise error(f"git timed out after {timeout}s in {cwd} (stopped with its whole "
                     f"process group)") from exc
@@ -450,6 +461,19 @@ def verify_release_checkout(
         "head": head,
         "git_common_dir": common,
     }
+
+
+def release_lock_location(project_path: str | os.PathLike[str]) -> str | None:
+    """The repository whose release OPERATION LOCK a project registered at
+    `project_path` uses (K-118 L8 — the ONE identity every mutating release
+    command derives, with or without a current directory): the realpath of
+    the git common dir of the work tree holding the path, or None when the
+    path is CONFIRMED outside every repository (the project then locks its
+    directory). Anything that cannot be confirmed — a missing directory, a
+    broken repository, git missing, a timeout — raises
+    CheckoutVerificationError: there is no substitute identity."""
+    location = _strict_location(os.fspath(project_path), "project path")
+    return None if location is None else location[1]
 
 
 # ── strict read-only readers (the release proof layer, K-72 layer 1) ────────
@@ -610,16 +634,20 @@ def git_write(
     cwd: str | os.PathLike[str], *args: str,
     ok_codes: tuple[int, ...] = (0,), timeout: float = GIT_READ_TIMEOUT_SECONDS,
     index_file: str | None = None, network: bool = False, diagnostic: bool = False,
+    env: dict[str, str] | None = None, stdin: int | None = None,
 ) -> tuple[int, str]:
     """(exit code, stdout) of a git command that MAY write (`git -C <cwd>
     <args>`, no shell, C locale, stdin closed, no terminal) — the release
     effects layer only (dct.workflows.release.effects). GIT_* variables are
     dropped except WRITE_ENV_PASSTHROUGH (+ NETWORK_ENV_PASSTHROUGH and
     GIT_TERMINAL_PROMPT=0 with `network`); `index_file` sets GIT_INDEX_FILE
-    (a TEMPORARY index — the user's index is never touched through it; a
-    `git commit` exports it to the repository's hooks). An exit code outside
-    `ok_codes`, git missing, or a timeout raises GitWriteError with git's
-    stderr (bounded: its start and its end).
+    (a TEMPORARY index — the user's index is never touched through it; `git
+    hook run` exports it to the repository's hooks); `env` adds variables
+    on top (what `git commit` exports to its hooks: GIT_EDITOR, the author
+    identity); `stdin` is a readable descriptor of DATA the command reads
+    (a message file for `stripspace`). An exit code outside `ok_codes`,
+    git missing, or a timeout raises GitWriteError with git's stderr
+    (bounded: its start and its end).
 
     Supervised (K-108 / K-118 L10): hooks, filters and transports git
     starts are in its process group — a timeout or an interruption stops
@@ -628,7 +656,9 @@ def git_write(
     `ls-remote`, `hash-object`, `write-tree`); `diagnostic=True` is for
     commands whose stdout only carries hook / transport chatter (`commit`,
     `push`): bounded, never an error for its size (K-113)."""
-    extra = {"GIT_INDEX_FILE": index_file} if index_file else {}
+    extra = dict(env or {})
+    if index_file:
+        extra["GIT_INDEX_FILE"] = index_file
     keep = WRITE_ENV_PASSTHROUGH
     if network:
         keep = keep | NETWORK_ENV_PASSTHROUGH
@@ -636,9 +666,106 @@ def git_write(
     result = _strict_git(
         os.fspath(cwd), *args, timeout=timeout, error=GitWriteError,
         decode_errors="replace", keep_env=keep, extra_env=extra or None,
-        diagnostic=diagnostic,
+        diagnostic=diagnostic, stdin=stdin,
     )
     if result.returncode not in ok_codes:
         detail = (result.stderr or "").strip() or f"exit code {result.returncode}"
         raise GitWriteError(f"`git {' '.join(args)}` failed in {os.fspath(cwd)}: {detail}")
     return result.returncode, result.stdout
+
+
+class GitRefRaceError(GitWriteError):
+    """A compare-and-swap ref update lost: the ref was not at the expected
+    old value (or could not be locked) — nothing was updated."""
+
+
+class GitRefVerifyError(GitWriteError):
+    """The caller's `verify` refused a PREPARED ref transaction — it was
+    aborted, nothing was updated. `reason` is what verify returned."""
+
+    def __init__(self, reason: str):
+        super().__init__(reason)
+        self.reason = reason
+
+
+def git_update_ref_cas(
+    cwd: str | os.PathLike[str], ref: str, new: str, old: str, *, message: str,
+    no_deref: bool = False, verify: Callable[[], str | None] | None = None,
+    timeout: float = GIT_READ_TIMEOUT_SECONDS,
+) -> None:
+    """Move `ref` from EXACTLY `old` to `new` — ONE ref transaction of `git
+    update-ref -m <message> --stdin` (start / update <ref> <new> <old> /
+    prepare / commit; needs git >= 2.27), a real compare-and-swap: git locks
+    the ref, compares its value with `old` and only then writes. `ref` is a
+    full ref name (`refs/heads/<b>`), or `HEAD` with `no_deref` for a
+    detached HEAD (HEAD itself is locked and compared, never the branch it
+    may name meanwhile).
+
+    `verify` runs BETWEEN prepare and commit — while git holds the locks of
+    the prepared transaction (the ref; with the files backend also HEAD
+    when HEAD names that ref, so no `git switch` / `checkout` can re-point
+    HEAD meanwhile; with reftable the whole ref database). It returns None
+    to commit, or a reason to abort: GitRefVerifyError, nothing updated.
+
+    GitRefRaceError when the prepare fails (the ref is not at `old`, or a
+    lock is held by another git process) — nothing updated; GitWriteError
+    for any other failure (git missing, a timeout, an unexpected answer —
+    the transaction is then abandoned: git drops an uncommitted transaction
+    and its locks when it exits). The `reference-transaction` hook runs, as
+    for every ref update of git. Supervised like every git process
+    (dct.core.procs.stream_lines); the reflog entry is `message`."""
+    cwd = os.fspath(cwd)
+    git = shutil.which("git")
+    if not git:
+        raise GitWriteError("git is not on PATH — the checkout cannot be verified")
+    for value in (ref, new, old):
+        # One command per line, fields separated by a space (a field that
+        # STARTS with a quote would be read as C-quoted).
+        if not value or value.startswith('"') or any(ch.isspace() or ch == "\0" for ch in value):
+            raise GitWriteError(f"refusing a ref update with the unsafe argument {value!r}")
+    reader, writer = os.pipe()
+    lines = procs.stream_lines(
+        [git, "-C", cwd, "update-ref", "-m", message, "--stdin"],
+        env=_git_env(WRITE_ENV_PASSTHROUGH), timeout=timeout, stdin=reader,
+        stderr=procs.bounded(_STREAM_STDERR_MAX_BYTES))
+    answers = iter(lines)
+
+    def expect(answer: str) -> None:
+        got = next(answers, None)
+        if got is None or got.decode("utf-8", "replace").strip() != answer:
+            raise GitWriteError(
+                f"`git update-ref --stdin` in {cwd} answered {got!r} instead of {answer!r} — "
+                f"the ref transaction is abandoned, nothing updated")
+
+    reason = None
+    prepared = False
+    try:
+        os.write(writer, (
+            "start\n" + ("option no-deref\n" if no_deref else "")
+            + f"update {ref} {new} {old}\nprepare\n").encode("utf-8"))
+        expect("start: ok")
+        expect("prepare: ok")
+        prepared = True
+        reason = verify() if verify is not None else None
+        os.write(writer, b"abort\n" if reason else b"commit\n")
+        os.close(writer)
+        writer = None
+        expect("abort: ok" if reason else "commit: ok")
+        for _ in answers:  # to the exit: the generator ends only after exit 0
+            pass
+    except procs.Failed as exc:
+        kind = GitWriteError if prepared else GitRefRaceError
+        raise kind(f"`git update-ref {ref}` failed in {cwd}: {exc}") from exc
+    except procs.TimedOut as exc:
+        raise GitWriteError(f"`git update-ref {ref}` timed out after {timeout}s in {cwd} "
+                            f"(stopped with its whole process group)") from exc
+    except procs.ProcessError as exc:
+        raise GitWriteError(f"could not run git in {cwd}: {exc}") from exc
+    finally:
+        lines.close()
+        for fd in (reader, writer):
+            if fd is not None:
+                with contextlib.suppress(OSError):
+                    os.close(fd)
+    if reason:
+        raise GitRefVerifyError(reason)

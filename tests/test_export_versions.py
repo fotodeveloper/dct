@@ -17,7 +17,7 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 import sqlalchemy as sa
-from conftest import run_cli
+from conftest import alias_argv, run_cli
 
 from dct.core.changelog import add_entry, list_entries, release_entries
 from dct.core.projects import create_project, get_project
@@ -106,7 +106,9 @@ def test_v_prefixed_release_flow_core_cli_export(cli_engine, tmp_path, monkeypat
     # A legacy row of the SAME version in yet another spelling (pre-contract).
     legacy = add_entry(engine, "proj-v", "fixed", "legacy v-spelled row")["id"]
 
-    run_cli(monkeypatch, ["clog", "release", "--confirm", "--no-push", "-P", "proj-v", "v1.6.0", "--entries", str(a)])
+    run_cli(monkeypatch, alias_argv(engine, "proj-v", [
+        "clog", "release", "--confirm", "--no-push", "-P", "proj-v", "v1.6.0", "--entries",
+        str(a)]))
     out = capsys.readouterr().out
     assert "as 1.6.0" in out and "current version: 1.6.0" in out
     _stamp_raw(engine, legacy, "v1.6", datetime.now(UTC))

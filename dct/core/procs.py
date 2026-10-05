@@ -35,8 +35,8 @@ case is covered by the record the group left in the lock file. Without
 process groups (Windows) only the started process itself is killed and
 nothing is recorded.
 
-Because the process has no controlling terminal and its stdin is closed, it
-can never prompt: a hook, a credential helper or an ssh that needs a
+Because the process has no controlling terminal and its stdin is closed (or
+a file / pipe of data the caller supplies — `stdin=`), it can never prompt: a hook, a credential helper or an ssh that needs a
 passphrase fails (use an agent / a helper / askpass) instead of waiting on
 a terminal nobody watches.
 
@@ -562,7 +562,7 @@ def _stop_group(proc: subprocess.Popen, term_grace: float | None) -> tuple[bool,
 class _Group:
     """One started process and the bookkeeping of its group."""
 
-    def __init__(self, argv: Sequence[str], *, cwd, env, stdout, stderr):
+    def __init__(self, argv: Sequence[str], *, cwd, env, stdout, stderr, stdin=None):
         self.scope = _SCOPE.get()
         self.ledger = self.scope.groups if self.scope and _HAS_GROUPS else None
         self.stopped = False
@@ -572,7 +572,8 @@ class _Group:
             self.ledger.spawning()
         try:
             self.proc = subprocess.Popen(
-                list(argv), cwd=cwd, env=env, stdin=subprocess.DEVNULL, stdout=stdout,
+                list(argv), cwd=cwd, env=env,
+                stdin=subprocess.DEVNULL if stdin is None else stdin, stdout=stdout,
                 stderr=stderr, start_new_session=_HAS_GROUPS)
         except BaseException as exc:
             # Popen leaves no process behind when it raises.
@@ -642,16 +643,19 @@ def run(
     argv: Sequence[str], *, timeout: float | None, cwd: str | None = None,
     env: dict[str, str] | None = None, stdout: Capture | None = None,
     stderr: Capture | None = None, merge_stderr: bool = False,
-    term_grace: float | None = None,
+    term_grace: float | None = None, stdin: int | None = None,
 ) -> Result:
-    """Run `argv` (no shell, stdin closed, its own session / process group)
-    to its end and return its Result — the ONE way the release workflow
+    """Run `argv` (no shell, stdin closed by default, its own session /
+    process group) to its end and return its Result — the ONE way the release workflow
     runs a process to completion.
 
     `timeout` — wall-clock seconds (None = none); `stdout` / `stderr` — the
     capture policy of each stream (default bounded(DIAGNOSTIC_MAX_BYTES));
     `merge_stderr` sends stderr into the stdout pipe (one stream, one
-    policy); `term_grace` overrides TERM_GRACE_SECONDS.
+    policy); `term_grace` overrides TERM_GRACE_SECONDS; `stdin` — a
+    readable file descriptor the process reads as its stdin (a file of
+    DATA the caller opened, never a terminal; the caller keeps and closes
+    its own copy) instead of the closed default.
 
     Raises StartFailed (not started), TimedOut (with the partial Result),
     OutputLimitExceeded (a complete() stream over its limit), GroupSurvived
@@ -667,7 +671,8 @@ def run(
     active = _shield()
     try:
         group = _Group(argv, cwd=cwd, env=env, stdout=subprocess.PIPE,
-                       stderr=subprocess.STDOUT if merge_stderr else subprocess.PIPE)
+                       stderr=subprocess.STDOUT if merge_stderr else subprocess.PIPE,
+                       stdin=stdin)
         proc = group.proc
         pump = _Pump([(proc.stdout, sinks[0]), (proc.stderr, sinks[1])])
         timed_out = False
@@ -720,11 +725,15 @@ def stream_lines(
     argv: Sequence[str], *, timeout: float | None, cwd: str | None = None,
     env: dict[str, str] | None = None, max_line_bytes: int | None = None,
     stderr: Capture | None = None, term_grace: float | None = None,
+    stdin: int | None = None,
 ) -> Iterator[bytes]:
     """The stdout LINES of `argv` (bytes, without their newline), streamed —
     for output that must be complete but may be large. Same process setup
     and supervision as run(); stderr is captured by `stderr` (default
-    bounded).
+    bounded). `stdin` — as for run(); with the read end of a pipe the
+    caller can answer the lines it reads (a command protocol: git's
+    `update-ref --stdin`), the process starting with the first line asked
+    for.
 
     Never a silently partial result: the generator finishes normally ONLY
     after the process exited 0. Failed (non-zero exit, with stderr),
@@ -738,7 +747,8 @@ def stream_lines(
     err = _Sink(stderr or bounded())
     active = _shield()
     try:
-        group = _Group(argv, cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        group = _Group(argv, cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                       stdin=stdin)
         proc = group.proc
         pump = _Pump([(proc.stderr, err)])
         expired = threading.Event()

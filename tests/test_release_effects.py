@@ -23,6 +23,7 @@ from pathlib import Path
 
 import pytest
 from conftest import (
+    alias_argv,
     approved_plan_digest,
     approved_proposal_digest,
     git,
@@ -805,7 +806,8 @@ def test_cli_clog_release_alias_releases_every_proven_entry(engine, cli_proj, mo
     repo, _ = cli_proj
     a = proven(engine, repo, "feature a")
     candidate = git(repo, "rev-parse", "HEAD")
-    run_cli(monkeypatch, ["clog", "release", "--confirm", "-P", SLUG, "--minor"])
+    run_cli(monkeypatch, alias_argv(engine, SLUG, [
+        "clog", "release", "--confirm", "-P", SLUG, "--minor"]))
     assert "Released 1 entries as 1.1.0" in capsys.readouterr().out
     assert_released(engine, repo, candidate, [a])
 

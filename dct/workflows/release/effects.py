@@ -1,7 +1,8 @@
 """The release EFFECTS layer (K-72 layer 3) — the default executable release
 workflow behind `/release`: `dct release attest / prepare / apply / resume /
-abandon / reconstruct` (and `dct clog release`, an alias of prepare + apply
-that needs --confirm like apply, K-96 D1).
+abandon / reconstruct` (and `dct clog release`, an alias of apply without
+--plan-digest: it needs --confirm like apply, K-96 D1, and the approved
+--proposal-digest — it never prepares or approves a proposal itself, K-117).
 
 ONE implementation for the CLI and both clients' skills (they only run the
 dialog, K-49): every effect is performed by this module and VERIFIED against
@@ -17,6 +18,9 @@ it returns: prepare, apply (and the alias), resume, attest, abandon,
 reconstruct --confirm and the old ledger commands (`clog release-advance` =
 record_progress, `clog release-abandon` = abandon — K-96 D10). A second one
 refuses at once; editors and other git processes are never blocked by it.
+ONE lock identity for all of them (K-118 L8, _lock_file): a function of the
+project's REGISTERED path only; a project without a path, or with a path
+that cannot be verified, is refused — never locked on a substitute key.
 
 PROCESSES (K-108, K-113, K-118 L10): the version-sync script and every git
 command — so every hook, filter and push transport git starts — run through
@@ -88,18 +92,30 @@ Stages of one release:
      as the project's PENDING proposal (core.releases.set_pending_proposal).
      Expected blobs live in the repository's object database (`git add` in
      the temporary worktree) or, outside git, in dct's release blob store
-     (dct.paths.release_store_dir). Nothing is stamped.
+     (dct.paths.release_store_dir). K-117: each proposal has a stable `id`
+     and its blobs are PINNED by the ref PIN_REF_PREFIX/<project>/<id>
+     (a tree) until the release is completed or abandoned or the pending
+     proposal is replaced; the store follows the same lifetime, keeping
+     what another live proposal still names (release_proposal_resources).
+     A failing script reports its environment contract (sync_environment,
+     J2 / J3) — it is never re-run in the user's checkout. Nothing is
+     stamped.
   1. pre-checks of apply — strict checkout (K-52; a registered path), no
      unfinished record, clean index and work tree (K-50); the plan
      re-derived FOR THE PINNED CANDIDATE must match the approved snapshot
-     digest (K-80); the requested set ⊆ the plan's proven ids; the push
-     target (push_target: the branch's upstream, or the explicit
-     --push-remote / --push-branch, or --no-push — no upstream is refused,
-     never guessed) and the remote read once (no tag of V there, its branch
-     contained in the candidate — K-97 F2); the approved proposal
-     (--proposal-digest) must be the pending one, bound to the same
-     candidate, version and plan digest, with the script and the baseline
-     unchanged; HEAD unchanged right before the stamp;
+     digest (K-80); the requested set ⊆ the plan's proven ids; git itself
+     recent enough for the hook lifecycle (MIN_GIT_VERSION, K-103); the ONE
+     push target (push_target, K-104: the branch's upstream, or the
+     explicit --push-remote / --push-branch, or --no-push — no upstream is
+     refused, never guessed; its URL is the remote's effective push
+     address from the full `get-url --push --all`, --push-url choosing one
+     of several — several without a choice are refused) and that URL read
+     once (no tag of V there, its branch contained in the candidate — K-97
+     F2); the approved proposal (--proposal-digest, REQUIRED for a new
+     release — also for the alias, K-117) must be the pending one, bound
+     to the same candidate, version and plan digest (K-116 H2), with the
+     script and the baseline unchanged, its blobs available and pinned;
+     HEAD unchanged right before the stamp;
   2. stamp — core release_entries (the record, status 'stamped'), bound to
      the plan inside its transaction (K-81: stampable_ids, expected_entries)
      and consuming the approved proposal in the SAME transaction
@@ -121,24 +137,38 @@ Stages of one release:
      every hash and the expected tree are computed from that one read and
      checked against the approved content (K-77) before the manifest
      {changelog, version_files, tree} is recorded with 'files_written';
-  5. commit — the expected tree (candidate tree + exactly the manifest
-     blobs) is built in a TEMPORARY index; the real index is checked
-     read-only for foreign paths / content (and a foreign index.lock);
-     `git commit` from the temporary index creates the commit THROUGH THE
-     REPOSITORY'S HOOKS (K-96: pre-commit, prepare-commit-msg, commit-msg,
-     post-commit; never --no-verify, never commit-tree), HEAD moving by
-     git's own compare-and-swap; parent, tree and subject are re-validated
-     (a refusing hook → nothing committed; a hook that changed the content
-     → refused with the observed commit, never adopted); then the user's
-     REAL index follows the commit under git's index.lock protocol, its
-     own staging preserved (K-79, _sync_real_index) → 'committed';
+  5. commit (K-103) — the expected tree (candidate tree + exactly the
+     manifest blobs) is built in a TEMPORARY index; the real index is
+     checked read-only for foreign paths / content (and a foreign
+     index.lock). The commit is created by the EXPLICIT hook lifecycle of
+     _hook_commit — never `git commit`, whose parent is whatever HEAD is
+     when IT reads it: HEAD's commit and the ref HEAD names are PINNED;
+     `git hook run` pre-commit → prepare-commit-msg → commit-msg (the
+     repository's hooks, core.hooksPath, in the same work tree, with the
+     temporary index, GIT_EDITOR and the author identity as `git commit`
+     exports them — never skipped, K-96); then the tree the temporary
+     index writes, the artifacts in the work tree and the cleaned message
+     are verified; `git commit-tree <tree> -p <candidate>` (signed when
+     commit.gpgSign says so) creates an UNPUBLISHED object, read back and
+     checked (tree, parent, subject); only then the pinned ref moves by a
+     real compare-and-swap inside one ref transaction in which HEAD must
+     still name it; post-commit runs after that (a failure is a warning).
+     A refusing hook, a hook that changed the content or the message, a
+     HEAD that moved, a branch switch → refused with NOTHING published: no
+     foreign commit is left on the branch, nothing is reset (K-118 L1–L3).
+     Then the user's REAL index follows the commit under git's index.lock
+     protocol, its own staging preserved (K-79, _sync_real_index) →
+     'committed'. Needs git >= MIN_GIT_VERSION, checked before any effect;
   6. tag `v<V>` (lightweight) at the verified release commit → 'tagged'
      with its tag_proof (K-115 G4; an existing tag of V at that commit —
      also an annotated one — is verified and recorded instead);
-  7. push (K-97 F2) — `git push --atomic` of the release commit and the tag
-     to the CONSENTED target, verified with `git ls-remote` → 'pushed'
-     with its push_proof (K-115 G4), then 'completed'; a failed push leaves
-     'tagged' and resume retries
+  7. push (K-97 F2, K-104) — `git push --atomic <url> <commit>:refs/heads/
+     <branch> <commit>:refs/tags/<tag>`: the release commit and the tag to
+     the CONSENTED target's URL itself with explicit refspecs (a later
+     change of the remote's configuration adds no recipient), verified
+     with `git ls-remote <url>` — the same address → 'pushed' with its
+     push_proof (K-115 G4), then 'completed' (the proposal's pin / store
+     blobs are released); a failed push leaves 'tagged' and resume retries
      only the push. Without a push target (--no-push, outside git) the
      record goes 'tagged' → 'completed' (no push proof: the consent's
      push_target null is the explicit local release).
@@ -182,6 +212,7 @@ from dct.core.changelog import (
     release_entries,
     version_spelling,
 )
+from dct.core.ids import new_ulid
 from dct.core.projects import get_project
 from dct.core.version import (
     compare_versions,
@@ -230,9 +261,14 @@ INTERRUPTION_POINTS = (
     "after_version_file",    # ONE version file written (fires after each write)
     "after_version_files",   # every artifact written; not verified, not 'files_written'
     "after_files_written",   # manifest recorded; before the commit
-    "before_commit",         # real index checked, temporary index built; `git commit` not run
-    "after_commit",          # commit created (hooks ran) + HEAD moved + verified; the real
-                             # index not yet updated; not 'committed'
+    "before_commit",         # real index checked; no hook has run, no object created
+    "before_publish",        # pre-commit / prepare-commit-msg / commit-msg ran; the commit
+                             # object exists (on the pinned parent) and is verified; NO ref
+                             # moved yet
+    "publishing",            # the ref transaction is PREPARED (git holds the lock of the
+                             # pinned ref — and of HEAD naming it); not committed
+    "after_commit",          # the ref moved (compare-and-swap), post-commit ran, verified;
+                             # the real index not yet updated; not 'committed'
     "after_index",           # real index entries of the artifacts = the commit's; not 'committed'
     "after_committed",       # before the tag
     "after_tag",             # tag created + verified; not 'tagged'
@@ -262,12 +298,18 @@ PREPARE_GIT_TIMEOUT_SECONDS = 600
 # bounded, a larger directory is refused instead of copied.
 COPY_MAX_FILES = 20000
 COPY_MAX_BYTES = 256 * 1024 * 1024
-# `git commit` runs the repository's hooks (a pre-commit test suite …) and
+# `git hook run` runs the repository's hooks (a pre-commit test suite …) and
 # `git push` the remote side's — both may take far longer than a git read.
 # Past it git is stopped WITH its whole process group: the hook, the
 # transport and everything they started (K-118 L10).
 HOOK_GIT_TIMEOUT_SECONDS = 900
+# K-103: the commit goes through the hook lifecycle EXPLICITLY — `git hook
+# run` (git 2.36); the ref transaction protocol of `git update-ref --stdin`
+# (start / prepare / commit) is older (2.27). Checked before any effect.
+MIN_GIT_VERSION = (2, 36)
 
+_GIT_VERSION_RE = re.compile(r"git version (\d+)\.(\d+)")
+_IDENT_RE = re.compile(r"(.*) <([^<>]*)> (\d+) ([+-]\d{4})")
 _MARKER_RE = re.compile(r"^## \[([^\]\r\n]*)\]")
 _RELEASE_SUBJECT_RE = re.compile(r"^release: (\S+)$")
 _IN_PROGRESS = ("MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "rebase-merge", "rebase-apply")
@@ -569,36 +611,260 @@ def _commit_facts(repo: str, commit: str) -> dict:
             "subject": _subject(repo, commit)}
 
 
-def _hook_commit(run_refuse: Callable[..., ReleaseRefused], repo: str, tree: str, parent: str,
-                 message: str) -> str:
-    """Create a commit of EXACTLY `tree` on `parent` (= HEAD) through `git
-    commit` — the repository's hook lifecycle runs (pre-commit,
-    prepare-commit-msg, commit-msg, post-commit; commit.gpgSign and the
-    like as git applies them; never --no-verify, K-96). The commit is built
-    from a TEMPORARY index holding `tree` (GIT_INDEX_FILE, exported to the
-    hooks — they see exactly what is committed); the user's index is not
-    touched. HEAD is moved by git commit's own ref transaction, a
-    compare-and-swap against the HEAD it read (`parent`): a concurrent HEAD
-    move fails the commit. Returns HEAD afterwards — UNVERIFIED: the caller
-    re-validates parent, tree and message (a hook may have changed them). A
-    failed `git commit` (a refusing hook, a lost ref race, a signing
-    failure) → refusal naming what HEAD is now."""
+def _check_git_version(repo: str) -> None:
+    """K-103 — BEFORE any effect: the explicit hook lifecycle needs `git hook
+    run` (MIN_GIT_VERSION). An older (or unrecognisable) git is refused with
+    nothing done — never a fallback that would skip the hooks."""
+    _, out = gitinfo.git_read(repo, "version")
+    match = _GIT_VERSION_RE.match(out.strip())
+    found = (int(match.group(1)), int(match.group(2))) if match else None
+    if found is None or found < MIN_GIT_VERSION:
+        needed = ".".join(str(part) for part in MIN_GIT_VERSION)
+        raise ReleaseRefused(
+            f"the release workflow needs git {needed} or newer (it runs the repository's commit "
+            f"hooks explicitly with `git hook run` and publishes the commit with a ref "
+            f"transaction); this is {out.strip()!r} — upgrade git; nothing done.",
+            details={"git_version": out.strip(), "required_git_version": needed})
+
+
+def _head_ref(repo: str) -> str | None:
+    """The full name of the ref HEAD NAMES (`refs/heads/<b>`), or None for a
+    detached HEAD — the symbolic HEAD, not its commit."""
+    code, out = gitinfo.git_read(repo, "symbolic-ref", "-q", "HEAD", ok_codes=(0, 1))
+    return (out.strip() or None) if code == 0 else None
+
+
+def _commit_config(repo: str, key: str, *flags: str) -> str | None:
+    """A config value as the COMMIT will see it — read through the writer
+    (its config-location variables are the caller's), not the stripped
+    read-only environment."""
+    code, out = gitinfo.git_write(repo, "config", *flags, "--get", key, ok_codes=(0, 1))
+    return (out.strip() or None) if code == 0 else None
+
+
+def _commit_identity(run_refuse: Callable[..., ReleaseRefused], repo: str) -> dict[str, str]:
+    """The author identity of the commit, resolved ONCE the way `git commit`
+    does (`git var GIT_AUTHOR_IDENT`: the caller's GIT_AUTHOR_* variables,
+    else user.name / user.email) and exported to every hook and to the
+    commit itself as GIT_AUTHOR_NAME / GIT_AUTHOR_EMAIL / GIT_AUTHOR_DATE —
+    what `git commit` exports to its hooks. The committer identity must
+    resolve too. An unknown identity is refused before any hook runs."""
+    try:
+        _, author = gitinfo.git_write(repo, "var", "GIT_AUTHOR_IDENT")
+        gitinfo.git_write(repo, "var", "GIT_COMMITTER_IDENT")
+    except gitinfo.GitWriteError as exc:
+        raise run_refuse(
+            f"git cannot determine the identity to commit with ({exc}) — set user.name / "
+            f"user.email; nothing committed.", git_error=str(exc)) from None
+    match = _IDENT_RE.fullmatch(author.strip())
+    if match is None:
+        raise run_refuse(f"unexpected author identity from git: {author.strip()!r} — nothing "
+                         f"committed.")
+    name, email, when, zone = match.groups()
+    return {"GIT_AUTHOR_NAME": name, "GIT_AUTHOR_EMAIL": email,
+            "GIT_AUTHOR_DATE": f"@{when} {zone}"}
+
+
+def _cleaned_message(run_refuse: Callable[..., ReleaseRefused], repo: str, path: str) -> str:
+    """The message file after the hooks, cleaned up as `git commit -m` does
+    (commit.cleanup: default / whitespace / scissors → `git stripspace`,
+    strip → `--strip-comments`, verbatim → as it is)."""
+    mode = (_commit_config(repo, "commit.cleanup") or "default").lower()
+    raw = _read_bytes(path)
+    if raw is None:
+        raise run_refuse(f"a hook removed the commit message file {path} — nothing committed.")
+    if mode == "verbatim":
+        text = raw.decode("utf-8", "replace")
+    else:
+        args = ("stripspace", "--strip-comments") if mode == "strip" else ("stripspace",)
+        with open(path, "rb") as fh:
+            _, text = gitinfo.git_write(repo, *args, stdin=fh.fileno())
+    if "�" in text and "�".encode() not in raw:
+        raise run_refuse("a hook left a commit message that is not UTF-8 — nothing committed.")
+    return text
+
+
+def _hook_commit(
+    run_refuse: Callable[..., ReleaseRefused], repo: str, tree: str, parent: str, message: str,
+    *, check: Callable[[dict, object], tuple[str, dict] | None],
+    work_tree_check: Callable[[], None] | None = None,
+    on_point: Callable[[str], None] | None = None,
+) -> tuple[str, list[str]]:
+    """Create the commit of EXACTLY `tree` on the PINNED `parent` and publish
+    it on the ref HEAD names — K-103: the repository's hook lifecycle run
+    EXPLICITLY, in `git commit`'s order and with what it gives the hooks,
+    then a real compare-and-swap. Returns (commit, warnings).
+
+    1. Pinned: HEAD must be `parent`; the ref HEAD NAMES (`refs/heads/<b>`,
+       or none — detached) is resolved now and is the ONLY ref published to.
+    2. Hooks, each through `git hook run --ignore-missing` (core.hooksPath
+       honoured; supervised, HOOK_GIT_TIMEOUT_SECONDS): pre-commit →
+       prepare-commit-msg <file> message → commit-msg <file>. They run in
+       the SAME work tree (cwd = its top level) with GIT_INDEX_FILE = a
+       TEMPORARY index holding `tree`, GIT_EDITOR=":" and the author
+       identity (GIT_AUTHOR_NAME / EMAIL / DATE) exactly as `git commit -m`
+       exports them; `<file>` is this checkout's COMMIT_EDITMSG. The user's
+       index is never used.
+    3. Verified BEFORE any commit object exists: the temporary index still
+       writes `tree` (a hook that staged / reformatted content → refused),
+       `work_tree_check()` (the caller's artifacts unchanged), the message
+       cleaned as `git commit` cleans it and not empty.
+    4. `git commit-tree <tree> -p <parent>` — an UNPUBLISHED object, with the
+       identity of step 2 and the signing policy in force (commit-tree
+       ignores commit.gpgSign: `-S` is passed when it is true; user.signingKey
+       / gpg.* are git's). Read back and checked: tree, the single parent,
+       and `check(facts, commit)` — the caller's message contract (the
+       subject; for attest the EXACT id set, K-107), returning None or
+       (reason, details). A hook that changed the message → refused; the
+       object stays unreferenced.
+    5. Publication — gitinfo.git_update_ref_cas: ONE ref transaction that
+       moves the pinned ref (HEAD itself, not dereferenced, when detached)
+       from `parent` to the commit; inside the prepared transaction (git
+       holds the ref's lock, and HEAD's when HEAD names it) HEAD must still
+       name the pinned ref. A HEAD that moved, a branch switch, an attach /
+       detach → refused, NOTHING published, the other process's commits and
+       staging untouched.
+    6. post-commit — only after the publication; a failure is a WARNING: the
+       commit stays, the hook is never run again (resume adopts the commit).
+
+    Every refusal before step 5 leaves no ref changed (K-118 L1–L3); nothing
+    is ever reset. Interruption points: before_publish (after step 4),
+    publishing (inside step 5)."""
+    ref = _head_ref(repo)
+    head = _rev(repo, "HEAD^{commit}")
+    if head != parent:
+        raise run_refuse(
+            f"HEAD is {head}, not {parent} — it moved since the last check; nothing "
+            f"committed, nothing changed.", head=head, expected_parent=parent)
+    identity = _commit_identity(run_refuse, repo)
+    env = {"GIT_EDITOR": ":", **identity}
+    _, shown = gitinfo.git_read(repo, "rev-parse", "--git-path", "COMMIT_EDITMSG")
+    message_arg = shown.strip()  # as `git commit` passes it (relative to the top level)
+    message_path = message_arg if os.path.isabs(message_arg) else os.path.join(repo, message_arg)
+    subject = message.split("\n", 1)[0]
+    warnings: list[str] = []
+
+    def unchanged(what: str) -> str:
+        now = _rev(repo, "HEAD^{commit}")
+        return (f"{what}; nothing was published: no ref moved, HEAD is "
+                + ("still " if now == parent else "now (moved by another process) ") + f"{now}")
+
     with tempfile.TemporaryDirectory(prefix="dct-release-commit-") as tmp:
         index = os.path.join(tmp, "index")
         gitinfo.git_write(repo, "read-tree", tree, index_file=index)
+
+        def hook(name: str, *args: str) -> None:
+            try:
+                gitinfo.git_write(repo, "hook", "run", "--ignore-missing", name,
+                                  *(("--", *args) if args else ()), index_file=index, env=env,
+                                  timeout=HOOK_GIT_TIMEOUT_SECONDS, diagnostic=True)
+            except gitinfo.GitWriteError as exc:
+                raise run_refuse(
+                    unchanged(f"the repository's {name} hook refused the commit ({exc})")
+                    + " — nothing recorded; fix the cause and run the command again.",
+                    git_error=str(exc), hook=name, head=_rev(repo, "HEAD^{commit}"),
+                    expected_parent=parent) from None
+
+        hook("pre-commit")
+        with open(message_path, "w", encoding="utf-8", newline="") as fh:
+            fh.write(message if message.endswith("\n") else message + "\n")
+        hook("prepare-commit-msg", message_arg, "message")
+        hook("commit-msg", message_arg)
+        # 3. — nothing exists yet that a refusal would have to take back.
         try:
-            gitinfo.git_write(repo, "commit", "--quiet", "--allow-empty", "-m", message,
-                              index_file=index, timeout=HOOK_GIT_TIMEOUT_SECONDS,
+            _, after = gitinfo.git_write(repo, "write-tree", index_file=index)
+        except gitinfo.GitWriteError as exc:
+            raise run_refuse(
+                unchanged(f"a hook left the index it was given unusable ({exc})") + ".",
+                git_error=str(exc), head=_rev(repo, "HEAD^{commit}"),
+                expected_tree=tree) from None
+        after = after.strip()
+        if after != tree:
+            changed = sorted(_diff_names(repo, tree, after))
+            raise run_refuse(
+                unchanged(f"a hook changed the content to be committed ({', '.join(changed)} — "
+                          f"a formatter, restaged files): tree {after}, approved {tree}")
+                + ". dct commits only the approved content and restores nothing: make the "
+                  "hook leave these files alone (or approve content the hook accepts), put "
+                  "the files back as approved, then run the command again.",
+                head=_rev(repo, "HEAD^{commit}"), expected_tree=tree, tree=after,
+                changed=changed)
+        if work_tree_check is not None:
+            work_tree_check()
+        text = _cleaned_message(run_refuse, repo, message_path)
+        if not text.strip():
+            raise run_refuse(unchanged("a hook emptied the commit message") + ".",
+                             head=_rev(repo, "HEAD^{commit}"))
+        final = os.path.join(tmp, "message")
+        with open(final, "w", encoding="utf-8", newline="") as fh:
+            fh.write(text)
+        sign = ["-S"] if _commit_config(repo, "commit.gpgSign", "--type=bool") == "true" else []
+        try:
+            _, out = gitinfo.git_write(repo, "commit-tree", *sign, tree, "-p", parent, "-F",
+                                       final, env=identity, timeout=HOOK_GIT_TIMEOUT_SECONDS)
+        except gitinfo.GitWriteError as exc:
+            what = ("git could not create the signed commit — signing (commit.gpgSign) failed"
+                    if sign else "git could not create the commit object")
+            raise run_refuse(unchanged(f"{what} ({exc})") + ".", git_error=str(exc),
+                             head=_rev(repo, "HEAD^{commit}"), signed=bool(sign)) from None
+        commit = out.strip().lower()
+        # 4. — the object is unpublished: read it back with the proof layer's
+        # own reader and hold it against the contract.
+        facts = _commit_facts(repo, commit)
+        problem = None
+        if facts["tree"] != tree or facts["parents"] != [parent]:
+            problem = (f"git created tree {facts['tree']} on parents {facts['parents']}", {})
+        else:
+            problem = check(facts, planning.read_commits(repo, "-1", commit)[0])
+        if problem is not None:
+            reason, extra = problem
+            raise run_refuse(
+                unchanged(f"a hook changed the commit message outside its contract: {reason}")
+                + f". The commit object {commit} was created but is NOT published (it is "
+                  f"referenced by nothing; git's garbage collection removes it). Fix the hook "
+                  f"and run the command again.",
+                **{**facts, "head": _rev(repo, "HEAD^{commit}"), "unpublished_commit": commit,
+                   "expected_tree": tree, "expected_parent": parent, **extra})
+        _point(on_point, "before_publish")
+
+        def still_named() -> str | None:
+            _point(on_point, "publishing")
+            now = _head_ref(repo)
+            if now != ref:
+                return (f"HEAD names {now or 'no branch (detached)'} now, not "
+                        f"{ref or 'a detached HEAD'} as at the pre-check")
+            return None
+
+        try:
+            gitinfo.git_update_ref_cas(
+                repo, ref or "HEAD", commit, parent, message=f"commit: {subject}",
+                no_deref=ref is None, verify=still_named, timeout=HOOK_GIT_TIMEOUT_SECONDS)
+        except gitinfo.GitRefVerifyError as exc:
+            raise run_refuse(
+                unchanged(f"{exc.reason} — the symbolic HEAD changed between the last check and "
+                          f"the publication (a branch switch)")
+                + ". Neither branch was changed; switch back and run the command again.",
+                pinned_ref=ref, head_ref=_head_ref(repo), head=_rev(repo, "HEAD^{commit}"),
+                expected_parent=parent, unpublished_commit=commit) from None
+        except gitinfo.GitWriteError as exc:
+            raise run_refuse(
+                unchanged(f"{ref or 'HEAD'} could not be moved from {parent} to the new commit "
+                          f"by compare-and-swap ({exc}) — it moved meanwhile, or another git "
+                          f"process holds its lock")
+                + ". The other process's commits and staging are untouched.",
+                git_error=str(exc), pinned_ref=ref, head_ref=_head_ref(repo),
+                head=_rev(repo, "HEAD^{commit}"), expected_parent=parent,
+                unpublished_commit=commit) from None
+        # 6. — published. post-commit cannot undo or repeat it.
+        try:
+            gitinfo.git_write(repo, "hook", "run", "--ignore-missing", "post-commit",
+                              index_file=index, env=env, timeout=HOOK_GIT_TIMEOUT_SECONDS,
                               diagnostic=True)
         except gitinfo.GitWriteError as exc:
-            head = _rev(repo, "HEAD^{commit}")
-            moved = "unchanged" if head == parent else f"now {head} (moved by another process)"
-            raise run_refuse(
-                f"`git commit` refused the commit — a repository hook rejected it, HEAD moved "
-                f"meanwhile or signing failed ({exc}); dct created no commit, HEAD is {moved}; "
-                f"nothing recorded — fix the cause and run the command again.",
-                git_error=str(exc), head=head, expected_parent=parent) from None
-    return _head(repo)
+            warnings.append(
+                f"the post-commit hook failed AFTER the commit {commit} was published ({exc}) — "
+                f"the commit stays and the hook is not run again.")
+    return commit, warnings
 
 
 @contextlib.contextmanager
@@ -699,15 +965,17 @@ def _sync_real_index(run: _Run, commit: str, paths: list[str]) -> list[str]:
     return todo
 
 
-def _ls_remote(repo: str, remote: str) -> dict[str, str]:
-    """{ref: object} of `remote` (`git ls-remote`, network; an annotated tag
-    maps to the commit it peels to)."""
+def _ls_remote(repo: str, url: str) -> dict[str, str]:
+    """{ref: object} of the repository at `url` (`git ls-remote <url>`,
+    network; an annotated tag maps to the commit it peels to). K-104: the
+    caller passes the EFFECTIVE PUSH URL of the approved target — never a
+    remote name, which git would resolve to the fetch URL."""
     try:
-        _, out = gitinfo.git_write(repo, "ls-remote", remote, network=True,
+        _, out = gitinfo.git_write(repo, "ls-remote", url, network=True,
                                    timeout=HOOK_GIT_TIMEOUT_SECONDS)
     except gitinfo.GitWriteError as exc:
-        raise ReleaseRefused(f"the remote {remote} cannot be read ({exc}) — nothing pushed.",
-                             details={"git_error": str(exc), "remote": remote}) from None
+        raise ReleaseRefused(f"the push destination {url} cannot be read ({exc}) — nothing "
+                             f"pushed.", details={"git_error": str(exc), "url": url}) from None
     refs: dict[str, str] = {}
     for line in out.splitlines():
         sha, _, ref = line.partition("\t")
@@ -855,25 +1123,44 @@ def _locate(engine: sa.Engine, slug: str, cwd: str | None) -> tuple[dict, dict |
     return project, checkout, checkout["project_root"]
 
 
-def _lock_file(project: dict, checkout: dict | None) -> str:
-    """The operation lock of the project's REPOSITORY (K-96 D7,
-    dct.workflows.release.oplock): its git common dir — the same for the
-    main checkout, every linked worktree and every project in that
-    repository — or, for a project CONFIRMED outside git, its directory.
-    Without a verified checkout (abandon) the registered path is resolved
-    the same way; a path that cannot be verified locks on the path itself."""
+def _lock_file(project: dict, checkout: dict | None = None) -> str:
+    """The ONE canonical lock identity of every local release mutation
+    (K-96 D7, K-118 L8 — dct.workflows.release.oplock): a function of the
+    project's REGISTERED PATH only — the git common dir of the repository
+    holding it (the same for the main checkout, every linked worktree and
+    every project in that repository), or, for a path CONFIRMED outside
+    git, that directory. `checkout` (a verified checkout of the same
+    repository, _locate) is only a shortcut to the same common dir.
+
+    There is NO substitute key: a project without a registered path, or
+    with a path that cannot be verified (a missing directory, a broken
+    repository, git missing), is REFUSED — a lock derived from the slug or
+    the path string would let the command run beside a release that holds
+    the repository's lock."""
+    slug, path = project["slug"], project.get("path")
+    if not path:
+        raise ReleaseRefused(
+            f"project '{slug}' has no registered path — its checkout cannot be verified (a "
+            f"project outside git must be CONFIRMED outside git) and the repository whose "
+            f"release operation lock this command must hold cannot be determined; dct never "
+            f"locks on a substitute key. Register the path first (`dct project rename {slug} "
+            f"--path <dir>`) — a release dct does not execute can also be recorded through "
+            f"the MCP ledger tools (advance_release / abandon_release); nothing done.",
+            details={"lock": None, "reason": "no_path"})
     if checkout is not None:
         return oplock.lock_path(git_common_dir=checkout["git_common_dir"])
-    path = project.get("path")
-    if not path:
-        return oplock.lock_path(project_path=os.path.join(
-            str(dct_paths.release_lock_dir()), f"project-{project['slug']}"))
     try:
-        found = gitinfo.verify_release_checkout(path, path)
-    except gitinfo.CheckoutVerificationError:
-        found = None
-    if found is not None:
-        return oplock.lock_path(git_common_dir=found["git_common_dir"])
+        common = gitinfo.release_lock_location(path)
+    except gitinfo.CheckoutVerificationError as exc:
+        raise ReleaseRefused(
+            f"the checkout of project '{slug}' ({path}) cannot be verified ({exc}) — the "
+            f"repository whose release operation lock this command must hold cannot be "
+            f"determined, and dct never locks on a substitute key; run it where the "
+            f"registered path exists (or correct the path: `dct project rename {slug} --path "
+            f"<dir>`); nothing done.",
+            details={"lock": None, "reason": "unverifiable_path", "path": path}) from None
+    if common is not None:
+        return oplock.lock_path(git_common_dir=common)
     return oplock.lock_path(project_path=path)
 
 
@@ -1245,6 +1532,138 @@ def _blob_available(run: _Run, blob: str) -> bool:
     return code == 0
 
 
+# ── the lifetime of a proposal's resources (K-117) ───────────────────────────
+#
+# A proposal names content that nothing else keeps alive: the expected blobs
+# of a project in git are unreachable until the release commit exists (`git
+# gc` may prune them), and the blobs of a project outside git live in dct's
+# store. Both are kept for exactly as long as a proposal needs them:
+#
+#   - git: ONE ref per proposal, PIN_REF_PREFIX/<project key>/<proposal id>,
+#     pointing at a TREE that holds every blob the proposal names
+#     (`expected/<path>`, `base/<path>`, `changelog-base/<path>`). The name
+#     distinguishes the project (several dct projects may share a
+#     repository) and the proposal's STABLE identity (proposal.id — not the
+#     version, which a second prepare reuses, and not a content hash, which
+#     two proposals may share). A tree, not a commit: `git log --all` and
+#     the proof layer never see it. Identical files of two proposals are
+#     one blob reachable from two refs — removing one ref never takes it
+#     from the other.
+#   - outside git: the store is content-addressed and shared by every
+#     project of this database; a blob is deleted only when no other LIVE
+#     proposal (core.releases.live_proposals: every pending proposal and
+#     every unfinished record) names it.
+#
+# Kept from prepare until the release is completed or abandoned, or the
+# pending proposal is replaced by a new prepare. Cleaning is best effort
+# (a warning, never a failed release). Limit: a blob another project is
+# storing at this very moment (its prepare runs under ITS lock) can be
+# removed before that proposal is recorded — its apply then refuses with
+# "prepare again", never with wrong content (the store re-hashes on read).
+
+PIN_REF_PREFIX = "refs/dct/release-proposals"
+_REF_SAFE_SLUG_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]*", re.ASCII)
+
+
+def _project_ref_key(slug: str) -> str:
+    """The project's component of a pin ref: `s-<slug>` when the slug is
+    safe in a ref name, else `h-<hash of the slug>`."""
+    if _REF_SAFE_SLUG_RE.fullmatch(slug):
+        return f"s-{slug}"
+    return "h-" + _sha256(slug.encode("utf-8"))[:16]
+
+
+def pin_ref(slug: str, proposal: dict) -> str | None:
+    """The ref that pins `proposal`'s blobs, None for a proposal without an
+    identity (stored before K-117)."""
+    identity = proposal.get("id")
+    return f"{PIN_REF_PREFIX}/{_project_ref_key(slug)}/{identity}" if identity else None
+
+
+def _proposal_blobs(proposal: dict) -> dict[str, str]:
+    """{pin path: blob id} of everything `proposal` names."""
+    blobs = {f"expected/{rel}": blob for rel, blob in proposal["expected_blobs"].items()}
+    blobs.update({f"base/{rel}": blob for rel, blob in proposal["base_blobs"].items() if blob})
+    changelog = proposal.get("changelog") or {}
+    if changelog.get("base_blob"):
+        blobs[f"changelog-base/{changelog['path']}"] = changelog["base_blob"]
+    return blobs
+
+
+def _pin_proposal(repo: str, slug: str, proposal: dict) -> str | None:
+    """Make `proposal`'s blobs reachable (git): build the tree of
+    _proposal_blobs in a temporary index and point pin_ref at it — created
+    only if absent or already this tree (idempotent). Returns the ref."""
+    ref = pin_ref(slug, proposal)
+    if ref is None:
+        return None
+    blobs = _proposal_blobs(proposal)
+    with tempfile.TemporaryDirectory(prefix="dct-release-pin-") as tmp:
+        index = os.path.join(tmp, "index")
+        gitinfo.git_write(repo, "read-tree", "--empty", index_file=index)
+        if blobs:
+            entries = [arg for path in sorted(blobs)
+                       for arg in ("--cacheinfo", f"100644,{blobs[path]},{path}")]
+            gitinfo.git_write(repo, "update-index", "--add", *entries, index_file=index)
+        _, tree = gitinfo.git_write(repo, "write-tree", index_file=index)
+    tree = tree.strip()
+    if _rev(repo, ref) != tree:
+        gitinfo.git_write(repo, "update-ref", "-m", "dct release: pin proposal blobs", ref,
+                          tree, "")
+    return ref
+
+
+def _store_digests(proposal: dict) -> set[str]:
+    """The release blob store entries `proposal` names (outside git only)."""
+    if proposal.get("release_mode") != ledger.WITHOUT_GIT:
+        return set()
+    digests = set(proposal["expected_blobs"].values())
+    changelog = proposal.get("changelog") or {}
+    if changelog.get("base_blob"):
+        digests.add(changelog["base_blob"])
+    return digests
+
+
+def release_proposal_resources(engine: sa.Engine, slug: str, proposal: dict | None,
+                               repo: str | None) -> list[str]:
+    """Let go of what was kept for `proposal`, which is no longer live (its
+    release completed or was abandoned, or a new prepare replaced it):
+    its pin ref (git, in `repo`) and those of its store blobs that NO live
+    proposal of any project still names. A proposal that is still live
+    (ledger.live_proposals — by its id) is left alone. Best effort →
+    warnings (never raises): a leftover ref / blob costs disk, not
+    correctness."""
+    if not proposal:
+        return []
+    warnings: list[str] = []
+    try:
+        live = [item["proposal"] for item in ledger.live_proposals(engine)]
+    except Exception as exc:  # noqa: BLE001 - cleanup must not fail the command
+        return [("the resources of the finished proposal were not cleaned (the live "
+                 f"proposals could not be read: {exc})")]
+    identity = proposal.get("id")
+    if identity and any(other.get("id") == identity for other in live):
+        return []
+    ref = pin_ref(slug, proposal)
+    if ref and repo and os.path.isdir(repo):
+        try:
+            if _rev(repo, ref) is not None:
+                gitinfo.git_write(repo, "update-ref", "-m", "dct release: unpin proposal blobs",
+                                  "-d", ref)
+        except gitinfo.CheckoutVerificationError as exc:
+            warnings.append(f"the pin {ref} was not removed ({exc}) — remove it yourself: "
+                            f"`git update-ref -d {ref}`")
+    in_use = set().union(*(_store_digests(other) for other in live)) if live else set()
+    for digest in sorted(_store_digests(proposal) - in_use):
+        try:
+            os.unlink(_store_path(digest))
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            warnings.append(f"the stored blob {digest} was not removed ({exc})")
+    return warnings
+
+
 # ── the version-sync script (prepare only, K-96 D9) ──────────────────────────
 
 
@@ -1291,17 +1710,49 @@ def run_sync_script(script: str, version: str, cwd: str) -> dict:
     }
 
 
-def _sync_failed(run: _Run, script: str, sync: dict) -> SyncFailed:
-    details = {"script": script, "exit_code": sync["exit_code"], "sync": sync}
+def sync_environment(run: _Run, cwd: str) -> dict:
+    """The ENVIRONMENT CONTRACT of the version-sync script (K-117 J2 / J3) —
+    what it can rely on, reported with every failure so a missing
+    dependency reads as what it is. The script runs ISOLATED and only
+    there: there is no fallback to a run in the user's checkout."""
+    in_git = run.repo is not None
+    return {
+        "isolated": True,
+        "in_place_fallback": False,
+        "cwd": cwd,
+        "files": ("only the files of the release candidate (a temporary detached worktree): "
+                  "no untracked or ignored file of your checkout — virtualenvs, node_modules, "
+                  "build output, local tools, .env files — and no submodule content"
+                  if in_git else
+                  "a temporary copy of the project directory as it is now"),
+        "script": ("the script committed in the candidate (an untracked or modified one "
+                   "never runs)" if in_git else "the script in the project directory"),
+        "environment": "the caller's environment without GIT_* repository variables; PATH "
+                       "as dct sees it",
+        "stdin": "closed; no terminal",
+        "hooks": "none (the temporary checkout runs no repository hook)" if in_git else "n/a",
+        "timeout_seconds": SYNC_TIMEOUT_SECONDS,
+        "output_max_bytes": SYNC_OUTPUT_MAX_BYTES,
+    }
+
+
+def _sync_failed(run: _Run, script: str, sync: dict, cwd: str) -> SyncFailed:
+    environment = sync_environment(run, cwd)
+    details = {"script": script, "exit_code": sync["exit_code"], "sync": sync,
+               "environment": environment}
+    contract = (f" It ran isolated, with {environment['files']}; dct never runs it in your "
+                f"checkout instead. If it needs something that is not in the candidate, make "
+                f"the script provide it (install / build it itself, or use a tool on PATH) "
+                f"and commit that.")
     if sync["timed_out"]:
         return SyncFailed(
             f"version-sync script timed out after {SYNC_TIMEOUT_SECONDS}s and was stopped "
             f"(its whole process group): {script} — nothing stamped, no proposal stored; fix "
-            f"the script and run `dct release prepare` again.", SYNC_TIMEOUT_EXIT,
+            f"the script and run `dct release prepare` again.{contract}", SYNC_TIMEOUT_EXIT,
             details=details, steps=run.steps)
     return SyncFailed(
         f"version-sync script failed (exit {sync['exit_code']}): {script} — nothing stamped, "
-        f"no proposal stored; fix the script and run `dct release prepare` again.",
+        f"no proposal stored; fix the script and run `dct release prepare` again.{contract}",
         sync["exit_code"], details=details, steps=run.steps)
 
 
@@ -1533,8 +1984,8 @@ def _prepare_git(run: _Run, version: str, script: tuple[str, bytes] | None) -> t
     before = _git_state(repo)
     prefix = _project_prefix(run)
     with _isolated_worktree(repo, candidate) as wt:
-        sync = run_sync_script(os.path.join(wt, *script[0].split("/")), version,
-                               os.path.join(wt, *prefix.split("/")) if prefix else wt)
+        sync_cwd = os.path.join(wt, *prefix.rstrip("/").split("/")) if prefix else wt
+        sync = run_sync_script(os.path.join(wt, *script[0].split("/")), version, sync_cwd)
         changed = _state_diff(before, _git_state(repo))
         if changed:
             raise run.refuse(
@@ -1543,7 +1994,7 @@ def _prepare_git(run: _Run, version: str, script: tuple[str, bytes] | None) -> t
                 "those changes yourself, then fix the script; nothing prepared.",
                 checkout_changed=changed, sync=sync)
         if sync["exit_code"] != 0:
-            raise _sync_failed(run, script[0], sync)
+            raise _sync_failed(run, script[0], sync, sync_cwd)
         changes = _worktree_changes(wt, candidate)
     if run.changelog_rel in changes:
         raise run.refuse(
@@ -1602,7 +2053,7 @@ def _prepare_plain(run: _Run, version: str, script: tuple[str, bytes] | None) ->
                 "undo those changes yourself, then fix the script; nothing prepared.",
                 checkout_changed=changed, sync=sync)
         if sync["exit_code"] != 0:
-            raise _sync_failed(run, script[0], sync)
+            raise _sync_failed(run, script[0], sync, copy)
         result_entries = _walk(copy)
         deleted = sorted(set(before) - set(result_entries))
         changed = sorted(rel for rel, entry in result_entries.items() if before.get(rel) != entry)
@@ -1645,6 +2096,8 @@ def _build_proposal(run: _Run, version: str, plan_digest: str) -> tuple[dict, di
             raise run.refuse(f"{exc} — the version sync's result breaks the version-file "
                              f"contract; nothing prepared.", path=rel, sync=sync) from None
     proposal = ledger.validate_proposal({
+        # K-117: the STABLE identity of THIS proposal — names its pin.
+        "id": new_ulid(),
         "paths": sorted(files),
         "base_blobs": {rel: item["base"] for rel, item in files.items()},
         "expected_blobs": {rel: item["expected"] for rel, item in files.items()},
@@ -1897,14 +2350,43 @@ def _check_index_for_commit(run: _Run, candidate: str, expected: str, paths: lis
             foreign_paths=foreign_paths, foreign_content=foreign_content)
 
 
-def _publish_commit(run: _Run, commit: str, paths: list[str]) -> None:
-    """After a verified release commit: the real index follows it (K-79,
-    _sync_real_index), then 'committed' with release_commit_sha."""
+def _record_commit(run: _Run, commit: str, paths: list[str]) -> None:
+    """After a verified, published release commit: the real index follows it
+    (K-79, _sync_real_index), then 'committed' with release_commit_sha."""
     updated = _sync_real_index(run, commit, paths)
     run.step("index", "done" if updated else "verified", paths=updated)
     _point(run.on_point, "after_index")
     run.advance("committed", release_commit_sha=commit)
     _point(run.on_point, "after_committed")
+
+
+def _foreign_head(run: _Run, head: str) -> ReleaseRefused:
+    """K-118 L1–L3 — HEAD is not the candidate and not the release commit
+    (a commit of the owner, or the leftover of an older run whose `git
+    commit` let a hook change the content): reported EXACTLY (commit,
+    parents, tree against the approved one, subject); no ref, no staging
+    and no file is touched; the repair hint is conditional — the decision
+    is the owner's, dct never resets."""
+    candidate = run.record["candidate_sha"]
+    approved = (run.record["manifest"] or {}).get("tree")
+    facts = _commit_facts(run.repo, head)
+    leftover = (facts["parents"] == [candidate]
+                and facts["subject"] == RELEASE_SUBJECT.format(version=run.version))
+    return run.refuse(
+        f"HEAD is {head}, not the release candidate {candidate} — the release commit is "
+        f"created on its candidate only; nothing done. Found at HEAD: commit {head}, parents "
+        f"{facts['parents']}, tree {facts['tree']} (approved {approved}), subject "
+        f"{facts['subject']!r}"
+        + (" — titled like this release and sitting on the candidate, but NOT the approved "
+           "content: the leftover of an earlier run whose commit hook changed it, or a commit "
+           "made by hand" if leftover else "")
+        + f". dct never resets or rewrites a branch: no ref, no staged change and no file was "
+          f"touched. IF that commit is yours to discard and nothing is based on it, move the "
+          f"branch back to {candidate} yourself (e.g. `git reset --soft {candidate}` keeps "
+          f"your index and files), put the artifacts back as approved and run `dct release "
+          f"resume`; otherwise abandon the release (`dct release abandon`) and plan a new one "
+          f"from the current HEAD.",
+        head=head, candidate=candidate, expected_tree=approved, **facts)
 
 
 def _step_commit(run: _Run) -> None:
@@ -1915,16 +2397,15 @@ def _step_commit(run: _Run) -> None:
     paths = _manifest_paths(manifest)
     head = _head(repo)
     if head != candidate:
-        # Interrupted between the commit and its progress write: adopt HEAD
-        # only when it IS the release commit (parent, tree, subject).
+        # Interrupted between the publication and its progress write: adopt
+        # HEAD only when it IS the release commit (parent, tree, subject) —
+        # no hook runs again, post-commit included.
         if _is_release_commit(run, head):
             _verify_manifest_files(run)
             run.step("commit", "adopted", commit=head)
-            _publish_commit(run, head, paths)
+            _record_commit(run, head, paths)
             return
-        raise run.refuse(
-            f"HEAD is {head}, not the release candidate {candidate} — the release commit "
-            f"is created on its candidate only; nothing done.", head=head, candidate=candidate)
+        raise _foreign_head(run, head)
     _verify_manifest_files(run)
     expected = expected_tree(repo, candidate, paths)
     if expected != manifest.get("tree"):
@@ -1932,29 +2413,40 @@ def _step_commit(run: _Run) -> None:
                          f"{manifest.get('tree')} (got {expected}) — nothing committed.")
     _check_index_for_commit(run, candidate, expected, paths)
     _point(run.on_point, "before_commit")
-    commit = _hook_commit(run.refuse, repo, expected, candidate, subject)
-    if not _is_release_commit(run, commit):
-        facts = _commit_facts(repo, commit)
-        raise run.refuse(
-            f"the commit `git commit` created ({commit}; the repository's hooks ran) is not the "
-            f"release commit of {run.version}: tree {facts['tree']} (approved "
-            f"{manifest.get('tree')}), parents {facts['parents']}, subject {facts['subject']!r} "
-            f"— a hook changed it (a formatter, restaged files) or HEAD moved. It is NOT "
-            f"adopted: HEAD is {commit}, the record stays 'files_written', nothing tagged or "
-            f"pushed; dct restores nothing — reset HEAD to {candidate} and the artifacts as "
-            f"approved yourself (or abandon the release), then resume.",
-            head=commit, expected_tree=manifest.get("tree"), **facts)
+
+    def message_contract(facts: dict, _commit) -> tuple[str, dict] | None:
+        if facts["subject"] != subject:
+            return f"its subject is {facts['subject']!r}, not {subject!r}", {}
+        return None
+
+    def artifacts_unchanged() -> None:
+        try:
+            _verify_manifest_files(run)
+        except ReleaseRefused as exc:
+            changed = exc.details.get("changed", [])
+            raise run.refuse(
+                f"a commit hook changed the work tree ({', '.join(changed)}) — the approved "
+                f"content is no longer what the files hold; nothing committed, nothing "
+                f"published (HEAD is still {candidate}). dct restores nothing: put those "
+                f"files back as approved, then resume.", head=candidate, changed=changed,
+                expected_tree=expected) from None
+
+    commit, warnings = _hook_commit(run.refuse, repo, expected, candidate, subject,
+                                    check=message_contract,
+                                    work_tree_check=artifacts_unchanged, on_point=run.on_point)
+    run.warnings.extend(warnings)
     try:
         _verify_manifest_files(run)
     except ReleaseRefused as exc:
         raise run.refuse(
-            f"the release commit {commit} was created with the approved tree, but a hook "
-            f"changed the work tree afterwards ({', '.join(exc.details.get('changed', []))}) — "
-            f"not recorded; restore those files to the commit's content yourself, then resume.",
+            f"the release commit {commit} was published with the approved tree, but the "
+            f"post-commit hook changed the work tree afterwards "
+            f"({', '.join(exc.details.get('changed', []))}) — not recorded; restore those files "
+            f"to the commit's content yourself, then resume.",
             commit=commit, head=commit, changed=exc.details.get("changed", [])) from None
     run.step("commit", "done", commit=commit)
     _point(run.on_point, "after_commit")
-    _publish_commit(run, commit, paths)
+    _record_commit(run, commit, paths)
 
 
 def _check_committed_head(run: _Run) -> None:
@@ -2036,31 +2528,76 @@ def _config(repo: str, key: str) -> str | None:
     return (out.strip() or None) if code == 0 else None
 
 
-def _remote_url(repo: str, remote: str) -> str | None:
-    code, out = gitinfo.git_read(repo, "remote", "get-url", "--push", remote,
-                                 ok_codes=(0, 1, 2, 128))
-    return (out.strip() or None) if code == 0 else None
+def _push_urls(repo: str, remote: str) -> list[str] | None:
+    """EVERY address `git push <remote>` would send to — the full `git
+    remote get-url --push --all` (K-104: `--push` alone prints only the
+    first), in git's order without repeats; None when there is no such
+    remote. Read with the writer's configuration view (the one the push
+    itself runs with); url.*.insteadOf / pushInsteadOf already applied by
+    git."""
+    code, out = gitinfo.git_write(repo, "remote", "get-url", "--push", "--all", remote,
+                                  ok_codes=(0, 1, 2, 128))
+    if code != 0:
+        return None
+    return list(dict.fromkeys(line.strip() for line in out.splitlines() if line.strip()))
+
+
+def _check_literal_url(run: _Run, url: str) -> None:
+    """The approved URL goes on git's command line (`git push <url>`, `git
+    ls-remote <url>`) — it must reach the repository it NAMES. A
+    url.<base>.insteadOf / pushInsteadOf rule whose value is a prefix of it
+    would make git send (or read) elsewhere, so such a URL is refused:
+    what is pushed to is exactly what was approved, whatever rule is added
+    later."""
+    code, out = gitinfo.git_write(
+        run.repo, "config", "-z", "--get-regexp", r"^url\..*\.(insteadof|pushinsteadof)$",
+        ok_codes=(0, 1))
+    if code != 0:
+        return
+    for item in (i for i in out.split("\0") if i):
+        key, _, value = item.partition("\n")
+        if value and url.startswith(value):
+            raise run.refuse(
+                f"the push destination {url} cannot be addressed literally: the git "
+                f"configuration `{key} = {value}` (insteadOf / pushInsteadOf) would rewrite "
+                f"it to another address when dct passes it to `git push` — dct pushes only to "
+                f"the exact approved URL; remove that rule (or point the remote at the final "
+                f"address); nothing pushed.", url=url, rewrite_rule=key)
 
 
 def push_target(run: _Run, version: str, *, push_remote: str | None = None,
-                push_branch: str | None = None, no_push: bool = False) -> dict | None:
-    """The push target the owner approves with apply (K-97 F2) — None for a
-    project outside git or with `no_push` (an explicit local release).
-    Default: the current branch's UPSTREAM (`branch.<b>.remote` +
-    `branch.<b>.merge`); no upstream (also a detached HEAD, or a local
-    upstream `.`) → refused with the explicit choice, never guessed.
-    `push_remote` names the remote; its branch is `push_branch`, else the
-    upstream's branch when the upstream is on that remote, else refused.
-    → {remote, url (its push URL now), branch, tag: "v<V>"}. Read-only, no
-    network."""
+                push_branch: str | None = None, push_url: str | None = None,
+                no_push: bool = False) -> dict | None:
+    """The ONE effective push target the owner approves with apply (K-97
+    F2, K-104) — None for a project outside git or with `no_push` (an
+    explicit local release). Default: the current branch's UPSTREAM
+    (`branch.<b>.remote` + `branch.<b>.merge`); no upstream (also a
+    detached HEAD, or a local upstream `.`) → refused with the explicit
+    choice, never guessed. `push_remote` names the remote; its branch is
+    `push_branch`, else the upstream's branch when the upstream is on that
+    remote, else refused.
+
+    The URL is the remote's EFFECTIVE PUSH address — from the full `git
+    remote get-url --push --all` (_push_urls), never the fetch URL (a fetch
+    URL and a different push URL — https to read, ssh to write — is a valid
+    layout: the push URL is the target). Exactly one address → that one;
+    SEVERAL → `push_url` must choose ONE of them (refused otherwise, with
+    the list: `git push <remote>` would send to all of them; dct has no
+    mirror mode — the release goes to one destination, verified there).
+    `push_url` must be one of the remote's push addresses. The URL must be
+    literal (_check_literal_url).
+    → {remote, url, branch, tag: "v<V>"} — what prepare shows, the consent
+    stores, the pre-stamp read, the push, its verification and every resume
+    use. Read-only, no network."""
     if run.repo is None:
-        if push_remote or push_branch:
+        if push_remote or push_branch or push_url:
             raise run.refuse("the project is outside git — there is nothing to push; drop "
-                             "--push-remote / --push-branch.")
+                             "--push-remote / --push-branch / --push-url.")
         return None
     if no_push:
-        if push_remote or push_branch:
-            raise run.refuse("--no-push contradicts --push-remote / --push-branch — choose one.")
+        if push_remote or push_branch or push_url:
+            raise run.refuse("--no-push contradicts --push-remote / --push-branch / "
+                             "--push-url — choose one.")
         return None
     branch = planning._current_branch(run.repo)
     up_remote = _config(run.repo, f"branch.{branch}.remote") if branch else None
@@ -2083,10 +2620,28 @@ def push_target(run: _Run, version: str, *, push_remote: str | None = None,
         if not target_branch:
             raise run.refuse(f"name the branch of {push_remote} to push to: --push-branch "
                              f"<branch>; nothing released.", remote=push_remote)
-    url = _remote_url(run.repo, remote)
-    if url is None:
+    urls = _push_urls(run.repo, remote)
+    if not urls:
         raise run.refuse(f"there is no remote named {remote!r} — {_PUSH_CHOICE}; nothing "
                          f"released.", remote=remote)
+    if push_url is not None:
+        if push_url not in urls:
+            raise run.refuse(
+                f"--push-url {push_url} is not a push URL of the remote {remote} (its push "
+                f"URLs: {', '.join(urls)}) — dct pushes only to an address the remote is "
+                f"configured to push to; nothing released.", remote=remote, push_urls=urls)
+        url = push_url
+    elif len(urls) > 1:
+        raise run.refuse(
+            f"the remote {remote} has {len(urls)} push URLs ({', '.join(urls)}) — `git push "
+            f"{remote}` would send to all of them, but a release is pushed to ONE approved "
+            f"destination and verified there (no mirror mode: an atomic push covers the branch "
+            f"and the tag in one repository, never several repositories). Choose it: "
+            f"`--push-url <one of them>` (push the others yourself afterwards), or `--no-push`; "
+            f"nothing released.", remote=remote, push_urls=urls, push_target=None)
+    else:
+        url = urls[0]
+    _check_literal_url(run, url)
     code, _ = gitinfo.git_read(run.repo, "check-ref-format", f"refs/heads/{target_branch}",
                                ok_codes=(0, 1))
     if code != 0:
@@ -2095,40 +2650,46 @@ def push_target(run: _Run, version: str, *, push_remote: str | None = None,
 
 
 def _check_push_precondition(run: _Run, target: dict, version: str, candidate: str) -> None:
-    """Before the stamp (network, K-97 F2): the remote must not hold a tag of
-    V already (any spelling — the release commit does not exist yet, so any
-    such tag is elsewhere), and its branch must be absent or contained in
-    the candidate (else the push could never be a fast-forward)."""
-    refs = _ls_remote(run.repo, target["remote"])
+    """Before the stamp (network, K-97 F2): the push destination (the
+    target's URL, K-104) must not hold a tag of V already (any spelling —
+    the release commit does not exist yet, so any such tag is elsewhere),
+    and its branch must be absent or contained in the candidate (else the
+    push could never be a fast-forward)."""
+    refs = _ls_remote(run.repo, target["url"])
     tags = _remote_version_tags(refs, version)
     if tags:
         raise run.refuse(
-            f"the remote {target['remote']} already has a tag of {version} "
+            f"the remote {target['remote']} ({target['url']}) already has a tag of {version} "
             f"({', '.join(t['name'] for t in tags)}) — refused before the stamp; nothing "
             f"released.", remote_tags=tags, push_target=target)
     tip = refs.get(f"refs/heads/{target['branch']}")
     if tip is not None and not _contains(run.repo, candidate, tip):
         raise run.refuse(
-            f"{target['remote']}/{target['branch']} is at {tip}, which the candidate "
-            f"{candidate} does not contain — the push would be rejected; fetch and integrate "
-            f"it first (then plan again); nothing released.", remote_branch=tip,
+            f"{target['remote']}/{target['branch']} ({target['url']}) is at {tip}, which the "
+            f"candidate {candidate} does not contain — the push would be rejected; fetch and "
+            f"integrate it first (then plan again); nothing released.", remote_branch=tip,
             push_target=target)
 
 
 def _consented_target(run: _Run) -> dict | None:
-    """The push target of the record's consent (K-97 F4) — the remote must
-    still have the approved push URL (anything else is outside the consent:
-    refused, never re-derived from today's upstream)."""
+    """The push target of the record's consent (K-97 F4, K-104) — what every
+    resume uses, never re-derived from today's upstream. Its URL must STILL
+    be one of the push addresses of its remote (a remote re-pointed
+    elsewhere is outside the consent: refused) and still literal
+    (_check_literal_url). Addresses ADDED to the remote since are not
+    recipients: the push names the approved URL itself."""
     target = (run.record.get("consent") or {}).get("push_target")
     if target is None:
         return None
-    url = _remote_url(run.repo, target["remote"])
-    if url != target["url"]:
+    urls = _push_urls(run.repo, target["remote"])
+    if not urls or target["url"] not in urls:
         raise run.refuse(
-            f"the approved push target {target['remote']} ({target['url']}) is not this "
-            f"repository's remote any more (now {url or 'missing'}) — outside the consent of "
+            f"the approved push target {target['remote']} ({target['url']}) is not a push "
+            f"address of this repository's remote any more (now "
+            f"{', '.join(urls) if urls else 'missing'}) — outside the consent of "
             f"{run.version}: restore the remote, or abandon the release; nothing pushed.",
-            push_target=target, url_now=url)
+            push_target=target, push_urls=urls or [], url_now=urls[0] if urls else None)
+    _check_literal_url(run, target["url"])
     return target
 
 
@@ -2155,39 +2716,47 @@ def _pushed(run: _Run, refs: dict[str, str], target: dict, commit: str) -> bool:
 
 
 def _step_push(run: _Run) -> None:
-    """'tagged' → 'pushed' (K-97 F2): `git push --atomic <remote>
-    <commit>:refs/heads/<branch> <commit>:refs/tags/<tag>` to the CONSENTED
-    target (the remote's hooks and the local pre-push hook run), verified
-    with `git ls-remote`. Already there → verified, not pushed again. A
-    failure leaves 'tagged' — resume retries only this step."""
+    """'tagged' → 'pushed' (K-97 F2, K-104): `git push --atomic <url>
+    <commit>:refs/heads/<branch> <commit>:refs/tags/<tag>` — the APPROVED
+    URL itself and explicit refspecs, so nothing the remote's configuration
+    gained since (another pushurl, a push refspec, a mirror flag) adds a
+    recipient or a ref; the remote side's hooks and the local pre-push hook
+    run (it receives the URL as the remote's name). Verified with `git
+    ls-remote <url>` — the same address. Already there → verified, not
+    pushed again. A failure leaves 'tagged' — resume retries only this
+    step. (Pushing by URL does not move `refs/remotes/<remote>/<branch>`;
+    the next fetch does.)"""
     target = _consented_target(run)
     if target is None:
         run.step("push", "skipped", reason="no push target approved")
         return
     commit = run.record["release_commit_sha"]
-    where = {"remote": target["remote"], "branch": target["branch"], "tag": target["tag"]}
-    refs = _ls_remote(run.repo, target["remote"])
+    where = {"remote": target["remote"], "url": target["url"], "branch": target["branch"],
+             "tag": target["tag"]}
+    refs = _ls_remote(run.repo, target["url"])
     if _pushed(run, refs, target, commit):
         run.step("push", "verified", **where)
     else:
         _point(run.on_point, "before_push")
         try:
-            gitinfo.git_write(run.repo, "push", "--atomic", target["remote"],
+            gitinfo.git_write(run.repo, "push", "--atomic", target["url"],
                               f"{commit}:refs/heads/{target['branch']}",
                               f"{commit}:refs/tags/{target['tag']}",
                               network=True, timeout=HOOK_GIT_TIMEOUT_SECONDS,
                               diagnostic=True)
         except gitinfo.GitWriteError as exc:
             raise run.refuse(
-                f"the push of {run.version} to {target['remote']} ({target['branch']}, "
-                f"{target['tag']}) failed ({exc}) — the release stays 'tagged' (commit and tag "
-                f"exist locally); fix the cause and run `dct release resume`: it retries ONLY "
-                f"the push.", git_error=str(exc), push_target=target) from None
-        refs = _ls_remote(run.repo, target["remote"])
+                f"the push of {run.version} to {target['remote']} ({target['url']}; "
+                f"{target['branch']}, {target['tag']}) failed ({exc}) — the release stays "
+                f"'tagged' (commit and tag exist locally); fix the cause and run `dct release "
+                f"resume`: it retries ONLY the push.", git_error=str(exc),
+                push_target=target) from None
+        refs = _ls_remote(run.repo, target["url"])
         if not _pushed(run, refs, target, commit):
             raise run.refuse(
-                f"after the push, {target['remote']} does not show {target['branch']} and "
-                f"{target['tag']} at {commit} — not recorded as pushed.", push_target=target)
+                f"after the push, {target['remote']} ({target['url']}) does not show "
+                f"{target['branch']} and {target['tag']} at {commit} — not recorded as pushed.",
+                push_target=target)
         run.step("push", "done", **where)
         _point(run.on_point, "after_push")
     # K-115 G4: 'pushed' is recorded WITH the target as verified just now.
@@ -2196,21 +2765,21 @@ def _step_push(run: _Run) -> None:
 
 
 def _verify_push(run: _Run) -> None:
-    """A 'pushed' record on resume: the remote must still show it."""
+    """A 'pushed' record on resume: the approved destination must still show it."""
     target = _consented_target(run)
     if target is None:
         run.step("push", "verified", reason="no push target approved")
         return
-    refs = _ls_remote(run.repo, target["remote"])
+    refs = _ls_remote(run.repo, target["url"])
     if not _pushed(run, refs, target, run.record["release_commit_sha"]):
         raise run.refuse(
-            f"release {run.version} is recorded as pushed, but {target['remote']} does not "
-            f"show {target['branch']} and {target['tag']} at its release commit — nothing "
-            f"done.", push_target=target)
+            f"release {run.version} is recorded as pushed, but {target['remote']} "
+            f"({target['url']}) does not show {target['branch']} and {target['tag']} at its "
+            f"release commit — nothing done.", push_target=target)
     if run.record.get("push_proof") is None:  # an older record: proven now (K-115 G4)
         run.verified["push_proof"] = _push_proof(refs, target)
-    run.step("push", "verified", remote=target["remote"], branch=target["branch"],
-             tag=target["tag"])
+    run.step("push", "verified", remote=target["remote"], url=target["url"],
+             branch=target["branch"], tag=target["tag"])
 
 
 # ── the pipeline (apply after the stamp, and resume) ─────────────────────────
@@ -2255,6 +2824,10 @@ def _continue(run: _Run, *, fresh: bool) -> None:
             run.step("files", "verified")
     run.advance("completed")
     run.step("complete", "done")
+    # K-117: the release ended — its proposal's pin and store blobs go
+    # (only what no other live proposal uses).
+    run.warnings.extend(release_proposal_resources(
+        run.engine, run.slug, run.record.get("proposal"), run.repo))
 
 
 def _finish(action: str, run: _Run, outcome: str, **details) -> dict:
@@ -2398,6 +2971,7 @@ def _approved_context(engine: sa.Engine, project_slug: str, located: tuple, *, v
             details={"unfinished": unfinished["version"]}, release=unfinished)
     pre_untracked: set[str] = set()
     if checkout:
+        _check_git_version(checkout["repo_root"])
         state = _clean_tree(run, planning._artifacts(
             project, checkout, ledger.get_version_files(engine, project_slug)["version_files"]))
         pre_untracked = set(state["untracked"])
@@ -2443,11 +3017,18 @@ def _prepared(run: _Run, target: str, plan: dict) -> dict:
     """Build the proposal (isolated sync) and store it as PENDING → the
     prepare result's details."""
     proposal, report = _build_proposal(run, target, plan["snapshot_digest"])
+    replaced = ledger.get_pending_proposal(run.engine, run.slug)
+    # K-117: reachable BEFORE the proposal can be approved — its blobs are
+    # pinned by the time anything refers to them.
+    pin = _pin_proposal(run.repo, run.slug, proposal) if run.repo else None
     stored = _ledger_write(run.engine, run.slug, normalize_version(target), "proposal",
                            lambda: ledger.set_pending_proposal(run.engine, run.slug, proposal),
                            steps=run.steps)
+    if replaced is not None:  # the earlier pending proposal can never be approved now
+        run.warnings.extend(release_proposal_resources(
+            run.engine, run.slug, replaced["proposal"], run.repo))
     contract = ledger.get_version_files(run.engine, run.slug)["version_files"]
-    run.step("proposal", "done", proposal_sha256=stored["proposal_sha256"])
+    run.step("proposal", "done", proposal_sha256=stored["proposal_sha256"], pin=pin)
     return {
         "proposal": stored["proposal"],
         "proposal_sha256": stored["proposal_sha256"],
@@ -2585,28 +3166,15 @@ def _check_approved_proposal(run: _Run, plan: dict, target: str, approval: str) 
         raise run.refuse(
             f"approved content is no longer available ({', '.join(missing)}; e.g. pruned "
             f"by `git gc`) — {hint}; nothing released.", missing_blobs=missing)
+    if run.repo:
+        # K-117: the blobs stay reachable until the release ends — the pin of
+        # prepare is verified (re-created when someone removed the ref).
+        if not proposal.get("id"):
+            raise run.refuse(
+                f"the pending proposal has no identity (prepared by an older dct): its blobs "
+                f"cannot be pinned for the release — {hint}; nothing released.")
+        _pin_proposal(run.repo, run.slug, proposal)
     return proposal
-
-
-def _alias_approval(run: _Run, target: str, plan: dict) -> str:
-    """The `clog release` alias without --proposal-digest: prepare inside
-    the call; the fresh proposal is approved only when its paths EQUAL the
-    project's confirmed contract (the content is checked by the D9 rules
-    and bound to this candidate). A first release or a contract change is
-    refused with the proposal (now pending) — approve it with
-    --proposal-digest."""
-    details = _prepared(run, target, plan)
-    contract = details["contract"]["confirmed"]
-    digest = details["proposal_sha256"]
-    if contract is not None and not details["contract"]["change"]:
-        run.step("proposal", "approved", reason="equals the confirmed version-file contract")
-        return digest
-    what = "first release" if contract is None else "the version-file contract changes"
-    raise run.refuse(
-        f"{what} of '{run.slug}': the version sync changes "
-        f"{', '.join(details['proposal']['paths']) or 'no files'} (confirmed contract: "
-        f"{contract}) — review the proposal and approve it with `--proposal-digest {digest}`; "
-        f"nothing released.", **details)
 
 
 @_conflict_boundary("apply")
@@ -2624,6 +3192,7 @@ def apply_release(
     proposal_digest: str | None = None,
     push_remote: str | None = None,
     push_branch: str | None = None,
+    push_url: str | None = None,
     no_push: bool = False,
     cwd: str | None = None,
     on_point: Callable[[str], None] | None = None,
@@ -2643,10 +3212,12 @@ def apply_release(
     itself binds the plan (core release_entries `stampable_ids` /
     `expected_entries`, K-81).
 
-    K-76: `proposal_digest` is the `proposal_sha256` of `dct release
-    prepare` for the same version, selection and plan digest — required for
-    a NEW release (a re-run of a recorded / historical release needs none).
-    It must name the project's PENDING proposal, prepared for this
+    K-76 / K-117: `proposal_digest` is the `proposal_sha256` of `dct release
+    prepare` for the same version, selection and plan digest — REQUIRED for
+    a NEW release, with or without `strict` (a re-run of a recorded /
+    historical release needs none); a missing one is refused before the
+    stamp with the prepare procedure — nothing is prepared or approved
+    inside this call. It must name the project's PENDING proposal, prepared for this
     candidate, version and plan, with the script and the baseline unchanged
     (_check_approved_proposal); the stamp consumes it in its transaction
     (the record's proposal and consent {version, entry_ids, candidate_sha,
@@ -2658,17 +3229,20 @@ def apply_release(
     carrying V) or `no_entries=True` (version-only) — one is required unless
     `strict` (the `clog release` alias: no ids = every unreleased entry, all
     of which must be proven; a range base other than v<current_version> is
-    refused instead of being confirmed; without `proposal_digest` it
-    prepares inside the call and proceeds only when the proposal equals the
-    confirmed contract — _alias_approval). `confirm=True` is required —
+    refused instead of being confirmed; it takes no plan digest, so the
+    approved proposal must carry the digest of the plan derived here —
+    K-116 H2, _check_approved_proposal). `confirm=True` is required —
     also for the alias (K-96 D1: running it is no longer the confirmation).
 
-    K-97 F2: `push_remote` / `push_branch` / `no_push` choose the push
-    target (push_target(): default the branch's upstream; none → refused
-    with the choice, never guessed; `no_push` = an explicit local release).
-    Before the stamp the remote is read (no tag of V there, its branch
-    contained in the candidate); the target is recorded in the consent and
-    is what the push — and every resume — uses (K-97 F4).
+    K-97 F2 / K-104: `push_remote` / `push_branch` / `push_url` / `no_push`
+    choose the ONE push target (push_target(): default the branch's
+    upstream; none → refused with the choice, never guessed; the URL is the
+    remote's effective push address, `push_url` choosing one when it has
+    several — refused without the choice; `no_push` = an explicit local
+    release). Before the stamp that address is read (no tag of V there,
+    its branch contained in the candidate); the target is recorded in the
+    consent and is what the push, its verification — and every resume —
+    address literally (K-97 F4).
 
     K-85: a project whose release_executor is 'own' is refused before any
     write (details.executor 'own').
@@ -2677,7 +3251,7 @@ def apply_release(
     historical / legacy release — no side effect). Raises ReleaseRefused
     (nothing done beyond what the result's steps say), ReleaseConflict (a
     lost serialization race, K-88 — the effects observed so far listed),
-    SyncFailed (the alias's internal prepare), or gitinfo errors."""
+    or gitinfo errors."""
     if confirm is not True:
         raise ReleaseRefused("apply needs --confirm (it stamps, writes, commits, tags and "
                              "pushes)")
@@ -2690,7 +3264,8 @@ def apply_release(
         return _apply(engine, project_slug, located, version=version, bump_type=bump_type,
                       entry_ids=entry_ids, no_entries=no_entries, strict=strict,
                       plan_digest=plan_digest, proposal_digest=proposal_digest,
-                      push=(push_remote, push_branch, no_push), cwd=cwd, on_point=on_point)
+                      push=(push_remote, push_branch, push_url, no_push), cwd=cwd,
+                      on_point=on_point)
 
 
 def _apply(engine, project_slug, located, *, version, bump_type, entry_ids, no_entries, strict,
@@ -2710,14 +3285,28 @@ def _apply(engine, project_slug, located, *, version, bump_type, entry_ids, no_e
     consent = None
     push_to = None
     if before is None:
-        push_remote, push_branch, no_push = push
+        if proposal_digest is None and _newer_than_current(run.project, target):
+            # K-117 / K-116 H2: a NEW release needs the owner's approval of
+            # ONE specific proposal — also through the alias. Equal paths and
+            # a checked version field are no consent to the content.
+            raise run.refuse(
+                f"a new release needs the APPROVED version-file proposal: run `dct release "
+                f"prepare --version {target} (--entries … | --no-entries) --plan-digest "
+                f"<snapshot_digest of `dct release plan … --json`>`, review the files it "
+                f"proposes and pass its proposal_sha256 as --proposal-digest"
+                + (" (the `clog release` alias takes no --plan-digest: the approved proposal "
+                   "must have been prepared for exactly the plan the alias derives — every "
+                   "unreleased entry, or your --entries / --no-entries)" if strict else "")
+                + "; nothing prepared, nothing released.",
+                proposal_digest=None, version=target, plan_digest=plan["snapshot_digest"])
+        push_remote, push_branch, push_url, no_push = push
         push_to = push_target(run, normalize_version(target), push_remote=push_remote,
-                              push_branch=push_branch, no_push=no_push)
+                              push_branch=push_branch, push_url=push_url, no_push=no_push)
         if push_to is not None:
             _check_push_precondition(run, push_to, target, checkout["head"])
-        if proposal_digest is None and strict and _newer_than_current(run.project, target):
-            proposal_digest = _alias_approval(run, target, plan)
         if proposal_digest is not None:
+            # … bound to THIS candidate, version and plan (H2: the alias has no
+            # plan flag — proposal.plan_digest must be the digest derived here).
             _check_approved_proposal(run, plan, target, proposal_digest)
         consent = {"version": target, "entry_ids": ids,
                    "candidate_sha": checkout["head"] if checkout else None,
@@ -2859,8 +3448,10 @@ def resume_release(
         _check_record_scope(run)
         _check_record_consistency(run)
         _check_record_location(run)
-        if run.repo and _operation_in_progress(run.repo):
-            raise run.refuse("a git operation is in progress — finish or abort it first")
+        if run.repo:
+            _check_git_version(run.repo)
+            if _operation_in_progress(run.repo):
+                raise run.refuse("a git operation is in progress — finish or abort it first")
         _continue(run, fresh=False)
         return _finish("resume", run, "completed")
 
@@ -2886,11 +3477,17 @@ def abandon(engine: sa.Engine, project_slug: str, version: str, reason: str, *,
                 # that may end a release dct's effects layer executes.
                 lambda: ledger.abandon_release(engine, project_slug, version, reason,
                                                confirm=confirm, actor="dct"), steps=[])
+            record = out["release"]
+            # K-117: an abandoned release needs its proposal's pin / blobs no
+            # longer (still under the lock; a repeat cleans what is left).
+            repo = record.get("checkout_root") if record.get("candidate_sha") else None
+            warnings = release_proposal_resources(engine, project_slug,
+                                                  record.get("proposal"), repo)
     except ValueError as exc:
         raise ReleaseRefused(str(exc)) from None
-    record = out["release"]
     return result("abandon", project_slug, "abandoned" if out["updated"] else "noop",
-                  version=record["version"], release=record, details={"updated": out["updated"]})
+                  version=record["version"], release=record, warnings=warnings,
+                  details={"updated": out["updated"]})
 
 
 def _normalized_or_none(version: str | None) -> str | None:
@@ -2946,21 +3543,27 @@ def attest(
     *,
     confirm: bool = False,
     cwd: str | None = None,
+    on_point: Callable[[str], None] | None = None,
 ) -> dict:
     """`dct release attest` (K-16/K-69): the EMPTY attestation commit
     `chore: attest changelog entries` whose final paragraph is the trailer
     `Changelog: <ids ascending>` — on the current branch (or detached
     HEAD), only for ids the plan lists as unproven, only when nothing is
     staged and no operation is in progress, under the project operation
-    lock (K-96 D7). Created by `git commit --allow-empty` from a temporary
-    index holding HEAD's tree (_hook_commit): the repository's hooks run
-    (K-96), the user's index and work tree are untouched, HEAD moves by
-    git's own compare-and-swap. Re-validated afterwards: parent = the old
-    HEAD, tree unchanged, subject, the trailer proves the ids — a hook that
-    changed any of it → refused with the observed effects (the commit
-    exists, HEAD moved), never accepted. Returns result() with details
-    {previous_head, head, entry_ids}; the candidate changes (no record
-    exists yet)."""
+    lock (K-96 D7). Created by the same mechanism as the release commit
+    (_hook_commit, K-103): the repository's hooks run explicitly on a
+    temporary index holding HEAD's tree, the user's index and work tree are
+    untouched, the commit object is created on the PINNED HEAD and checked
+    BEFORE it is published — tree unchanged, subject, and (K-107) the ids
+    the proof parser reads from it (trailer + body scan) EXACTLY the
+    approved ones: a hook that adds, drops or duplicates an id, or stages
+    content, is refused with nothing published (a hook's addition that
+    leaves the set alone — a Signed-off-by — is fine). The ref HEAD names
+    then moves by compare-and-swap; a HEAD that moved meanwhile loses
+    nothing. Returns result() with details {previous_head, head,
+    entry_ids} (warnings: a failed post-commit hook); the candidate changes
+    (no record exists yet). `on_point` — the interruption points
+    before_publish / publishing, for tests."""
     if confirm is not True:
         raise ReleaseRefused("attest needs --confirm (it creates a commit)")
     ids = sorted(set(entry_ids or ()))
@@ -2971,10 +3574,12 @@ def attest(
         raise ReleaseRefused(f"project '{project_slug}' is not in a git checkout — nothing to "
                              f"attest in")
     with _operation(project, checkout, "attest"):
-        return _attest(engine, project_slug, checkout, ids, cwd=cwd)
+        return _attest(engine, project_slug, checkout, ids, cwd=cwd, on_point=on_point)
 
 
-def _attest(engine, project_slug: str, checkout: dict, ids: list[int], *, cwd) -> dict:
+def _attest(engine, project_slug: str, checkout: dict, ids: list[int], *, cwd,
+            on_point=None) -> dict:
+    _check_git_version(checkout["repo_root"])
     unfinished = ledger.get_release(engine, project_slug)
     if unfinished:
         raise ReleaseRefused(f"release {unfinished['version']} is unfinished — resume or "
@@ -2999,21 +3604,23 @@ def _attest(engine, project_slug: str, checkout: dict, ids: list[int], *, cwd) -
     message = f"{ATTEST_SUBJECT}\n\nChangelog: {', '.join(str(i) for i in ids)}\n"
 
     def refuse(msg: str, **details) -> ReleaseRefused:
-        return ReleaseRefused(msg, details=details)
+        return ReleaseRefused(msg, details={**details, "previous_head": head})
 
-    commit = _hook_commit(refuse, repo, tree, head, message)
-    facts = _commit_facts(repo, commit)
-    commits = planning.read_commits(repo, "-1", commit)
-    if facts["parents"] != [head] or facts["tree"] != tree or facts["subject"] != ATTEST_SUBJECT \
-            or not set(ids) <= proven_ids(commits[0]):
-        raise ReleaseRefused(
-            f"the commit `git commit` created ({commit}; the repository's hooks ran) is not the "
-            f"empty attestation commit proving {ids}: parents {facts['parents']}, tree "
-            f"{facts['tree']} (expected {tree}), subject {facts['subject']!r} — a hook changed "
-            f"it. It is NOT accepted: HEAD is {commit}; dct restores nothing — reset HEAD to "
-            f"{head} yourself and attest again.",
-            details={**facts, "head": commit, "expected_tree": tree, "previous_head": head})
-    return result("attest", project_slug, "attested",
+    def message_contract(facts: dict, commit) -> tuple[str, dict] | None:
+        # K-107: EXACT equality with the whole set the proof parser reads
+        # from this commit (trailer + body scan) — a hook that adds, drops or
+        # duplicates an id changes what the next plan would take as proven.
+        proven = sorted(proven_ids(commit))
+        if facts["subject"] != ATTEST_SUBJECT:
+            return f"its subject is {facts['subject']!r}, not {ATTEST_SUBJECT!r}", {}
+        if proven != ids:
+            return (f"it would prove {proven}, not exactly the approved {ids}",
+                    {"approved_ids": ids, "proven_ids": proven})
+        return None
+
+    commit, warnings = _hook_commit(refuse, repo, tree, head, message, check=message_contract,
+                                    on_point=on_point)
+    return result("attest", project_slug, "attested", warnings=warnings,
                   steps=[{"step": "attest", "result": "done", "commit": commit}],
                   details={"previous_head": head, "head": commit, "entry_ids": ids})
 

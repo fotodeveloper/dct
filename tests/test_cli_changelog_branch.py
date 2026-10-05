@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 from conftest import (
+    alias_argv,
     approved_plan_digest,
     git,
     git_commit_proving,
@@ -110,7 +111,8 @@ def versioned(cli_engine, tmp_path):
     create_project(cli_engine, slug="proj-v", name="V", path=_plain(tmp_path),
                    current_version="1.0.0")
     # K-76 / D4: no version-sync script — the confirmed contract is "no
-    # version files", so the alias auto-approves the (empty) proposal.
+    # version files"; the (empty) proposal is still approved by its digest
+    # (K-117, alias_argv).
     set_version_files(cli_engine, "proj-v", [], confirm=True)
     ids = [add_entry(cli_engine, "proj-v", "added", f"e{i}")["id"] for i in range(3)]
     return cli_engine, ids
@@ -118,8 +120,8 @@ def versioned(cli_engine, tmp_path):
 
 def test_release_entries_stamps_only_the_selection(versioned, monkeypatch, capsys):
     engine, ids = versioned
-    run_cli(monkeypatch, ["clog", "release", "--confirm", "--no-push", "-P", "proj-v", "--patch",
-                          "--entries", f"{ids[0]}, {ids[2]}"])
+    run_cli(monkeypatch, alias_argv(engine, "proj-v", ["clog", "release", "--confirm", "--no-push", "-P", "proj-v", "--patch",
+                          "--entries", f"{ids[0]}, {ids[2]}"]))
     out = capsys.readouterr().out
     assert "1.0.0 → 1.0.1 (patch)" in out
     assert "Released 2 entries as 1.0.1 (mode: selected)" in out
@@ -132,7 +134,7 @@ def test_release_no_entries_is_version_only_even_with_nothing_unreleased(
     create_project(cli_engine, slug="proj-v", name="V", path=_plain(tmp_path),
                    current_version="1.0.0")
     set_version_files(cli_engine, "proj-v", [], confirm=True)  # confirmed: no version files
-    run_cli(monkeypatch, ["clog", "release", "--confirm", "--no-push", "-P", "proj-v", "--minor", "--no-entries"])
+    run_cli(monkeypatch, alias_argv(cli_engine, "proj-v", ["clog", "release", "--confirm", "--no-push", "-P", "proj-v", "--minor", "--no-entries"]))
     assert "mode: version_only" in capsys.readouterr().out
     assert get_project(cli_engine, "proj-v")["current_version"] == "1.1.0"
 
@@ -161,8 +163,9 @@ def test_release_entries_and_no_entries_are_mutually_exclusive(versioned, monkey
 
 def test_release_unknown_entry_errors_and_writes_nothing(versioned, monkeypatch, capsys):
     engine, _ = versioned
-    assert _exit_code(monkeypatch, ["clog", "release", "--confirm", "--no-push", "-P", "proj-v", "2.0.0",
-                                    "--entries", "424242"]) == 1
+    assert _exit_code(monkeypatch, alias_argv(engine, "proj-v", [
+        "clog", "release", "--confirm", "--no-push", "-P", "proj-v", "2.0.0",
+        "--entries", "424242"])) == 1
     assert "Unknown changelog entry" in capsys.readouterr().err
     assert get_project(engine, "proj-v")["current_version"] == "1.0.0"
 
@@ -183,9 +186,10 @@ def _sync_script(checkout: Path) -> None:
 @needs_git
 def test_release_from_a_linked_worktree_runs_that_checkouts_sync_script(
         cli_engine, monkeypatch, tmp_path, capsys, git_identity):
-    """The CANDIDATE's script (the linked worktree's commit) runs — isolated
-    (K-76); the first release shows the proposal and is approved by its
-    digest; the approved file lands in THAT checkout only."""
+    """The CANDIDATE's script (the linked worktree's commit) runs — isolated,
+    in `release prepare` (K-76); the alias releases only the proposal
+    approved by its digest (K-117); the approved file lands in THAT
+    checkout only."""
     import json
 
     main = make_git_repo(tmp_path / "repo")
@@ -199,12 +203,17 @@ def test_release_from_a_linked_worktree_runs_that_checkouts_sync_script(
     git_commit_proving(linked, eid)
 
     monkeypatch.chdir(linked)
-    assert _exit_code(monkeypatch, ["clog", "release", "--confirm", "--no-push", "--patch", "--json"]) == 1
-    refused = json.loads(capsys.readouterr().out)["details"]
-    assert refused["proposal"]["paths"] == ["synced-version"]
+    assert _exit_code(monkeypatch, ["clog", "release", "--confirm", "--no-push", "--patch",
+                                    "--json"]) == 1  # K-117: no approved proposal
+    assert "--proposal-digest" in json.loads(capsys.readouterr().out)["details"]["error"]
+    plan = approved_plan_digest(cli_engine, "proj-g", linked, bump_type="patch", entry_ids=[eid])
+    run_cli(monkeypatch, ["release", "prepare", "--patch", "--entries", str(eid),
+                          "--plan-digest", plan, "--json"])
+    prepared = json.loads(capsys.readouterr().out)["details"]
+    assert prepared["proposal"]["paths"] == ["synced-version"]
     assert not (linked / "synced-version").exists()  # the sync ran isolated
     run_cli(monkeypatch, ["clog", "release", "--confirm", "--no-push", "--patch", "--proposal-digest",
-                          refused["proposal_sha256"]])
+                          prepared["proposal_sha256"]])
     assert (linked / "synced-version").read_text().strip() == "1.0.1"
     assert not (Path(main) / "synced-version").exists()
     assert git(linked, "show", "--name-only", "--format=", "HEAD").split() == [
@@ -260,7 +269,7 @@ def test_release_sync_script_runs_from_the_project_root_not_the_subdirectory(
     sub = main / "src" / "deep"
     sub.mkdir(parents=True)
     monkeypatch.chdir(sub)
-    run_cli(monkeypatch, ["clog", "release", "--confirm", "--no-push", "-P", "proj-g", "1.1.0"])
+    run_cli(monkeypatch, alias_argv(engine, "proj-g", ["clog", "release", "--confirm", "--no-push", "-P", "proj-g", "1.1.0"]))
     assert (main / "VERSION").read_text().strip() == "1.1.0"
     assert not (sub / "VERSION").exists()
 
@@ -271,9 +280,10 @@ def test_release_historical_retry_leaves_version_files_untouched(
     engine, main = gitproj
     monkeypatch.chdir(main)
     git_commit_proving(main, add_entry(engine, "proj-g", "added", "a")["id"])
-    run_cli(monkeypatch, ["clog", "release", "--confirm", "--no-push", "-P", "proj-g", "1.1.0"])
+    run_cli(monkeypatch, alias_argv(engine, "proj-g", ["clog", "release", "--confirm", "--no-push", "-P", "proj-g", "1.1.0"]))
     git_commit_proving(main, add_entry(engine, "proj-g", "added", "b")["id"])
-    run_cli(monkeypatch, ["clog", "release", "--confirm", "--no-push", "-P", "proj-g", "1.2.0"])
+    run_cli(monkeypatch, alias_argv(engine, "proj-g", [
+        "clog", "release", "--confirm", "--no-push", "-P", "proj-g", "1.2.0"]))
     assert (main / "VERSION").read_text().strip() == "1.2.0"
     head = git(main, "rev-parse", "HEAD")
     capsys.readouterr()
@@ -312,9 +322,10 @@ def test_release_resume_of_a_record_without_an_approved_proposal_is_refused(
 
 @needs_git
 def test_release_version_only_runs_the_sync(gitproj, monkeypatch, capsys, git_identity):
-    _, main = gitproj
+    engine, main = gitproj
     monkeypatch.chdir(main)
-    run_cli(monkeypatch, ["clog", "release", "--confirm", "--no-push", "-P", "proj-g", "--minor", "--no-entries"])
+    run_cli(monkeypatch, alias_argv(engine, "proj-g", [
+        "clog", "release", "--confirm", "--no-push", "-P", "proj-g", "--minor", "--no-entries"]))
     out = capsys.readouterr().out
     assert "Released 0 entries as 1.1.0 (mode: version_only)" in out
     assert (main / "VERSION").read_text().strip() == "1.1.0"
@@ -331,10 +342,16 @@ def test_release_failing_sync_script_exits_nonzero(
     create_project(cli_engine, slug="proj-g", name="G", path=str(main), current_version="1.0.0")
     git_commit_proving(main, add_entry(cli_engine, "proj-g", "added", "a")["id"])
     monkeypatch.chdir(main)
-    assert _exit_code(monkeypatch, ["clog", "release", "--confirm", "--no-push", "-P", "proj-g", "1.1.0"]) == 3
+    # The sync runs in `release prepare` only (K-117: the alias never runs it).
+    plan = approved_plan_digest(cli_engine, "proj-g", main, version="1.1.0", entry_ids=[1])
+    assert _exit_code(monkeypatch, ["release", "prepare", "-P", "proj-g", "--version", "1.1.0",
+                                    "--entries", "1", "--plan-digest", plan]) == 3
     err = capsys.readouterr().err
     assert "version-sync script failed (exit 3)" in err
     assert "dct release prepare" in err  # nothing stamped: prepare again
+    assert _exit_code(monkeypatch, ["clog", "release", "--confirm", "--no-push", "-P", "proj-g",
+                                    "1.1.0"]) == 1  # no approved proposal
+    assert "--proposal-digest" in capsys.readouterr().err
     assert get_release(cli_engine, "proj-g", "1.1.0") is None
 
 
@@ -373,7 +390,8 @@ def test_release_monorepo_subproject_syncs_in_the_worktree_subdirectory(
     set_version_files(cli_engine, "proj-m", ["packages/app/VERSION"], confirm=True)
     git_commit_proving(linked, add_entry(cli_engine, "proj-m", "added", "a")["id"])
     monkeypatch.chdir(linked)
-    run_cli(monkeypatch, ["clog", "release", "--confirm", "--no-push", "-P", "proj-m", "1.1.0"])
+    run_cli(monkeypatch, alias_argv(cli_engine, "proj-m", [
+        "clog", "release", "--confirm", "--no-push", "-P", "proj-m", "1.1.0"]))
     assert (linked / "packages" / "app" / "VERSION").read_text().strip() == "1.1.0"
     assert not (main / "packages" / "app" / "VERSION").exists()
     assert not (linked / "VERSION").exists()
@@ -407,14 +425,16 @@ def test_release_project_path_outside_git_keeps_the_registered_path(
     elsewhere = tmp_path / "elsewhere"
     elsewhere.mkdir()
     monkeypatch.chdir(elsewhere)
-    run_cli(monkeypatch, ["clog", "release", "--confirm", "--no-push", "-P", "proj-p", "1.1.0"])
+    run_cli(monkeypatch, alias_argv(cli_engine, "proj-p", [
+        "clog", "release", "--confirm", "--no-push", "-P", "proj-p", "1.1.0"]))
     assert (plain / "VERSION").read_text().strip() == "1.1.0"
     assert not (elsewhere / "VERSION").exists()
 
 
 def test_release_v_prefixed_version_is_reported_normalized(versioned, monkeypatch, capsys):
     engine, _ = versioned
-    run_cli(monkeypatch, ["clog", "release", "--confirm", "--no-push", "-P", "proj-v", "v1.1.0"])
+    run_cli(monkeypatch, alias_argv(engine, "proj-v", [
+        "clog", "release", "--confirm", "--no-push", "-P", "proj-v", "v1.1.0"]))
     assert "as 1.1.0" in capsys.readouterr().out
     assert get_project(engine, "proj-v")["current_version"] == "1.1.0"
 

@@ -6,7 +6,14 @@ import shutil
 from pathlib import Path
 
 import pytest
-from conftest import git, git_commit_proving, ledger_proofs, make_git_repo, run_cli
+from conftest import (
+    alias_argv,
+    git,
+    git_commit_proving,
+    ledger_proofs,
+    make_git_repo,
+    run_cli,
+)
 
 from dct.core.changelog import add_entry, list_entries, release_entries
 from dct.core.projects import create_project, get_project
@@ -35,7 +42,7 @@ def gitproj(cli_engine, tmp_path):
     main = make_git_repo(tmp_path / "repo")
     create_project(cli_engine, slug="proj-g", name="G", path=main, current_version="1.0.0")
     # No version-sync script: the confirmed contract is "no version files"
-    # (K-76 / D4 — the alias auto-approves only a proposal equal to it).
+    # (K-76 / D4); the alias still needs the approved proposal (K-117).
     set_version_files(cli_engine, "proj-g", [], confirm=True)
     return cli_engine, Path(main)
 
@@ -48,7 +55,8 @@ def test_release_pins_head_and_checkout_root(gitproj, monkeypatch, capsys, git_i
     sub = main / "src"
     sub.mkdir()
     monkeypatch.chdir(sub)
-    run_cli(monkeypatch, ["clog", "release", "--confirm", "--no-push", "-P", "proj-g", "1.1.0"])
+    run_cli(monkeypatch, alias_argv(engine, "proj-g", [
+        "clog", "release", "--confirm", "--no-push", "-P", "proj-g", "1.1.0"]))
     rec = get_release(engine, "proj-g", "1.1.0")
     assert rec["candidate_sha"] == candidate
     assert rec["checkout_root"] == str(main)
@@ -66,7 +74,8 @@ def test_release_from_a_linked_worktree_pins_that_checkout(
     eid = add_entry(engine, "proj-g", "added", "a")["id"]
     candidate = git_commit_proving(wt, eid)
     monkeypatch.chdir(wt)
-    run_cli(monkeypatch, ["clog", "release", "--confirm", "--no-push", "-P", "proj-g", "1.1.0"])
+    run_cli(monkeypatch, alias_argv(engine, "proj-g", [
+        "clog", "release", "--confirm", "--no-push", "-P", "proj-g", "1.1.0"]))
     rec = get_release(engine, "proj-g", "1.1.0")
     assert rec["checkout_root"] == str(wt)
     assert rec["candidate_sha"] == candidate
@@ -198,8 +207,11 @@ def test_release_rerun_with_a_different_set_exits_nonzero(cli_engine, tmp_path, 
 
 
 @pytest.fixture
-def recorded(cli_engine):
-    create_project(cli_engine, slug="proj-v", name="V", current_version="1.0.0")
+def recorded(cli_engine, tmp_path):
+    # K-118 L8: the ledger commands lock the repository / directory of the
+    # project's REGISTERED path — a pathless project is refused.
+    create_project(cli_engine, slug="proj-v", name="V", path=_plain(tmp_path),
+                   current_version="1.0.0")
     a = add_entry(cli_engine, "proj-v", "added", "a")["id"]
     release_entries(cli_engine, "proj-v", "1.1.0", candidate_sha="abcdef0",
                     checkout_root="/tmp/proj-v")

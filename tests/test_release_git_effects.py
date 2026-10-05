@@ -3,13 +3,16 @@ the production effects layer on real throwaway repositories with real hooks
 (executable bash scripts) and a BARE remote under tmp_path:
 
 - K-96: the release commit and the attestation commit go through the
-  repository's hook lifecycle (`git commit`, never --no-verify / commit-tree);
-  a refusing hook leaves the record unchanged and nothing tagged; a hook that
-  CHANGES the content is refused with the observed effects, never adopted;
+  repository's hook lifecycle (never skipped); a refusing hook leaves the
+  record unchanged and nothing tagged. Since K-103 the lifecycle is run
+  explicitly (`git hook run` + commit-tree on the pinned parent + a
+  compare-and-swap of the ref) — a hook that CHANGES the content or the
+  message, and the races at the publication boundary, are pinned in
+  tests/test_release_round4_git.py;
 - K-79: the real index is updated only under git's own index.lock protocol
   (a foreign index.lock is refused and left alone) and the USER'S staged
   blobs survive a concurrent stage at both windows (before the commit and
-  during it), a concurrent HEAD move fails the commit's CAS;
+  during it), a concurrent HEAD move fails the publication's CAS;
 - K-96 D7: one operation lock per repository — a second mutating command
   (also from another worktree, also another process) refuses at once;
 - K-96 D1: the `clog release` alias needs --confirm;
@@ -31,7 +34,7 @@ import threading
 from pathlib import Path
 
 import pytest
-from conftest import git, run_cli
+from conftest import alias_argv, git, run_cli
 from test_release_effects import (
     SLUG,
     Interrupted,
@@ -153,31 +156,6 @@ def test_a_refusing_commit_hook_leaves_the_record_and_nothing_tagged(engine, pro
     assert sync_runs(log) == ["1.1.0"]
 
 
-def test_a_formatter_hook_that_rewrites_an_artifact_is_refused_never_adopted(engine, proj):
-    repo, _ = proj
-    install_hook(hooks_dir(repo), "pre-commit",
-                 'printf "# formatted\\n" >> pyproject.toml\ngit add pyproject.toml\n')
-    a = proven(engine, repo, "feature a")
-    candidate = git(repo, "rev-parse", "HEAD")
-    before_remote = remote_refs(repo)
-    with pytest.raises(ReleaseRefused, match="not the release commit") as exc:
-        apply(engine, repo, version="1.1.0", entry_ids=[a])
-    record = get_release(engine, SLUG, "1.1.0")
-    observed = exc.value.details
-    # The observed effects: a commit EXISTS (HEAD moved to it), its tree is
-    # not the approved one — reported, never recorded as the release commit.
-    head = git(repo, "rev-parse", "HEAD")
-    assert observed["commit"] == head and observed["head"] == head
-    assert observed["tree"] != record["manifest"]["tree"]
-    assert git(repo, "rev-parse", "HEAD^") == candidate
-    assert record["status"] == "files_written" and record["release_commit_sha"] is None
-    assert local_tag(repo, "v1.1.0") == "" and remote_refs(repo) == before_remote
-    assert (repo / "pyproject.toml").read_text().endswith("# formatted\n")  # nothing restored
-    with pytest.raises(ReleaseRefused, match="not the release candidate"):
-        resume(engine, repo)
-    assert get_release(engine, SLUG, "1.1.0")["status"] == "files_written"
-
-
 def test_attestation_commit_runs_the_hooks_and_a_refusal_attests_nothing(engine, proj,
                                                                           tmp_path):
     repo, _ = proj
@@ -197,18 +175,6 @@ def test_attestation_commit_runs_the_hooks_and_a_refusal_attests_nothing(engine,
     assert out["outcome"] == "attested" and git(repo, "rev-parse", "HEAD^") == head
     assert trace.read_text().split() == ["pre-commit", "commit-msg", "post-commit"]
     assert git(repo, "rev-parse", "HEAD^{tree}") == git(repo, "rev-parse", f"{head}^{{tree}}")
-
-
-def test_an_attestation_hook_that_stages_content_is_refused_with_its_effects(engine, proj):
-    repo, _ = proj
-    from dct.core.changelog import add_entry
-
-    a = add_entry(engine, SLUG, "added", "squashed work")["id"]
-    head = git(repo, "rev-parse", "HEAD")
-    install_hook(hooks_dir(repo), "pre-commit", 'echo x > hooked.txt\ngit add hooked.txt\n')
-    with pytest.raises(ReleaseRefused, match="not the empty attestation") as exc:
-        attest(engine, SLUG, [a], confirm=True, cwd=str(repo))
-    assert exc.value.details["commit"] == git(repo, "rev-parse", "HEAD") != head
 
 
 # ── K-79: git's index.lock protocol and the user's staged blobs ──────────────
@@ -269,9 +235,9 @@ def test_window_b_a_stage_during_the_commit_is_preserved(engine, proj, tmp_path)
 
 
 def test_window_b_head_moved_during_the_commit_fails_its_compare_and_swap(engine, proj):
-    """HEAD moves WHILE the commit runs: git commit's own ref transaction
-    (old value = the candidate) refuses, nothing is committed by dct, the
-    other process's HEAD stays."""
+    """HEAD moves WHILE the hooks run: the publication's compare-and-swap
+    (old value = the pinned candidate) refuses, nothing is published by
+    dct, the other process's HEAD stays."""
     repo, _ = proj
     a = proven(engine, repo, "feature a")
     candidate = git(repo, "rev-parse", "HEAD")
@@ -429,7 +395,8 @@ def test_clog_release_alias_needs_confirm(engine, cli_proj, monkeypatch, capsys)
     assert _exit(monkeypatch, ["clog", "release", "-P", SLUG, "1.1.0"]) == 1
     assert "--confirm" in capsys.readouterr().err
     assert get_release(engine, SLUG, "1.1.0") is None
-    run_cli(monkeypatch, ["clog", "release", "-P", SLUG, "1.1.0", "--confirm"])
+    run_cli(monkeypatch, alias_argv(engine, SLUG, [
+        "clog", "release", "-P", SLUG, "1.1.0", "--confirm"]))
     assert_released(engine, repo, candidate, [a])
 
 

@@ -1189,14 +1189,26 @@ RELEASE_EXECUTOR_EPILOG = (
     "A lost database serialization race exits 75 (outcome 'conflict': the step, the effects "
     "already performed, the re-read record) — never retried automatically. ")
 
-RELEASE_PUSH_EPILOG = RELEASE_EXECUTOR_EPILOG + (
-    "Locks: the command holds the release operation lock of the repository (one at a "
-    "time, also across worktrees; another release command refuses at once). Commit: "
-    "`git commit` — the repository's hooks run; a refusing or content-changing hook stops "
-    "the release (resume after fixing). Push (after the tag): `git push --atomic` of the "
-    "release commit and the tag to the push target — default the current branch's "
-    "upstream; without one choose --push-remote [--push-branch] or --no-push. A failed "
-    "push leaves the release 'tagged'; `dct release resume` retries only the push.")
+RELEASE_LOCK_EPILOG = (
+    "Locks: the command holds the release operation lock of the repository of the "
+    "project's REGISTERED path (one at a time, also across worktrees; another release "
+    "command refuses at once). A project without a registered path, or with a path that "
+    "cannot be verified, is refused — dct never locks on a substitute key. ")
+
+RELEASE_PUSH_EPILOG = RELEASE_EXECUTOR_EPILOG + RELEASE_LOCK_EPILOG + (
+    "Commit (needs git >= 2.36): the repository's hooks run explicitly (pre-commit, "
+    "prepare-commit-msg, commit-msg on a temporary index holding the approved tree), the "
+    "commit is created on the pinned candidate and published by a compare-and-swap of the "
+    "branch HEAD names, then post-commit. A refusing hook, a hook that changes the approved "
+    "content or message, a HEAD that moved or a branch switch stops the release with "
+    "NOTHING published (resume after fixing; nothing is reset). Push (after the tag): `git "
+    "push --atomic <url> <commit>:refs/heads/<branch> <commit>:refs/tags/v<V>` to ONE "
+    "approved destination — default the current branch's upstream and its push URL (`git "
+    "remote get-url --push --all`); without an upstream choose --push-remote "
+    "[--push-branch] or --no-push; a remote with several push URLs needs --push-url (no "
+    "mirror mode). The same URL is read before the stamp and to verify the push. A failed "
+    "push leaves the release 'tagged'; `dct release resume` retries only the push, to the "
+    "approved URL.")
 
 
 def _add_push_flags(parser) -> None:
@@ -1207,6 +1219,11 @@ def _add_push_flags(parser) -> None:
     parser.add_argument(
         "--push-branch",
         help="Branch of that remote (default: the upstream's branch when it is on that remote)")
+    parser.add_argument(
+        "--push-url",
+        help="Which ONE of the remote's push URLs (`git remote get-url --push --all`) the "
+             "release goes to — required when the remote has several; refused when it is not "
+             "one of them")
     parser.add_argument(
         "--no-push", action="store_true",
         help="An explicit local release: commit and tag, nothing pushed")
@@ -1231,7 +1248,7 @@ def _apply_from_args(args, *, strict: bool) -> None:
         confirm=args.confirm, strict=strict,
         plan_digest=None if strict else args.plan_digest,
         proposal_digest=args.proposal_digest, push_remote=args.push_remote,
-        push_branch=args.push_branch, no_push=args.no_push))
+        push_branch=args.push_branch, push_url=args.push_url, no_push=args.no_push))
     if as_json:
         return
     details = out["details"]
@@ -1241,8 +1258,8 @@ def _apply_from_args(args, *, strict: bool) -> None:
         print(f"✓ Released {details['released']} entries as {out['version']} "
               f"(mode: {details['mode']}) — current version: {details['current_version']}")
         target = details.get("push_target")
-        print(f"  pushed to {target['remote']} ({target['branch']}, {target['tag']})" if target
-              else "  not pushed (no push target approved)")
+        print(f"  pushed to {target['remote']} {target['url']} ({target['branch']}, "
+              f"{target['tag']})" if target else "  not pushed (no push target approved)")
     else:
         print(f"✓ {details['requested_version']} already released — nothing to do "
               f"(mode: {details['mode']}); current version: {details['current_version']}")
@@ -1254,18 +1271,19 @@ def cmd_clog_release(args):
 
     Flags map 1:1 (version or --patch/--minor/--major, --entries /
     --no-entries, --proposal-digest, --push-remote / --push-branch /
-    --no-push); --confirm is REQUIRED as for apply (K-96 D1: the alias
-    commits, tags and pushes — running it is not the confirmation).
+    --push-url / --no-push); --confirm is REQUIRED as for apply (K-96 D1:
+    the alias commits, tags and pushes — running it is not the
+    confirmation), and so is --proposal-digest for a new release (K-117:
+    the alias never prepares or approves a proposal by itself — run `dct
+    release prepare` and approve its proposal_sha256).
     Decisions that need the owner are REFUSED instead of
-    guessed: unproven entries (no --entries = every unreleased entry, all
-    of which must be proven), a proof range that does not start at
-    v<current_version>, a version-file proposal that is not the confirmed
-    contract (a first release, a contract change — K-76: the alias
-    prepares inside the call and shows the proposal; approve it with
-    --proposal-digest). No --plan-digest: the plan is derived inside the
-    call for the candidate it pins, and the stamp is bound to it the same
-    way (K-80/K-81). Effects, order and verification: see
-    dct.workflows.release.effects.
+    guessed: a missing proposal digest, unproven entries (no --entries =
+    every unreleased entry, all of which must be proven), a proof range
+    that does not start at v<current_version>. No --plan-digest: the plan
+    is derived inside the call for the candidate it pins, the stamp is
+    bound to it the same way (K-80/K-81), and the approved proposal must
+    have been prepared for exactly that plan (K-116 H2). Effects, order
+    and verification: see dct.workflows.release.effects.
     """
     _apply_from_args(args, strict=True)
 
@@ -1322,7 +1340,8 @@ def cmd_release_prepare(args):
     target = details.get("push_target")
     print(f"  push target (default): {target['remote']} {target['branch']} ({target['url']}), "
           f"tag {target['tag']}" if target else
-          "  push target: none by default — apply needs --push-remote … or --no-push")
+          "  push target: none by default — apply needs --push-remote … [--push-url …] or "
+          "--no-push (see the warnings)")
     print(f"  next: dct release apply --version {out['version']} … --plan-digest "
           f"{details['plan_digest']} --proposal-digest {details['proposal_sha256']} --confirm")
     _print_effects(out)
@@ -2753,8 +2772,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_clog_release = p_clog_sub.add_parser(
         "release",
-        help="Release (alias of `release prepare` + `release apply`): isolated sync, stamp, "
-             "changelog, version files, commit, tag")
+        help="Release (alias of `release apply` without --plan-digest; needs the approved "
+             "--proposal-digest): stamp, changelog, version files, commit, tag, push")
     p_clog_release.add_argument(
         "version", nargs="?", help="X.Y or X.Y.Z (a leading v is dropped)")
     p_clog_release.add_argument("--project", "-P")
@@ -2770,8 +2789,9 @@ def build_parser() -> argparse.ArgumentParser:
         help="Version-only release: stamp no entries, only set the version")
     p_clog_release.add_argument(
         "--proposal-digest",
-        help="The proposal_sha256 of `dct release prepare` (or of this command's own "
-             "refusal) — approves that version-file proposal")
+        help="Required for a new release: the proposal_sha256 of the approved `dct release "
+             "prepare` — prepared for exactly the plan this command derives (same version "
+             "and selection)")
     p_clog_release.add_argument(
         "--confirm-version-files", action="store_true", help=argparse.SUPPRESS)
     p_clog_release.add_argument(
@@ -2780,13 +2800,17 @@ def build_parser() -> argparse.ArgumentParser:
     _add_push_flags(p_clog_release)
     p_clog_release.add_argument("--json", action="store_true", help="Stable JSON document")
     p_clog_release.epilog = (
-        "Alias of `dct release prepare` + `dct release apply` (needs --confirm like apply): "
-        "the version sync runs isolated, then stamp, changelog file, the approved version "
+        "Alias of `dct release apply` (needs --confirm like apply) that derives the plan "
+        "itself instead of taking --plan-digest: stamp, changelog file, the approved version "
         "files, release commit (through the repository's hooks) and tag, pushed to the push "
-        "target, each verified. Refuses — instead of guessing — when the owner must decide: "
-        "entries without proof, a proof range not starting at v<current_version>, version "
-        "files that are not the confirmed contract (a first release or a change: approve the "
-        "shown proposal with --proposal-digest), no upstream to push to. " + RELEASE_PUSH_EPILOG)
+        "target, each verified. It never runs the version sync and never approves a "
+        "proposal: run `dct release plan --version V --json` and `dct release prepare "
+        "--version V (--entries … | --no-entries) --plan-digest D` first, review the "
+        "proposed files and pass its proposal_sha256 as --proposal-digest — the proposal must "
+        "be bound to exactly the plan this command derives. Refuses — instead of guessing — "
+        "when the owner must decide: no approved proposal, entries without proof, a proof "
+        "range not starting at v<current_version>, no upstream to push to, several push "
+        "URLs. " + RELEASE_PUSH_EPILOG)
 
     p_clog_rstatus = p_clog_sub.add_parser(
         "release-status",
@@ -2823,8 +2847,7 @@ def build_parser() -> argparse.ArgumentParser:
         "only what you verified. A status is never proof: a release with git reaches tagged "
         "/ pushed / completed only with --tag-proof (full commit ids; its commit must be the "
         "release commit), and pushed only with --push-proof. A release dct executes is "
-        "refused (`dct release resume` records its progress). Holds the release operation "
-        "lock of the repository.")
+        "refused (`dct release resume` records its progress). " + RELEASE_LOCK_EPILOG)
 
     p_clog_rabandon = p_clog_sub.add_parser(
         "release-abandon",
@@ -2837,7 +2860,9 @@ def build_parser() -> argparse.ArgumentParser:
         help="Required: the version stays taken by the abandoned record")
     p_clog_rabandon.add_argument("--project", "-P")
     p_clog_rabandon.add_argument("--json", action="store_true", help="Stable JSON document")
-    p_clog_rabandon.epilog = "Alias of `dct release abandon` (same rules, same operation lock)."
+    p_clog_rabandon.epilog = (
+        "Alias of `dct release abandon` (same rules, same operation lock). "
+        + RELEASE_LOCK_EPILOG)
 
     p_clog_cand = p_clog_sub.add_parser(
         "candidates",
@@ -2898,6 +2923,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_rel_attest = p_release_sub.add_parser(
         "attest", help="Create the empty attestation commit for unproven entries")
+    p_rel_attest.epilog = (
+        "The empty commit `chore: attest changelog entries` with the trailer `Changelog: "
+        "<ids>` on the current HEAD (needs git >= 2.36). The repository's commit hooks run; "
+        "the commit is created on the pinned HEAD and checked BEFORE it is published: it "
+        "must prove EXACTLY the given ids (a hook that adds, drops or duplicates an id, or "
+        "stages content, is refused with nothing published), then the branch HEAD names "
+        "moves by compare-and-swap. " + RELEASE_LOCK_EPILOG)
     p_rel_attest.add_argument("--entries", required=True,
                               help="Comma-separated ids the plan lists as unproven")
     p_rel_attest.add_argument("--confirm", action="store_true",
@@ -2958,8 +2990,15 @@ def build_parser() -> argparse.ArgumentParser:
         "candidate ONCE with V in a temporary detached worktree (a project outside git: in a "
         "temporary copy of its directory) — never in your checkout, which is verified "
         "unchanged afterwards; writes the expected blobs into the repository's object "
-        "database (outside git: dct's release blob store) and the pending proposal into the "
-        "database. Nothing is stamped, committed or tagged. " + RELEASE_EXECUTOR_EPILOG)
+        "database, pinned by the ref refs/dct/release-proposals/<project>/<proposal id> "
+        "until the release is completed or abandoned or a new prepare replaces the proposal "
+        "(outside git: dct's release blob store, same lifetime), and the pending proposal "
+        "into the database. Nothing is stamped, committed or tagged. Environment of the "
+        "script: only the files of the candidate (no untracked or ignored file of your "
+        "checkout — virtualenvs, node_modules, build output — and no submodule content), "
+        "stdin closed, no terminal, GIT_* repository variables dropped, a timeout; a script "
+        "that needs anything else fails with that contract — dct never runs it in your "
+        "checkout instead. " + RELEASE_LOCK_EPILOG + RELEASE_EXECUTOR_EPILOG)
 
     p_rel_resume = p_release_sub.add_parser(
         "resume", help="Finish the unfinished release (verifies every effect first; executes "
@@ -2968,7 +3007,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_rel_resume.add_argument(
         "--confirm-version-files", action="store_true", help=argparse.SUPPRESS)
     p_rel_resume.add_argument("--json", action="store_true", help="Stable JSON document")
-    p_rel_resume.epilog = RELEASE_EXECUTOR_EPILOG + (
+    p_rel_resume.epilog = RELEASE_EXECUTOR_EPILOG + RELEASE_LOCK_EPILOG + (
+        "The push goes to the URL approved at apply (it must still be a push URL of its "
+        "remote; URLs added since receive nothing). "
         "A record stamped outside `dct release apply` (MCP release_changelog, an own tool, a "
         "partial reconstruction) is refused: finish it with `dct clog release-advance` after "
         "verifying its effects yourself, or abandon it.")
@@ -2980,6 +3021,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_rel_abandon.add_argument("--confirm", action="store_true", help="Required")
     p_rel_abandon.add_argument("--project", "-P")
     p_rel_abandon.add_argument("--json", action="store_true", help="Stable JSON document")
+    p_rel_abandon.epilog = (
+        "The record ends 'abandoned'; every effect stays and nothing is reset. The ref "
+        "pinning its proposal's blobs is removed. " + RELEASE_LOCK_EPILOG)
 
     p_rel_recon = p_release_sub.add_parser(
         "reconstruct", help="Record a legacy release made before release records existed")

@@ -182,10 +182,18 @@ def test_prepare_runs_the_sync_isolated_and_leaves_the_checkout_byte_identical(e
     candidate = git(repo, "rev-parse", "HEAD")
     before = checkout_state(repo)
     out = prepare(engine, repo, version="1.1.0", entry_ids=[a])
-    assert checkout_state(repo) == before
+    proposal = out["details"]["proposal"]
+    after = checkout_state(repo)
+    # The ONE thing prepare adds to the repository: the ref that pins the
+    # proposal's blobs (K-117) — HEAD, branches, tags, index, status and
+    # every file are byte-identical.
+    pin = f"refs/dct/release-proposals/s-{SLUG}/{proposal['id']}"
+    added = [line for line in after["refs"].splitlines()
+             if line not in before["refs"].splitlines()]
+    assert [line.split(" ")[0] for line in added] == [pin]
+    assert {**after, "refs": before["refs"]} == before
     assert worktrees(repo) == [f"worktree {repo}"]  # the temporary worktree is gone
     assert out["outcome"] == "prepared" and out["action"] == "prepare"
-    proposal = out["details"]["proposal"]
     assert proposal["paths"] == ["pyproject.toml"]
     assert proposal["base_blobs"] == {"pyproject.toml": git(repo, "rev-parse",
                                                             f"{candidate}:pyproject.toml")}
@@ -582,28 +590,36 @@ def test_cli_prepare_then_apply(engine, proj, monkeypatch, capsys):
     assert json.loads(capsys.readouterr().out)["outcome"] == "completed"
 
 
-def test_cli_alias_first_release_needs_the_approved_proposal(engine, proj, monkeypatch, capsys):
-    """The `clog release` alias auto-approves only a proposal EQUAL to the
-    confirmed contract; a first release (or a contract change) is refused
-    with the proposal shown, then approved by its digest."""
+def test_cli_alias_needs_the_approved_proposal_for_every_new_release(engine, proj, monkeypatch,
+                                                                    capsys):
+    """K-117: the `clog release` alias never prepares or approves a proposal
+    itself — a first release AND a later one with an unchanged contract both
+    need the digest of an approved `dct release prepare`."""
+    from conftest import alias_argv
+
     from dct import cli
 
-    repo, _ = proj
+    repo, log = proj
     monkeypatch.setattr(cli, "_get_engine", lambda: engine)
     monkeypatch.setattr(cli, "_get_readonly_engine", lambda: engine)
     monkeypatch.chdir(repo)
     a = proven(engine, repo, "feature a")
+    argv = ["clog", "release", "--confirm", "--no-push", "-P", SLUG, "1.1.0"]
     with pytest.raises(SystemExit) as exc:
-        run_cli(monkeypatch, ["clog", "release", "--confirm", "--no-push", "-P", SLUG, "1.1.0", "--json"])
+        run_cli(monkeypatch, [*argv, "--json"])
     assert exc.value.code == 1
     doc = json.loads(capsys.readouterr().out)
-    assert doc["details"]["proposal"]["paths"] == ["pyproject.toml"]
+    assert "--proposal-digest" in doc["details"]["error"]
     nothing_stamped(engine, a)
-    run_cli(monkeypatch, ["clog", "release", "--confirm", "--no-push", "-P", SLUG, "1.1.0", "--proposal-digest",
-                          doc["details"]["proposal_sha256"]])
+    assert runs(log) == [] and get_pending_proposal(engine, SLUG) is None
+    run_cli(monkeypatch, alias_argv(engine, SLUG, argv))
     assert get_release(engine, SLUG, "1.1.0")["status"] == "completed"
     b = proven(engine, repo, "feature b")
-    run_cli(monkeypatch, ["clog", "release", "--confirm", "--no-push", "-P", SLUG, "1.2.0"])  # contract unchanged
+    again = ["clog", "release", "--confirm", "--no-push", "-P", SLUG, "1.2.0"]
+    with pytest.raises(SystemExit):  # the contract is unchanged — still no auto-approval
+        run_cli(monkeypatch, again)
+    assert get_release(engine, SLUG, "1.2.0") is None
+    run_cli(monkeypatch, alias_argv(engine, SLUG, again))
     assert get_release(engine, SLUG, "1.2.0")["entry_ids"] == [b]
 
 

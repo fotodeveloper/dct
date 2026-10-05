@@ -97,8 +97,12 @@ def test_interruption_table_is_the_codes_interruption_points():
     assert documented == list(effects.INTERRUPTION_POINTS)
 
 
-def _stamped_release(engine):
-    create_project(engine, slug="proj-a", name="Project A", path="/tmp/proj-a",
+def _stamped_release(engine, tmp_path):
+    # K-118 L8: abandon locks the directory of the project's registered path
+    # — it must exist (here: CONFIRMED outside git).
+    plain = tmp_path / "proj-a"
+    plain.mkdir()
+    create_project(engine, slug="proj-a", name="Project A", path=str(plain),
                    current_version="1.0.0")
     eid = add_entry(engine, "proj-a", "added", "shipped work")["id"]
     release_entries(engine, "proj-a", "1.1.0", entry_ids=[eid],
@@ -106,18 +110,18 @@ def _stamped_release(engine):
     return eid
 
 
-def test_abandon_without_explicit_confirmation_changes_nothing(engine):
+def test_abandon_without_explicit_confirmation_changes_nothing(engine, tmp_path):
     """The dialog's "explicit confirmation" is the workflow's own gate."""
-    _stamped_release(engine)
+    _stamped_release(engine, tmp_path)
     with pytest.raises(effects.ReleaseRefused):
         effects.abandon(engine, "proj-a", "1.1.0", "superseded", confirm=False)
     record = get_release(engine, "proj-a")
     assert record is not None and record["status"] == "stamped"
 
 
-def test_abandon_keeps_the_record_the_stamps_and_the_version(engine):
+def test_abandon_keeps_the_record_the_stamps_and_the_version(engine, tmp_path):
     """As the dialog tells the owner: everything stays, V stays taken."""
-    eid = _stamped_release(engine)
+    eid = _stamped_release(engine, tmp_path)
     out = effects.abandon(engine, "proj-a", "1.1.0", "superseded by 1.2.0", confirm=True)
     assert out["outcome"] == "abandoned" and set(out) == set(effects.RESULT_KEYS)
     assert get_release(engine, "proj-a") is None, "nothing left to resume"

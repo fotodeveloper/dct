@@ -371,6 +371,62 @@ def approved_proposal_digest(engine, slug: str, cwd, *, plan_digest: str, **kw) 
     return out["details"]["proposal_sha256"]
 
 
+def alias_proposal(engine, slug: str, cwd, **selection) -> list[str]:
+    """`["--proposal-digest", P]` for the `clog release` alias (K-117: it
+    needs the APPROVED proposal and never prepares one itself) — the tests'
+    stand-in for the owner running `dct release prepare` for exactly the
+    plan the alias derives (the same version / bump and selection; no
+    selection = every unreleased entry) and approving its digest. A prepare
+    that is refused (unproven entries, nothing to prepare, a failing sync
+    …) yields [] — the alias then decides on its own (a refusal of a new
+    release without a proposal, or a no-op re-run)."""
+    from dct.workflows.release.effects import ReleaseRefused, prepare_release
+
+    selection = {k: selection[k] for k in ("version", "bump_type", "entry_ids", "no_entries")
+                 if k in selection}
+    if selection.get("entry_ids") is not None:
+        selection["entry_ids"] = list(selection["entry_ids"])
+    try:
+        out = prepare_release(engine, slug, cwd=None if cwd is None else str(cwd), strict=True,
+                              **selection)
+    except ReleaseRefused:
+        return []
+    return ["--proposal-digest", out["details"]["proposal_sha256"]]
+
+
+_ALIAS_VALUE_FLAGS = ("-P", "--project", "--entries", "--push-remote", "--push-branch",
+                      "--push-url", "--proposal-digest")
+
+
+def alias_argv(engine, slug: str, argv: list[str], cwd=None) -> list[str]:
+    """The argv of a `dct clog release …` call plus the approved proposal
+    for exactly that call (alias_proposal; the selection is read from the
+    argv, the checkout is `cwd` or the process cwd — chdir first). An argv
+    whose --entries value does not parse is returned unchanged (the CLI
+    refuses it)."""
+    selection: dict = {}
+    rest = argv[argv.index("release") + 1:]
+    index = 0
+    while index < len(rest):
+        token = rest[index]
+        if token in _ALIAS_VALUE_FLAGS:
+            if token == "--entries":
+                try:
+                    selection["entry_ids"] = [int(part) for part in rest[index + 1].split(",")]
+                except ValueError:
+                    return list(argv)
+            index += 2
+            continue
+        if token in ("--patch", "--minor", "--major"):
+            selection["bump_type"] = token[2:]
+        elif token == "--no-entries":
+            selection["no_entries"] = True
+        elif not token.startswith("-"):
+            selection["version"] = token
+        index += 1
+    return [*argv, *alias_proposal(engine, slug, cwd, **selection)]
+
+
 def tag_proof_for(commit: str, name: str = "v1.1.0", *, tag_object: str | None = None) -> dict:
     """A tag proof as a ledger-path caller reports it (K-115 G4,
     core.releases.validate_tag_proof): a lightweight tag `name` at `commit`,

@@ -210,20 +210,26 @@ corrections; the CLI where the effects need it):
    version-file contract — say so explicitly; an empty list is a contract
    too), `details.sync` (exit code, output, `output_dropped_bytes` cut) and
    the push target `details.push_target` (remote, URL, branch, tag `v<V>` —
-   the branch's upstream; `null` → the owner chooses `--push-remote <remote>
-   --push-branch <branch>` or `--no-push`, never guessed). The owner
+   the branch's upstream and that remote's ONE push URL, K-104; `null` →
+   the owner chooses `--push-remote <remote> --push-branch <branch>` or
+   `--no-push`, never guessed; a remote with several push URLs is listed in
+   `warnings` — the owner chooses ONE with `--push-url <url>`). The owner
    approves THAT file list and THAT push target; keep `proposal_sha256`
    (`P`). `failed` → the script failed or timed out (124): fix it, prepare
    again. `refused` → the table below.
 9. **Apply**, only on the owner's yes:
    `dct release apply --version V --entries <ids> --plan-digest <D> --proposal-digest <P> --confirm --json`
    (the upstream target), or with the owner's choice
-   `dct release apply --version V --entries <ids> --plan-digest <D> --proposal-digest <P> --push-remote <remote> --push-branch <branch> --confirm --json`,
+   `dct release apply --version V --entries <ids> --plan-digest <D> --proposal-digest <P> --push-remote <remote> --push-branch <branch> --confirm --json`
+   (add `--push-url <url>` when that remote has several push URLs — the
+   release goes to that ONE address),
    or `dct release apply --version V --no-entries --plan-digest <D> --proposal-digest <P> --no-push --confirm --json`.
    It stamps, writes the changelog section and the approved version files,
-   commits `release: v<V>` through the hooks, updates the real index, tags
-   and pushes the commit and the tag atomically (K-97 F2). Never pass a
-   digest the owner has not seen.
+   commits `release: v<V>` through the hooks (on the pinned candidate,
+   published by compare-and-swap — K-103; needs git >= 2.36), updates the
+   real index, tags and pushes the commit and the tag atomically to the
+   approved URL (K-97 F2, K-104). Never pass a digest the owner has not
+   seen.
 10. **Read the result and report** — `completed`; `noop` (already released —
    nothing done); `refused` (show `details.error`, act by the table; only
    the listed `steps` happened; an unfinished `release` → the resume path);

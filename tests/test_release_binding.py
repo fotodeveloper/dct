@@ -171,6 +171,10 @@ def test_entry_change_racing_the_stamp_is_refused_in_the_transaction(engine, rep
     a = proven(engine, repo, "a")
     other = add_entry(engine, SLUG, "added", "unproven bystander")["id"]
     approved = digest(engine, repo, version="1.1.0", entry_ids=[a])
+    # The proposal is prepared (and its blobs pinned by a ref, K-117) BEFORE
+    # the state is taken: the refused apply must change nothing after that.
+    proposal = approved_proposal_digest(engine, SLUG, repo, plan_digest=approved,
+                                        version="1.1.0", entry_ids=[a])
     before = state(engine, repo)
 
     def hook(point):
@@ -186,7 +190,8 @@ def test_entry_change_racing_the_stamp_is_refused_in_the_transaction(engine, rep
                              .values(deleted_at=sa.func.now()))
 
     with pytest.raises(ReleaseRefused, match="changed since the approved plan"):
-        apply(engine, repo, version="1.1.0", entry_ids=[a], plan_digest=approved, on_point=hook)
+        apply(engine, repo, version="1.1.0", entry_ids=[a], plan_digest=approved,
+              proposal_digest=proposal, on_point=hook)
     after = state(engine, repo)
     assert after["current"] == before["current"] == "1.0.0"
     assert after["records"] == before["records"] == 0

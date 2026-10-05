@@ -667,8 +667,9 @@ def validate_render(render: Mapping | None) -> dict | None:
 
 PROPOSAL_KEYS = frozenset({
     "paths", "base_blobs", "expected_blobs", "script", "candidate_sha",
-    "version", "plan_digest", "release_mode", "changelog",
+    "version", "plan_digest", "release_mode", "changelog", "id",
 })
+PROPOSAL_ID_RE = re.compile(r"[0-9A-Za-z]{1,64}", re.ASCII)
 PROPOSAL_CHANGELOG_KEYS = frozenset({"path", "base_blob", "base_sha256"})
 
 
@@ -688,8 +689,18 @@ def validate_proposal(proposal: Mapping | None) -> dict | None:
     normalize_version_files path), "base_blob" (blob id | null = absent),
     "base_sha256" (hex SHA-256 | null = absent)}, or null when the project
     has no managed changelog file). base_blobs and expected_blobs name
-    EXACTLY `paths`. Blob ids are hex 7-64 chars (lowercased). ≤
-    PROPOSAL_MAX_BYTES of canonical JSON. ValueError / TypeError
+    EXACTLY `paths`. Blob ids are hex 7-64 chars (lowercased).
+
+    "id" (optional; K-117) — the STABLE identity `dct release prepare`
+    gives each proposal it builds (a ULID: letters and digits, ≤ 64): it
+    stays the same from the pending proposal to the record that consumed
+    it, and names the resources kept for it (the ref pinning its blobs).
+    Neither the version nor the content: two prepares of the same content
+    have different ids (and so different digests). A proposal stored before
+    the field has none — the key is then ABSENT from the canonical form, so
+    its digest is unchanged.
+
+    ≤ PROPOSAL_MAX_BYTES of canonical JSON. ValueError / TypeError
     otherwise."""
     if proposal is None:
         return None
@@ -740,6 +751,11 @@ def validate_proposal(proposal: Mapping | None) -> dict | None:
         "release_mode": validate_release_mode(proposal.get("release_mode")),
         "changelog": changelog,
     }
+    identity = proposal.get("id")
+    if identity is not None:
+        if not isinstance(identity, str) or not PROPOSAL_ID_RE.fullmatch(identity):
+            raise ValueError(f"proposal.id must be 1-64 letters / digits, got {identity!r}")
+        out["id"] = identity
     ensure_json_fits(out, "proposal", PROPOSAL_MAX_BYTES)
     return out
 
@@ -2006,6 +2022,30 @@ def read_pending_proposal(conn: sa.Connection, pid: int) -> dict | None:
     inside its own transaction)."""
     return _pending(conn.execute(
         sa.select(projects.c.release_proposal).where(projects.c.id == pid)).scalar())
+
+
+def live_proposals(engine: sa.Engine) -> list[dict]:
+    """Every proposal that is still NEEDED, across ALL projects (K-117 —
+    dct's release blob store is shared by them): each live project's
+    PENDING proposal and the proposal of every live release record that is
+    not terminal (completed / abandoned). → [{"project" (slug), "version"
+    (None for a pending proposal), "proposal"}]. Read-only. What a cleanup
+    of a finished proposal's resources must keep: anything one of these
+    still names."""
+    out: list[dict] = []
+    with engine.begin() as conn:
+        for slug, text in conn.execute(
+                sa.select(projects.c.slug, projects.c.release_proposal).where(
+                    projects.c.deleted_at.is_(None),
+                    projects.c.release_proposal.isnot(None))):
+            out.append({"project": slug, "version": None, "proposal": json.loads(text)})
+        for slug, version, text in conn.execute(
+                sa.select(projects.c.slug, releases.c.version, releases.c.proposal)
+                .select_from(releases.join(projects, releases.c.project_id == projects.c.id))
+                .where(releases.c.deleted_at.is_(None), releases.c.proposal.isnot(None),
+                       releases.c.status.notin_(sorted(TERMINAL_STATUSES)))):
+            out.append({"project": slug, "version": version, "proposal": json.loads(text)})
+    return out
 
 
 def clear_pending_proposal(conn: sa.Connection, pid: int) -> None:
