@@ -106,7 +106,7 @@ def test_v_prefixed_release_flow_core_cli_export(cli_engine, tmp_path, monkeypat
     # A legacy row of the SAME version in yet another spelling (pre-contract).
     legacy = add_entry(engine, "proj-v", "fixed", "legacy v-spelled row")["id"]
 
-    run_cli(monkeypatch, ["clog", "release", "-P", "proj-v", "v1.6.0", "--entries", str(a)])
+    run_cli(monkeypatch, ["clog", "release", "--confirm", "--no-push", "-P", "proj-v", "v1.6.0", "--entries", str(a)])
     out = capsys.readouterr().out
     assert "as 1.6.0" in out and "current version: 1.6.0" in out
     _stamp_raw(engine, legacy, "v1.6", datetime.now(UTC))
@@ -118,7 +118,7 @@ def test_v_prefixed_release_flow_core_cli_export(cli_engine, tmp_path, monkeypat
     # legacy stamp put an entry carrying 1.6 outside the record's set, so the
     # retry is refused before any effect (K-94 B3), never extending the record.
     with pytest.raises(SystemExit):
-        run_cli(monkeypatch, ["clog", "release", "-P", "proj-v", "1.6", "--entries", str(a)])
+        run_cli(monkeypatch, ["clog", "release", "--confirm", "--no-push", "-P", "proj-v", "1.6", "--entries", str(a)])
     assert "no longer matches the record" in capsys.readouterr().err
     assert get_release(engine, "proj-v", "1.6.0")["entry_ids"] == [a]
 

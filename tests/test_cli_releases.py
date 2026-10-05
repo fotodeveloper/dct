@@ -48,7 +48,7 @@ def test_release_pins_head_and_checkout_root(gitproj, monkeypatch, capsys, git_i
     sub = main / "src"
     sub.mkdir()
     monkeypatch.chdir(sub)
-    run_cli(monkeypatch, ["clog", "release", "-P", "proj-g", "1.1.0"])
+    run_cli(monkeypatch, ["clog", "release", "--confirm", "--no-push", "-P", "proj-g", "1.1.0"])
     rec = get_release(engine, "proj-g", "1.1.0")
     assert rec["candidate_sha"] == candidate
     assert rec["checkout_root"] == str(main)
@@ -66,7 +66,7 @@ def test_release_from_a_linked_worktree_pins_that_checkout(
     eid = add_entry(engine, "proj-g", "added", "a")["id"]
     candidate = git_commit_proving(wt, eid)
     monkeypatch.chdir(wt)
-    run_cli(monkeypatch, ["clog", "release", "-P", "proj-g", "1.1.0"])
+    run_cli(monkeypatch, ["clog", "release", "--confirm", "--no-push", "-P", "proj-g", "1.1.0"])
     rec = get_release(engine, "proj-g", "1.1.0")
     assert rec["checkout_root"] == str(wt)
     assert rec["candidate_sha"] == candidate
@@ -80,7 +80,7 @@ def test_release_of_a_project_without_path_is_refused(cli_engine, monkeypatch, c
     without_git release; nothing is stamped."""
     create_project(cli_engine, slug="proj-v", name="V", current_version="1.0.0")
     eid = add_entry(cli_engine, "proj-v", "added", "a")["id"]
-    assert _exit_code(monkeypatch, ["clog", "release", "-P", "proj-v", "1.1.0"]) == 1
+    assert _exit_code(monkeypatch, ["clog", "release", "--confirm", "--no-push", "-P", "proj-v", "1.1.0"]) == 1
     assert "no registered path" in capsys.readouterr().err
     _assert_nothing_released(cli_engine, "proj-v", eid)
 
@@ -96,7 +96,7 @@ def test_release_in_a_repo_without_commits_is_refused_before_stamping(
     create_project(cli_engine, slug="proj-e", name="E", path=str(repo), current_version="1.0.0")
     eid = add_entry(cli_engine, "proj-e", "added", "a")["id"]
     monkeypatch.chdir(repo)
-    assert _exit_code(monkeypatch, ["clog", "release", "-P", "proj-e", "1.1.0"]) == 1
+    assert _exit_code(monkeypatch, ["clog", "release", "--confirm", "--no-push", "-P", "proj-e", "1.1.0"]) == 1
     assert "no commit" in capsys.readouterr().err
     _assert_nothing_released(cli_engine, "proj-e", eid)
 
@@ -119,7 +119,7 @@ def test_release_with_git_missing_is_refused_before_stamping(
     eid = add_entry(cli_engine, "proj-p", "added", "a")["id"]
     monkeypatch.setattr(gitinfo.shutil, "which", lambda name: None)
     monkeypatch.chdir(plain)
-    assert _exit_code(monkeypatch, ["clog", "release", "-P", "proj-p", "1.1.0"]) == 1
+    assert _exit_code(monkeypatch, ["clog", "release", "--confirm", "--no-push", "-P", "proj-p", "1.1.0"]) == 1
     err = capsys.readouterr().err
     assert "Cannot verify" in err and "git is not on PATH" in err and "nothing released" in err
     _assert_nothing_released(cli_engine, "proj-p", eid)
@@ -143,7 +143,7 @@ def test_release_with_a_failing_git_is_refused_before_stamping(
     eid = add_entry(cli_engine, "proj-p", "added", "a")["id"]
     monkeypatch.setattr(gitinfo.shutil, "which", lambda name: str(fake))
     monkeypatch.chdir(plain)
-    assert _exit_code(monkeypatch, ["clog", "release", "-P", "proj-p", "1.1.0"]) == 1
+    assert _exit_code(monkeypatch, ["clog", "release", "--confirm", "--no-push", "-P", "proj-p", "1.1.0"]) == 1
     assert "dubious ownership" in capsys.readouterr().err
     _assert_nothing_released(cli_engine, "proj-p", eid)
 
@@ -154,7 +154,7 @@ def test_release_of_a_project_whose_directory_is_gone_is_refused(
                    current_version="1.0.0")
     eid = add_entry(cli_engine, "proj-p", "added", "a")["id"]
     monkeypatch.chdir(tmp_path)
-    assert _exit_code(monkeypatch, ["clog", "release", "-P", "proj-p", "1.1.0"]) == 1
+    assert _exit_code(monkeypatch, ["clog", "release", "--confirm", "--no-push", "-P", "proj-p", "1.1.0"]) == 1
     assert "does not exist" in capsys.readouterr().err
     _assert_nothing_released(cli_engine, "proj-p", eid)
 
@@ -165,7 +165,7 @@ def test_release_with_an_unfinished_record_points_to_resume(cli_engine, tmp_path
     add_entry(cli_engine, "proj-v", "added", "a")
     release_entries(cli_engine, "proj-v", "1.1.0")
     advance_release(cli_engine, "proj-v", "1.1.0", "committed", release_commit_sha="1234567")
-    assert _exit_code(monkeypatch, ["clog", "release", "-P", "proj-v", "1.1.0"]) == 1
+    assert _exit_code(monkeypatch, ["clog", "release", "--confirm", "--no-push", "-P", "proj-v", "1.1.0"]) == 1
     err = capsys.readouterr().err
     assert "release 1.1.0 is unfinished (committed)" in err and "dct release resume" in err
 
@@ -176,7 +176,7 @@ def test_release_rerun_of_a_completed_release_is_a_noop(cli_engine, tmp_path, mo
     a = add_entry(cli_engine, "proj-v", "added", "a")["id"]
     release_entries(cli_engine, "proj-v", "1.1.0")
     advance_release(cli_engine, "proj-v", "1.1.0", "completed", release_commit_sha="1234567")
-    run_cli(monkeypatch, ["clog", "release", "-P", "proj-v", "1.1.0", "--entries", str(a)])
+    run_cli(monkeypatch, ["clog", "release", "--confirm", "--no-push", "-P", "proj-v", "1.1.0", "--entries", str(a)])
     out = capsys.readouterr().out
     assert "already released" in out and "release record 1.1.0: completed" in out
 
@@ -188,7 +188,7 @@ def test_release_rerun_with_a_different_set_exits_nonzero(cli_engine, tmp_path, 
     add_entry(cli_engine, "proj-v", "added", "b")
     release_entries(cli_engine, "proj-v", "1.1.0", entry_ids=[a])
     advance_release(cli_engine, "proj-v", "1.1.0", "completed", release_commit_sha="1234567")
-    assert _exit_code(monkeypatch, ["clog", "release", "-P", "proj-v", "1.1.0"]) == 1
+    assert _exit_code(monkeypatch, ["clog", "release", "--confirm", "--no-push", "-P", "proj-v", "1.1.0"]) == 1
     assert "different set" in capsys.readouterr().err
 
 

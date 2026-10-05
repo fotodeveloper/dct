@@ -108,6 +108,14 @@ def release_store_dir() -> Path:
     return (Path(env) if env else data_dir()) / "release-blobs"
 
 
+def release_lock_dir() -> Path:
+    """Where the release OPERATION LOCK of a project CONFIRMED outside git
+    lives (K-96 D7; a project in git locks in its git common dir instead) —
+    <data dir>/release-locks; DCT_DATA_DIR wins, as for the database."""
+    env = os.environ.get("DCT_DATA_DIR")
+    return (Path(env) if env else data_dir()) / "release-locks"
+
+
 def sqlite_url(path: PurePath | str) -> str:
     # Honor the caller's flavour instead of re-wrapping: PurePath() re-flavours
     # a PureWindowsPath to PurePosixPath on POSIX hosts, where the drive then

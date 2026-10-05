@@ -23,7 +23,8 @@ the release record itself. This skill therefore:
   commits and the tag are made by `dct release attest` / `apply` / `resume`);
 - never calls `advance_release` and never stamps through `release_changelog`
   itself — the ledger is written by the workflow;
-- never pushes, never resets, stashes or cleans the owner's work.
+- never pushes itself (the workflow pushes the release commit and the tag),
+  never resets, stashes or cleans the owner's work.
 
 Run every command in the CURRENT checkout (your shell's working directory),
 never in the MCP server's directory. Add `-P <slug>` only when the project is
@@ -228,13 +229,13 @@ project's `details.current_version` SEPARATELY (K-55 / K-31):
 ✓ proj-a released: requested 1.1.0 · record 1.1.0 · current_version 1.1.0
   5 entries stamped (#12, #13, #15, #16, #17); attested: #16, #17; left unreleased: #18
   Steps: stamp done · changelog done · version_files done · commit done · tag done · complete done
-  Tag v1.1.0: local only
+  Pushed: <details.push_target.remote> <branch> + v1.1.0
 ```
 
-Pushing is the owner's action — this skill never pushes; name the command
-for the owner (`git push origin <branch> v<V>`). When
-`.github/workflows/publish.yml` exists in the repository, say that pushing
-the tag publishes the package.
+The workflow pushes the release commit and the tag to the approved push
+target (`details.push_target`; `null` = an explicit `--no-push` release) —
+this skill never pushes itself. When `.github/workflows/publish.yml` exists
+in the repository, say that the pushed tag publishes the package.
 
 ## Resume path
 

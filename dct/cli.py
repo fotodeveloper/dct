@@ -1171,6 +1171,29 @@ def _refuse_removed_flag(args) -> None:
         sys.exit(1)
 
 
+RELEASE_PUSH_EPILOG = (
+    "Locks: the command holds the release operation lock of the repository (one at a "
+    "time, also across worktrees; another release command refuses at once). Commit: "
+    "`git commit` — the repository's hooks run; a refusing or content-changing hook stops "
+    "the release (resume after fixing). Push (after the tag): `git push --atomic` of the "
+    "release commit and the tag to the push target — default the current branch's "
+    "upstream; without one choose --push-remote [--push-branch] or --no-push. A failed "
+    "push leaves the release 'tagged'; `dct release resume` retries only the push.")
+
+
+def _add_push_flags(parser) -> None:
+    """The push target of `release apply` / `clog release` (K-97 F2)."""
+    parser.add_argument(
+        "--push-remote",
+        help="Remote to push the release commit and tag to (default: the branch's upstream)")
+    parser.add_argument(
+        "--push-branch",
+        help="Branch of that remote (default: the upstream's branch when it is on that remote)")
+    parser.add_argument(
+        "--no-push", action="store_true",
+        help="An explicit local release: commit and tag, nothing pushed")
+
+
 def _apply_from_args(args, *, strict: bool) -> None:
     """`dct release apply` and its alias `dct clog release` (strict)."""
     from dct.workflows.release.effects import apply_release
@@ -1187,9 +1210,10 @@ def _apply_from_args(args, *, strict: bool) -> None:
     out = _run_effects("apply", project_slug, as_json, lambda: apply_release(
         engine, project_slug, version=version, bump_type=None if version else args.bump,
         entry_ids=entry_ids, no_entries=args.no_entries,
-        confirm=True if strict else args.confirm, strict=strict,
+        confirm=args.confirm, strict=strict,
         plan_digest=None if strict else args.plan_digest,
-        proposal_digest=args.proposal_digest))
+        proposal_digest=args.proposal_digest, push_remote=args.push_remote,
+        push_branch=args.push_branch, no_push=args.no_push))
     if as_json:
         return
     details = out["details"]
@@ -1198,6 +1222,9 @@ def _apply_from_args(args, *, strict: bool) -> None:
     if out["outcome"] == "completed":
         print(f"✓ Released {details['released']} entries as {out['version']} "
               f"(mode: {details['mode']}) — current version: {details['current_version']}")
+        target = details.get("push_target")
+        print(f"  pushed to {target['remote']} ({target['branch']}, {target['tag']})" if target
+              else "  not pushed (no push target approved)")
     else:
         print(f"✓ {details['requested_version']} already released — nothing to do "
               f"(mode: {details['mode']}); current version: {details['current_version']}")
@@ -1208,8 +1235,10 @@ def cmd_clog_release(args):
     """`dct clog release` — an alias of `dct release apply` (K-72).
 
     Flags map 1:1 (version or --patch/--minor/--major, --entries /
-    --no-entries, --proposal-digest); running the command is the
-    confirmation. Decisions that need the owner are REFUSED instead of
+    --no-entries, --proposal-digest, --push-remote / --push-branch /
+    --no-push); --confirm is REQUIRED as for apply (K-96 D1: the alias
+    commits, tags and pushes — running it is not the confirmation).
+    Decisions that need the owner are REFUSED instead of
     guessed: unproven entries (no --entries = every unreleased entry, all
     of which must be proven), a proof range that does not start at
     v<current_version>, a version-file proposal that is not the confirmed
@@ -1272,13 +1301,20 @@ def cmd_release_prepare(args):
         for line in sync["output"].splitlines():
             print(f"    {line}")
     print(f"  proposal digest {details['proposal_sha256']}")
+    target = details.get("push_target")
+    print(f"  push target (default): {target['remote']} {target['branch']} ({target['url']}), "
+          f"tag {target['tag']}" if target else
+          "  push target: none by default — apply needs --push-remote … or --no-push")
     print(f"  next: dct release apply --version {out['version']} … --plan-digest "
           f"{details['plan_digest']} --proposal-digest {details['proposal_sha256']} --confirm")
     _print_effects(out)
 
 
 def cmd_release_resume(args):
-    """`dct release resume` — finish the unfinished release record."""
+    """`dct release resume` — finish the unfinished release record. No
+    --confirm (K-97 F4): it executes the consent stored at apply (version,
+    entries, candidate, proposal, push target) and refuses whatever lies
+    outside it."""
     from dct.workflows.release.effects import resume_release
 
     engine = _get_engine()
@@ -2689,14 +2725,19 @@ def build_parser() -> argparse.ArgumentParser:
              "refusal) — approves that version-file proposal")
     p_clog_release.add_argument(
         "--confirm-version-files", action="store_true", help=argparse.SUPPRESS)
+    p_clog_release.add_argument(
+        "--confirm", action="store_true",
+        help="Required: it stamps, writes, commits, tags and pushes (K-96 D1)")
+    _add_push_flags(p_clog_release)
     p_clog_release.add_argument("--json", action="store_true", help="Stable JSON document")
     p_clog_release.epilog = (
-        "Alias of `dct release prepare` + `dct release apply` (running it is the "
-        "confirmation): the version sync runs isolated, then stamp, changelog file, the "
-        "approved version files, release commit and tag, each verified. Refuses — instead "
-        "of guessing — when the owner must decide: entries without proof, a proof range not "
-        "starting at v<current_version>, version files that are not the confirmed contract "
-        "(a first release or a change: approve the shown proposal with --proposal-digest).")
+        "Alias of `dct release prepare` + `dct release apply` (needs --confirm like apply): "
+        "the version sync runs isolated, then stamp, changelog file, the approved version "
+        "files, release commit (through the repository's hooks) and tag, pushed to the push "
+        "target, each verified. Refuses — instead of guessing — when the owner must decide: "
+        "entries without proof, a proof range not starting at v<current_version>, version "
+        "files that are not the confirmed contract (a first release or a change: approve the "
+        "shown proposal with --proposal-digest), no upstream to push to. " + RELEASE_PUSH_EPILOG)
 
     p_clog_rstatus = p_clog_sub.add_parser(
         "release-status",
@@ -2795,7 +2836,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_rel_apply = p_release_sub.add_parser(
         "apply", help="Release: stamp, changelog file, the approved version files, commit, "
-                      "tag (verified)")
+                      "tag, push (verified)")
     p_rel_apply.add_argument("--project", "-P")
     p_rel_apply_v = p_rel_apply.add_mutually_exclusive_group()
     p_rel_apply_v.add_argument("--version", help="Target version (X.Y or X.Y.Z)")
@@ -2818,7 +2859,9 @@ def build_parser() -> argparse.ArgumentParser:
              "prepare` (same version, selection and plan digest)")
     p_rel_apply.add_argument(
         "--confirm-version-files", action="store_true", help=argparse.SUPPRESS)
+    _add_push_flags(p_rel_apply)
     p_rel_apply.add_argument("--json", action="store_true", help="Stable JSON document")
+    p_rel_apply.epilog = RELEASE_PUSH_EPILOG
 
     p_rel_prepare = p_release_sub.add_parser(
         "prepare", help="Run the version sync isolated and store the version-file proposal "
@@ -2848,7 +2891,8 @@ def build_parser() -> argparse.ArgumentParser:
         "database. Nothing is stamped, committed or tagged.")
 
     p_rel_resume = p_release_sub.add_parser(
-        "resume", help="Finish the unfinished release (verifies every effect first)")
+        "resume", help="Finish the unfinished release (verifies every effect first; executes "
+                       "the consent stored at apply — no --confirm)")
     p_rel_resume.add_argument("--project", "-P")
     p_rel_resume.add_argument(
         "--confirm-version-files", action="store_true", help=argparse.SUPPRESS)

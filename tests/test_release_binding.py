@@ -81,6 +81,7 @@ def apply(engine, repo, **kw):
     `prepare` stores for it (K-76) — None when prepare refuses (a stale
     plan: apply then refuses on the plan first)."""
     kw.setdefault("confirm", True)
+    kw.setdefault("no_push", True)  # no remote: an explicit local release (K-97 F2)
     if kw.get("plan_digest") and "proposal_digest" not in kw:
         selection = {k: kw[k] for k in ("version", "bump_type", "entry_ids", "no_entries")
                      if k in kw}
@@ -241,7 +242,7 @@ def test_cli_plan_digest_then_apply(cli_engine, repo, monkeypatch, capsys):
     plan = json.loads(capsys.readouterr().out)
     assert plan["snapshot"]["selected_ids"] == [a]
     with pytest.raises(SystemExit) as exc:
-        run_cli(monkeypatch, ["release", "apply", "-P", SLUG, "--version", "1.1.0",
+        run_cli(monkeypatch, ["release", "apply", "--no-push", "-P", SLUG, "--version", "1.1.0",
                               "--entries", str(a), "--confirm"])
     assert exc.value.code == 2  # --plan-digest is required
     capsys.readouterr()
@@ -250,7 +251,7 @@ def test_cli_plan_digest_then_apply(cli_engine, repo, monkeypatch, capsys):
                           "--json"])
     prepared = json.loads(capsys.readouterr().out)
     assert prepared["outcome"] == "prepared"
-    run_cli(monkeypatch, ["release", "apply", "-P", SLUG, "--version", "1.1.0",
+    run_cli(monkeypatch, ["release", "apply", "--no-push", "-P", SLUG, "--version", "1.1.0",
                           "--entries", str(a), "--confirm", "--plan-digest",
                           plan["snapshot_digest"], "--proposal-digest",
                           prepared["details"]["proposal_sha256"], "--json"])

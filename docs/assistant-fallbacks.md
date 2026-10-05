@@ -136,7 +136,8 @@ or the tag. A project with its OWN release tool integrates as described in
 The assistant never edits the changelog file, never runs the version sync
 itself, never commits, tags or pushes for the release and never calls
 `advance_release` —
-the workflow performs, verifies and records every effect. Run every command
+the workflow performs (the release commit through the repository's hooks,
+the tag, the push), verifies and records every effect. Run every command
 in the CURRENT checkout. Show long content as text first, then ask.
 
 1. `dct release plan --json`. A missing / older CLI (unknown subcommand or
@@ -173,13 +174,18 @@ in the CURRENT checkout. Show long content as text first, then ask.
    changes nothing in the checkout. Show `details.proposal.paths`, the
    `checks`, `details.contract` (`change: true` = a first release or a
    changed version-file contract — say so explicitly; an empty list is a
-   contract too) and the sync output; the owner approves THAT list.
+   contract too) and the sync output; the owner approves THAT list —
+   and the push target: `details.push_target` (the branch's upstream:
+   remote, URL, branch, tag `v<V>`). `null` (no upstream — see
+   `warnings`) → the owner chooses `--push-remote <remote> [--push-branch
+   <branch>]` or `--no-push` (a local release); never guess one.
    `failed` → the script failed or timed out (show `details.sync`): fix
    it, prepare again. `refused` → show the reason (e.g. the script wrote
    outside its worktree or touched the changelog), STOP.
 9. Only on the owner's yes:
    `dct release apply --version V --entries <ids> --plan-digest <snapshot_digest> --proposal-digest <proposal_sha256> --confirm --json`
-   (or `--no-entries`). A refusal "differs from the approved plan" (HEAD,
+   (or `--no-entries`; plus the owner's `--push-remote … [--push-branch …]`
+   or `--no-push` when the default target was not approved). A refusal "differs from the approved plan" (HEAD,
    entries, selection, version or proof changed) or one voiding the
    proposal (another candidate / version / plan, a changed script or
    baseline, a newer prepare) → show it, plan / prepare again, ask again —
@@ -190,16 +196,23 @@ in the CURRENT checkout. Show long content as text first, then ask.
    its baseline and the approved content — nothing was overwritten, the
    owner restores or finishes it, then resume). Report the requested
    version (`details.requested_version`), the record's `version` and
-   `details.current_version` separately. The tag is local; pushing is the
-   owner's action.
+   `details.current_version` separately, and where it was pushed
+   (`details.push_target`). A refusal naming a repository hook (`git
+   commit` refused, or a hook changed the commit — `details.commit` /
+   `head` exist) → show the hook output, the owner fixes it, then resume.
+   A failed push leaves the record `tagged` (`details.git_error`) → the
+   owner fixes the cause, then resume — it retries ONLY the push. A refusal
+   naming the operation lock (`details.lock`) → another release command
+   holds the repository's lock: wait for it, never loop.
 
 **Resume path** — show the RECORDED release (`resume`: candidate, entry
 set, proof, effect state) and, separately, today's HEAD
 (`resume.head`, `checkout.matches_record`) and the entries added since
 (`resume.new_unreleased` — not part of this release), then the owner
-chooses: finish → `dct release resume --json` (another checkout or
-HEAD is refused — run it in the record's `checkout_root`; the record is never
-re-pinned); abandon → the owner's reason and explicit confirmation (the
+chooses: finish → `dct release resume --json` (no new approval: it
+executes the consent stored at apply, push target included, and refuses
+what lies outside it; another checkout or HEAD is refused — run it in the
+record's `checkout_root`; the record is never re-pinned); abandon → the owner's reason and explicit confirmation (the
 record, stamps, `current_version` and effects stay, V stays taken) →
 `dct release abandon --version V --reason "<reason>" --confirm --json`; or
 stop.

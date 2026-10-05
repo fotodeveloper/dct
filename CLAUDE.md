@@ -106,8 +106,10 @@ dct/workflows/release/   — Release workflow (K-72): proof layer, read-only —
                            effects layer — effects.py (`dct release attest /
                            prepare / apply / resume / abandon / reconstruct`,
                            alias `clog release`: the version sync runs once,
-                           isolated, in prepare; every effect verified before
-                           the ledger records it; schema: docs/release-workflow.md)
+                           isolated, in prepare; commits through the repo's
+                           hooks, tag, push; every effect verified before
+                           the ledger records it; schema: docs/release-workflow.md);
+                           oplock.py (the per-repository operation lock, K-96 D7)
 dct/integrations/base.py — Shared contract and conservative file ownership
 dct/integrations/doctor.py — Read-only per-runtime dependency diagnostics
 dct/assets/              — Indirection for packaged asset dirs (physical

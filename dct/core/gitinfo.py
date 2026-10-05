@@ -21,9 +21,10 @@ STRICT (raises instead of guessing — the mutating release path only, K-52):
     bounded timeout); any failure raises GitReadError, never a partial
     answer.
 WRITER (the release effects layer only, dct.workflows.release.effects):
-  - git_write(cwd, *args, index_file=None) — keeps the caller's identity /
-    config-location variables (WRITE_ENV_PASSTHROUGH), may target a
-    temporary index; any failure raises GitWriteError.
+  - git_write(cwd, *args, index_file=None, network=False) — keeps the
+    caller's identity / config-location variables (WRITE_ENV_PASSTHROUGH;
+    with `network` also the transport ones), may target a temporary index;
+    any failure raises GitWriteError.
 
 The Codex hook bridge (autoscan ownership bound to the current worktree) uses
 git_toplevel alone — exactly one git process, no branch read.
@@ -274,7 +275,10 @@ def _strict_git(
     try:
         return subprocess.run(
             [git, *global_args, "-C", cwd, *args],
-            env=env, capture_output=True, timeout=timeout, check=False, **text,
+            env=env, capture_output=True, timeout=timeout, check=False,
+            # Never interactive: no git command dct runs reads stdin, and a
+            # hook / credential helper must not wait on the caller's terminal.
+            stdin=subprocess.DEVNULL, **text,
         )
     except subprocess.TimeoutExpired as exc:
         raise error(f"git timed out after {timeout}s in {cwd}") from exc
@@ -466,6 +470,16 @@ WRITE_ENV_PASSTHROUGH = frozenset({
 })
 
 
+# A git command that talks to a REMOTE (the release push and its
+# `ls-remote` verification, K-97 F2) additionally keeps the caller's
+# transport configuration; GIT_TERMINAL_PROMPT=0 makes a missing credential
+# a failure instead of a prompt nobody answers.
+NETWORK_ENV_PASSTHROUGH = frozenset({
+    "GIT_SSH", "GIT_SSH_COMMAND", "GIT_SSH_VARIANT", "GIT_ASKPASS", "GIT_PROXY_COMMAND",
+    "GIT_SSL_CAINFO", "GIT_SSL_NO_VERIFY", "GIT_HTTP_PROXY_AUTHMETHOD",
+})
+
+
 class GitWriteError(CheckoutVerificationError):
     """A git command of the release effects layer failed or timed out."""
 
@@ -473,19 +487,25 @@ class GitWriteError(CheckoutVerificationError):
 def git_write(
     cwd: str | os.PathLike[str], *args: str,
     ok_codes: tuple[int, ...] = (0,), timeout: float = GIT_READ_TIMEOUT_SECONDS,
-    index_file: str | None = None,
+    index_file: str | None = None, network: bool = False,
 ) -> tuple[int, str]:
     """(exit code, stdout) of a git command that MAY write (`git -C <cwd>
-    <args>`, no shell, C locale) — the release effects layer only
-    (dct.workflows.release.effects). GIT_* variables are dropped except
-    WRITE_ENV_PASSTHROUGH; `index_file` sets GIT_INDEX_FILE (a TEMPORARY
-    index — the user's index is never touched through it). An exit code
-    outside `ok_codes`, git missing, or a timeout raises GitWriteError with
-    git's stderr."""
-    extra = {"GIT_INDEX_FILE": index_file} if index_file else None
+    <args>`, no shell, C locale, stdin closed) — the release effects layer
+    only (dct.workflows.release.effects). GIT_* variables are dropped except
+    WRITE_ENV_PASSTHROUGH (+ NETWORK_ENV_PASSTHROUGH and
+    GIT_TERMINAL_PROMPT=0 with `network`); `index_file` sets GIT_INDEX_FILE
+    (a TEMPORARY index — the user's index is never touched through it; a
+    `git commit` exports it to the repository's hooks). An exit code outside
+    `ok_codes`, git missing, or a timeout raises GitWriteError with git's
+    stderr."""
+    extra = {"GIT_INDEX_FILE": index_file} if index_file else {}
+    keep = WRITE_ENV_PASSTHROUGH
+    if network:
+        keep = keep | NETWORK_ENV_PASSTHROUGH
+        extra["GIT_TERMINAL_PROMPT"] = "0"
     result = _strict_git(
         os.fspath(cwd), *args, timeout=timeout, error=GitWriteError,
-        decode_errors="replace", keep_env=WRITE_ENV_PASSTHROUGH, extra_env=extra,
+        decode_errors="replace", keep_env=keep, extra_env=extra or None,
     )
     if result.returncode not in ok_codes:
         detail = (result.stderr or "").strip() or f"exit code {result.returncode}"

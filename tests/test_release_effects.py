@@ -74,9 +74,15 @@ def write_sync_script(root: Path, log: Path) -> None:
 
 @pytest.fixture
 def proj(engine, tmp_path):
+    return make_release_repo(engine, tmp_path)
+
+
+def make_release_repo(engine, tmp_path):
     """proj-r: a repo with changelog.md history, pyproject.toml 1.0.0, a sync
     script logging every run to sync.log (outside the repo), tagged v1.0.0;
-    the version-file contract is already ["pyproject.toml"]."""
+    the version-file contract is already ["pyproject.toml"]. Its branch
+    `main` tracks `origin/main` of a BARE remote (remote.git under tmp_path)
+    holding main and v1.0.0 — the default push target (K-97 F2)."""
     repo = Path(make_git_repo(tmp_path / "proj-r"))
     log = tmp_path / "sync.log"
     (repo / "changelog.md").write_text(HISTORY)
@@ -85,6 +91,10 @@ def proj(engine, tmp_path):
     git(repo, "add", ".")
     git(repo, "commit", "-q", "-m", "chore: setup")
     git(repo, "tag", "v1.0.0")
+    remote = tmp_path / "remote.git"
+    git(tmp_path, "init", "-q", "--bare", "-b", "main", str(remote))
+    git(repo, "remote", "add", "origin", str(remote))
+    git(repo, "push", "-q", "-u", "origin", "main", "v1.0.0")
     create_project(engine, slug=SLUG, name="R", path=str(repo), current_version="1.0.0")
     set_version_files(engine, SLUG, ["pyproject.toml"], confirm=True)
     return repo, log
@@ -116,6 +126,12 @@ def snapshot(repo: Path) -> dict:
         "changelog": (repo / "changelog.md").read_bytes(),
         "pyproject": (repo / "pyproject.toml").read_bytes(),
     }
+
+
+def remote_refs(repo) -> dict[str, str]:
+    """{ref: object} of the push remote `origin` (git ls-remote)."""
+    out = git(repo, "ls-remote", "origin")
+    return {ref: sha for sha, ref in (line.split("\t") for line in out.splitlines())}
 
 
 def sync_runs(log: Path) -> list[str]:
@@ -186,6 +202,13 @@ def assert_released(engine, repo, candidate: str, ids: list[int], version="1.1.0
     assert git(repo, "cat-file", "-t", f"v{version}") == "commit"
     assert git(repo, "rev-parse", f"v{version}") == head
     assert git(repo, "tag", "--list").split() == sorted(["v1.0.0", f"v{version}"])
+    # K-97 F2: the release commit and its tag are on the push target (the
+    # branch's upstream), verified — and recorded as the consent's target
+    remote = remote_refs(repo)
+    assert remote["refs/heads/main"] == head and remote[f"refs/tags/v{version}"] == head
+    assert record["consent"]["push_target"] == {
+        "remote": "origin", "url": git(repo, "remote", "get-url", "--push", "origin"),
+        "branch": "main", "tag": f"v{version}"}
     # files and index consistent with HEAD
     assert git(repo, "status", "--porcelain", "--untracked-files=all") == ""
     text = (repo / "changelog.md").read_text()
@@ -214,7 +237,7 @@ def test_apply_performs_and_verifies_every_effect(engine, proj):
     out = apply(engine, repo, version="1.1.0", entry_ids=[a])
     assert out["outcome"] == "completed" and tuple(out) == RESULT_KEYS
     assert [s["step"] for s in out["steps"]] == ["stamp", "changelog", "version_files", "commit",
-                                                  "tag", "complete"]
+                                                  "index", "tag", "push", "complete"]
     record = assert_released(engine, repo, candidate, [a])
     assert record["proof"] == {str(a): {"commits": [candidate], "merge_commit": None,
                                         "pr": None, "source": None, "ambiguous": False,
@@ -551,11 +574,13 @@ def test_foreign_staged_path_at_resume_is_refused(engine, proj):
     assert git(repo, "rev-parse", "HEAD") == candidate
 
 
-def test_interrupted_staging_resumes(engine, proj):
+def test_interrupted_before_the_commit_resumes_with_the_index_untouched(engine, proj):
+    """K-79: the release commit is built from a TEMPORARY index — the real
+    index is never staged before the commit (no `git add` on it)."""
     repo, _ = proj
-    a, candidate = _interrupted(engine, repo, "after_stage")
-    assert git(repo, "diff", "--cached", "--name-only").split() == ["changelog.md",
-                                                                     "pyproject.toml"]
+    a, candidate = _interrupted(engine, repo, "before_commit")
+    assert git(repo, "diff", "--cached", "--name-only") == ""
+    assert git(repo, "rev-parse", "HEAD") == candidate
     resume(engine, repo)
     assert_released(engine, repo, candidate, [a])
 
@@ -730,6 +755,11 @@ def test_release_of_a_project_without_git(engine, tmp_path):
 
 @pytest.fixture
 def cli_proj(proj, engine, monkeypatch):
+    return use_cli(proj, engine, monkeypatch)
+
+
+def use_cli(proj, engine, monkeypatch):
+    """Point the CLI at the test engine and the project's checkout."""
     from dct import cli
 
     monkeypatch.setattr(cli, "_get_engine", lambda: engine)
@@ -771,7 +801,7 @@ def test_cli_clog_release_alias_refuses_unproven_entries(engine, cli_proj, monke
     repo, _ = cli_proj
     proven(engine, repo, "feature a")
     b = add_entry(engine, SLUG, "added", "no proof")["id"]
-    assert _exit(monkeypatch, ["clog", "release", "-P", SLUG, "1.1.0"]) == 1
+    assert _exit(monkeypatch, ["clog", "release", "--confirm", "-P", SLUG, "1.1.0"]) == 1
     assert f"#{b} (no_trailer)" in capsys.readouterr().err
     assert get_release(engine, SLUG, "1.1.0") is None
 
@@ -780,7 +810,7 @@ def test_cli_clog_release_alias_releases_every_proven_entry(engine, cli_proj, mo
     repo, _ = cli_proj
     a = proven(engine, repo, "feature a")
     candidate = git(repo, "rev-parse", "HEAD")
-    run_cli(monkeypatch, ["clog", "release", "-P", SLUG, "--minor"])
+    run_cli(monkeypatch, ["clog", "release", "--confirm", "-P", SLUG, "--minor"])
     assert "Released 1 entries as 1.1.0" in capsys.readouterr().out
     assert_released(engine, repo, candidate, [a])
 

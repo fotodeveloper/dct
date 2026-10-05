@@ -141,6 +141,7 @@ def prepare(engine, repo, **kw):
 
 def apply(engine, repo, proposal: str | None, **kw):
     kw.setdefault("confirm", True)
+    kw.setdefault("no_push", True)  # no remote: an explicit local release (K-97 F2)
     kw.setdefault("plan_digest", approved_plan_digest(engine, SLUG, repo, **kw))
     return apply_release(engine, SLUG, cwd=str(repo), proposal_digest=proposal, **kw)
 
@@ -569,13 +570,13 @@ def test_cli_prepare_then_apply(engine, proj, monkeypatch, capsys):
     assert doc["outcome"] == "prepared" and doc["details"]["proposal"]["paths"] == [
         "pyproject.toml"]
     with pytest.raises(SystemExit) as exc:
-        run_cli(monkeypatch, ["release", "apply", "-P", SLUG, "--version", "1.1.0",
+        run_cli(monkeypatch, ["release", "apply", "--no-push", "-P", SLUG, "--version", "1.1.0",
                               "--entries", str(a), "--confirm", "--plan-digest", digest,
                               "--confirm-version-files"])
     assert exc.value.code == 1
     assert "dct release prepare" in capsys.readouterr().err
     nothing_stamped(engine, a)
-    run_cli(monkeypatch, ["release", "apply", "-P", SLUG, "--version", "1.1.0",
+    run_cli(monkeypatch, ["release", "apply", "--no-push", "-P", SLUG, "--version", "1.1.0",
                           "--entries", str(a), "--confirm", "--plan-digest", digest,
                           "--proposal-digest", doc["details"]["proposal_sha256"], "--json"])
     assert json.loads(capsys.readouterr().out)["outcome"] == "completed"
@@ -593,16 +594,16 @@ def test_cli_alias_first_release_needs_the_approved_proposal(engine, proj, monke
     monkeypatch.chdir(repo)
     a = proven(engine, repo, "feature a")
     with pytest.raises(SystemExit) as exc:
-        run_cli(monkeypatch, ["clog", "release", "-P", SLUG, "1.1.0", "--json"])
+        run_cli(monkeypatch, ["clog", "release", "--confirm", "--no-push", "-P", SLUG, "1.1.0", "--json"])
     assert exc.value.code == 1
     doc = json.loads(capsys.readouterr().out)
     assert doc["details"]["proposal"]["paths"] == ["pyproject.toml"]
     nothing_stamped(engine, a)
-    run_cli(monkeypatch, ["clog", "release", "-P", SLUG, "1.1.0", "--proposal-digest",
+    run_cli(monkeypatch, ["clog", "release", "--confirm", "--no-push", "-P", SLUG, "1.1.0", "--proposal-digest",
                           doc["details"]["proposal_sha256"]])
     assert get_release(engine, SLUG, "1.1.0")["status"] == "completed"
     b = proven(engine, repo, "feature b")
-    run_cli(monkeypatch, ["clog", "release", "-P", SLUG, "1.2.0"])  # contract unchanged
+    run_cli(monkeypatch, ["clog", "release", "--confirm", "--no-push", "-P", SLUG, "1.2.0"])  # contract unchanged
     assert get_release(engine, SLUG, "1.2.0")["entry_ids"] == [b]
 
 
