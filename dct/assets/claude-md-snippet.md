@@ -56,8 +56,10 @@ Rules of thumb:
 
 Every new item gets a `short_title` label: a 2-4 word English noun phrase
 naming what it is about (≤ 50 chars, no item number, no project name — e.g.
-"Windows hook paths"). The `create_item` ack echoes it; if it does not, the
-MCP server is outdated — restart it.
+"Windows hook paths"). The `create_item` ack echoes the stored `short_title`
+(null when none); a missing key means an outdated MCP server contract — report
+it and restart the server, but never retry the create (the item exists). On
+`update_item` the label is optional: omit it to keep the stored one.
 
 **MCP tools** — 59 total; most important:
 - `pickup_work`, `handoff_work`, `get_context_snapshot` — composed session-edge ops; prefer them over chaining the granular tools below
@@ -89,14 +91,19 @@ Sketch the work breakdown BEFORE starting code.
 
 **Committing** — "commit" / "save this" / "commit this"
 → `/commit` (parallel pre-flight probe, per-branch changelog guard, HEREDOC message with `(vX.Y.Z)`).
-The message ends with a `Changelog: <id>, <id>` trailer (ids ascending, before
-`Co-Authored-By:`) naming the unreleased entries of the CURRENT branch whose
-text matches the staged diff — `/release` stamps only entries proven that way.
-`/clog` records `branch` / `worktree` from the agent's own working directory.
+Order: stage the chosen paths first (a deliberate partial staging stays as it
+is), THEN pick the trailer from the complete `git diff --cached`, THEN
+`git commit` without another `git add`; any later index change means picking
+again. The message ends with a `Changelog: <id>, <id>` trailer (ids ascending,
+before `Co-Authored-By:`) naming the unreleased entries of the CURRENT branch
+whose text matches the staged diff — `/release` stamps only entries proven
+that way. `/clog` records `branch` / `worktree` from the agent's own working
+directory; an entry with `branch_source='server'` is unconfirmed until
+`update_changelog` sets the real branch/worktree.
 If pre-commit hook rejects: fix underlying issue, re-stage, **NEW commit** (never `--amend`, never `--no-verify`).
 
 **Releasing** — "release" / "bump version" / "ship it"
-→ `/release` (capability probe → proof by `Changelog:` trailers in range, attest/correct/withdraw/leave the rest → stamp the exact `entry_ids` at an explicit version → append-only export → commit `release: vX.Y.Z` + tag).
+→ `/release` (capability probe → `get_release` first: an unfinished release is RESUMED, verified effect by effect → WIP commit → proof by `Changelog:` trailers in range, attest/correct/withdraw/leave the rest → stamp the exact `entry_ids` at an explicit version with the pinned candidate → append-only changelog section → version-sync → commit `release: vX.Y.Z` → tag, each step recorded with `advance_release`).
 
 **Session end** — "handoff" / "end session" / "wrap up" / "next session"
 → `/handoff` (flag sprint items, optionally write handoff prompt).
@@ -119,7 +126,9 @@ complete_checkpoint(7)
 
 **Write ops return a minimal ack**, not the full record — the created/updated `id`
 plus a few post-state scalars (e.g. `create_item` → `{id, project, item_type,
-priority, status, title}`; checkpoint ops → `{id, item_id, status, progress}`).
+priority, status, title, short_title}`; checkpoint ops → `{id, item_id, status,
+progress}`; `add_changelog` → `{id, project, category, component, branch,
+branch_source}` + `warning` when the server detected the branch).
 **Remember the `id`** for follow-up calls. Need full context? Fetch it deliberately:
 `get_item(id)` (fields, notes, checkpoints, progress) or `get_handoff(id)`
 (untruncated prompt + context_summary) — both return a full semantic dict.

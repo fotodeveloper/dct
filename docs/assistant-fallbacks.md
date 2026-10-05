@@ -95,9 +95,27 @@ no `Changelog:` trailer.
    that keep the original commit messages inside the body; quoted or bulleted
    prose (`> Changelog: 12`, `- Changelog: 12`) never counts.
 
-A squash configured as "PR title and description" drops the commit bodies —
-the trailers are lost, and those entries need an attestation commit (below).
-An entry whose trailer lies below the previous tag is "without proof in range".
+**Squash merges lose trailers.** A squash configured as "PR title and
+description" drops the commit bodies, and a LOCAL `git merge --squash` indents
+every original message by four spaces in the squash commit's body — neither
+read above sees an indented `    Changelog: 12`. Those entries end up WITHOUT
+proof: they need an explicit attestation (below), never an automatic
+assignment from the squashed history.
+
+**Detached HEAD.** `git branch --show-current` prints nothing: there is no
+branch to filter on, and an empty `branch` filter means "every entry of every
+branch". Never fall into that unfiltered list by accident — narrow the
+candidates by `worktree=<toplevel>` instead, select nothing automatically, and
+ask the owner which entries (if any) the commit carries.
+
+**Server-detected entries are unconfirmed.** A row with
+`branch_source='server'` names the MCP server's own checkout (the session
+start directory), not where the agent worked. It is never attached as found:
+confirm or correct it first with `update_changelog(entry_id, branch=<current>,
+worktree=<toplevel>)` against the actual checkout (both fields — that makes it
+`branch_source='client'`). The commit hook's count is only a gate (are there
+entries at all?), never proof that an entry belongs to the commit — the
+trailer set is always chosen from the final staged diff.
 
 **Attestation commit (created only by `/release`).** The only way to add proof
 after the fact: once the owner confirms the entries' changes are in the
@@ -115,63 +133,186 @@ MSG
 
 ## `/release` fallback
 
+A release is a sequence of effects — DB stamp → changelog file + version
+files → release commit → tag — and the server keeps a durable **release
+record** of it (`get_release` / `advance_release`): the version `V`, the
+exact `entry_ids` (also `[]`), the pinned `candidate_sha`, the
+`checkout_root`, the creation date and a forward-only status
+`stamped → files_written → committed → tagged → completed`. Every step below
+that finishes an effect advances the record; an interrupted release is
+RESUMED from it, never restarted with a new bump.
+
+**Project root and changelog file (shared by both paths).** `checkout` =
+`git rev-parse --show-toplevel` of the CURRENT checkout. `root` = the project
+root in THIS checkout = `checkout` + the project's `path` relative to the
+toplevel of the checkout that holds `path` (`git -C <path> rev-parse
+--show-toplevel`; equal to `checkout` for a single-project repo, a
+subdirectory of it for a monorepo project). Before using it confirm that
+`git -C <checkout> rev-parse --git-common-dir` and `git -C <path> rev-parse
+--git-common-dir` resolve to the same directory — otherwise this is not a
+checkout of the project's repository: STOP. The changelog file is
+`F = {root}/{changelog_path}` (`changelog_path` from `list_projects`, default
+`changelog.md`) and the version-sync script is
+`{root}/scripts/dct-version-sync.sh`, run with `root` as its working
+directory. (`dct project changelog-path <slug>` resolves against the
+registered path — the main checkout — so it is NOT the destination when the
+release runs in a linked worktree.)
+
+**Changelog-file contract (bootstrap, existing file, resume).** After the
+file step the section `## [V]` appears in `F` EXACTLY once, every earlier
+section is byte-for-byte unchanged, and a resumed release keeps the date of
+the original release (the record's `created_at` date; an exported section
+already carries the stamp date). The section is
+`export_changelog(project, version=V)`, or — for a version-only release,
+where that export is `""` — `## [V] - <date>` followed by the line
+`- Version-only release — no changelog entries.`:
+- `F` missing (bootstrap): write `export_changelog(project,
+  include_unreleased=false)`; the full export omits version-only releases, so
+  when `V` is version-only insert its section below the `# Changelog` header
+  (as the top section). A bootstrap may recreate many sections at once —
+  check only that `## [V]` occurs exactly once.
+- `F` exists: count the lines starting with `## [` (`N`). If a line starting
+  with `## [V]` is already there, do not write (resume: verify it instead).
+  Otherwise PREPEND the section directly below the `# Changelog` header —
+  NEVER regenerate the file (a full-DB export drops pre-adoption history) —
+  and re-count: exactly `N + 1`, else restore `F` and STOP.
+- `## [V]` more than once, or a status at/after `files_written` with the
+  section missing → a contradiction: STOP.
+
+**Normal path:**
+
 1. **Capability probe.** Load the schemas (`list_projects`,
    `count_unreleased_changelog`, `list_changelog`, `release_changelog`,
-   `export_changelog`, `update_changelog`, `delete_changelog`). The loaded
-   `release_changelog` schema MUST list `entry_ids`; otherwise STOP: "The dct
-   MCP server is older than this skill — restart it (or upgrade dct) before
-   releasing." (an old server silently ignores unknown arguments and would
-   stamp every entry).
-2. Detect current project: match CWD against `mcp__dct__list_projects()` results, take longest path prefix.
-3. **Unsafe git state stops the flow:** a merge / rebase / cherry-pick in
+   `get_release`, `advance_release`, `export_changelog`, `update_changelog`,
+   `delete_changelog`). The loaded `release_changelog` schema MUST list
+   `entry_ids`, `candidate_sha` and `checkout_root`, and `get_release` /
+   `advance_release` MUST exist; otherwise STOP: "The dct MCP server is older
+   than this skill — restart it (or upgrade dct) before releasing." (an old
+   server silently ignores unknown arguments and would stamp every entry).
+2. Detect current project: match CWD against `mcp__dct__list_projects()` results, take longest path prefix; resolve `checkout`, `root` and `F` as above.
+3. **Unfinished release first — BEFORE any WIP commit and BEFORE any bump.**
+   `get_release(project)` (no version = the latest record that is not
+   `completed`). A record → follow the **resume path** below instead of this
+   one. No record → the **legacy check**: with `CUR` = `current_version` set,
+   if the tag `v$CUR` is missing or `F` exists without a `## [CUR]` line, the
+   state is ambiguous (a release from before records existed, or one that
+   never happened). Do NOT guess: reconstruct what is known (entries carrying
+   `CUR` in `list_changelog(project, unreleased_only=false)`, a commit with
+   subject `release: v$CUR`, the tag, the section) and ask the owner how to
+   proceed — finish the missing effects by hand (each one confirmed), treat
+   it as complete, or stop. There is no tool that creates a record for an
+   old release.
+4. **Unsafe git state stops the flow:** a merge / rebase / cherry-pick in
    progress — resolve each marker with `git rev-parse --git-path MERGE_HEAD`
    / `rebase-merge` / `rebase-apply` / `CHERRY_PICK_HEAD` (worktree-safe) and
    test whether the path exists. A dirty tree is NOT a stop: commit the WIP
-   first as its own commit(s), each following the `/commit` trailer rule.
-4. Pin the candidate `SHA=$(git rev-parse HEAD)`, compute `R`, read the proof
+   first as its own commit(s), each following the `/commit` order — stage the
+   chosen paths (keep deliberate partial staging), THEN select the trailer
+   against the complete `git diff --cached`, THEN `git commit` without
+   another `git add`.
+5. Pin the candidate `SHA=$(git rev-parse HEAD)`, compute `R`, read the proof
    (rules above), and split `list_changelog(project, unreleased_only=true)`
    into entries **with proof in range** and **without proof**.
-5. For EACH entry without proof (entries with a null branch included) the
+6. For EACH entry without proof (entries with a null branch included) the
    owner chooses: (i) **attest** — confirm the change is in the candidate,
    then create the attestation commit; (ii) **correct** it
    (`update_changelog`); (iii) **withdraw** it (`delete_changelog`); (iv)
    **leave it unreleased**. There is no "include without proof" option.
-6. After every commit the flow itself creates (WIP, attestation): re-pin `SHA`
+7. After every commit the flow itself creates (WIP, attestation): re-pin `SHA`
    and re-scan `R`.
-7. Ask via AskUserQuestion: `patch` | `minor` | `major` | explicit version.
+8. Ask via AskUserQuestion: `patch` | `minor` | `major` | explicit version.
    Compute `V` ONCE from that choice; every retry reuses the same `V`.
-8. Confirm the proven set. When it is empty, ask explicitly whether to release
-   the version only (no entries).
-9. `mcp__dct__release_changelog(project, version=V, entry_ids=[<proven ids>])`
-   (`entry_ids=[]` for a version-only release) — always an EXPLICIT version,
-   never `bump_type`; repeating the same call is a no-op. Check that the
-   answer's `mode`, `entry_ids` and `released` (plus `already_released` on a
-   retry) match the selection; STOP on mismatch.
-10. Render ONLY the just-released version's section: `mcp__dct__export_changelog(project, version=V)` (headerless, single-version). If it returns an `{"error": ...}` dict, STOP (the DB was already stamped in step 9 — fix the export and re-run step 10, or revert the stamp). `""` is expected only for a version-only release: the section is then `## [V] - YYYY-MM-DD` followed by the line `- Version-only release — no changelog entries.` (note: `since=last_release` does not move, and a full export omits V).
-11. **Append-only:** resolve the project's changelog file `F = {root}/{changelog_path}`, where `root` = the CURRENT checkout's toplevel (`git rev-parse --show-toplevel`) when it lies inside `project.path`, else `project.path` (`changelog_path` comes from the step 2 `list_projects` result, default `changelog.md`; authoritative cross-check `dct project changelog-path <slug>` prints the resolved path). PREPEND that section to `F`, directly below the `# Changelog` header (above the previous top version) — NEVER overwrite/regenerate the whole file (a full-DB export drops pre-adoption history). Bootstrap exception: if `F` does not exist yet, write the full `export_changelog(project, include_unreleased=false)`. Mandatory safety check: re-read `F` and confirm the count of lines starting with `## [` (anchored to line start) rose by exactly 1 — one section added, zero lost — before committing.
-12. If `{root}/scripts/dct-version-sync.sh` exists, run it with the new version. This bumps `pyproject.toml`/`Cargo.toml`/`package.json`/`tauri.conf.json`/etc. per the project-specific template. dct itself bumps `pyproject.toml` + `dct/__init__.py` fallback `__version__`.
-13. Stage the changelog file `F` + any files modified by the sync script; commit with literal message `release: vX.Y.Z` — no scope, no description, no suffix, no `Changelog:` trailer.
-14. **Tag** the release: `git tag vX.Y.Z` on HEAD. The hook's release bypass already let the commit through; the tag is the canonical marker for git describe / GitHub / PyPI.
-15. Tell the user the tag is **local only** — pushing to remote is a separate step they must confirm (`git push origin vX.Y.Z` or `git push --tags`).
+9. Confirm the proven set. When it is empty, ask explicitly whether to release
+   the version only (no entries) — a version-only release needs that explicit
+   consent; zero unreleased entries never block it.
+10. `mcp__dct__release_changelog(project, version=V, entry_ids=[<proven ids>], candidate_sha=SHA, checkout_root=checkout)`
+    — ALWAYS an explicit `version` (never `bump_type`) and ALWAYS an explicit
+    `entry_ids` list (`[]` for a version-only release; an omitted `entry_ids`
+    stamps every unreleased entry). Check the answer: `mode`, `entry_ids` and
+    `released` (plus `already_released`) match the selection, `release` is a
+    record with exactly those `entry_ids`, and `current_version` equals `V`.
+    Report the requested `V` and the returned `current_version` separately.
+    `current_version` ≠ `V` (a historical re-run) → STOP: never run
+    version-sync or create a tag for it. `release` null (a legacy no-op) →
+    STOP and treat it as the legacy check in step 3. STOP on any mismatch or
+    `{"error": ...}`.
+11. Changelog file: write the section per the contract above (`""` from the
+    single-version export is expected only for a version-only release; an
+    `{"error": ...}` → STOP — the DB is stamped, fix the export and resume).
+12. If `{root}/scripts/dct-version-sync.sh` exists, run
+    `bash scripts/dct-version-sync.sh V` with `root` as the working directory.
+    A non-zero exit STOPS the release (resume after fixing the script). This
+    bumps `pyproject.toml`/`Cargo.toml`/`package.json`/`tauri.conf.json`/etc.
+    per the project-specific template. Then
+    `advance_release(V, "files_written", project)`.
+13. Stage the changelog file `F` + any files modified by the sync script (explicit paths); commit with literal message `release: vX.Y.Z` — no scope, no description, no suffix, no `Changelog:` trailer. Then
+    `advance_release(V, "committed", project, candidate_sha=$(git rev-parse HEAD))`
+    — the record now pins the release commit.
+14. **Tag** the release commit: `git tag vX.Y.Z`; then
+    `advance_release(V, "tagged", project)`. A tag `vX.Y.Z` that already
+    points elsewhere is a contradiction: STOP and report — move a tag only on
+    the owner's explicit instruction.
+15. Tell the user the tag is **local only** — pushing to remote is a separate
+    step they must confirm (`git push origin vX.Y.Z`). Finish with
+    `advance_release(V, "completed", project)`.
+
+**Resume path** (a record from `get_release`, status not `completed`): show
+the record (`version`, `status`, `entry_ids`, `candidate_sha`,
+`checkout_root`, `created_at`) and get the owner's consent to finish it.
+Then verify each effect against reality, in order, SKIP an effect that
+exists and matches, perform a missing one, STOP on any contradiction, and
+advance the record after each verified or finished effect:
+1. Checkout: `checkout` must equal the record's `checkout_root` (when set),
+   and `current_version` must equal the record's `version` — a release older
+   than the current version is never resumed here (no version-sync, no tag
+   for a historical version): STOP and report both versions.
+2. DB stamp: the live entries carrying `V` (`list_changelog(project,
+   unreleased_only=false)`) are EXACTLY the record's `entry_ids` (none for a
+   version-only release). Nothing to re-stamp: the stamp and the record are
+   written together.
+3. Files (status `stamped`): HEAD must still be the record's `candidate_sha`
+   (later commits → STOP); write or verify the changelog section per the
+   contract (date preserved), run the version-sync script as in step 12
+   (a failure stops), then `advance_release(V, "files_written", project)`.
+   Status already `files_written` or later: the section must be present
+   exactly once (else STOP).
+4. Release commit (status below `committed`): HEAD = `candidate_sha` → make
+   the release commit as in step 13; HEAD already a commit with subject
+   exactly `release: vV` whose parent is `candidate_sha` → it exists, skip;
+   anything else → STOP. Then
+   `advance_release(V, "committed", project, candidate_sha=<release commit SHA>)`.
+   Status `committed` or later: the record's `candidate_sha` must be a commit
+   with subject `release: vV` that is HEAD or an ancestor of HEAD (else STOP).
+5. Tag: missing → `git tag vV <release commit>`; present and pointing at the
+   release commit → skip; pointing elsewhere → STOP. Then
+   `advance_release(V, "tagged", project)`.
+6. Step 15 (push question), then `advance_release(V, "completed", project)`.
+   A resume may finish these steps even though `released` would now be 0 —
+   nothing is re-stamped, only the missing effects are completed.
 
 ## `/commit` fallback
 
+The order is fixed: **stage → select → commit**. The `Changelog:` trailer
+attests what the commit CONTAINS, so it is chosen only after the index holds
+exactly what will be committed, and nothing is staged after the choice.
+
 1. Pre-flight: run in parallel — `git status`, `git diff --cached --stat`, `git diff --stat`, `git log --oneline -5`, `git branch --show-current`, `git rev-parse --show-toplevel`.
 2. Detect project via CWD.
-3. `mcp__dct__count_unreleased_changelog(project, branch=<current>, include_unbranched=true)` (detached HEAD → project-wide count, no `branch`) — if 0 and non-exempt files staged, prompt user to run `/clog` or add entry inline via `mcp__dct__add_changelog`. Exempt paths decide only whether an entry is REQUIRED; attaching an existing matching entry is always allowed.
-4. **Trailer selection.** Candidates = `mcp__dct__list_changelog(project, unreleased_only=true, branch=<current>)` rows whose `worktree` equals the current toplevel or is null, minus the ids already proven in `R` (target `SHA` = `HEAD`; rules above). Against the FINAL staged diff (`git diff --cached`), keep the candidates whose entry text / `source_file` describe what is being committed; ask when unsure. Never attach an entry with a null `branch` automatically. No candidates, but unreleased entries of THIS worktree carry another branch → offer `update_changelog(entry_id, branch=<current>)`.
-5. Determine commit type + scope + description. Read `current_version` from project.
-6. Stage files explicitly (path by path). Never `git add -A`. Never stage `.env`, credentials, binaries.
-7. HEREDOC commit: `<type>(<scope>): <description> (v<version>)`; the final trailer block is `Changelog: <ids>` (when any were selected) followed by `Co-Authored-By:`.
+3. `mcp__dct__count_unreleased_changelog(project, branch=<current>, include_unbranched=true)` (detached HEAD → project-wide count, no `branch` — a gate only, never a candidate list) — if 0 and non-exempt files staged, prompt user to run `/clog` or add entry inline via `mcp__dct__add_changelog`. Exempt paths decide only whether an entry is REQUIRED; attaching an existing matching entry is always allowed. The count is only this gate — never proof that an entry belongs to the commit.
+4. Determine commit type + scope + description. Read `current_version` from project.
+5. **Stage first.** Stage the chosen files explicitly, path by path:
+   `git add -- <path> <path>`. Never `git add -A` / `git add .`. Never stage `.env`, credentials, binaries. A path that is ALREADY partially staged (it shows in both `git diff --cached` and `git diff`) is a deliberate choice — leave it as it is; never re-add the whole file unless the owner asks for its unstaged hunks too.
+6. **Then select the trailer** against the complete staged diff (`git diff --cached`) — the index is now final. Candidates = `mcp__dct__list_changelog(project, unreleased_only=true, branch=<current>, include_unbranched=true)` rows whose `worktree` equals the current toplevel or is null, minus the ids already proven in `R` (target `SHA` = `HEAD`; rules above). Keep the candidates whose entry text / `source_file` describe what is staged; ask when unsure. An uncertain row — `branch` null or `branch_source='server'` — is never attached automatically: when it matches, ask, and confirm it first with `update_changelog(entry_id, branch=<current>, worktree=<toplevel>)`. Detached HEAD → `list_changelog(project, unreleased_only=true, worktree=<toplevel>)`, no automatic selection, ask (never an unfiltered list). No candidates, but unreleased entries of THIS worktree carry another branch → offer `update_changelog(entry_id, branch=<current>)`.
+7. **Then commit — WITHOUT another `git add`.** HEREDOC: `git commit -m "<type>(<scope>): <description> (v<version>) …"`; the final trailer block is `Changelog: <ids>` (when any were selected) followed by `Co-Authored-By:`.
 8. Verify: `git log --oneline -3`, report the commit hash and the attached changelog ids.
-9. On hook rejection: fix the reported issue, re-stage, recompute the trailer selection against the new staged diff, create a NEW commit (never `--amend`, never `--no-verify`).
+9. On hook rejection: fix the reported issue. ANY change to the index afterwards (re-staging, a new file from the fix) means the selection is stale: re-run step 6 against the new `git diff --cached`, then create a NEW commit (never `--amend`, never `--no-verify`).
 
 ## `/track` (create item) fallback
 
 1. Determine project (CWD detect or ask).
 2. Gather: item_type, title, `short_title` (the label: a 2-4 word English noun phrase naming what the item is about, ≤ 50 chars, no item number, no project name — e.g. "Windows hook paths"), priority, description, component, tags (optional).
 3. Present draft to user (the label shown as "Label"), confirm.
-4. `mcp__dct__create_item(item_type, title, project, short_title, ...)` — **REMEMBER the returned `id`**. The ack must echo `short_title`; if it does not, the MCP server is outdated — tell the user to restart it instead of claiming the label was saved.
+4. `mcp__dct__create_item(item_type, title, project, short_title, ...)` — **REMEMBER the returned `id`**. The ack must echo `short_title` (null when none was stored); a MISSING key means the MCP server predates the field — report an unsupported (outdated) server contract and tell the user to restart/upgrade it. Do NOT retry the create (the item already exists) and do not claim the label was saved.
 5. For feature/improvement items: break work into 3-7 checkpoints via `mcp__dct__add_checkpoint(item_id, text)` — each one concrete and actionable. **REMEMBER each returned `id`**.
 6. Report to user: `#<id> <type>/<priority> [<short_title>] — <title>` plus checkpoint count.
 
@@ -182,7 +323,8 @@ MSG
 3. In the agent's CURRENT working directory read `git branch --show-current` (empty = detached → omit `branch`) and `git rev-parse --show-toplevel` → `branch` / `worktree`. Pass them explicitly: the MCP server's directory is the session start directory, which may be another checkout.
 4. Present draft, confirm.
 5. `mcp__dct__add_changelog(category, entry, project, component, source_file, source_lines, related_item_id, branch, worktree)`.
-6. Report: `✓ clog #<id> [<category>] — <entry>`.
+6. If the ack carries `branch_source='server'` (or a `warning`), the entry is NOT confirmed: correct it with `update_changelog(id, branch=<current>, worktree=<toplevel>)`.
+7. Report: `✓ clog #<id> [<category>] — <entry>`.
 
 ## `/track-resolve` (resolve/close item) fallback
 

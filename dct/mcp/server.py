@@ -366,7 +366,11 @@ def list_projects(format: str = "structured"):
     Returns: table of all non-deleted projects with {id, slug, current_version,
         name, path, changelog_path}, shaped per `format`. changelog_path (#225)
         is the changelog file location relative to the project root (default
-        'changelog.md'); /release resolves {path}/{changelog_path}.
+        'changelog.md'). /release resolves it against the project root of
+        the checkout the release RUNS in — that checkout's toplevel plus the
+        project's path relative to its own repository toplevel (a monorepo
+        subdirectory maps to the same subdirectory of a linked worktree) —
+        not against `path`, which names the main checkout.
     """
     from dct.core.projects import list_projects as _list
     rows = _list(_get_engine())
@@ -1157,7 +1161,10 @@ def count_unreleased_changelog(
             without `branch`.
 
     Returns: {"count": <int>} on success, {"error": "..."} on failure.
-    Typical use: gate before /release (stop if count == 0).
+    Typical use: the /commit changelog gate (are there entries at all?) — a
+    gate only, never proof that an entry belongs to a commit. Zero does NOT
+    block a release: an explicit version-only release (entry_ids=[]) or the
+    resume of an unfinished release (get_release) proceeds without entries.
     """
     from dct.core.changelog import count_unreleased
     try:
@@ -1930,8 +1937,10 @@ def pickup_work(
             consume. 'false' = pure read (contradictory with handoff_id).
         consumed_by: REQUIRED whenever consumption is possible (consume ''
             or 'true') — self-identify like create_handoff's created_by
-            ("claude-opus-4-7 @ 2026-04-17T14:30Z"). Empty errors; > 200
-            chars is refused (never truncated) when a consume happens.
+            ("claude-opus-4-7 @ 2026-04-17T14:30Z"). Validated whenever
+            consumption is POSSIBLE, even when nothing ends up consumed (0 or
+            several candidates): empty errors, > 200 chars is refused (never
+            truncated).
         handoff_id: Consume this exact handoff (0 = none given). WINS over
             scope, which is then ignored EVERYWHERE — candidate selection AND
             the returned handoff.latest. An id from another project reads as
@@ -1951,8 +1960,9 @@ def pickup_work(
         handoffs of that scope remain AFTER the write, so 0 ("nothing for this
         workstream") is distinguishable from "several pending, pick one"; the
         key is absent when no scope was given. {"error": "..."} on an invalid consume token (nothing
-        is read or written), empty consumed_by while consumption is possible,
-        a > 200-char consumed_by on a consume (nothing is written),
+        is read or written), an empty or > 200-char consumed_by while
+        consumption is possible (consume '' or 'true' — nothing is read or
+        written),
         handoff_id with consume='false', an unknown/already-consumed handoff_id,
         consume='true' with no candidate, an unknown section, or an unresolvable
         project.

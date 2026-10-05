@@ -13,7 +13,10 @@ when appropriate rather than duplicate it. Before `add_changelog`, run
 `git branch --show-current` and `git rev-parse --show-toplevel` in your current
 working directory and pass them as `branch` and `worktree` (omit `branch` when
 detached); the server's own directory is the session start directory, not
-necessarily yours. Write a concise English description of observable behavior,
+necessarily yours. If the ack reports `branch_source` "server" (with a
+`warning`), the values describe the server's checkout, not yours: confirm or
+correct them at once with `update_changelog` (pass your `branch` and
+`worktree`) — a server-detected entry is never treated as confirmed. Write a concise English description of observable behavior,
 with the appropriate category and linked item ID when known. Do not describe
 planned or unverified behavior as delivered. Return the entry ID. Recording a
 change is not permission to commit, bump, publish or release.

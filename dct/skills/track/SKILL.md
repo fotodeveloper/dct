@@ -83,9 +83,12 @@ skip confirmation.
 
 Call `mcp__dct__create_item(project, item_type, title, short_title, ...)` with
 all fields.
-Verify the ack echoes `short_title`. If it does not, the MCP server is older
-than this skill — warn the user to restart the MCP server (or upgrade dct)
-and set the label later with `update_item`; do not claim the label was saved.
+Verify the ack echoes `short_title` (the stored label; null when none). A
+MISSING `short_title` key means the MCP server's contract is older than this
+skill: report an unsupported (outdated) server contract and ask the user to
+restart the MCP server (or upgrade dct). Do NOT retry `create_item` — the item
+was created; a retry would duplicate it — and do not claim the label was
+saved.
 **REMEMBER the returned `id`** — needed for any follow-up (add_checkpoint,
 update_item, resolve_item).
 

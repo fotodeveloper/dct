@@ -38,6 +38,12 @@ Wait for confirmation.
 Call `mcp__dct__add_changelog(project, category, entry, branch, worktree, ...)`.
 The ack echoes `branch` and `branch_source`; if `branch` is missing from the
 ack, the MCP server is older than this skill — tell the user to restart it.
+If the ack says `branch_source: "server"` (it then carries a `warning`), the
+server filled in ITS OWN checkout, not yours — the entry is NOT confirmed.
+Correct it right away against your actual checkout:
+`mcp__dct__update_changelog(id, branch=<yours>, worktree=<yours>)` (both
+fields; on a detached HEAD pass only `worktree`). `/commit` never attaches a
+server-detected entry without that confirmation.
 
 ### Step 4: Report
 ```
