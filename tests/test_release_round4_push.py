@@ -78,9 +78,21 @@ def test_two_push_urls_are_refused_before_the_stamp_without_a_choice(engine, pro
     git(repo, "config", "--add", "remote.origin.pushurl", str(two))
     a = proven(engine, repo, "feature a")
     before = refs(one), refs(two), refs(fetch_address(repo))
+    # prepare shows NO target (never the first URL) and says why …
+    digest = approved_plan_digest(engine, SLUG, repo, version="1.1.0", entry_ids=[a])
+    prepared = effects.prepare_release(engine, SLUG, version="1.1.0", entry_ids=[a],
+                                       plan_digest=digest, cwd=str(repo))
+    assert prepared["details"]["push_target"] is None
+    assert any(str(one) in w and str(two) in w and "--push-url" in w
+               for w in prepared["warnings"])
+    # … and an apply that names the remote and the branch but no URL is
+    # refused: the URL is never completed from the configuration (K-123).
     with pytest.raises(ReleaseRefused, match="--push-url") as exc:
-        apply(engine, repo, version="1.1.0", entry_ids=[a])
-    assert exc.value.details["push_urls"] == [str(one), str(two)]
+        effects.apply_release(
+            engine, SLUG, version="1.1.0", entry_ids=[a], confirm=True, plan_digest=digest,
+            proposal_digest=prepared["details"]["proposal_sha256"], cwd=str(repo),
+            push_remote="origin", push_branch="main")
+    assert exc.value.details["push_target"] is None
     assert get_release(engine, SLUG, "1.1.0") is None  # refused before the stamp
     assert (refs(one), refs(two), refs(fetch_address(repo))) == before
 
@@ -163,7 +175,9 @@ def test_prepare_shows_the_same_target_apply_consents_to(engine, proj, tmp_path)
     assert shown["url"] == str(write_side)
     effects.apply_release(engine, SLUG, version="1.1.0", entry_ids=[a], confirm=True,
                           plan_digest=digest,
-                          proposal_digest=prepared["details"]["proposal_sha256"], cwd=str(repo))
+                          proposal_digest=prepared["details"]["proposal_sha256"], cwd=str(repo),
+                          push_remote=shown["remote"], push_branch=shown["branch"],
+                          push_url=shown["url"])
     assert get_release(engine, SLUG, "1.1.0")["consent"]["push_target"] == shown
 
 

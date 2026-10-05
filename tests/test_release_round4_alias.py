@@ -24,7 +24,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
-from conftest import approved_plan_digest, git, run_cli
+from conftest import approved_plan_digest, approved_push, git, push_argv, run_cli
 from test_release_effects import (
     SLUG,
     Interrupted,
@@ -66,7 +66,9 @@ def prepare(engine, repo, **selection) -> dict:
 
 
 def alias(engine, repo, **kw):
-    return effects.apply_release(engine, SLUG, strict=True, confirm=True, cwd=str(repo), **kw)
+    """The alias with the approved push choice (K-123, conftest.approved_push)."""
+    return effects.apply_release(engine, SLUG, strict=True, confirm=True, cwd=str(repo),
+                                 **approved_push(repo), **kw)
 
 
 def pins(repo: Path) -> dict[str, str]:
@@ -144,7 +146,7 @@ def test_cli_alias_without_the_proposal_digest_names_the_procedure(engine, proj,
     assert get_release(engine, SLUG, "1.1.0") is None
     details = prepare(engine, repo, version="1.1.0", entry_ids=[a])
     run_cli(monkeypatch, ["clog", "release", "-P", SLUG, "1.1.0", "--confirm",
-                          "--proposal-digest", details["proposal_sha256"]])
+                          "--proposal-digest", details["proposal_sha256"], *push_argv(repo)])
     assert_released(engine, repo, candidate, [a])
 
 

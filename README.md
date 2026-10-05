@@ -287,7 +287,7 @@ dct clog add added "New Python parser support" --project myproj
 dct clog list --project myproj --unreleased
 dct clog count --project myproj       # Used by hooks
 dct clog count --branch feat/x --include-unbranched   # This branch + unbranched/server-detected
-dct clog release 1.1 --project myproj --proposal-digest <p> --confirm  # Alias of `dct release apply` that derives the plan itself (after `dct release prepare`): commit, tag, push to the upstream (run from a checkout)
+dct clog release 1.1 --project myproj --proposal-digest <p> --push-remote origin --push-branch main --push-url <url> --confirm  # Alias of `dct release apply` that derives the plan itself (after `dct release prepare`): commit, tag, push to the approved target (run from a checkout)
 dct clog release --patch --entries 12,15 --proposal-digest <p> --confirm --no-push   # Only these (proven) entries; a local release
 dct clog update 12 --branch feat/x    # Amend an unreleased entry
 dct clog delete 12                    # Soft-delete an unreleased entry
@@ -297,8 +297,8 @@ dct clog export --project myproj --output changelog.md
 dct release plan --patch              # Read-only: proven / unproven entries, range, index state
 dct release attest --entries 16 --confirm             # Empty attestation commit for unproven entries
 dct release plan --patch --entries 12,15 --json       # The snapshot to approve (snapshot_digest)
-dct release prepare --patch --entries 12,15 --plan-digest <digest>         # Isolated version sync → the file list to approve
-dct release apply --patch --entries 12,15 --plan-digest <digest> --proposal-digest <p> --confirm  # Stamp, changelog, files, commit, tag, push (--no-push: local)
+dct release prepare --patch --entries 12,15 --plan-digest <digest>         # Isolated version sync → the file list and the push target to approve
+dct release apply --patch --entries 12,15 --plan-digest <digest> --proposal-digest <p> --push-remote origin --push-branch main --push-url <url> --confirm  # Stamp, changelog, files, commit, tag, push to the approved target (or --no-push: local)
 dct release resume                    # Finish an interrupted release (verifies every effect; the stored consent, no new approval)
 dct release abandon --version 1.1 --reason "broken build" --confirm
 dct release reconstruct --version 1.0 --confirm       # Record a release made before release records

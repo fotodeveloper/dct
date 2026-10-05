@@ -600,6 +600,48 @@ def test_every_executable_clog_release_usage_respects_the_shared_consent(text):
     assert "never pushed automatically" not in " ".join(body.split()).lower()
 
 
+_PUSH_SET = {"--push-remote", "--push-branch", "--push-url"}
+
+
+@pytest.mark.parametrize("text", [
+    *RELEASE_DIALOGS,
+    pytest.param(_snippet, id="claude-md-snippet"),
+    pytest.param(lambda: (ROOT / "README.md").read_text(encoding="utf-8"), id="readme"),
+    pytest.param(lambda: _workflow_doc(), id="release-workflow"),
+])
+def test_every_executable_release_names_the_complete_push_target(text):
+    """K-123: apply (and its alias) never selects the push target — every
+    EXECUTABLE `dct release apply` / `dct clog release` usage the documents
+    show (one that carries `--confirm`) names the complete approved target
+    (`--push-remote`, `--push-branch`, `--push-url`) or `--no-push`. The
+    no-flag form, which pushed to whatever the upstream was at apply time,
+    is gone from all of them."""
+    body = text()
+    usages = [set(flags) for group, sub, flags in _commands(body)
+              if (group, sub) in {("release", "apply"), ("clog", "release")}
+              and "--confirm" in flags]
+    assert usages, "no executable apply / alias usage"
+    for flags in usages:
+        # (the workflow doc's command table shows both alternatives in one line)
+        assert _PUSH_SET <= flags or (
+            "--no-push" in flags and not _PUSH_SET & flags), sorted(flags)
+    assert any(_PUSH_SET <= flags for flags in usages), "no pushing usage shown"
+
+
+def test_cli_help_states_the_complete_push_target():
+    """The same contract in `dct release apply --help` / `dct clog release
+    --help` (the epilog and the three flags' help)."""
+    cli = _cli()
+    for parser in (cli["release"]["apply"], cli["clog"]["release"]):
+        epilog = " ".join(parser.epilog.split())
+        for flag in sorted(_PUSH_SET):
+            assert flag in epilog
+        assert "never selects" in epilog
+        assert "--no-follow-tags" in epilog and "--recurse-submodules=no" in epilog
+        helps = {a.option_strings[0]: a.help for a in parser._actions if a.option_strings}
+        assert all("REQUIRED" in helps[flag] for flag in _PUSH_SET)
+
+
 def test_release_dialogs_never_run_the_alias():
     for body in (_skill("release"), _release_fallback()):
         assert ("clog", "release") not in {(g, s) for g, s, _ in _commands(body)}

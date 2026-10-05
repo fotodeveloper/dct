@@ -4,6 +4,7 @@ import argparse
 import atexit
 import contextlib
 import os
+import shlex
 import signal
 import socket
 import subprocess
@@ -1213,28 +1214,41 @@ RELEASE_PUSH_EPILOG = RELEASE_EXECUTOR_EPILOG + RELEASE_LOCK_EPILOG + (
     "branch HEAD names, then post-commit. A refusing hook, a hook that changes the approved "
     "content or message, a HEAD that moved or a branch switch stops the release with "
     "NOTHING published (resume after fixing; nothing is reset). Push (after the tag): `git "
-    "push --atomic <url> <commit>:refs/heads/<branch> <commit>:refs/tags/v<V>` to ONE "
-    "approved destination — default the current branch's upstream and its push URL (`git "
-    "remote get-url --push --all`); without an upstream choose --push-remote "
-    "[--push-branch] or --no-push; a remote with several push URLs needs --push-url (no "
-    "mirror mode). The same URL is read before the stamp and to verify the push. A failed "
-    "push leaves the release 'tagged'; `dct release resume` retries only the push, to the "
-    "approved URL.")
+    "push --atomic --no-follow-tags --recurse-submodules=no <url> "
+    "<commit>:refs/heads/<branch> <commit>:refs/tags/v<V>` to ONE approved destination — "
+    "exactly those two refs: no tag push.followTags would add, no submodule commit (a "
+    "submodule is never pushed; publishing the commit a gitlink names is the owner's). A "
+    "NEW release that pushes needs the COMPLETE approved target: --push-remote, "
+    "--push-branch and --push-url, the `push_target` that `dct release prepare` showed (the "
+    "current branch's upstream and its push URL, `git remote get-url --push --all`) and the "
+    "owner approved — apply never selects it itself, a missing or mismatching part is "
+    "refused before the stamp; --no-push is an explicit local release. The URL must be one "
+    "of the remote's push URLs (several: it chooses ONE, no mirror mode) and must not be "
+    "readable as a remote NAME or rewritten by insteadOf (write a path as ./name, an "
+    "absolute path or a real URL). The same URL is read before the stamp and to verify "
+    "the push. A failed push leaves the release 'tagged'; `dct release resume` retries only "
+    "the push, to the approved URL.")
 
 
 def _add_push_flags(parser) -> None:
-    """The push target of `release apply` / `clog release` (K-97 F2)."""
+    """The push target of `release apply` / `clog release` (K-97 F2; K-123:
+    all three are required there for a new release that pushes) and of
+    `release takeover` (its preview derives what is not given)."""
     parser.add_argument(
         "--push-remote",
-        help="Remote to push the release commit and tag to (default: the branch's upstream)")
+        help="Remote to push the release commit and tag to. apply / clog release: REQUIRED "
+             "for a new release that pushes, with --push-branch and --push-url (the "
+             "push_target `dct release prepare` showed). takeover: default the branch's "
+             "upstream")
     parser.add_argument(
         "--push-branch",
-        help="Branch of that remote (default: the upstream's branch when it is on that remote)")
+        help="Branch of that remote. apply / clog release: REQUIRED with --push-remote. "
+             "takeover: default the upstream's branch when it is on that remote")
     parser.add_argument(
         "--push-url",
         help="Which ONE of the remote's push URLs (`git remote get-url --push --all`) the "
-             "release goes to — required when the remote has several; refused when it is not "
-             "one of them")
+             "release goes to; refused when it is not one of them. apply / clog release: "
+             "REQUIRED with --push-remote. takeover: required when the remote has several")
     parser.add_argument(
         "--no-push", action="store_true",
         help="An explicit local release: commit and tag, nothing pushed")
@@ -1281,8 +1295,9 @@ def cmd_clog_release(args):
     """`dct clog release` — an alias of `dct release apply` (K-72).
 
     Flags map 1:1 (version or --patch/--minor/--major, --entries /
-    --no-entries, --proposal-digest, --push-remote / --push-branch /
-    --push-url / --no-push); --confirm is REQUIRED as for apply (K-96 D1:
+    --no-entries, --proposal-digest, and the COMPLETE approved push target
+    --push-remote + --push-branch + --push-url, or --no-push — K-123, as
+    for apply); --confirm is REQUIRED as for apply (K-96 D1:
     the alias commits, tags and pushes — running it is not the
     confirmation), and so is --proposal-digest for a new release (K-117:
     the alias never prepares or approves a proposal by itself — run `dct
@@ -1351,10 +1366,14 @@ def cmd_release_prepare(args):
     target = details.get("push_target")
     print(f"  push target (default): {target['remote']} {target['branch']} ({target['url']}), "
           f"tag {target['tag']}" if target else
-          "  push target: none by default — apply needs --push-remote … [--push-url …] or "
-          "--no-push (see the warnings)")
+          "  push target: none by default — apply needs --push-remote … --push-branch … "
+          "--push-url … or --no-push (see the warnings)")
+    push = (f"--push-remote {shlex.quote(target['remote'])} --push-branch "
+            f"{shlex.quote(target['branch'])} --push-url {shlex.quote(target['url'])}"
+            if target else "(--push-remote … --push-branch … --push-url … | --no-push)")
     print(f"  next: dct release apply --version {out['version']} … --plan-digest "
-          f"{details['plan_digest']} --proposal-digest {details['proposal_sha256']} --confirm")
+          f"{details['plan_digest']} --proposal-digest {details['proposal_sha256']} {push} "
+          f"--confirm")
     _print_effects(out)
 
 
@@ -2954,8 +2973,8 @@ def build_parser() -> argparse.ArgumentParser:
         "proposed files and pass its proposal_sha256 as --proposal-digest — the proposal must "
         "be bound to exactly the plan this command derives. Refuses — instead of guessing — "
         "when the owner must decide: no approved proposal, entries without proof, a proof "
-        "range not starting at v<current_version>, no upstream to push to, several push "
-        "URLs. " + RELEASE_PUSH_EPILOG)
+        "range not starting at v<current_version>, a push target that is not the complete "
+        "approved one (--push-remote, --push-branch, --push-url). " + RELEASE_PUSH_EPILOG)
 
     p_clog_rstatus = p_clog_sub.add_parser(
         "release-status",

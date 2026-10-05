@@ -409,7 +409,7 @@ K-97 F3) → `apply` → `resume` after an interruption.
 | --- | --- |
 | `dct release attest --entries 16,17 --confirm` | the EMPTY attestation commit on the current branch (or detached HEAD): subject `chore: attest changelog entries`, final paragraph `Changelog: <ids ascending>`. Only ids the plan lists as unproven; refused when anything is staged, an operation (merge, rebase, cherry-pick, revert) is in progress, or a release is unfinished. Created by the same mechanism as the release commit ([Commits and hooks](#commits-and-hooks-k-96-k-79-k-103): the repository's hooks run, on a temporary index holding HEAD's tree; the commit object is created on the PINNED HEAD and checked BEFORE publication): tree unchanged, subject, and the ids the proof parser reads from it — git's `Changelog` trailer plus the strict body scan — EXACTLY the approved ones (K-107: equality, not containment; `details.approved_ids` / `proven_ids`). A hook that adds, drops or duplicates an id, rewrites the subject or stages content is refused with NOTHING published (no later plan can read an unapproved attestation from history); an addition that leaves the id set alone (a `Signed-off-by:`) is fine. Then the ref HEAD names moves by compare-and-swap. The candidate changes; no record exists yet. |
 | `dct release prepare [--version V \| --patch \| --minor \| --major] (--entries … \| --no-entries) --plan-digest D [--json]` | the PREPARE stage (K-76, [below](#prepare-dct-release-prepare-k-76)): the version-sync script runs ONCE, isolated, and its result becomes the project's PENDING version-file proposal; outcome `prepared` with `proposal_sha256`. Nothing is stamped. |
-| `dct release apply [--version V \| --patch \| --minor \| --major] (--entries … \| --no-entries) --plan-digest D --proposal-digest P [[--push-remote R [--push-branch B]] [--push-url U] \| --no-push] --confirm` | one release from the APPROVED plan (K-80) and the APPROVED proposal (K-76): `D` = the `snapshot_digest` of `dct release plan`, `P` = the `proposal_sha256` of `dct release prepare`, both with the SAME version and selection — steps 1-7 below. The push target (step 7) is approved with it. A re-run of a recorded / historical release needs no `P` (no-op). |
+| `dct release apply [--version V \| --patch \| --minor \| --major] (--entries … \| --no-entries) --plan-digest D --proposal-digest P (--push-remote R --push-branch B --push-url U \| --no-push) --confirm` | one release from the APPROVED plan (K-80) and the APPROVED proposal (K-76): `D` = the `snapshot_digest` of `dct release plan`, `P` = the `proposal_sha256` of `dct release prepare`, both with the SAME version and selection — steps 1-7 below. The push target (step 7) is approved with it: in git a new release names the COMPLETE target prepare showed — remote, branch and URL — or `--no-push` (K-123; outside git: no push flag). A re-run of a recorded / historical release needs no `P` (no-op). |
 | `dct release resume` | finishes the unfinished record (table below). No `--confirm` (K-97 F4): it executes the CONSENT stored at apply — version, entries, candidate, proposal, push target — and refuses whatever lies outside it (then: a new apply, or abandon) |
 | `dct release abandon --version V --reason "…" --confirm` | core `abandon_release` as the actor `dct`, under the operation lock (the repository of the project's registered path — refused when it cannot be determined, K-118 L8): the record ends `abandoned`; stamps, `current_version` and every effect stay; V stays taken; the pin of its proposal's blobs is removed (K-117). The ONLY path that abandons a release dct executes (K-119 M6): MCP `abandon_release` holds no lock and refuses such a record, so no effect runs past an abandon — afterwards `resume` finds no unfinished record |
 | `dct release reconstruct --version V [--release-commit SHA \| --evidence FILE] [--confirm]` | a legacy release WITHOUT a record: evidence is gathered read-only and shown (the verified scope, every candidate, the stage it proves, how to finish it); `--confirm` records it (core `reconstruct_release`, no re-stamp, nothing in the repository modified). `--release-commit` chooses one of several verified candidates; `--evidence` is the adapter of a project whose executor is `own` — [Reconstruct](#reconstruct-dct-release-reconstruct-k-60-k-86-k-96-d8) |
@@ -418,7 +418,7 @@ K-97 F3) → `apply` → `resume` after an interruption.
 | `dct release status [--version V]` | the record (read-only) |
 | `dct clog release-advance V STATUS [--release-commit-sha S] [--tag-proof JSON] [--push-proof JSON] [--json]` | the LEDGER path (K-96 D10, `effects.record_progress`): core `advance_release` as the actor `ledger` under the operation lock, for a release dct does NOT execute (an `own` record, or one stamped outside `apply`); a release dct executes is refused (`resume` records its progress). `--tag-proof` / `--push-proof` carry what the caller verified ([proofs](#proof-of-the-tag-and-of-the-push-k-115)) — a record with git reaches `tagged` / `pushed` / `completed` only with them. Outcome `advanced` / `noop`, details `{updated, previous_status}` |
 | `dct clog release-abandon V --reason "…" --confirm [--json]` | alias of `dct release abandon` (the same function, the same lock) |
-| `dct clog release [V] [--patch …] [--entries … \| --no-entries] --proposal-digest P [[--push-remote R [--push-branch B]] [--push-url U] \| --no-push] --confirm [--json]` | alias of `apply` (the same function, no rules of its own); `--confirm` is REQUIRED as for apply (K-96 D1 — it commits, tags and pushes; running it is not the confirmation). `--proposal-digest` is REQUIRED for a new release (K-117): the alias never prepares and never approves a proposal by itself — equal paths and a checked version field are no consent to the content. No `--plan-digest`: the plan is derived inside the call for the candidate it pins, with the same stamp binding, and the approved proposal must have been prepared for EXACTLY that plan (K-116 H2: `proposal.plan_digest` = the digest derived here; `details.mismatch` otherwise) — so run `dct release plan --version V … --json`, `dct release prepare … --plan-digest D`, then the alias with that `P`. Without `--entries` it releases every unreleased entry — all must be proven. Refused instead of guessed: a missing proposal digest, unproven entries, a proof range that needs confirmation (`range.confirm_required`). |
+| `dct clog release [V] [--patch …] [--entries … \| --no-entries] --proposal-digest P (--push-remote R --push-branch B --push-url U \| --no-push) --confirm [--json]` | alias of `apply` (the same function, no rules of its own — the same complete push target, K-123); `--confirm` is REQUIRED as for apply (K-96 D1 — it commits, tags and pushes; running it is not the confirmation). `--proposal-digest` is REQUIRED for a new release (K-117): the alias never prepares and never approves a proposal by itself — equal paths and a checked version field are no consent to the content. No `--plan-digest`: the plan is derived inside the call for the candidate it pins, with the same stamp binding, and the approved proposal must have been prepared for EXACTLY that plan (K-116 H2: `proposal.plan_digest` = the digest derived here; `details.mismatch` otherwise) — so run `dct release plan --version V … --json`, `dct release prepare … --plan-digest D`, then the alias with that `P`. Without `--entries` it releases every unreleased entry — all must be proven. Refused instead of guessed: a missing proposal digest, unproven entries, a proof range that needs confirmation (`range.confirm_required`). |
 
 ### Executor (K-85)
 
@@ -633,7 +633,9 @@ for a first release (`confirmed` null) and for a changed set — approving
    -e`) and its pin in place (re-created if someone removed the ref; a
    pending proposal without an `id`, prepared by an older dct → prepare
    again). **The push target** — see [The push target](#the-push-target-k-97-f2-k-104):
-   ONE destination `{remote, url, branch, tag}`, or `--no-push`. Its URL
+   ONE destination `{remote, url, branch, tag}` named COMPLETELY by the
+   caller (`--push-remote`, `--push-branch`, `--push-url` — a missing one
+   refuses, `details.push_target: null`; K-123), or `--no-push`. Its URL
    is READ before the stamp (`git ls-remote <url>`, network): a tag of V
    there in any spelling, or a branch there the candidate does not contain
    (the push could never be a fast-forward), refuses — nothing stamped.
@@ -732,10 +734,11 @@ for a first release (`confirmed` null) and for a changed set — approving
    `details.push_urls`). `git ls-remote <url>` first: a tag of V there at
    another commit refuses; both already there (the branch at the release
    commit or a descendant this repository knows, the tag exactly at it) →
-   `verified`, not pushed again. Else `git push --atomic <url>
-   <commit>:refs/heads/<branch> <commit>:refs/tags/v<V>` — the approved
-   URL itself and explicit refspecs (the local `pre-push` and the remote's
-   hooks run; `GIT_TERMINAL_PROMPT=0`, the caller's SSH / credential
+   `verified`, not pushed again. Else `git push --atomic --no-follow-tags
+   --recurse-submodules=no <url> <commit>:refs/heads/<branch>
+   <commit>:refs/tags/v<V>` — the approved URL itself and only the
+   refspecs the destination still lacks, nothing git configuration would
+   add (K-126, K-134; the local `pre-push` and the remote's hooks run; `GIT_TERMINAL_PROMPT=0`, the caller's SSH / credential
    variables kept) — and `git ls-remote <url>` again must show both; then
    `pushed` — recorded
    WITH what that address showed (`push_proof`: the consented target, the
@@ -753,16 +756,35 @@ for a first release (`confirmed` null) and for a changed set — approving
 
 ONE effective destination, `effects.push_target` → `{remote, url, branch,
 tag: "v<V>"}` — the same value in `prepare`'s `details.push_target` (what
-apply would use by default), in the consent, in the pre-stamp read, in the
-push, in its verification, in the `push_proof` and in every resume.
+the owner is shown and approves), in the consent, in the pre-stamp read,
+in the push, in its verification, in the `push_proof` and in every resume.
 
-- **Remote and branch**: `--push-remote R [--push-branch B]`, else the
-  current branch's UPSTREAM (`branch.<b>.remote` + `branch.<b>.merge`); no
-  upstream (also a detached HEAD or a local `.` upstream) → refused with
-  the explicit choice (`--push-remote …` or `--no-push`), never guessed;
-  `--push-remote` without `--push-branch` needs the upstream to be on that
-  remote. `--no-push` = an explicit local release (`push_target: null`); a
-  project outside git has none.
+- **Apply names the approved target completely (K-123)**: a NEW release in
+  git that pushes needs `--push-remote R --push-branch B --push-url U` —
+  the `remote`, `branch` and `url` of the `push_target` the approved
+  prepare showed. `dct release apply` and the `clog release` alias never
+  select the upstream themselves: between prepare and apply the remote's
+  URL, the branch's upstream or the current branch (another branch at the
+  same commit) can change while HEAD and both digests stay valid, and the
+  default would then be a destination nobody approved. A missing flag →
+  refused before the stamp (`details.push_target: null`, the missing flags
+  named); a URL that is not a push address of that remote any more, or a
+  remote that does not exist → refused before the stamp. `--no-push` = an
+  explicit local release (`push_target: null`), only as the owner's
+  choice; a project outside git has no target and takes no push flag.
+  `resume` takes no push flag (the stored consent); a takeover binds its
+  own target in the takeover digest. (The target is not part of the
+  proposal digest; binding it there is future work — today the caller
+  passes what was approved and every part is checked against the
+  repository.)
+- **What prepare shows (and a takeover derives)**: `--push-remote R
+  [--push-branch B]` for a takeover, else the current branch's UPSTREAM
+  (`branch.<b>.remote` + `branch.<b>.merge`); no upstream (also a detached
+  HEAD or a local `.` upstream) → no default: prepare shows `push_target:
+  null` with the reason in `warnings`, a takeover refuses with the
+  explicit choice — never guessed. The owner then names the destination
+  (apply: all three flags, the URL being one of `git remote get-url --push
+  --all <remote>`), or `--no-push`.
 - **URL**: the remote's EFFECTIVE PUSH address, from the full `git remote
   get-url --push --all <remote>` — never only its first line, and never the
   fetch URL (git resolves a remote NAME given to `ls-remote` to the fetch
@@ -777,14 +799,42 @@ push, in its verification, in the `push_proof` and in every resume.
   addresses yourself. `--push-url` must be one of the remote's push
   addresses (it cannot name an arbitrary repository).
 - **Literal addressing**: the commands are `git ls-remote <url>` and `git
-  push --atomic <url> <commit>:refs/heads/<branch> <commit>:refs/tags/v<V>`
-  — the approved URL and explicit refspecs, so a later change of the
-  remote's configuration (another `pushurl`, a push refspec, `mirror`)
-  cannot add a recipient or a ref. A `url.<base>.insteadOf` /
-  `pushInsteadOf` rule whose value is a prefix of the approved URL would
-  make git rewrite it on the command line: such a URL is refused
-  (`details.rewrite_rule`), at approval and at every use. (The URL `get-url`
-  reports already has the rewrites of the remote's own URL applied.)
+  push --atomic --no-follow-tags --recurse-submodules=no <url>
+  <commit>:refs/heads/<branch> <commit>:refs/tags/v<V>` — the approved URL
+  and explicit refspecs, so a later change of the remote's configuration
+  (another `pushurl`, a push refspec, `mirror`) cannot add a recipient or a
+  ref. Two things would still make git address ANOTHER repository with the
+  same string; both are refused before the stamp, by a takeover and before
+  every push / control read (`effects._check_literal_url`):
+  - a `url.<base>.insteadOf` / `pushInsteadOf` rule whose value is a prefix
+    of the approved URL — git would rewrite it on the command line
+    (`details.url`, `details.rewrite_rule`). (The URL `get-url` reports
+    already has the rewrites of the remote's own URL applied.)
+  - K-124: the URL is also the NAME of a remote (`details.url`,
+    `details.remote_name`) — git then reads that remote's `url` and pushes
+    to its `pushurl`, not to the path the string names. Every name git
+    resolves counts: `remote.<name>.*` in any configuration scope (system,
+    global, local, worktree, includes) and the legacy `<git common
+    dir>/remotes/<name>` / `branches/<name>` files. A slash is no proof of a
+    path (`group/publish` is a legal remote name), and git reads ANY string
+    as a remote when a remote of exactly that name is configured — so the
+    whole string is compared with every configured name. Before the stamp,
+    write a relative path explicitly (`./name`), use an absolute path or a
+    real URL (`scheme://…`), or rename the colliding remote, then prepare
+    again; an unfinished release keeps the approved string, so there only
+    renaming or removing the colliding remote helps (or abandon).
+- **Scope of the publication (K-126, K-134)**: the push sends the release
+  commit to the approved branch and the tag `v<V>` — two explicit refs,
+  nothing else. `--no-follow-tags`: `push.followTags` (repository or
+  global) adds no other tag, although annotated tags reachable from the
+  release commit may be missing at the destination. `--recurse-submodules=no`:
+  `push.recurseSubmodules` / `submodule.recurse` never make dct push a
+  submodule — the consent covers the superproject's destination, not the
+  submodules' remotes. This is a LIMIT of what dct publishes, not a
+  guarantee for consumers: a gitlink of the release may name a commit its
+  submodule's remote does not have yet. dct neither pushes it nor checks
+  it (a separate availability check is future work) — publish submodule
+  commits yourself, before or after the release.
 - **Resume**: uses the STORED target. The approved URL must still be among
   the remote's push addresses (a re-pointed remote is outside the consent
   → refused); addresses ADDED since receive nothing.
@@ -1193,9 +1243,10 @@ dct release resume        # performs ONLY the missing effects (the tag, the push
    verified release commit (nothing was made yet, the section is not the
    database's, the history changed), or a contradiction → REFUSED, nothing
    written; the ledger path stays.
-3. **The push target** is an explicit choice, as for apply ([push
-   target](#the-push-target-k-97-f2-k-104)): the branch's upstream,
-   `--push-remote` / `--push-branch` / `--push-url`, or `--no-push`. A tag
+3. **The push target** is chosen here and bound by the takeover digest
+   ([push target](#the-push-target-k-97-f2-k-104)): the branch's upstream,
+   `--push-remote` / `--push-branch` / `--push-url`, or `--no-push` — the
+   preview shows it, the confirmation takes the same flags. A tag
    of V that already exists at the release commit is the tag that is
    pushed.
 4. **What the owner approves is shown** (outcome `preview`, read-only, no
@@ -1248,7 +1299,7 @@ One shape, `effects.RESULT_KEYS` (pinned by
 | `release` | the record (`core.releases.RECORD_FIELDS`) or null |
 | `steps` | `[{step, result, …}]` — step ∈ `sync`, `proposal` (prepare; `pin` = the ref keeping its blobs), `stamp`, `changelog`, `version_files`, `files`, `commit`, `index` (the real index after the commit), `tag`, `push` (`remote`, `url`, `branch`, `tag`; `skipped` with `reason` without a push target), `complete`, `attest`, `takeover` (`pin` = the ref keeping the derived proposal's blobs); result ∈ `done`, `verified`, `skipped`, `adopted`, `conflict` (the last step of a conflict response) |
 | `warnings` | human-readable strings (e.g. a post-commit hook that failed after the commit was published; a pin or stored blob that could not be cleaned) |
-| `details` | prepare: see [Prepare](#prepare-dct-release-prepare-k-76), plus `push_target` (what apply would push to by default — the upstream — or null, read-only); apply: `{requested_version, previous_version, bump, entry_ids, mode, released, current_version, push_target}`; attest: `{previous_head, head, entry_ids}`; abandon: `{updated}`; reconstruct: `{evidence: {version (authoritative), requested_version, spellings, entry_ids, candidate_sha, release_commit_sha, tag, tag_proof ({name, object, commit, annotated} \| null), checkout_root, manifest, verification, contract, status, without_git, candidates}, executor: {assigned, provenance: false}, finish: [{way, command, what}]}` (`status` = `completed` \| `committed` — the own adapter also `tagged`; `candidates` (git, dct's rules) = `[{commit, verified, reason, history}]`; `verification` = the recorded scope, `contract` = `{version_files, state}` — [Reconstruct](#reconstruct-dct-release-reconstruct-k-60-k-86-k-96-d8); `executor` = the ASSIGNED responsibility, never provenance; `finish` = the ways to finish a release that is not `completed`); takeover: `{consent, proposal, stage, record_status, status_after, missing_effects, takeover_digest, evidence: {candidate_sha, release_commit_sha, manifest, tag_proof, candidates}, executor}` (+ `next` once taken over — [Takeover](#takeover-dct-release-takeover-k-119-m3-k-117-j4)); version-files: `{contract: {version_files, state, confirmed_at}}` (+ `proposed`, `change` in the preview; `updated` after `--confirm`); advance: `{updated, previous_status}`; conflict: [Conflicts](#conflicts-k-88); refused / failed: the reason (`error`) plus the refusal's data (e.g. `staged`, `unproven`, `proposal_digest` / `plan_digest` (a new release without an approved proposal — also the alias), `mismatch`, `checkout_changed`, `foreign`, `foreign_paths`, `foreign_content`, `foreign_staged`, `changed`, `path`, `sync`, `exit_code`, `environment` (the sync script's environment contract); the commit: `git_error`, `hook`, `commit`, `head`, `tree`, `parents`, `subject`, `expected_tree`, `expected_parent`, `unpublished_commit`, `pinned_ref`, `head_ref`, `signed`, `candidate`, `approved_ids` / `proven_ids` (attest), `previous_head` (attest), `git_version` / `required_git_version`, `index_lock`; the push: `push_target`, `push_urls`, `url`, `rewrite_rule`, `remote_tags`, `remote_branch`, `outside_consent`; a reconstruction / takeover: `candidates`, `history` (`[{commit, state, diff, diff_lines, diff_sha256}]` — the candidates that changed older changelog history, K-109), `contract` (an unknown version-file contract, K-110), `executor`, `contradictions`, `approved_digest` / `derived_digest` (the takeover digest), `artifacts`; the operation lock: `lock` (null with `reason`: `no_path` \| `unverifiable_path` when its identity cannot be determined), `holder`, `process_groups` (groups a killed dct left running — or `[]` when that cannot be verified), `process_group` (a sync script's group that could not be stopped); the executor: `executor`, `consent`) |
+| `details` | prepare: see [Prepare](#prepare-dct-release-prepare-k-76), plus `push_target` (the upstream target the owner is shown — apply takes its `remote`, `branch` and `url` as `--push-remote` / `--push-branch` / `--push-url`, K-123 — or null, read-only); apply: `{requested_version, previous_version, bump, entry_ids, mode, released, current_version, push_target}`; attest: `{previous_head, head, entry_ids}`; abandon: `{updated}`; reconstruct: `{evidence: {version (authoritative), requested_version, spellings, entry_ids, candidate_sha, release_commit_sha, tag, tag_proof ({name, object, commit, annotated} \| null), checkout_root, manifest, verification, contract, status, without_git, candidates}, executor: {assigned, provenance: false}, finish: [{way, command, what}]}` (`status` = `completed` \| `committed` — the own adapter also `tagged`; `candidates` (git, dct's rules) = `[{commit, verified, reason, history}]`; `verification` = the recorded scope, `contract` = `{version_files, state}` — [Reconstruct](#reconstruct-dct-release-reconstruct-k-60-k-86-k-96-d8); `executor` = the ASSIGNED responsibility, never provenance; `finish` = the ways to finish a release that is not `completed`); takeover: `{consent, proposal, stage, record_status, status_after, missing_effects, takeover_digest, evidence: {candidate_sha, release_commit_sha, manifest, tag_proof, candidates}, executor}` (+ `next` once taken over — [Takeover](#takeover-dct-release-takeover-k-119-m3-k-117-j4)); version-files: `{contract: {version_files, state, confirmed_at}}` (+ `proposed`, `change` in the preview; `updated` after `--confirm`); advance: `{updated, previous_status}`; conflict: [Conflicts](#conflicts-k-88); refused / failed: the reason (`error`) plus the refusal's data (e.g. `staged`, `unproven`, `proposal_digest` / `plan_digest` (a new release without an approved proposal — also the alias), `mismatch`, `checkout_changed`, `foreign`, `foreign_paths`, `foreign_content`, `foreign_staged`, `changed`, `path`, `sync`, `exit_code`, `environment` (the sync script's environment contract); the commit: `git_error`, `hook`, `commit`, `head`, `tree`, `parents`, `subject`, `expected_tree`, `expected_parent`, `unpublished_commit`, `pinned_ref`, `head_ref`, `signed`, `candidate`, `approved_ids` / `proven_ids` (attest), `previous_head` (attest), `git_version` / `required_git_version`, `index_lock`; the push: `push_target`, `push_urls`, `url`, `rewrite_rule`, `remote_name`, `remote_tags`, `remote_branch`, `outside_consent`; a reconstruction / takeover: `candidates`, `history` (`[{commit, state, diff, diff_lines, diff_sha256}]` — the candidates that changed older changelog history, K-109), `contract` (an unknown version-file contract, K-110), `executor`, `contradictions`, `approved_digest` / `derived_digest` (the takeover digest), `artifacts`; the operation lock: `lock` (null with `reason`: `no_path` \| `unverifiable_path` when its identity cannot be determined), `holder`, `process_groups` (groups a killed dct left running — or `[]` when that cannot be verified), `process_group` (a sync script's group that could not be stopped); the executor: `executor`, `consent`) |
 
 Exit codes: 0 success (also `noop`), 1 refused, the script's own code when
 the version sync fails in prepare (124 on timeout), 75 for a conflict

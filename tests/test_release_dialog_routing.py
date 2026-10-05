@@ -349,7 +349,8 @@ def test_work_in_progress_is_committed_then_the_documented_run_releases_and_push
     workflow refuses (the refusal row points at Step 3 — the commit inside
     the workflow); the agent commits it by the /commit procedure (trailer
     from `dct clog candidates`), plans again, binds the selection, prepares,
-    applies — the documented commands, with the documented flags — and the
+    applies — the documented commands, with the documented flags, the push
+    choice being the complete target the prepare showed (K-123) — and the
     release commit and its tag are on the approved push target."""
     body = text()
     repo, run = cli
@@ -389,11 +390,20 @@ def test_work_in_progress_is_committed_then_the_documented_run_releases_and_push
                               values))
     assert code == 0 and prepared["outcome"] == "prepared"
     url = git(repo, "remote", "get-url", "--push", "origin")
-    assert prepared["details"]["push_target"]["url"] == url   # what the owner approves
+    shown = prepared["details"]["push_target"]                # what the owner approves
+    assert shown == {"remote": "origin", "branch": "main", "url": url, "tag": "v1.1.0"}
     values["--proposal-digest"] = prepared["details"]["proposal_sha256"]
-    code, doc = run(argv("apply", documented(
-        body, "apply", having=("--entries",),
-        lacking=("--push-remote", "--push-url", "--no-push")), values))
+    # K-123: no documented apply pushes without the complete approved target —
+    # the dialog passes details.push_target.{remote,branch,url} of the prepare.
+    pushing = [flags for group, sub, flags in _commands(body)
+               if (group, sub) == ("release", "apply") and len(flags) > 1
+               and "--no-push" not in flags]
+    assert pushing and all(
+        {"--push-remote", "--push-branch", "--push-url"} <= set(flags) for flags in pushing)
+    values.update({"--push-remote": shown["remote"], "--push-branch": shown["branch"],
+                   "--push-url": shown["url"]})
+    code, doc = run(argv("apply", documented(body, "apply", having=("--entries",),
+                                             lacking=("--no-push",)), values))
     assert code == 0 and doc["outcome"] == "completed"
     steps = {step["step"]: step for step in doc["steps"]}
     assert steps["push"]["result"] == "done" and steps["push"]["url"] == url

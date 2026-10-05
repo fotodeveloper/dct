@@ -309,14 +309,14 @@ def test_a_second_mutating_command_refuses_while_a_release_runs(engine, proj, tm
             assert go.wait(60), "the test never released the barrier"
 
     # Digests are computed BEFORE the race (prepare takes the lock itself).
-    from conftest import approved_plan_digest, approved_proposal_digest
+    from conftest import approved_plan_digest, approved_proposal_digest, approved_push
 
     digest = approved_plan_digest(engine, SLUG, repo, version="1.1.0", entry_ids=[a])
     proposal = approved_proposal_digest(engine, SLUG, repo, plan_digest=digest,
                                         version="1.1.0", entry_ids=[a])
     thread, box = _in_thread(lambda: effects.apply_release(
         engine, SLUG, version="1.1.0", entry_ids=[a], confirm=True, plan_digest=digest,
-        proposal_digest=proposal, cwd=str(repo), on_point=barrier))
+        proposal_digest=proposal, cwd=str(repo), on_point=barrier, **approved_push(repo)))
     try:
         assert entered.wait(60), box.get("error")
         lock = oplock.lock_path(git_common_dir=common_dir(repo))

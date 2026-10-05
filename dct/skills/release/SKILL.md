@@ -305,15 +305,22 @@ Outcome `prepared` → show, as plain text:
   branch's upstream) and `details.push_target.url`: the ONE effective push
   URL — the remote's push address, never its fetch URL; the release is read,
   pushed and verified exactly there. `null` (the reason is in `warnings`) →
-  the owner decides, never guess: no upstream → `--push-remote <remote>
-  --push-branch <branch>`, or a local release (`--no-push`); a remote with
-  SEVERAL push URLs (listed in `warnings`) → the owner picks ONE with
-  `--push-url <url>` — there is no mirror mode, the other addresses are the
-  owner's to push.
+  the owner decides, never guess: no upstream → the owner names the remote
+  and the branch, or a local release (`--no-push`); a remote with SEVERAL
+  push URLs (listed in `warnings`) → the owner picks ONE — there is no
+  mirror mode, the other addresses are the owner's to push; a URL git would
+  read as a remote NAME or rewrite → the owner fixes the remote's push URL
+  (the refusal table), then prepare again.
 
 Then ask: `"Release with these files, pushed to <remote>/<branch> (<url>)"`
 / `"Other push target"` / `"Local release — no push"` / `"Not these files —
-stop"`. Keep `details.proposal_sha256` (`P`). Outcome `failed` → the script
+stop"`. Keep `details.proposal_sha256` (`P`) and the APPROVED push target —
+its three values `remote`, `branch` and `url`, exactly as shown: apply takes
+all three and never selects a target itself (the upstream may change after
+the approval). `"Other push target"` → the owner names remote and branch;
+show that remote's push URLs (`git remote get-url --push --all <remote>`,
+read-only) and let the owner approve ONE — those three are then the
+approved target. Outcome `failed` → the script
 failed or timed out (exit code 124; `details.sync`, with the environment
 contract it ran under in `details.environment`): nothing stamped; the owner
 fixes the script, then prepare again. `refused` → the refusal table below.
@@ -321,19 +328,23 @@ fixes the script, then prepare again. `refused` → the refusal table below.
 ### Step 9: Apply — only on the owner's yes
 
 ```bash
-dct release apply --version 1.1.0 --entries 12,13,15,16,17 --plan-digest <D> --proposal-digest <P> --confirm --json
-dct release apply --version 1.1.0 --entries 12,13,15,16,17 --plan-digest <D> --proposal-digest <P> --push-remote origin --push-branch main --confirm --json   # another push target
-dct release apply --version 1.1.0 --entries 12,13,15,16,17 --plan-digest <D> --proposal-digest <P> --push-remote origin --push-branch main --push-url <url> --confirm --json   # ONE of several push URLs
+dct release apply --version 1.1.0 --entries 12,13,15,16,17 --plan-digest <D> --proposal-digest <P> --push-remote origin --push-branch main --push-url <url> --confirm --json   # the approved push target: details.push_target.{remote,branch,url} of Step 8
 dct release apply --version 1.1.0 --no-entries --plan-digest <D> --proposal-digest <P> --no-push --confirm --json   # version-only, local
 ```
 
-The first form pushes to the upstream shown in Step 8; pass the push flags
-the owner chose, nothing else. The workflow stamps, writes the changelog
+A release that pushes ALWAYS carries the three push flags — the `remote`,
+`branch` and `url` the owner approved in Step 8 (the shown
+`details.push_target`, or the other target the owner named there), verbatim.
+There is no form without them: an apply that lacks one is refused before the
+stamp, and `--no-push` only on the owner's explicit choice of a local
+release. The workflow stamps, writes the changelog
 section and the approved version files, makes the `release: v<V>` commit
 through the repository's hooks (on the pinned candidate, published by
 compare-and-swap — needs git 2.36 or newer), updates the real index, tags
 `v<V>` and pushes the commit and the tag atomically to the approved URL
-(K-97 F2, K-104) — each verified and recorded. Never pass a digest the
+(K-97 F2, K-104) — exactly those two refs: no other tag, and never a
+submodule (a commit a gitlink names stays the owner's to publish) — each
+verified and recorded. Never pass a digest the
 owner has not seen.
 
 ### Step 10: Read the result and report
@@ -377,8 +388,8 @@ Refusals (the keys are the workflow's own, `dct/workflows/release/effects.py`):
 | `details.commit`, `details.parents`, `details.tree`, `details.expected_tree`, `details.candidate` | on resume HEAD is neither the candidate nor the release commit — a commit made by hand, or the leftover of an older run (`commit`, its `parents`, its `tree` against the approved `expected_tree`, the `candidate`); reported exactly: dct touched no ref, no staging and no file, and it never resets | show it. The hint of `details.error` is conditional: IF that commit is the owner's to discard and nothing is based on it, the owner moves the branch back to the candidate, then resume. The owner decides — never this dialog |
 | `details.foreign_staged` | after the release commit: the owner's own staged version of a release file was preserved | the owner unstages or commits it, then resume |
 | `details.index_lock` | another git process holds `index.lock` (never removed by dct) | wait for it, then resume |
-| `details.push_target`, `details.push_urls` | before the stamp, nothing released: no upstream (`push_target: null`), or the remote has several push URLs (`push_urls`) — a release goes to ONE approved address (no mirror mode) | the owner chooses `--push-remote … --push-branch …`, picks ONE of the listed addresses with `--push-url <url>`, or `--no-push`; then apply again. On resume `push_urls` without the approved URL = the remote no longer pushes to the approved address (outside the consent): the owner restores the remote, then resume |
-| `details.url`, `details.rewrite_rule` | a git `insteadOf` / `pushInsteadOf` rule (`rewrite_rule`) would rewrite the approved address `url` on git's command line — dct pushes only to the exact approved URL | the owner removes that rule (or points the remote at the final address); then the same command (after the stamp: resume) |
+| `details.push_target`, `details.push_urls` | before the stamp, nothing released: the apply did not name the COMPLETE approved push target (`push_target: null` — a missing `--push-remote` / `--push-branch` / `--push-url`; apply never selects the upstream), the named URL is not a push address of that remote (`push_urls`: the remote changed since the approval), or — prepare / takeover — no upstream, or the remote has several push URLs (`push_urls`) — a release goes to ONE approved address (no mirror mode) | pass the three values the owner approved in Step 8; when the target itself changed or is unsettled the owner chooses again — remote, branch and ONE of the listed addresses (`--push-remote … --push-branch … --push-url <url>`), or `--no-push`; then apply again. On resume `push_urls` without the approved URL = the remote no longer pushes to the approved address (outside the consent): the owner restores the remote, then resume |
+| `details.url`, `details.rewrite_rule`, `details.remote_name` | git would not send the approved address `url` to the repository it names: an `insteadOf` / `pushInsteadOf` rule (`rewrite_rule`) would rewrite it on git's command line, or the string is also the name of a git remote (`remote_name` — any config scope, also global; a slash does not make it a path) and git would use that remote's own addresses — dct pushes only to the exact approved URL | the owner removes that rule (or points the remote at the final address); for a remote name BEFORE the stamp: writes the remote's push URL explicitly (`./name`, an absolute path or a real URL) or renames the colliding remote, then Step 8 again; AFTER the stamp the consent keeps the approved string, so only renaming or removing the colliding remote works, then resume (or abandon) |
 | `details.git_error`, `details.push_target` | a failed push → the record stays `tagged` (the commit and the tag exist locally) | fix the cause, then resume — it retries ONLY the push, to the approved URL |
 | `details.remote_tags` | the push destination already has a tag of V | stop; the owner decides (another version, or the remote's tag) |
 | `details.remote_branch` | the remote branch is not contained in the candidate | the owner fetches and integrates it, then re-plan from Step 0 |

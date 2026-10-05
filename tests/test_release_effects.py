@@ -26,8 +26,10 @@ from conftest import (
     alias_argv,
     approved_plan_digest,
     approved_proposal_digest,
+    approved_push,
     git,
     make_git_repo,
+    push_argv,
     run_cli,
 )
 
@@ -153,7 +155,9 @@ def record_date(engine, version="1.1.0") -> str:
 def apply(engine, repo, **kw):
     """apply_release with the digest of the plan for the same selection (the
     owner's approval, K-80) and of the proposal `prepare` stores for it
-    (K-76) unless the test passes its own."""
+    (K-76) unless the test passes its own — and the push choice the owner
+    approves with it (K-123, conftest.approved_push: the upstream target
+    prepare shows; what the test passes wins)."""
     kw.setdefault("confirm", True)
     if "plan_digest" not in kw and not kw.get("strict"):
         kw["plan_digest"] = approved_plan_digest(engine, SLUG, repo, **kw)
@@ -162,15 +166,22 @@ def apply(engine, repo, **kw):
                      if k in kw}
         kw["proposal_digest"] = approved_proposal_digest(
             engine, SLUG, repo, plan_digest=kw["plan_digest"], **selection)
-    return apply_release(engine, SLUG, cwd=str(repo), **kw)
+    push = {k: kw.pop(k) for k in ("push_remote", "push_branch", "push_url", "no_push")
+            if k in kw}
+    return apply_release(engine, SLUG, cwd=str(repo), **kw, **approved_push(repo, **push))
 
 
-def cli_digest(engine, repo, version: str, entries: list[int] | None) -> list[str]:
+def cli_digest(engine, repo, version: str, entries: list[int] | None, *,
+               push: bool = True) -> list[str]:
+    """The approval flags of a `dct release apply` argv: both digests and
+    (`push`) the approved push choice (K-123) — a push flag the test adds
+    AFTER these wins (argparse keeps the last)."""
     kw = {"entry_ids": entries} if entries is not None else {"no_entries": True}
     plan = approved_plan_digest(engine, SLUG, repo, version=version, **kw)
     proposal = approved_proposal_digest(engine, SLUG, repo, plan_digest=plan, version=version,
                                         **kw)
-    return ["--plan-digest", plan, *(["--proposal-digest", proposal] if proposal else [])]
+    return ["--plan-digest", plan, *(["--proposal-digest", proposal] if proposal else []),
+            *(push_argv(repo) if push else [])]
 
 
 def resume(engine, repo, **kw):

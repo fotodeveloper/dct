@@ -28,7 +28,13 @@ import time
 from pathlib import Path
 
 import pytest
-from conftest import approved_plan_digest, approved_proposal_digest, git, make_git_repo
+from conftest import (
+    approved_plan_digest,
+    approved_proposal_digest,
+    approved_push,
+    git,
+    make_git_repo,
+)
 from test_procs import MIB, ROOT, Family
 from test_release_effects import SLUG as SLUG_R
 from test_release_effects import apply, make_release_repo, proven, remote_refs, resume
@@ -193,7 +199,7 @@ cfg = json.loads(sys.argv[1])
 procs.TERM_GRACE_SECONDS = 0.3
 effects.apply_release(get_engine(cfg["url"]), cfg["slug"], version="1.1.0",
                       entry_ids=cfg["ids"], confirm=True, plan_digest=cfg["digest"],
-                      proposal_digest=cfg["proposal"], cwd=cfg["repo"])
+                      proposal_digest=cfg["proposal"], cwd=cfg["repo"], **cfg["push"])
 '''
 
 
@@ -211,7 +217,8 @@ def test_an_apply_interrupted_inside_a_commit_hook_stops_the_hook_and_stays_resu
                                         version="1.1.0", entry_ids=[a])
     hook = install_hook(hooks_dir(repo), "pre-commit", bash_family(family))
     config = {"url": engine.url.render_as_string(hide_password=False), "slug": SLUG_R,
-              "ids": [a], "repo": str(repo), "digest": digest, "proposal": proposal}
+              "ids": [a], "repo": str(repo), "digest": digest, "proposal": proposal,
+              "push": approved_push(repo)}
     script = tmp_path / "apply.py"
     script.write_text(APPLY)
     helper = subprocess.Popen([sys.executable, str(script), json.dumps(config)], cwd=ROOT,

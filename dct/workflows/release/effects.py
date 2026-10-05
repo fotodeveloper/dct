@@ -114,11 +114,13 @@ Stages of one release:
      re-derived FOR THE PINNED CANDIDATE must match the approved snapshot
      digest (K-80); the requested set ⊆ the plan's proven ids; git itself
      recent enough for the hook lifecycle (MIN_GIT_VERSION, K-103); the ONE
-     push target (push_target, K-104: the branch's upstream, or the
-     explicit --push-remote / --push-branch, or --no-push — no upstream is
-     refused, never guessed; its URL is the remote's effective push
-     address from the full `get-url --push --all`, --push-url choosing one
-     of several — several without a choice are refused) and that URL read
+     push target (push_target, K-104 / K-123: a new release names it
+     COMPLETELY — --push-remote, --push-branch and --push-url, what
+     prepare showed and the owner approved — or --no-push; apply never
+     selects the upstream, a missing part is refused; its URL must be one
+     of the remote's push addresses from the full `get-url --push --all`
+     and addressable literally — no insteadOf rewrite, not a remote's
+     name, K-124) and that URL read
      once (no tag of V there, its branch contained in the candidate — K-97
      F2); the approved proposal (--proposal-digest, REQUIRED for a new
      release — also for the alias, K-117) must be the pending one, bound
@@ -171,10 +173,12 @@ Stages of one release:
   6. tag `v<V>` (lightweight) at the verified release commit → 'tagged'
      with its tag_proof (K-115 G4; an existing tag of V at that commit —
      also an annotated one — is verified and recorded instead);
-  7. push (K-97 F2, K-104) — `git push --atomic <url> <commit>:refs/heads/
-     <branch> <commit>:refs/tags/<tag>`: the release commit and the tag to
+  7. push (K-97 F2, K-104) — `git push --atomic --no-follow-tags
+     --recurse-submodules=no <url> <commit>:refs/heads/<branch>
+     <commit>:refs/tags/<tag>`: the release commit and the tag to
      the CONSENTED target's URL itself with explicit refspecs (a later
-     change of the remote's configuration adds no recipient), verified
+     change of the remote's configuration adds no recipient; no followed
+     tag, no submodule push — K-126, K-134), verified
      with `git ls-remote <url>` — the same address → 'pushed' with its
      push_proof (K-115 G4), then 'completed' (the proposal's pin / store
      blobs are released); a failed push leaves 'tagged' and resume retries
@@ -2537,8 +2541,9 @@ def _check_recorded_tag(run: _Run) -> None:
 
 # ── step 7: the push (K-97 F2) ───────────────────────────────────────────────
 
-_PUSH_CHOICE = ("choose explicitly: `--push-remote <remote> [--push-branch <branch>]` (the "
-                "remote and branch the release commit and its tag go to) or `--no-push` (a "
+_PUSH_CHOICE = ("choose explicitly: `--push-remote <remote> --push-branch <branch>` (the "
+                "remote and branch the release commit and its tag go to; an apply also "
+                "names `--push-url <url>`, that remote's push address) or `--no-push` (a "
                 "local release, nothing pushed)")
 
 
@@ -2563,17 +2568,31 @@ def _push_urls(repo: str, remote: str) -> list[str] | None:
 
 def _check_literal_url(run: _Run, url: str) -> None:
     """The approved URL goes on git's command line (`git push <url>`, `git
-    ls-remote <url>`) — it must reach the repository it NAMES. A
-    url.<base>.insteadOf / pushInsteadOf rule whose value is a prefix of it
-    would make git send (or read) elsewhere, so such a URL is refused:
-    what is pushed to is exactly what was approved, whatever rule is added
-    later."""
+    ls-remote <url>`) — it must reach the repository it NAMES. Refused when
+    git would read it as something else:
+
+    - a url.<base>.insteadOf / pushInsteadOf rule whose value is a prefix
+      of it would make git send (or read) elsewhere;
+    - K-124: the string is the NAME of a remote — git then uses that
+      remote's own url for `ls-remote` and its pushurl(s) for the push,
+      not the path the string names. Every name git itself would resolve
+      counts: a `remote.<name>.*` key in ANY configuration scope (system,
+      global, local, worktree, includes — read with the writer's view, the
+      one the push runs with) and, for a name without a directory
+      separator, the legacy `<git common dir>/remotes/<name>` and
+      `branches/<name>` files. No spelling proves a literal address:
+      `group/publish`, `./publish` and even a URL-like string are legal
+      remote names, and git reads a string as a remote whenever a remote
+      of exactly that name is configured — so the WHOLE string is compared
+      with every configured name.
+
+    What is pushed to is exactly what was approved, whatever rule or remote
+    is added later: the check runs before the stamp (push_target), in the
+    takeover and before every push / control read (_consented_target)."""
     code, out = gitinfo.git_write(
         run.repo, "config", "-z", "--get-regexp", r"^url\..*\.(insteadof|pushinsteadof)$",
         ok_codes=(0, 1))
-    if code != 0:
-        return
-    for item in (i for i in out.split("\0") if i):
+    for item in (i for i in out.split("\0") if i) if code == 0 else ():
         key, _, value = item.partition("\n")
         if value and url.startswith(value):
             raise run.refuse(
@@ -2582,6 +2601,26 @@ def _check_literal_url(run: _Run, url: str) -> None:
                 f"it to another address when dct passes it to `git push` — dct pushes only to "
                 f"the exact approved URL; remove that rule (or point the remote at the final "
                 f"address); nothing pushed.", url=url, rewrite_rule=key)
+    code, out = gitinfo.git_write(run.repo, "config", "-z", "--name-only", "--get-regexp",
+                                  r"^remote\.", ok_codes=(0, 1))
+    # `remote.<name>.<variable>` — the name may itself contain dots and slashes.
+    named = code == 0 and any(key[len("remote."):].rpartition(".")[0] == url
+                              for key in out.split("\0"))
+    if not named and url not in (".", "..") and not any(
+            sep in url for sep in (os.sep, os.altsep, "/") if sep):
+        named = any(os.path.lexists(_git_path(run.repo, f"{kind}/{url}"))
+                    for kind in ("remotes", "branches"))
+    if named:
+        raise run.refuse(
+            f"the push destination {url} cannot be addressed literally: {url!r} is also the "
+            f"name of a git remote here (configuration `remote.{url}.*` in any scope, or a "
+            f"legacy remotes/ or branches/ file), and git resolves such a string as that "
+            f"REMOTE — its own url and pushurl — not as the repository the path names. dct "
+            f"pushes only to the exact approved URL: rename or remove the remote {url!r}; "
+            f"for a release that is not stamped yet you may instead write the push URL "
+            f"explicitly as `./{url}`, an absolute path or a real URL (scheme://…) and "
+            f"prepare again — an unfinished release keeps the approved string, so there "
+            f"only the remote's name can change; nothing pushed.", url=url, remote_name=url)
 
 
 def push_target(run: _Run, version: str, *, push_remote: str | None = None,
@@ -2589,7 +2628,15 @@ def push_target(run: _Run, version: str, *, push_remote: str | None = None,
                 no_push: bool = False) -> dict | None:
     """The ONE effective push target the owner approves with apply (K-97
     F2, K-104) — None for a project outside git or with `no_push` (an
-    explicit local release). Default: the current branch's UPSTREAM
+    explicit local release). Three callers:
+
+    - apply (a new release, K-123) passes ALL of `push_remote`,
+      `push_branch`, `push_url` — it refuses an incomplete set itself, so
+      nothing below is derived there: the values are only CHECKED;
+    - prepare passes none: the default it SHOWS for the approval;
+    - a takeover passes the owner's choice, bound by its digest.
+
+    Default (what is not given): the current branch's UPSTREAM
     (`branch.<b>.remote` + `branch.<b>.merge`); no upstream (also a
     detached HEAD, or a local upstream `.`) → refused with the explicit
     choice, never guessed. `push_remote` names the remote; its branch is
@@ -2603,8 +2650,10 @@ def push_target(run: _Run, version: str, *, push_remote: str | None = None,
     SEVERAL → `push_url` must choose ONE of them (refused otherwise, with
     the list: `git push <remote>` would send to all of them; dct has no
     mirror mode — the release goes to one destination, verified there).
-    `push_url` must be one of the remote's push addresses. The URL must be
-    literal (_check_literal_url).
+    `push_url` must be one of the remote's push addresses (a remote
+    re-pointed since the approval is refused, `push_target: null`). The URL
+    must be literal (_check_literal_url: no rewrite rule, not a remote's
+    name).
     → {remote, url, branch, tag: "v<V>"} — what prepare shows, the consent
     stores, the pre-stamp read, the push, its verification and every resume
     use. Read-only, no network."""
@@ -2642,13 +2691,14 @@ def push_target(run: _Run, version: str, *, push_remote: str | None = None,
     urls = _push_urls(run.repo, remote)
     if not urls:
         raise run.refuse(f"there is no remote named {remote!r} — {_PUSH_CHOICE}; nothing "
-                         f"released.", remote=remote)
+                         f"released.", remote=remote, push_target=None)
     if push_url is not None:
         if push_url not in urls:
             raise run.refuse(
                 f"--push-url {push_url} is not a push URL of the remote {remote} (its push "
                 f"URLs: {', '.join(urls)}) — dct pushes only to an address the remote is "
-                f"configured to push to; nothing released.", remote=remote, push_urls=urls)
+                f"configured to push to; nothing released.", remote=remote, push_urls=urls,
+                push_target=None)
         url = push_url
     elif len(urls) > 1:
         raise run.refuse(
@@ -2734,12 +2784,27 @@ def _pushed(run: _Run, refs: dict[str, str], target: dict, commit: str) -> bool:
             and _contains(run.repo, refs.get(f"refs/heads/{target['branch']}"), commit))
 
 
+# The ONE push command of apply and resume sends the refspecs it names to the
+# URL it names — git configuration cannot widen it: `--no-follow-tags`
+# (K-126: push.followTags would add every annotated tag reachable from the
+# release commit that the destination lacks — an unapproved ref),
+# `--recurse-submodules=no` (K-134: push.recurseSubmodules / submodule.recurse
+# would publish the submodules' commits to THEIR remotes — repositories
+# outside the consent).
+_PUSH_SCOPE = ("--atomic", "--no-follow-tags", "--recurse-submodules=no")
+
+
 def _step_push(run: _Run) -> None:
-    """'tagged' → 'pushed' (K-97 F2, K-104): `git push --atomic <url>
-    <commit>:refs/heads/<branch> <commit>:refs/tags/<tag>` — the APPROVED
-    URL itself and explicit refspecs, so nothing the remote's configuration
-    gained since (another pushurl, a push refspec, a mirror flag) adds a
-    recipient or a ref; the remote side's hooks and the local pre-push hook
+    """'tagged' → 'pushed' (K-97 F2, K-104): `git push --atomic
+    --no-follow-tags --recurse-submodules=no <url>
+    <commit>:refs/heads/<branch> <commit>:refs/tags/<tag>` (_PUSH_SCOPE) —
+    the APPROVED URL itself and explicit refspecs, so nothing the
+    configuration holds or gained since (another pushurl, a push refspec, a
+    mirror flag, push.followTags, push.recurseSubmodules / submodule.recurse)
+    adds a recipient or a ref. Submodules are therefore NEVER pushed: a
+    gitlink of the release may name a commit its submodule's remote does not
+    have yet — publishing it is the owner's, dct does not check it. The
+    remote side's hooks and the local pre-push hook
     run (it receives the URL as the remote's name). Verified with `git
     ls-remote <url>` — the same address. Already there → verified, not
     pushed again; PARTLY there → only the missing refspec is pushed (a
@@ -2769,7 +2834,7 @@ def _step_push(run: _Run) -> None:
         if refs.get(f"refs/tags/{target['tag']}") != commit:
             refspecs.append(f"{commit}:refs/tags/{target['tag']}")
         try:
-            gitinfo.git_write(run.repo, "push", "--atomic", target["url"], *refspecs,
+            gitinfo.git_write(run.repo, "push", *_PUSH_SCOPE, target["url"], *refspecs,
                               network=True, timeout=HOOK_GIT_TIMEOUT_SECONDS,
                               diagnostic=True)
         except gitinfo.GitWriteError as exc:
@@ -3270,12 +3335,17 @@ def apply_release(
     K-116 H2, _check_approved_proposal). `confirm=True` is required —
     also for the alias (K-96 D1: running it is no longer the confirmation).
 
-    K-97 F2 / K-104: `push_remote` / `push_branch` / `push_url` / `no_push`
-    choose the ONE push target (push_target(): default the branch's
-    upstream; none → refused with the choice, never guessed; the URL is the
-    remote's effective push address, `push_url` choosing one when it has
-    several — refused without the choice; `no_push` = an explicit local
-    release). Before the stamp that address is read (no tag of V there,
+    K-97 F2 / K-104 / K-123: `push_remote` + `push_branch` + `push_url`
+    name the ONE push target — for a NEW release in git ALL THREE are
+    required (the `push_target` {remote, branch, url} prepare showed and
+    the owner approved), or `no_push=True` (an explicit local release): a
+    missing one is refused before the stamp (details.push_target null),
+    never completed from the upstream — the remote's URL, the upstream or
+    the current branch may have changed since the approval. Each value is
+    checked (push_target(): the remote exists, the URL is one of its push
+    addresses and literal — no rewrite rule, not a remote's name; a
+    mismatch is refused). Outside git no push flag is accepted; a re-run
+    of a recorded release reads none. Before the stamp that address is read (no tag of V there,
     its branch contained in the candidate); the target is recorded in the
     consent and is what the push, its verification — and every resume —
     address literally (K-97 F4).
@@ -3336,6 +3406,28 @@ def _apply(engine, project_slug, located, *, version, bump_type, entry_ids, no_e
                 + "; nothing prepared, nothing released.",
                 proposal_digest=None, version=target, plan_digest=plan["snapshot_digest"])
         push_remote, push_branch, push_url, no_push = push
+        missing = [flag for flag, value in (("--push-remote", push_remote),
+                                            ("--push-branch", push_branch),
+                                            ("--push-url", push_url)) if not value]
+        if run.repo is not None and not no_push and missing:
+            # K-123: what prepare showed is bound to nothing after the
+            # approval (the upstream, the remote's URL and the current branch
+            # can all change with HEAD and both digests intact) — so apply
+            # never derives the target: the caller names the approved one.
+            # Every version WITHOUT a record is covered (whether the stamp
+            # will write is only known inside it), a legacy no-op included.
+            raise run.refuse(
+                f"a new release (a version without a record) that pushes needs the COMPLETE "
+                f"approved push target — "
+                f"`--push-remote <remote> --push-branch <branch> --push-url <url>`, exactly "
+                f"the `push_target` (remote, branch, url) that `dct release prepare` showed "
+                f"and the owner approved (missing: {', '.join(missing)}). apply never selects "
+                f"the upstream itself: it may have changed since the approval. For another "
+                f"destination the owner names all three (the URL is one of `git remote "
+                f"get-url --push --all <remote>`); `--no-push` is an explicit local release. "
+                f"If {target} was already released before dct kept release records, record "
+                f"it with `dct release reconstruct --version {target}` instead of apply; "
+                f"nothing released.", push_target=None)
         push_to = push_target(run, normalize_version(target), push_remote=push_remote,
                               push_branch=push_branch, push_url=push_url, no_push=no_push)
         if push_to is not None:

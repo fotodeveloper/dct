@@ -27,7 +27,7 @@ import sys
 
 import pytest
 import sqlalchemy as sa
-from conftest import approved_plan_digest, approved_proposal_digest, git
+from conftest import approved_plan_digest, approved_proposal_digest, git, push_argv
 from test_release_effects import (
     SLUG,
     assert_released,
@@ -157,7 +157,8 @@ def apply_argv(engine, repo, a) -> list[str]:
     proposal = approved_proposal_digest(engine, SLUG, repo, plan_digest=plan, version="1.1.0",
                                         entry_ids=[a])
     return ["release", "apply", "-P", SLUG, "--version", "1.1.0", "--entries", str(a),
-            "--plan-digest", plan, "--proposal-digest", proposal, "--confirm", "--json"]
+            "--plan-digest", plan, "--proposal-digest", proposal, "--confirm", "--json",
+            *push_argv(repo)]
 
 
 MODES = ["raise", "real_pg"]

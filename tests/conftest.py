@@ -394,6 +394,57 @@ def alias_proposal(engine, slug: str, cwd, **selection) -> list[str]:
     return ["--proposal-digest", out["details"]["proposal_sha256"]]
 
 
+def approved_push(cwd, **given) -> dict:
+    """The push choice of an apply call as the OWNER approves it (K-123: a
+    new release that pushes names the complete target prepare showed —
+    `push_remote`, `push_branch`, `push_url`; apply never selects it) — the
+    tests' stand-in for the dialog passing `details.push_target` of the
+    approved prepare. Read from git the way prepare shows it: the current
+    branch's upstream and the ONE push URL of its remote; what the test
+    passes itself wins, and a part git does not settle (no upstream, a
+    local upstream `.`, several push URLs) is left out — apply then
+    refuses for its own reason. `no_push` or a directory that is no
+    checkout → `given` unchanged."""
+    out = dict(given)
+    if out.get("no_push") or cwd is None:
+        return out
+
+    def read(*args: str) -> str | None:
+        try:
+            return git(cwd, *args) or None
+        except (subprocess.CalledProcessError, OSError):
+            return None
+
+    branch = read("symbolic-ref", "-q", "--short", "HEAD")
+    up_remote = read("config", "--get", f"branch.{branch}.remote") if branch else None
+    merge = read("config", "--get", f"branch.{branch}.merge") if branch else None
+    remote = out.get("push_remote") or (up_remote if up_remote != "." else None)
+    if remote is None:
+        return out
+    out["push_remote"] = remote
+    if not out.get("push_branch") and remote == up_remote and (merge or "").startswith(
+            "refs/heads/"):
+        out["push_branch"] = merge[len("refs/heads/"):]
+    urls = (read("remote", "get-url", "--push", "--all", remote) or "").splitlines()
+    if not out.get("push_url") and len(set(urls)) == 1:
+        out["push_url"] = urls[0]
+    return out
+
+
+_PUSH_FLAGS = {"push_remote": "--push-remote", "push_branch": "--push-branch",
+               "push_url": "--push-url"}
+
+
+def push_argv(cwd, argv: list[str] = ()) -> list[str]:
+    """approved_push as CLI flags for an `apply` / `clog release` argv —
+    only the flags `argv` does not carry itself; nothing with `--no-push`."""
+    given = {key: argv[argv.index(flag) + 1] for key, flag in _PUSH_FLAGS.items()
+             if flag in argv}
+    chosen = approved_push(cwd, no_push="--no-push" in argv, **given)
+    return [part for key, flag in _PUSH_FLAGS.items() if key in chosen and key not in given
+            for part in (flag, chosen[key])]
+
+
 _ALIAS_VALUE_FLAGS = ("-P", "--project", "--entries", "--push-remote", "--push-branch",
                       "--push-url", "--proposal-digest")
 
@@ -401,7 +452,8 @@ _ALIAS_VALUE_FLAGS = ("-P", "--project", "--entries", "--push-remote", "--push-b
 def alias_argv(engine, slug: str, argv: list[str], cwd=None) -> list[str]:
     """The argv of a `dct clog release …` call plus the approved proposal
     for exactly that call (alias_proposal; the selection is read from the
-    argv, the checkout is `cwd` or the process cwd — chdir first). An argv
+    argv, the checkout is `cwd` or the process cwd — chdir first) and the
+    approved push choice (push_argv, K-123). An argv
     whose --entries value does not parse is returned unchanged (the CLI
     refuses it)."""
     selection: dict = {}
@@ -424,7 +476,8 @@ def alias_argv(engine, slug: str, argv: list[str], cwd=None) -> list[str]:
         elif not token.startswith("-"):
             selection["version"] = token
         index += 1
-    return [*argv, *alias_proposal(engine, slug, cwd, **selection)]
+    return [*argv, *alias_proposal(engine, slug, cwd, **selection),
+            *push_argv(os.getcwd() if cwd is None else cwd, argv)]
 
 
 def tag_proof_for(commit: str, name: str = "v1.1.0", *, tag_object: str | None = None) -> dict:
