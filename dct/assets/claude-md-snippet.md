@@ -25,8 +25,8 @@ prefix and trigger in any language:
 - `/track-update` — edit fields, status, priority, sprint membership
 - `/track-resolve` — close (resolved / wont_fix)
 - `/clog` — add changelog entry
-- `/commit` — conventional commit with `(vX.Y.Z)` suffix, changelog-aware
-- `/release` — stamp version, export Keep-a-Changelog MD, release commit
+- `/commit` — conventional commit with `(vX.Y.Z)` suffix; `Changelog:` trailer from `dct clog candidates --json`
+- `/release` — dialog over `dct release plan / attest / apply / resume` (the workflow stamps, writes, commits and tags, verified)
 - `/pickup` — start-of-session: read handoff, show sprint, propose first action
 - `/handoff` — end-of-session: flag sprint + write prompt for next session
 - `/plan-status` — cross-plan progress dashboard
@@ -95,15 +95,16 @@ Order: stage the chosen paths first (a deliberate partial staging stays as it
 is), THEN pick the trailer from the complete `git diff --cached`, THEN
 `git commit` without another `git add`; any later index change means picking
 again. The message ends with a `Changelog: <id>, <id>` trailer (ids ascending,
-before `Co-Authored-By:`) naming the unreleased entries of the CURRENT branch
-whose text matches the staged diff — `/release` stamps only entries proven
-that way. `/clog` records `branch` / `worktree` from the agent's own working
-directory; an entry with `branch_source='server'` is unconfirmed until
-`update_changelog` sets the real branch/worktree.
+before `Co-Authored-By:`) naming the `dct clog candidates --json` entries
+whose text matches the staged diff — `uncertain` ones (server-detected, no
+provenance, detached HEAD) only after the owner confirms them and
+`update_changelog` sets the real branch/worktree; `/release` stamps only
+entries proven that way. Reverts keep git's standard `Revert "…"` message.
+`/clog` records `branch` / `worktree` from the agent's own working directory.
 If pre-commit hook rejects: fix underlying issue, re-stage, **NEW commit** (never `--amend`, never `--no-verify`).
 
 **Releasing** — "release" / "bump version" / "ship it"
-→ `/release` (capability probe → `get_release` first: an unfinished release is RESUMED, verified effect by effect → WIP commit → proof by `Changelog:` trailers in range, attest/correct/withdraw/leave the rest → stamp the exact `entry_ids` at an explicit version with the pinned candidate → append-only changelog section → version-sync → commit `release: vX.Y.Z` → tag, each step recorded with `advance_release`).
+→ `/release` — a dialog over the local workflow: `dct release plan --json` (range, proof per entry, unproven entries, collective attestation proposals) → the owner decides attest / correct / withdraw / keep and the version → `dct release attest` / `dct release apply --version V --entries … --confirm` (stamp, changelog section, version files, `release: vX.Y.Z` commit, tag — each verified and recorded by the workflow; an unfinished release → `dct release resume` or `abandon`). Never pushed automatically.
 
 **Session end** — "handoff" / "end session" / "wrap up" / "next session"
 → `/handoff` (flag sprint items, optionally write handoff prompt).

@@ -95,6 +95,37 @@ entries with server / null provenance link only through an indented id.
 GitLab-style merge requests (`See merge request …!N`) are not parsed for a
 PR number. The groups are proposals — the owner confirms an attestation.
 
+## Merge policy
+
+Proof travels in commit MESSAGES, so the way a branch reaches the release
+line decides whether its entries arrive proven (K-69). Recommended, in any
+order:
+
+- **merge commit** — every original commit, trailer included, stays in the
+  candidate's ancestry;
+- **rebase merge** (fast-forward or rebase-and-merge) — the commits are
+  rewritten, their messages and trailers kept;
+- **hosted squash that keeps the commit messages** — the squash body
+  concatenates the original messages, each `Changelog:` line still in
+  column 0 (the strict body scan reads it).
+
+Proof is lost by:
+
+- **title-only squash** ("PR title" / "PR title and description" as the
+  squash message) — the commit bodies, and with them every trailer, are
+  dropped; nothing is left to read;
+- **local `git merge --squash`** — git writes `Squashed commit of the
+  following:` and INDENTS each original message by four spaces; an indented
+  `    Changelog: 12` is deliberately not proof (indented and quoted lines
+  never count, K-66).
+
+Such entries end up unproven. The plan recognises squash-looking commits and
+proposes ONE collective attestation per source branch (`attestation_groups`,
+heuristic and its limits: "Squash heuristic and its limits" above);
+the owner confirms it and `dct release attest` writes the proof — never an
+automatic assignment. Projects that must squash with title only can attest
+each branch's entries right after the merge, while the evidence is fresh.
+
 ## `dct clog candidates [-P slug] [--json]`
 
 Best-effort location (read-only; for `/commit`, K-53).
@@ -273,3 +304,48 @@ One shape, `effects.RESULT_KEYS` (pinned by
 
 Exit codes: 0 success (also `noop`), 1 refused, the script's own code when
 the version sync fails, 2 for a usage error.
+
+## Layers and a project's own release tool
+
+The three layers (K-72) and who may use them:
+
+| layer | surface | who uses it |
+| --- | --- | --- |
+| 1 proof | `dct release plan --json`, `dct clog candidates --json` | every project — read-only, no side effects |
+| 2 ledger | MCP / core `release_changelog`, `get_release`, `advance_release`, `abandon_release` | the effects layer, or a project's own release tool |
+| 3 effects | `dct release attest / apply / resume / abandon / reconstruct` | the default behind `/release` for projects without their own tool |
+
+The skills of both clients only run the dialog over layers 1 and 3; the MCP
+process never verifies files (it runs in its own directory, not in the
+release checkout).
+
+### Integrating a project's own release tool
+
+A project whose own tool writes the changelog, bumps the version, commits,
+tags or publishes REPLACES ONLY layer 3. It keeps the proof and the ledger:
+
+1. **Proof** — run `dct release plan --version V --json` in the release
+   checkout. Release only ids from `entries.proven` (or ids attested first
+   with `dct release attest`); take `candidate_sha` and `repo_root` from
+   `checkout`, and the proof map from `proof`.
+2. **Exact stamp** — `release_changelog(project, version=V, entry_ids=[…],
+   candidate_sha=<checkout.candidate_sha>, checkout_root=<checkout.repo_root>,
+   proof={<id>: proof[<id>], …})` with an explicit version and an explicit
+   `entry_ids` list (`[]` = version-only). It writes the release record
+   (`stamped`); a repeat with the same set is a no-op, a different set for
+   a recorded V is refused.
+3. **Own effects, verified by the tool** — the tool performs its effects and
+   checks each against reality itself (file content, the commit's tree and
+   parent, the tag's target). A status is never proof: report only what was
+   verified.
+4. **Progress** — `advance_release(version=V, status=…)` after each verified
+   effect, in order `files_written` (optionally with `manifest`) →
+   `committed` (with `release_commit_sha`; the candidate stays immutable) →
+   `tagged` → `completed`. An interrupted release is resumed from
+   `get_release(project)`, never re-stamped under a new version;
+   `abandon_release` ends it explicitly with a reason.
+
+A record the project's own tool advanced is finished by that tool: `dct
+release resume` verifies the effects layer's own manifest and refuses what
+it cannot verify, it does not adopt a foreign tool's effects.
+

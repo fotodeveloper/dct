@@ -1,20 +1,35 @@
-"""Prose contracts for labels and changelog proof (#817 / #801): the skills
-and the authoritative fallback doc must keep telling the assistant to set a
-`short_title`, to record the agent's own `branch` / `worktree`, to write and
-read `Changelog:` trailers, and to probe `release_changelog` for `entry_ids`
-before a release. A later edit that drops one of these silently reverts the
-workflow to the old stamp-everything behaviour."""
+"""Contracts of the skills and docs for labels and changelog proof (#817 /
+#801): the skills and the authoritative fallback doc must keep telling the
+assistant to set a `short_title` and to record the agent's own `branch` /
+`worktree`; /commit and /release are a THIN DIALOG over the release workflow
+(K-72) — checked against the workflow's REAL contract: every `dct release` /
+`dct clog` subcommand and flag they name exists in the production parser
+(dct.cli.build_parser), the keys they read exist in the workflow's schemas,
+the revert message and the quoted example behave as documented under the
+production proof rules, and the release dialog never performs an effect
+(ledger write, commit, tag, version sync, changelog edit) itself."""
 
+import argparse
+import inspect
 import re
 from pathlib import Path
 
 import pytest
 
 from dct.assets import skills_dir
+from dct.cli import build_parser
 from dct.integrations import codex
-from dct.workflows.release.proof import CHANGELOG_LINE_PATTERN
+from dct.workflows.release.proof import (
+    CHANGELOG_LINE_PATTERN,
+    TRAILER_FORMAT,
+    ids_from_body,
+    revert_target,
+)
 
-FALLBACKS = Path(__file__).resolve().parent.parent / "docs" / "assistant-fallbacks.md"
+ROOT = Path(__file__).resolve().parent.parent
+FALLBACKS = ROOT / "docs" / "assistant-fallbacks.md"
+WORKFLOW_DOC = ROOT / "docs" / "release-workflow.md"
+SNIPPET = ROOT / "dct" / "assets" / "claude-md-snippet.md"
 
 
 def _skill(name: str) -> str:
@@ -27,6 +42,10 @@ def _codex(name: str) -> str:
 
 def _fallbacks() -> str:
     return FALLBACKS.read_text(encoding="utf-8")
+
+
+def _snippet() -> str:
+    return SNIPPET.read_text(encoding="utf-8")
 
 
 def _trailer_regex() -> re.Pattern:
@@ -91,43 +110,290 @@ def test_clog_passes_branch_and_worktree_from_the_agent_cwd(text):
     assert "update_changelog" in flat
 
 
-def test_commit_writes_the_trailer_from_the_staged_diff():
-    body = _skill("commit")
-    assert "Changelog: <id>, <id>" in body
-    assert "git diff --cached" in body
-    assert "FINAL staged diff" in body
-    assert "include_unbranched=true" in body
-    # The heredoc example keeps the trailer before Co-Authored-By.
-    assert "Changelog: 12, 15\nCo-Authored-By:" in body
+def _section(body: str, start: str, end: str) -> str:
+    a = body.index(start)
+    return body[a:body.index(end, a)]
 
 
-def test_release_probes_entry_ids_and_attests_by_commit():
+def _in_order(body: str, *markers: str) -> None:
+    positions = [body.index(m) for m in markers]
+    assert positions == sorted(positions), list(zip(markers, positions))
+
+
+def _release_fallback() -> str:
+    return _section(_fallbacks(), "## `/release` fallback", "## `/commit` fallback")
+
+
+def _commit_fallback() -> str:
+    return _section(_fallbacks(), "## `/commit` fallback", "## `/track`")
+
+
+# ── the workflow's CLI is the contract the dialogs are written against ──────
+
+
+def _subparsers(parser: argparse.ArgumentParser) -> dict[str, argparse.ArgumentParser]:
+    for action in parser._actions:
+        if isinstance(action, argparse._SubParsersAction):
+            return dict(action.choices)
+    return {}
+
+
+def _cli() -> dict[str, dict[str, argparse.ArgumentParser]]:
+    """{group: {subcommand: parser}} for the `dct release` / `dct clog` groups
+    of the PRODUCTION parser."""
+    top = _subparsers(build_parser())
+    return {group: _subparsers(top[group]) for group in ("release", "clog")}
+
+
+def _option_strings(parser: argparse.ArgumentParser) -> set[str]:
+    return {opt for action in parser._actions for opt in action.option_strings}
+
+
+_COMMAND_RE = re.compile(r"\bdct (release|clog) ([a-z][a-z-]*)([^`\n]*)")
+
+
+def _commands(text: str) -> list[tuple[str, str, list[str]]]:
+    """(group, subcommand, flags) for every `dct release …` / `dct clog …`
+    invocation named in `text` (inline code and code blocks)."""
+    out = []
+    for group, sub, rest in _COMMAND_RE.findall(text):
+        rest = rest.split("#", 1)[0]  # a shell comment is not part of the command
+        out.append((group, sub, re.findall(r"(?<![\w-])--[a-z][a-z-]*", rest)))
+    return out
+
+
+DIALOG_DOCS = [
+    pytest.param(lambda: _skill("release"), id="release-skill"),
+    pytest.param(_release_fallback, id="release-fallback"),
+    pytest.param(lambda: _skill("commit"), id="commit-skill"),
+    pytest.param(_commit_fallback, id="commit-fallback"),
+    pytest.param(lambda: _section(_snippet(), "**Committing**", "**Session end**"),
+                 id="claude-md-snippet"),
+]
+
+
+@pytest.mark.parametrize("text", DIALOG_DOCS)
+def test_every_named_workflow_command_and_flag_exists_in_the_cli(text):
+    """A renamed subcommand or flag breaks the dialog docs, not the owner's
+    release: each `dct release <sub> --flag` they name is in the parser."""
+    cli = _cli()
+    commands = _commands(text())
+    assert commands, "no dct release / dct clog command named"
+    for group, sub, flags in commands:
+        assert sub in cli[group], f"dct {group} {sub}: no such subcommand"
+        unknown = set(flags) - _option_strings(cli[group][sub])
+        assert not unknown, f"dct {group} {sub}: unknown flags {sorted(unknown)}"
+
+
+def test_release_skill_and_fallback_drive_the_same_workflow_commands():
+    """K-72: the skill and the authoritative fallback describe ONE dialog over
+    the same commands — every effects / proof subcommand of the CLI."""
+    effects = {"plan", "attest", "apply", "resume", "abandon", "reconstruct", "status"}
+    assert effects <= set(_cli()["release"])
+    for text in (_skill("release"), _release_fallback()):
+        named = {sub for group, sub, _ in _commands(text) if group == "release"}
+        assert named == effects, sorted(named ^ effects)
+
+
+@pytest.mark.parametrize("text", [
+    pytest.param(lambda: _skill("release"), id="skill"),
+    pytest.param(_release_fallback, id="fallback"),
+])
+def test_release_dialog_passes_the_owners_decisions_as_flags(text):
+    """Explicit version, explicit selection, explicit confirmation — the flags
+    the effects layer requires (it refuses otherwise)."""
+    calls = [(sub, flags) for group, sub, flags in _commands(text()) if group == "release"]
+    applies = [flags for sub, flags in calls if sub == "apply" and len(flags) > 1]
+    assert applies, "no complete `dct release apply …` invocation"
+    for flags in applies:
+        assert "--version" in flags and "--confirm" in flags
+        assert ("--entries" in flags) != ("--no-entries" in flags)
+        assert not {"--patch", "--minor", "--major"} & set(flags)  # V computed once
+    abandons = [flags for sub, flags in calls if sub == "abandon" and flags]
+    assert abandons and all({"--version", "--reason", "--confirm"} <= set(f) for f in abandons)
+    attests = [flags for sub, flags in calls if sub == "attest" and flags]
+    assert attests and all({"--entries", "--confirm"} <= set(f) for f in attests)
+    flat = " ".join(text().split())
+    assert "--confirm-version-files" in flat
+    # The flags the dialog relies on are really required / present.
+    cli = _cli()["release"]
+    required = {a.option_strings[0] for a in cli["abandon"]._actions if a.required}
+    assert {"--version", "--reason"} <= required
+
+
+@pytest.mark.parametrize("text", [
+    pytest.param(lambda: _skill("release"), id="skill"),
+    pytest.param(_release_fallback, id="fallback"),
+])
+def test_release_dialog_never_performs_the_effects_itself(text):
+    """K-72: skills only do the dialog — no ledger write, no git effect, no
+    version sync and no changelog-file edit of their own."""
+    body = text()
+    for forbidden in ("advance_release(", "release_changelog(", "release-advance",
+                      "git tag", "git commit", "git add", "git push origin v",
+                      "version-sync.sh", "export_changelog", "--allow-empty"):
+        assert forbidden not in body, forbidden
+    for block in re.findall(r"```(?:bash)?\n(.*?)```", body, re.DOTALL):
+        for line in block.splitlines():
+            assert not line.lstrip().startswith("git "), line
+
+
+def test_release_skill_plans_first_and_reports_versions_separately():
     body = _skill("release")
-    assert "MUST list an `entry_ids` parameter" in body
-    assert "chore: attest changelog entries" in body
-    assert "git rev-parse --git-path" in body
-    assert "ALWAYS an explicit `version`" in body
-    assert 'There is NO "include without proof" option' in body
-
-
-def test_release_has_no_step_numbering_gaps_or_ghost_references():
-    body = _skill("release")
+    _in_order(body, "dct release plan --json", "## Resume path")
+    _in_order(body, "### Step 0:", "### Step 1:", "### Step 4:", "### Step 6:")
     headings = [int(n) for n in re.findall(r"^### Step (\d+)", body, re.MULTILINE)]
     assert headings == list(range(len(headings)))
-    assert "Step 2b" not in body and "Step 8b" not in body
-
-
-def test_fallbacks_carry_the_shared_trailer_and_range_rules():
-    body = _fallbacks()
-    assert f"`{CHANGELOG_LINE_PATTERN}`" in body
-    assert "%(trailers:key=Changelog,valueonly,separator=%x2C)" in body
-    # K-71: the range starts at the NEAREST ancestor release tag (computed by
-    # `dct release plan`), confirmed when it is not v<current_version>.
     flat = " ".join(body.split())
+    # K-55 / K-31: requested V, the record's version and current_version.
+    for key in ("details.requested_version", "details.current_version"):
+        assert key in flat
+    assert "range.confirm_required" in flat and "range.approximate" in flat
+    assert "attestation_groups" in flat
+    assert 'There is NO "include without proof" option' in body
+    assert "version-only" in flat.lower() and "consent" in flat
+
+
+def test_release_fallback_says_the_effects_need_the_local_cli():
+    flat = " ".join(_release_fallback().split())
+    assert "Without the CLI" in flat
+    assert re.search(r"ledger tools .{0,80}cannot verify", flat)
+
+
+def test_release_documented_keys_exist_in_the_workflow_schemas():
+    """The plan / result keys the dialog reads are the workflow's real ones."""
+    from dct.workflows.release.effects import OUTCOMES, RESULT_KEYS
+    from dct.workflows.release.plan import PLAN_KEYS
+
+    flat = " ".join((_skill("release") + _release_fallback()).split())
+    for key in ("kind", "unfinished_release", "range", "entries", "attestation_groups",
+                "index", "version_files", "warnings"):
+        assert key in PLAN_KEYS and re.search(rf"`(range\.)?{key}[`. ]", flat), key
+    for key in ("details", "steps", "version", "release"):
+        assert key in RESULT_KEYS
+    for outcome in ("completed", "noop", "refused", "failed", "attested", "preview"):
+        assert outcome in OUTCOMES and f"`{outcome}`" in flat, outcome
+
+
+# ── /commit: candidates from the workflow, K-30 order, K-53 / K-66 / K-68 ──
+
+
+def test_commit_selects_from_the_workflow_candidates_after_staging():
+    """K-30: stage → select from the final index → commit (no second add);
+    K-53: the selection is the workflow's `dct clog candidates`."""
+    body = _skill("commit")
+    _in_order(body, "### Step 4: Stage", "### Step 5: Select", "### Step 6: Commit")
+    step5 = _section(body, "### Step 5: Select", "### Step 6")
+    assert "dct clog candidates --json" in step5
+    assert "FINAL staged diff" in body and "git diff --cached" in step5
+    step6 = _section(body, "### Step 6: Commit", "### Step 7")
+    assert "git add" not in step6.split("```bash", 1)[1].split("```", 1)[0]
+    assert "Changelog: 12, 15\nCo-Authored-By:" in body
+    assert "partially staged" in body
+    recovery = " ".join(_section(body, "### Step 7", "### Step 8").split())
+    assert "ANY change to the index" in recovery and "redo Step 5" in recovery
+
+
+def test_commit_fallback_keeps_the_same_order_and_candidates():
+    commit = _commit_fallback()
+    _in_order(commit, "**Stage first.**", "**Then select the trailer**",
+              "**Then commit — WITHOUT another `git add`.**")
+    assert "partially staged" in commit and "ANY change to the index" in commit
+    assert "dct clog candidates --json" in commit
+
+
+@pytest.mark.parametrize("text", [
+    pytest.param(lambda: _skill("commit"), id="skill"),
+    pytest.param(_commit_fallback, id="fallback"),
+])
+def test_commit_attaches_uncertain_candidates_only_after_confirmation(text):
+    """K-53 / K-66: uncertain (server / no provenance / detached HEAD) are
+    matched but attached only after the owner confirms and update_changelog
+    fixes BOTH fields against the actual checkout — never automatically."""
+    flat = " ".join(text().split())
+    from dct.workflows.release.plan import CANDIDATE_KEYS
+
+    for key in ("confirmed", "uncertain", "other_branch", "already_proven"):
+        assert key in CANDIDATE_KEYS and f"`{key}`" in flat, key
+    assert "update_changelog(entry_id, branch=<current>, worktree=<toplevel>)" in flat
+    assert re.search(r"never (attached )?automatically", flat)
+    assert re.search(r"[Dd]etached HEAD", flat)
+
+
+@pytest.mark.parametrize("text", [
+    pytest.param(lambda: _skill("commit"), id="skill"),
+    pytest.param(_commit_fallback, id="fallback"),
+])
+def test_commit_revert_message_is_detected_by_the_production_rule(text):
+    """K-68: the documented revert message, filled in, is what proof.py
+    recognises as a revert of that commit."""
+    flat = " ".join(text().split())
+    assert 'Revert "<original subject>"' in flat
+    assert "This reverts commit <full sha>." in flat
+    sha = "0123456789abcdef0123456789abcdef01234567"
+    message = (f'Revert "feat(core): add parser (v1.0.0)"\n\n'
+               f"This reverts commit {sha}.\n")
+    assert revert_target(message) == sha
+
+
+@pytest.mark.parametrize("text", [
+    pytest.param(lambda: _skill("commit"), id="skill"),
+    pytest.param(_commit_fallback, id="fallback"),
+])
+def test_commit_quoted_trailer_example_proves_nothing(text):
+    """K-66: the strict format is reserved; the documented quoted example is
+    not proof under the production body scan, the unquoted line is."""
+    assert "`> Changelog: 12`" in text()
+    assert ids_from_body("feat: x\n\nThe format is\n> Changelog: 12\n") == set()
+    assert ids_from_body("feat: x\n\nChangelog: 12\n") == {12}
+
+
+def test_fallbacks_point_the_shared_rules_at_the_code():
+    shared = _section(_fallbacks(), "## Changelog proof", "## `/release` fallback")
+    flat = " ".join(shared.split())
+    assert f"`{CHANGELOG_LINE_PATTERN}`" in shared
+    assert TRAILER_FORMAT in shared
+    assert "dct/workflows/release/proof.py" in flat and "release-workflow.md" in flat
     assert "nearest release tag that is an ancestor" in flat
-    assert "dct release plan" in flat and "dct clog candidates" in flat
-    assert "chore: attest changelog entries" in body
-    assert "entry_ids" in body and "short_title" in body
+    assert "dct release attest" in flat and "chore: attest changelog entries" in flat
+    assert "never an automatic assignment" in flat
+    assert "never proof that an entry belongs to the commit" in flat
+    assert re.search(r"Never fall into an unfiltered list", flat)
+
+
+# ── docs/release-workflow.md: merge policy (K-69) and layering (K-72) ───────
+
+
+def _workflow_doc() -> str:
+    return WORKFLOW_DOC.read_text(encoding="utf-8")
+
+
+def test_workflow_doc_states_the_merge_policy():
+    policy = " ".join(_section(_workflow_doc(), "## Merge policy", "\n## ").split())
+    for mode in ("merge commit", "rebase merge", "hosted squash that keeps the commit messages",
+                 "title-only squash", "git merge --squash"):
+        assert mode in policy, mode
+    assert "INDENTS" in policy and "attestation_groups" in policy
+
+
+def test_own_release_tool_integration_uses_the_real_ledger_parameters():
+    """K-72: a project with its own tool uses the plan for proof and the
+    exact-stamp parameters of the REAL release_changelog / advance_release."""
+    from dct.core.releases import RELEASE_FLOW
+    from dct.mcp import server
+
+    doc = _workflow_doc()
+    integration = doc[doc.index("### Integrating a project's own release tool"):]
+    assert "dct release plan --version V --json" in integration
+    call = re.search(r"release_changelog\(([^)]*)\)", integration, re.DOTALL).group(1)
+    named = set(re.findall(r"(\w+)=", call))
+    assert {"version", "entry_ids", "candidate_sha", "checkout_root", "proof"} <= named
+    assert named <= set(inspect.signature(server.release_changelog).parameters)
+    assert "advance_release(version=V, status=" in integration
+    statuses = re.findall(r"`(files_written|committed|tagged|completed)`", integration)
+    assert list(dict.fromkeys(statuses)) == list(RELEASE_FLOW[1:])
+    assert set(inspect.signature(server.advance_release).parameters) >= {
+        "version", "status", "release_commit_sha", "manifest"}
 
 
 @pytest.mark.parametrize("line", ["Changelog: 3, 12", "Changelog: 7", "Changelog: 1, 2, 30"])
@@ -149,125 +415,3 @@ def test_strict_trailer_regex_rejects_prose_and_malformed_lines(line):
     assert not _trailer_regex().match(line)
 
 
-def _section(body: str, start: str, end: str) -> str:
-    a = body.index(start)
-    return body[a:body.index(end, a)]
-
-
-def _in_order(body: str, *markers: str) -> None:
-    positions = [body.index(m) for m in markers]
-    assert positions == sorted(positions), list(zip(markers, positions))
-
-
-def test_commit_stages_before_selecting_and_commits_without_adding():
-    """K-30: stage → select from the final index → commit (no second add)."""
-    body = _skill("commit")
-    _in_order(body, "### Step 4: Stage", "### Step 5: Select", "### Step 6: Commit")
-    step6 = _section(body, "### Step 6: Commit", "### Step 7")
-    assert "git add" not in step6.split("```bash", 1)[1].split("```", 1)[0]
-    assert "partially staged" in body
-    recovery = " ".join(_section(body, "### Step 7", "### Step 8").split())
-    assert "ANY change to the index" in recovery and "redo Step 5" in recovery
-
-
-def test_commit_fallback_keeps_the_same_staging_order():
-    commit = _section(_fallbacks(), "## `/commit` fallback", "## `/track`")
-    _in_order(commit, "**Stage first.**", "**Then select the trailer**",
-              "**Then commit — WITHOUT another `git add`.**")
-    assert "partially staged" in commit
-    assert "ANY change to the index" in commit
-
-
-def test_release_wip_commit_follows_the_commit_order():
-    step1 = _section(_skill("release"), "### Step 1:", "### Step 2:")
-    _in_order(step1, "**Stage first", "**Then select the trailer**",
-              "**Commit WITHOUT another `git add`**")
-    fallback = _section(_fallbacks(), "**Normal path:**", "**Resume path**")
-    _in_order(fallback, "A dirty tree is NOT a stop", "stage the",
-              "THEN select the trailer", "THEN `git commit` without")
-
-
-def test_release_checks_for_an_unfinished_release_before_wip_and_bump():
-    """K-41: resume detection precedes the WIP auto-commit and the bump."""
-    body = _skill("release")
-    _in_order(body, "### Step 0:", "mcp__dct__get_release(project)",
-              "### Step 1: Ensure a clean working tree", "**Question 2 — bump type.**")
-    assert "## Resume path" in body
-    fallback = _section(_fallbacks(), "**Normal path:**", "**Resume path**")
-    _in_order(fallback, "`get_release(project)`", "A dirty tree is NOT a stop",
-              "Ask via AskUserQuestion: `patch`")
-
-
-@pytest.mark.parametrize("text", [
-    pytest.param(lambda: _skill("release"), id="skill"),
-    pytest.param(_fallbacks, id="fallback"),
-])
-def test_every_release_call_passes_version_entry_ids_and_the_pin(text):
-    calls = re.findall(r"release_changelog\((project[^)`]*)\)", text())
-    assert calls, "no release_changelog call documented"
-    for args in calls:
-        assert "version=V" in args and "bump_type" not in args
-        assert "entry_ids=[" in args  # explicit — never omitted (= stamp all)
-        assert "candidate_sha=SHA" in args and "checkout_root=checkout" in args
-
-
-@pytest.mark.parametrize("text", [
-    pytest.param(lambda: _skill("release"), id="skill"),
-    pytest.param(_fallbacks, id="fallback"),
-])
-def test_release_advances_the_record_in_order(text):
-    """Normal path: one advance per finished effect, in status order; the
-    move to 'committed' records the release commit (K-61: separately — the
-    candidate commit is immutable and never passed to advance_release)."""
-    body = text()
-    if "**Normal path:**" in body:  # the fallback doc
-        normal = _section(body, "**Normal path:**", "**Resume path**")
-    else:  # the skill
-        normal = body[:body.index("## Resume path")]
-    calls = re.findall(r"advance_release\(([^)]*\)?[^)]*)\)", normal)
-    statuses = [re.search(r'"(\w+)"', c).group(1) for c in calls]
-    assert statuses == ["files_written", "committed", "tagged", "completed"]
-    committed = calls[1]
-    assert "release_commit_sha=$(git rev-parse HEAD" in committed
-    assert not any("candidate_sha" in c for c in calls), calls
-
-
-@pytest.mark.parametrize("text", [
-    pytest.param(lambda: _skill("release"), id="skill"),
-    pytest.param(_fallbacks, id="fallback"),
-])
-def test_historical_rerun_never_syncs_or_tags(text):
-    """K-31: V != current_version → no version-sync, no tag; report both."""
-    flat = " ".join(text().split())
-    assert re.search(r"`current_version` ≠ `V`.{0,120}never run version-sync or create a tag", flat)
-    assert re.search(r"requested `V` and the returned `current_version`", flat)
-    assert re.search(r"non-zero exit STOPS the release", flat)
-
-
-def test_fallback_bootstrap_writes_a_version_only_section_and_counts_only_appends():
-    """K-32: one changelog-file contract; +1 applies to an existing file only."""
-    contract = _section(_fallbacks(), "**Changelog-file contract", "**Normal path:**")
-    bootstrap = _section(contract, "- `F` missing (bootstrap)", "- `F` exists")
-    assert "version-only" in bootstrap and "exactly once" in bootstrap
-    assert "N + 1" not in bootstrap
-    assert "N + 1" in _section(contract, "- `F` exists", "- `## [V]` more than once")
-    assert "created_at" in contract  # a resume keeps the original date
-
-
-@pytest.mark.parametrize("text", [
-    pytest.param(lambda: _skill("release"), id="skill"),
-    pytest.param(_fallbacks, id="fallback"),
-])
-def test_release_resolves_files_in_the_current_checkout(text):
-    """K-34: F and the sync script live under the CURRENT checkout's project root."""
-    flat = " ".join(text().split())
-    assert "--git-common-dir" in flat
-    assert re.search(r"NOT the destination", flat)
-    assert "Authoritative cross-check" not in flat and "authoritative cross-check" not in flat
-
-
-def test_fallback_states_detached_head_and_squash_rules():
-    flat = " ".join(_fallbacks().split())
-    assert "git merge --squash" in flat and "never an automatic assignment" in flat
-    assert re.search(r"Detached HEAD.{0,400}never fall into that unfiltered list", flat, re.IGNORECASE)
-    assert "never proof that an entry belongs to the commit" in flat

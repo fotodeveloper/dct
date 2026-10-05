@@ -21,9 +21,11 @@ preflight:
 ToolSearch("select:mcp__dct__list_projects,mcp__dct__count_unreleased_changelog,mcp__dct__list_changelog,mcp__dct__update_changelog")
 ```
 
-The trailer format and the range / proof rules used below are defined ONCE in
-`docs/assistant-fallbacks.md` ("Changelog proof: trailers and range") —
-restated here briefly; on divergence that doc wins.
+The trailer format and the range / proof rules are implemented ONCE by the
+release workflow (`dct clog candidates --json`, `dct release plan --json`;
+schemas in `docs/release-workflow.md`) and described in
+`docs/assistant-fallbacks.md` ("Changelog proof: trailers and range") — on
+divergence the code and that doc win.
 
 ## Workflow
 
@@ -101,43 +103,46 @@ git add -- dct/core/items.py tests/test_items.py
 
 ### Step 5: Select the `Changelog:` trailer from the FINAL staged diff
 
-The trailer is the proof `/release` reads later: an entry no commit names is
-released only after an explicit attestation.
+The trailer is the proof the release workflow reads later: an entry no
+commit names is released only after an explicit attestation. The rules are
+computed by the workflow, not by this skill (`dct/workflows/release/`,
+schema `docs/release-workflow.md`):
 
-1. **Candidates** = `mcp__dct__list_changelog(project, unreleased_only=true,
-   branch=<current>, include_unbranched=true)` rows whose `worktree` equals
-   the current toplevel or is null, MINUS ids already present in trailers of
-   the range `R` (target SHA = `HEAD`):
-   - `R` = `v$CUR..HEAD` when `git rev-parse -q --verify "refs/tags/v$CUR"`
-     succeeds and `git merge-base --is-ancestor "v$CUR" HEAD` holds
-     (`CUR` = `current_version`); otherwise `--since=<oldest unreleased
-     entry's created_at minus 1 day> HEAD`, with a warning that the boundary
-     is approximate.
-   - Ids in `R` = union of
-     `git log --format='%(trailers:key=Changelog,valueonly,separator=%x2C)' R`
-     and the lines of `git log --format=%B R` that match
-     `^Changelog: [0-9]+(, [0-9]+)*$` exactly.
-2. **Match against the complete `git diff --cached`** (Step 4 is done — the
-   index is final): keep the candidates whose entry text / `source_file`
-   describe what is staged. Ask via `AskUserQuestion` when unsure.
-3. **Uncertain rows are never attached as found.** A row whose `branch` is
-   null, or whose `branch_source` is `'server'` (the MCP server's own
-   checkout, not a place you confirmed — whatever branch it stores), is never
-   attached automatically. When it matches the staged diff, ask; on "yes"
-   confirm it first against the actual checkout —
+1. **Candidates** — Step 4 is done, the index is final. Run
+   `dct clog candidates --json` in the current checkout. It returns
+   `confirmed` (client-recorded entries of THIS branch and checkout),
+   `uncertain` (server-detected or without provenance, whatever branch they
+   store; on a detached HEAD every entry of this checkout), `other_branch`,
+   `already_proven` (ids a commit of the range already names — never cited
+   again) and `staged_files`. Show its `warnings` (detached HEAD, approximate
+   range). CLI missing or too old → select by hand with the `/commit`
+   fallback of `docs/assistant-fallbacks.md` (same classification).
+2. **Match against the complete `git diff --cached`** (and `staged_files`):
+   keep the `confirmed` candidates whose entry text / `source_file` describe
+   what is staged. Ask via `AskUserQuestion` when unsure.
+3. **`uncertain` candidates are matched too, but never attached
+   automatically** (K-53). When one matches the staged diff, ask; only on
+   "yes" confirm it against the ACTUAL checkout first —
    `mcp__dct__update_changelog(entry_id, branch=<current>, worktree=<toplevel>)`
-   — then attach it.
-4. **No candidates, but unreleased entries of THIS worktree carry another
-   branch** (e.g. recorded before a branch rename or switch) → offer
+   (both fields) — then attach it. A candidate that describes another change
+   is left alone.
+4. **Detached HEAD** (`checkout.detached`, K-66): a soft presence check only.
+   There are no confirmed candidates; every entry of this checkout is
+   `uncertain` (`detached_head`) — ask which (if any) the commit carries.
+   Confirm a server-detected one with
+   `mcp__dct__update_changelog(entry_id, worktree=<toplevel>)` (no branch
+   exists; its unconfirmed branch is cleared). Never fall back to an
+   unfiltered list of every branch.
+5. **No match, but `other_branch` entries describe the staged change**
+   (recorded before a branch rename or switch) → offer
    `mcp__dct__update_changelog(entry_id, branch=<current>)`, then re-select.
-5. **Detached HEAD** → there is no branch to filter on, and an empty `branch`
-   means every entry of every branch: list with
-   `list_changelog(project, unreleased_only=true, worktree=<toplevel>)`
-   instead, select nothing automatically, and ask which entries (if any) to
-   attach.
 6. Format: ONE line `Changelog: <id>, <id>` — ids ascending, comma + space —
    in the final trailer block, before `Co-Authored-By:`. No selected ids → no
    `Changelog:` line.
+7. **The strict format is reserved** (K-66): a column-0 line
+   `Changelog: <ids>` ANYWHERE in the message counts as proof. When a body
+   shows the format as an example, quote or indent it (`> Changelog: 12`) so
+   it proves nothing.
 
 ### Step 6: Commit — WITHOUT another `git add`
 
@@ -163,6 +168,12 @@ EOF
 - `(v<version>)` suffix — OMIT if `current_version` is null or this IS the release commit.
 - Release commits use the literal `release: vX.Y.Z` format instead, and carry
   NO `Changelog:` trailer.
+- **Reverts** (K-68) keep git's standard message so the release workflow
+  sees the revert: `git revert --no-commit <sha>` stages it (Step 4), then
+  the subject is exactly `Revert "<original subject>"` and the body holds the
+  column-0 line `This reverts commit <full sha>.` (git's own wording; no
+  conventional type, no version suffix). The entries the reverted commit
+  proved lose that proof — never cite them in the revert's trailer.
 - The `Changelog:` line is the Step 5 selection; omit it when nothing was selected.
 
 ### Step 7: Hook-reject recovery
@@ -200,5 +211,7 @@ Report: `✓ Committed abc1234 — feat(core): add checkpoint CRUD (v0.1.0) · C
 - ALWAYS include `Co-Authored-By` trailer with Claude's model identifier.
 - Release commits use literal `release: vX.Y.Z` format — no scope, no description,
   no `Changelog:` trailer.
-- NEVER attach a changelog entry with a null `branch` or `branch_source='server'`
-  without asking and confirming it via `update_changelog`.
+- NEVER attach an `uncertain` candidate (null `branch`, `branch_source='server'`,
+  detached HEAD) without asking and confirming it via `update_changelog`.
+- Reverts keep git's standard `Revert "…"` / `This reverts commit <sha>.`
+  message; examples of the trailer format in a body are quoted.
