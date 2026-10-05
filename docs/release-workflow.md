@@ -14,7 +14,9 @@ The release workflow is layered (K-72):
    push), the
    default behind `/release` ([below](#the-effects-layer)). A project with its
    own release tool replaces only this layer: it verifies its own effects and
-   reports progress through `advance_release`.
+   reports progress through `advance_release`. Which of the two performs a
+   release is EXPLICIT — the project's `release_executor` (`dct` | `own`),
+   copied onto each record at its stamp ([Executor](#executor-k-85)).
 
 Implementation: `dct/workflows/release/proof.py` (pure rules over commit
 messages), `dct/workflows/release/plan.py` (git + database reads) and
@@ -212,7 +214,8 @@ push target (K-97 F2). The MCP server never runs this code.
 
 **Operation lock** (K-96 D7, `dct/workflows/release/oplock.py`): every
 MUTATING command — `prepare`, `apply`, `resume`, `attest`, `abandon`,
-`reconstruct --confirm` and the `clog release` alias — holds ONE lock per
+`reconstruct --confirm`, the `clog release` alias and the old ledger
+commands `clog release-advance` / `clog release-abandon` (K-96 D10) — holds ONE lock per
 repository from before its pre-checks / stamp until it returns:
 `<git common dir>/dct-release.lock` (shared by the main checkout, every
 linked worktree and every dct project inside that repository), for a project
@@ -239,9 +242,45 @@ K-97 F3) → `apply` → `resume` after an interruption.
 | `dct release apply [--version V \| --patch \| --minor \| --major] (--entries … \| --no-entries) --plan-digest D --proposal-digest P [--push-remote R [--push-branch B] \| --no-push] --confirm` | one release from the APPROVED plan (K-80) and the APPROVED proposal (K-76): `D` = the `snapshot_digest` of `dct release plan`, `P` = the `proposal_sha256` of `dct release prepare`, both with the SAME version and selection — steps 1-7 below. The push target (step 7) is approved with it. A re-run of a recorded / historical release needs no `P` (no-op). |
 | `dct release resume` | finishes the unfinished record (table below). No `--confirm` (K-97 F4): it executes the CONSENT stored at apply — version, entries, candidate, proposal, push target — and refuses whatever lies outside it (then: a new apply, or abandon) |
 | `dct release abandon --version V --reason "…" --confirm` | core `abandon_release`: the record ends `abandoned`; stamps, `current_version` and every effect stay; V stays taken |
-| `dct release reconstruct --version V [--confirm]` | a legacy release WITHOUT a record: evidence is gathered read-only and shown; `--confirm` records it (core `reconstruct_release`, no re-stamp) |
+| `dct release reconstruct --version V [--confirm]` | a legacy release WITHOUT a record: evidence is gathered read-only and shown; `--confirm` records it (core `reconstruct_release`, no re-stamp) — [Reconstruct](#reconstruct-dct-release-reconstruct-k-60-k-86-k-96-d8) |
 | `dct release status [--version V]` | the record (read-only) |
+| `dct clog release-advance V STATUS [--release-commit-sha S] [--json]` | the LEDGER path (K-96 D10, `effects.record_progress`): core `advance_release` as the actor `ledger` under the operation lock, for a release dct does NOT execute (an `own` record, or one stamped outside `apply`); a release dct executes is refused (`resume` records its progress). Outcome `advanced` / `noop`, details `{updated, previous_status}` |
+| `dct clog release-abandon V --reason "…" --confirm [--json]` | alias of `dct release abandon` (the same function, the same lock) |
 | `dct clog release [V] [--patch …] [--entries … \| --no-entries] [--proposal-digest P] [--push-remote R [--push-branch B] \| --no-push] --confirm [--json]` | alias of `prepare` + `apply` (the same functions, no rules of its own); `--confirm` is REQUIRED as for apply (K-96 D1 — it commits, tags and pushes; running it is not the confirmation). No `--plan-digest`: the plan is derived inside the call for the candidate it pins, with the same stamp binding. Without `--entries` it releases every unreleased entry — all must be proven. Without `--proposal-digest` it prepares inside the call and proceeds only when the proposal's files EQUAL the confirmed contract; a first release (also an empty contract, D4) or a contract change is refused with the proposal shown (it stays pending) — re-run with `--proposal-digest P`. Refused instead of guessed: unproven entries, a proof range that needs confirmation (`range.confirm_required`). |
+
+### Executor (K-85)
+
+Who performs a release's effects is explicit, never guessed from a script
+name: the project setting `release_executor` — `dct` (default for every
+project; the effects layer) or `own` (the project's own release tool; mark
+a project with an existing release process BEFORE it uses this workflow:
+`dct project release-executor <slug> own`). The setting is copied onto each
+NEW record at its stamp (`releases.executor`, immutable) — the RECORD decides
+from then on; a later change of the project setting never takes over an
+unfinished release (in either direction). dct never runs a command stored in
+the database.
+
+| surface | executor `dct` | executor `own` |
+| --- | --- | --- |
+| `release plan --json`, `clog candidates` (proof layer) | yes | yes — the own tool consumes the same plan, snapshot and proof map |
+| `release attest` (the attestation commit) | yes | yes — a PROOF-layer commit (no ledger write, no release effect); its trailer format is the contract, so an own tool may also write it itself |
+| `release prepare` / `apply` / the `clog release` alias | yes | REFUSED before any write (`details.executor: "own"`, pointing here) |
+| ledger: MCP `release_changelog`, `get_release`, `advance_release`, `abandon_release` | stamp: use `apply` (an MCP stamp has no consent — below) | yes — the own tool's path |
+| `release resume` | only a record with executor `dct` AND a recorded consent | REFUSED (`details.executor`) |
+| `release abandon`, `clog release-abandon` | yes | yes (ledger only) |
+| `release reconstruct` | yes | yes — it records VERIFIED history and performs no effect; the record gets the project's executor at reconstruction |
+
+**Who records progress** (`core.releases.progress_owner`,
+`advance_release(actor=…)`): a record with executor `dct` (null on older
+records counts as `dct`) AND a consent was stamped by `dct release apply` —
+only the effects layer advances it (`resume`, after verifying each effect);
+MCP `advance_release` and `clog release-advance` (actor `ledger`) are
+refused. Every other record — executor `own`, or stamped outside the effects
+layer (MCP `release_changelog`, older records, a partial reconstruction): no
+approved proposal, no approved push target — is advanced ONLY through the
+ledger path by whoever performed and verified its effects; `dct release
+resume` refuses it at every status (it never finishes such a record without
+a push, L9) — finish it yourself or abandon it.
 
 `--confirm-version-files` was removed (K-76): it approved whatever result
 happened to be present after the stamp. It survives as a hidden flag of
@@ -505,7 +544,9 @@ refused, the lock untouched.
 
 ### Resume and interruptions
 
-`resume` (under the operation lock) first verifies the record's FULL entry
+`resume` (under the operation lock) first checks the RECORD's executor
+([Executor](#executor-k-85): `dct` with a recorded consent, else refused
+before anything), then verifies the record's FULL entry
 set (K-94 B3, `core.releases.verify_release_entry_set`: exactly the live
 entries carrying its version — a mismatch refuses before any effect and is
 never repaired by widening the record), that its consent names its
@@ -555,18 +596,51 @@ A user edit between runs inside an artifact (a version file or F) is
 neither the baseline nor the approved content: the resume refuses and
 leaves the files and the index exactly as they are.
 
-### Reconstruct (`dct release reconstruct`, K-60)
+### Reconstruct (`dct release reconstruct`, K-60, K-86, K-96 D8)
 
-Evidence, read-only: the entries carrying V (version contract), exactly ONE
-commit titled `release: v<V>` (any spelling, any ref) whose single parent is
-the candidate, every tag of V pointing exactly at it, F at that commit
-holding the V section exactly once with the database's entries (its date is
-kept as `section_date`), and the files the commit changed besides F — equal
-to the project's contract when one exists — each containing V. Any
-ambiguity (several release commits, a tag missing or elsewhere, a merge as
-release commit, a section mismatch, a version file without V) refuses —
-never a guess. A project without git: F and the contract's files as found.
-The record: mode `reconstructed`, status `completed`, the manifest above.
+Evidence, read-only (`effects.gather_evidence`), in this order:
+
+1. **The version spelling first** (K-86): the AUTHORITATIVE spelling comes
+   from the SAME shared legacy resolver core uses
+   (`changelog.version_spelling` → `resolve_version_spelling`: the live
+   record's spelling, else the first-stamped entry's — earliest
+   `released_at`, null last, ties → the lowest id — else `current_version`).
+   The requested V is only reported (`requested_version`); the equivalence
+   map is shown (`spellings`); every comparison below is `same_version`, and
+   the files, the section, the tag and the record all refer to that ONE
+   resolved version (a request for 1.1.0 of a release stored as 1.1 records
+   1.1 — nothing re-stamped, nothing rewritten). The final spelling must fit
+   the schema (`ensure_version_fits`, K-87) — also in the preview. No entry
+   carries V and it is not `current_version` → refused.
+2. **Candidates** (D8): every commit titled `release: v<V>` (any equivalent
+   spelling, any local ref) and the commit the tags of V point at is a
+   CANDIDATE, verified on its own evidence: exactly ONE parent (the
+   candidate), the paths it changed besides F equal to the version-file
+   contract (when one exists), F at that commit holding the V section
+   EXACTLY once (any equivalent label; two sections such as `[1.1]` and
+   `[1.1.0]` are a contradiction) with the database's entries (its date
+   kept as `section_date`), and each changed version file passing the D9
+   contract against the parent (J8 — never a substring search): a file dct
+   has a reader for must have its version FIELD equal to V (`same_version`),
+   any other file may change only lines holding V as a whole version token
+   (any equivalent spelling). `candidates`: `[{commit, verified, reason}]`.
+3. **The stage the evidence reaches**: the tags of V must all point at ONE
+   commit (else refused — a contradiction). With a tag: that commit must be
+   a verified candidate → status `completed` (other candidates, e.g. a
+   backport on another branch, are listed, not used). Without a tag:
+   exactly one verified candidate → status `committed` — the record ends
+   where the evidence ends; dct's `resume` does not continue it (no
+   consent: nobody approved a push target) — tag / push it yourself and
+   record that with `dct clog release-advance`, or abandon it. No verified
+   candidate, or several without a tag → refused. Without a release commit
+   nothing is reconstructed (a stamp without its candidate cannot be
+   verified).
+4. **Without git**: F (the section, as above) and the contract's files as
+   found (version field, or a line holding V) → `completed`.
+
+The record: mode `reconstructed`, the resolved version, the status of step
+3, the manifest `{tree, changelog, version_files}`, no consent, proposal or
+render, the project's executor at reconstruction. Any refusal writes nothing.
 
 ### JSON (`--json`, every subcommand)
 
@@ -576,17 +650,49 @@ One shape, `effects.RESULT_KEYS` (pinned by
 | key | content |
 | --- | --- |
 | `schema_version` | `1` |
-| `action` | `prepare`, `apply`, `resume`, `attest`, `abandon`, `reconstruct`, `status` |
+| `action` | `prepare`, `apply`, `resume`, `attest`, `abandon`, `reconstruct`, `status`, `advance` (`clog release-advance`) |
 | `project` | slug |
-| `outcome` | `completed`, `noop`, `attested`, `abandoned`, `preview`, `reconstructed`, `prepared`, `found` / `none` (status), `refused`, `failed` (the version-sync script in prepare: non-zero exit or timeout) |
+| `outcome` | `completed`, `noop`, `attested`, `abandoned`, `preview`, `reconstructed`, `prepared`, `advanced`, `found` / `none` (status), `refused`, `failed` (the version-sync script in prepare: non-zero exit or timeout), `conflict` (a lost serialization race — [below](#conflicts-k-88)) |
 | `version` | the record's version (authoritative spelling) or null |
 | `release` | the record (`core.releases.RECORD_FIELDS`) or null |
-| `steps` | `[{step, result, …}]` — step ∈ `sync`, `proposal` (prepare, and the `clog release` alias), `stamp`, `changelog`, `version_files`, `files`, `commit`, `index` (the real index after the commit), `tag`, `push` (`remote`, `branch`, `tag`; `skipped` with `reason` without a push target), `complete`, `attest`; result ∈ `done`, `verified`, `skipped`, `adopted`, `approved` |
+| `steps` | `[{step, result, …}]` — step ∈ `sync`, `proposal` (prepare, and the `clog release` alias), `stamp`, `changelog`, `version_files`, `files`, `commit`, `index` (the real index after the commit), `tag`, `push` (`remote`, `branch`, `tag`; `skipped` with `reason` without a push target), `complete`, `attest`; result ∈ `done`, `verified`, `skipped`, `adopted`, `approved`, `conflict` (the last step of a conflict response) |
 | `warnings` | human-readable strings |
-| `details` | prepare: see [Prepare](#prepare-dct-release-prepare-k-76), plus `push_target` (what apply would push to by default — the upstream — or null, read-only); apply: `{requested_version, previous_version, bump, entry_ids, mode, released, current_version, push_target}`; attest: `{previous_head, head, entry_ids}`; abandon: `{updated}`; reconstruct: `{evidence: {version, entry_ids, candidate_sha, release_commit_sha, tag, checkout_root, manifest, status, without_git}}`; refused / failed: the reason (`error`) plus the refusal's data (e.g. `staged`, `unproven`, `proposal` / `proposal_sha256` / `contract` (the alias), `mismatch`, `checkout_changed`, `foreign`, `foreign_paths`, `foreign_content`, `foreign_staged`, `changed`, `path`, `sync`, `exit_code`; the git effects: `git_error`, `commit`, `head`, `tree`, `parents`, `subject`, `expected_tree`, `index_lock`, `push_target`, `remote_tags`, `remote_branch`, `outside_consent`; the operation lock: `lock`, `holder`) |
+| `details` | prepare: see [Prepare](#prepare-dct-release-prepare-k-76), plus `push_target` (what apply would push to by default — the upstream — or null, read-only); apply: `{requested_version, previous_version, bump, entry_ids, mode, released, current_version, push_target}`; attest: `{previous_head, head, entry_ids}`; abandon: `{updated}`; reconstruct: `{evidence: {version (authoritative), requested_version, spellings, entry_ids, candidate_sha, release_commit_sha, tag, checkout_root, manifest, status, without_git, candidates}}` (`status` = `completed` \| `committed`; `candidates` (git) = `[{commit, verified, reason}]`); advance: `{updated, previous_status}`; conflict: [Conflicts](#conflicts-k-88); refused / failed: the reason (`error`) plus the refusal's data (e.g. `staged`, `unproven`, `proposal` / `proposal_sha256` / `contract` (the alias), `mismatch`, `checkout_changed`, `foreign`, `foreign_paths`, `foreign_content`, `foreign_staged`, `changed`, `path`, `sync`, `exit_code`; the git effects: `git_error`, `commit`, `head`, `tree`, `parents`, `subject`, `expected_tree`, `index_lock`, `push_target`, `remote_tags`, `remote_branch`, `outside_consent`; the operation lock: `lock`, `holder`; the executor: `executor`, `consent`) |
 
 Exit codes: 0 success (also `noop`), 1 refused, the script's own code when
-the version sync fails in prepare (124 on timeout), 2 for a usage error.
+the version sync fails in prepare (124 on timeout), 75 for a conflict
+(`effects.CONFLICT_EXIT_CODE`, sysexits EX_TEMPFAIL), 2 for a usage error.
+
+### Conflicts (K-88)
+
+A database write of a release command can lose a serialization race on
+PostgreSQL (SQLSTATE 40001: another transaction changed the data after this
+one's snapshot). It is recognised ONLY by the shared detector
+`db.is_serialization_failure` (the domain `SerializationConflict` and a
+driver error carrying SQLSTATE 40001 — type and SQLSTATE, never message
+text; the same one pickup uses, K-74). The effects layer — where the step is
+known — turns it into `effects.ReleaseConflict`; the CLI prints the stable
+result with outcome `conflict` and exits 75. Never a traceback, and never
+retried automatically: not the write, not the sync, the commit, the tag or
+the push.
+
+The rollback covers only the FAILED transaction: files written, a commit, a
+tag or a push performed before it STAY and are reported — never "nothing
+written".
+
+| key | content |
+| --- | --- |
+| `steps` | the run's own step log up to the conflict, then `{step, result: "conflict"}` |
+| `details.conflict` | `{step, status}` — the write that was rolled back: `stamp`, `files` / `commit` / `tag` / `push` / `complete` (the progress write of `status` `files_written` … `completed`), `proposal` (prepare's pending proposal), `abandon`, `reconstruct`, `advance`; `status` null when the write is not a status move. A race that escaped every step-aware write (a read) names the command (`apply`, `resume`, …) |
+| `details.observed_effects` | the effect steps (`stamp`, `changelog`, `version_files`, `commit`, `index`, `tag`, `push`, `attest`) of the step log that are not `skipped`, each with its result (`done` = performed by this run, `verified` / `adopted` = found in place); `[]` = none before the conflict; `null` = UNKNOWN (the command-level boundary does not know the run's steps) |
+| `details.record_state` | `read` (`release` = the record as RE-READ after the rollback), `absent` (no record — e.g. a conflict at the stamp of a new version), `unknown` (the re-read failed too — `details.record_error`; the state is never guessed) |
+| `details.error` | the explanation: what was rolled back, what stays, what to do |
+
+What next: a conflict at the stamp left nothing of that stamp (the
+approved proposal is still pending) — run the same `apply` again; any
+later conflict left the record at the status it shows — `dct release
+resume` continues from there (an effect already in place is verified, not
+repeated).
 
 ## The release ledger (record fields)
 
@@ -605,7 +711,7 @@ and a refusal writes nothing.
 | `candidate_sha` | the commit the release was cut from, or null | immutable (K-61) |
 | `checkout_root` | absolute path of the release checkout, or null | fixed |
 | `release_mode` | the VERIFIED release mode (K-94 B1): `git` or `without_git` (a project CONFIRMED outside git); null = recorded before the field existed (unverified) | write-once |
-| `executor` | who performs the effects (K-85): `dct` (the effects layer) or `own` (the project's own tool) — copied from the project's `release_executor` at stamp time (and at reconstruction); null on records older than the field | immutable — a later project-setting change never takes over an unfinished release |
+| `executor` | who performs the effects (K-85): `dct` (the effects layer) or `own` (the project's own tool) — copied from the project's `release_executor` at stamp time (and at reconstruction); null on records older than the field (counts as `dct`). With `consent` it decides who records progress ([Executor](#executor-k-85)) | immutable — a later project-setting change never takes over an unfinished release |
 | `status` | the state machine below | forward only |
 | `release_commit_sha` | the verified release commit | set once, from `committed` on |
 | `manifest` | JSON object of the verified artifacts (e.g. `changelog`, `version_files`, `tree`, `untracked_baseline`) | write-once per key; the MERGED manifest ≤ 64 KiB |
@@ -703,6 +809,10 @@ release checkout).
 A project whose own tool writes the changelog, bumps the version, commits,
 tags or publishes REPLACES ONLY layer 3. It keeps the proof and the ledger:
 
+0. **Mark it** — `dct project release-executor <slug> own` before the first
+   release through this workflow ([Executor](#executor-k-85)): dct's
+   `prepare` / `apply` / `resume` then refuse to perform effects for it,
+   and its records carry executor `own`.
 1. **Proof** — run `dct release plan --version V --entries <ids> --json`
    in the release checkout. Release only ids from `entries.proven` (or ids
    attested first with `dct release attest`); take `candidate_sha`,
@@ -727,7 +837,10 @@ tags or publishes REPLACES ONLY layer 3. It keeps the proof and the ledger:
    `get_release(project)`, never re-stamped under a new version;
    `abandon_release` ends it explicitly with a reason.
 
-A record the project's own tool advanced is finished by that tool: `dct
-release resume` verifies the effects layer's own manifest and refuses what
-it cannot verify, it does not adopt a foreign tool's effects.
+A record the project's own tool stamped is finished by that tool: `dct
+release resume` refuses it (its executor is `own`, or — stamped through MCP
+without the setting — it carries no consent) and never adopts a foreign
+tool's effects. Its tests: `tests/test_release_executor.py` (a fake own tool
+run as a separate process: shared plan → ledger stamp → its own effects →
+`advance_release`; dct's `apply` / `resume` refuse and its effects survive).
 

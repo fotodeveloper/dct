@@ -1125,17 +1125,27 @@ def _print_effects(out: dict) -> None:
 
 def _run_effects(action: str, project_slug: str, as_json: bool, call) -> dict:
     """Run one effects-layer call; a refusal / failure prints its reason
-    (or the JSON result with outcome 'refused' / 'failed') and exits with
-    its code (1, or the failing version-sync script's code)."""
+    (or the JSON result with outcome 'refused' / 'failed' / 'conflict') and
+    exits with its code (1, the failing version-sync script's code, or 75
+    for a lost serialization race — K-88: the effects layer reports the
+    step, the effects it observed and the re-read record; nothing is
+    retried)."""
     import json
 
     from dct.core.gitinfo import CheckoutVerificationError
-    from dct.workflows.release.effects import ReleaseRefused, SyncFailed, result
+    from dct.workflows.release.effects import (
+        ReleaseConflict,
+        ReleaseRefused,
+        SyncFailed,
+        result,
+    )
 
     try:
         out = call()
     except ReleaseRefused as e:
-        outcome, code = ("failed" if isinstance(e, SyncFailed) else "refused"), e.exit_code
+        outcome = ("failed" if isinstance(e, SyncFailed)
+                   else "conflict" if isinstance(e, ReleaseConflict) else "refused")
+        code = e.exit_code
         failure = result(action, project_slug, outcome, release=e.release, steps=e.steps,
                          details={**e.details, "error": str(e)},
                          version=(e.release or {}).get("version"))
@@ -1171,7 +1181,15 @@ def _refuse_removed_flag(args) -> None:
         sys.exit(1)
 
 
-RELEASE_PUSH_EPILOG = (
+RELEASE_EXECUTOR_EPILOG = (
+    "Executor: a project whose release executor is 'own' (`dct project release-executor "
+    "<slug> own`) gets no effect from dct — prepare / apply / resume refuse before any write; "
+    "its own tool uses `dct release plan --json` and the ledger (MCP release_changelog / "
+    "advance_release). Resume performs only a release dct stamped with the owner's consent. "
+    "A lost database serialization race exits 75 (outcome 'conflict': the step, the effects "
+    "already performed, the re-read record) — never retried automatically. ")
+
+RELEASE_PUSH_EPILOG = RELEASE_EXECUTOR_EPILOG + (
     "Locks: the command holds the release operation lock of the repository (one at a "
     "time, also across worktrees; another release command refuses at once). Commit: "
     "`git commit` — the repository's hooks run; a refusing or content-changing hook stops "
@@ -1448,53 +1466,38 @@ def cmd_clog_release_status(args):
 
 
 def cmd_clog_release_advance(args):
-    """`dct clog release-advance V STATUS` — move a release record forward
-    and/or record the verified release commit (K-41, K-61); mirrors the
-    advance_release MCP tool (candidate_sha is immutable — not accepted;
-    the manifest is written by the release workflow). Errors exit 1."""
-    from dct.core.releases import advance_release, get_release
+    """`dct clog release-advance V STATUS` — the LEDGER path (K-96 D10): an
+    adapter of effects.record_progress — core advance_release as the actor
+    'ledger' (state machine, write-once fields, the release commit rule),
+    under the project operation lock. For a release dct does not execute (a
+    project's own tool, a record stamped outside `dct release apply`); a
+    release dct executes is refused (`dct release resume` records its
+    progress). candidate_sha is immutable — not accepted; the manifest is
+    written by the release workflow. Errors exit 1 (a lost serialization
+    race 75)."""
+    from dct.workflows.release.effects import record_progress
 
     engine = _get_engine()
     project_slug = args.project or _detect_project(engine)
-    try:
-        before = get_release(engine, project_slug, args.version)
-        out = advance_release(
-            engine, project_slug, args.version, args.status,
-            release_commit_sha=args.release_commit_sha or None,
-        )
-    except Exception as e:
-        print(f"✗ Error: {e}", file=sys.stderr)
-        sys.exit(1)
+    as_json = getattr(args, "json", False)
+    out = _run_effects("advance", project_slug, as_json, lambda: record_progress(
+        engine, project_slug, args.version, args.status,
+        release_commit_sha=args.release_commit_sha or None))
+    if as_json:
+        return
     record = out["release"]
-    if not out["updated"]:
+    if not out["details"]["updated"]:
         print(f"✓ Release {record['version']} unchanged: {record['status']}")
         return
-    previous = before["status"] if before else "?"
-    print(f"✓ Release {record['version']}: {previous} → {record['status']}")
+    print(f"✓ Release {record['version']}: {out['details']['previous_status'] or '?'} → "
+          f"{record['status']}")
 
 
 def cmd_clog_release_abandon(args):
-    """`dct clog release-abandon V --reason "…" --confirm` — end an unfinished
-    release as abandoned (K-60, ledger only); mirrors the abandon_release MCP
-    tool. Errors exit 1."""
-    from dct.core.releases import abandon_release
-
-    engine = _get_engine()
-    project_slug = args.project or _detect_project(engine)
-    try:
-        out = abandon_release(
-            engine, project_slug, args.version, args.reason or "", confirm=args.confirm,
-        )
-    except Exception as e:
-        print(f"✗ Error: {e}", file=sys.stderr)
-        sys.exit(1)
-    record = out["release"]
-    if not out["updated"]:
-        print(f"✓ Release {record['version']} was already abandoned "
-              f"({record['abandon_reason']})")
-        return
-    print(f"✓ Release {record['version']} abandoned — the record, the stamped entries "
-          f"and current_version stay; release the work under a new version")
+    """`dct clog release-abandon V --reason "…" --confirm` — an adapter of
+    `dct release abandon` (K-96 D10): the same effects.abandon (core
+    abandon_release under the project operation lock). Errors exit 1."""
+    cmd_release_abandon(args)
 
 
 def _proof_layer_error(e: Exception) -> None:
@@ -2756,6 +2759,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--release-commit-sha",
         help="The verified release commit — recorded once, from 'committed' on "
              "(the candidate commit is immutable)")
+    p_clog_radv.add_argument("--json", action="store_true", help="Stable JSON document")
+    p_clog_radv.epilog = (
+        "The ledger path for a release dct does NOT execute — a project's own release tool "
+        "(release executor 'own') or a record stamped outside `dct release apply`: report "
+        "only what you verified. A release dct executes is refused (`dct release resume` "
+        "records its progress). Holds the release operation lock of the repository.")
 
     p_clog_rabandon = p_clog_sub.add_parser(
         "release-abandon",
@@ -2767,6 +2776,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--confirm", action="store_true",
         help="Required: the version stays taken by the abandoned record")
     p_clog_rabandon.add_argument("--project", "-P")
+    p_clog_rabandon.add_argument("--json", action="store_true", help="Stable JSON document")
+    p_clog_rabandon.epilog = "Alias of `dct release abandon` (same rules, same operation lock)."
 
     p_clog_cand = p_clog_sub.add_parser(
         "candidates",
@@ -2888,7 +2899,7 @@ def build_parser() -> argparse.ArgumentParser:
         "temporary copy of its directory) — never in your checkout, which is verified "
         "unchanged afterwards; writes the expected blobs into the repository's object "
         "database (outside git: dct's release blob store) and the pending proposal into the "
-        "database. Nothing is stamped, committed or tagged.")
+        "database. Nothing is stamped, committed or tagged. " + RELEASE_EXECUTOR_EPILOG)
 
     p_rel_resume = p_release_sub.add_parser(
         "resume", help="Finish the unfinished release (verifies every effect first; executes "
@@ -2897,6 +2908,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_rel_resume.add_argument(
         "--confirm-version-files", action="store_true", help=argparse.SUPPRESS)
     p_rel_resume.add_argument("--json", action="store_true", help="Stable JSON document")
+    p_rel_resume.epilog = RELEASE_EXECUTOR_EPILOG + (
+        "A record stamped outside `dct release apply` (MCP release_changelog, an own tool, a "
+        "partial reconstruction) is refused: finish it with `dct clog release-advance` after "
+        "verifying its effects yourself, or abandon it.")
 
     p_rel_abandon = p_release_sub.add_parser(
         "abandon", help="End an unfinished release as abandoned (all effects stay)")
@@ -2913,6 +2928,12 @@ def build_parser() -> argparse.ArgumentParser:
                              help="Write the record (without: show the evidence only)")
     p_rel_recon.add_argument("--project", "-P")
     p_rel_recon.add_argument("--json", action="store_true", help="Stable JSON document")
+    p_rel_recon.epilog = (
+        "The version spelling is resolved first (the stored one: a request for 1.1.0 of a "
+        "release stored as 1.1 records 1.1). Commits titled `release: v<V>` are candidates, "
+        "each verified (one parent, the version-file contract, the changelog section, the "
+        "version fields); a tag of V → completed, a single verified release commit without a "
+        "tag → committed. Any contradiction is refused; nothing is re-stamped.")
 
     # _task-mirror (internal: worker for hooks/dct-task-mirror.sh)
     p_tm = sub.add_parser(

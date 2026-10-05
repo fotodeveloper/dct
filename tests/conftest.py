@@ -403,3 +403,116 @@ def require_tools(*tools: str) -> None:
 def hook_tools():
     """bash + jq for a test that runs a dct hook (see require_tools)."""
     require_tools("bash", "jq")
+
+
+# --- Lock contention (K-64 / K-91) ------------------------------------------
+# ONE mechanism for every race test of the release family: the first writer
+# holds the project write lock, the probe PROVES the second writer is blocked
+# on it (never a sleep, never "the future is not done yet"), then the first
+# releases and the test checks the outcome.
+
+
+@pytest.fixture
+def concurrent_engine(engine, tmp_path):
+    """The guarded PG lane, or a file SQLite database with real connections
+    (an in-memory database cannot be shared by two connections)."""
+    if engine.dialect.name == "postgresql":
+        yield engine
+        return
+    eng = get_engine(f"sqlite:///{tmp_path / 'race.db'}")
+    create_tables(eng)
+    try:
+        yield eng
+    finally:
+        eng.dispose()
+
+
+class LockProbe:
+    """Positive, sleep-free proof that a competitor transaction is BLOCKED on
+    the project write lock while the holder still holds it (K-64, K-91).
+
+    The competitor runs through `run()` in a worker thread; the probe watches
+    that thread's statements on the engine:
+    - PostgreSQL: project_transaction polls `pg_try_advisory_lock`; a SECOND
+      attempt from the competitor exists only because the first one was
+      refused — the lock was held when it tried.
+    - SQLite: right before the competitor's `BEGIN IMMEDIATE` a separate
+      connection with a zero busy timeout tries to take the same write lock;
+      "database is locked" proves the holder still holds it at that moment,
+      so the competitor's statement can only return after the release.
+    `blocked` is set on that proof; `free` records a probe that found the
+    lock FREE (the holder lost it — a failure, never retried away). The
+    bounded wait (`wait_until_blocked`) exposes a missing synchronisation
+    instead of hanging.
+    """
+
+    def __init__(self, engine):
+        import threading
+
+        self.engine = engine
+        self.blocked = threading.Event()
+        self.free = threading.Event()
+        self.thread_id: int | None = None
+        self.attempts = 0
+        sa.event.listen(engine, "before_cursor_execute", self._observe)
+
+    def close(self):
+        sa.event.remove(self.engine, "before_cursor_execute", self._observe)
+
+    def run(self, fn, *args, **kwargs):
+        import threading
+
+        self.thread_id = threading.get_ident()
+        return fn(*args, **kwargs)
+
+    def capture(self, fn, *args, **kwargs):
+        """run() returning the exception instead of raising it — the
+        competitor's outcome (a controlled refusal) is the assertion."""
+        try:
+            return self.run(fn, *args, **kwargs)
+        except Exception as exc:  # noqa: BLE001 - the outcome is the assertion
+            return exc
+
+    def _observe(self, conn, cursor, statement, parameters, context, executemany):
+        import threading
+
+        if threading.get_ident() != self.thread_id:
+            return
+        if "pg_try_advisory_lock" in statement:
+            self.attempts += 1
+            if self.attempts >= 2:
+                self.blocked.set()
+        elif statement.strip().upper() == "BEGIN IMMEDIATE":
+            self._probe_sqlite_write_lock()
+
+    def _probe_sqlite_write_lock(self):
+        import sqlite3
+
+        probe = sqlite3.connect(self.engine.url.database, timeout=0, isolation_level=None)
+        try:
+            probe.execute("BEGIN IMMEDIATE")
+        except sqlite3.OperationalError as exc:
+            if "locked" in str(exc):
+                self.blocked.set()
+                return
+            raise
+        else:
+            probe.execute("ROLLBACK")
+            self.free.set()
+        finally:
+            probe.close()
+
+    def wait_until_blocked(self, timeout: float = 15) -> None:
+        assert self.blocked.wait(timeout), (
+            "the competitor never reached the held lock"
+            + (" — the probe found it FREE" if self.free.is_set() else ""))
+        assert not self.free.is_set()
+
+
+@pytest.fixture
+def lock_probe(concurrent_engine):
+    probe = LockProbe(concurrent_engine)
+    try:
+        yield probe
+    finally:
+        probe.close()

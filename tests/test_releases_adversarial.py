@@ -18,7 +18,6 @@ from __future__ import annotations
 import itertools
 from concurrent.futures import ThreadPoolExecutor
 from functools import cmp_to_key
-from threading import Event
 
 import pytest
 import sqlalchemy as sa
@@ -33,7 +32,7 @@ from dct.core.version import (
     normalize_version,
     same_version,
 )
-from dct.db import changelog_entries, create_tables, get_engine, projects, releases
+from dct.db import changelog_entries, projects, releases
 
 
 @pytest.fixture
@@ -64,108 +63,112 @@ def _live_records(engine, slug="proj-a"):
             .order_by(releases.c.id))]
 
 
-# ── concurrency: two releases of one project on two connections ──────────────
+# ── concurrency: two releases of one project on two connections (K-91) ──────
+#
+# One mechanism (conftest.LockProbe): the FIRST writer holds the project write
+# lock (inside its stamp transaction, right after its record insert); the
+# SECOND writer is started on another connection and the probe PROVES it is
+# blocked on that lock; only then does the first commit and the outcome is
+# checked. Every scenario runs in BOTH orders, for a consistent and a
+# contradicting set, and asserts no partial write by the loser. SQLite (a
+# file database) and the PG lane.
 
 
-@pytest.fixture
-def concurrent_engine(engine, tmp_path):
-    """The guarded PG lane, or a file SQLite database with real connections."""
-    if engine.dialect.name == "postgresql":
-        yield engine
-        return
-    eng = get_engine(f"sqlite:///{tmp_path / 'race.db'}")
-    create_tables(eng)
-    try:
-        yield eng
-    finally:
-        eng.dispose()
-
-
-def _race(monkeypatch, eng, first_call, second_call):
-    """Run `first_call`; right after it inserted its record (still inside its
-    transaction, holding the project write lock) start `second_call` on
-    another connection and give it time to block on the lock. Returns
-    (first result, second result-or-exception)."""
+def _race(monkeypatch, lock_probe, first_call, second_call):
+    """Run `first_call`; right after it inserted its record (still inside
+    its transaction, holding the project write lock) start `second_call` in
+    a worker thread and WAIT until the probe proves it is blocked on that
+    lock — then let the first commit. Returns (first result, second result
+    or exception). Bounded: a competitor that never blocks fails the test."""
     original = release_records.insert_record
     started = []
 
     with ThreadPoolExecutor(max_workers=1) as pool:
-        def insert_then_start_rival(*args, **kwargs):
+        def insert_then_block_the_rival(*args, **kwargs):
             record = original(*args, **kwargs)
             if not started:
-                started.append(pool.submit(_capture, second_call))
-                Event().wait(0.5)  # the rival must be waiting on the lock now
+                started.append(pool.submit(lock_probe.capture, second_call))
+                lock_probe.wait_until_blocked()
             return record
 
-        monkeypatch.setattr(release_records, "insert_record", insert_then_start_rival)
+        monkeypatch.setattr(release_records, "insert_record", insert_then_block_the_rival)
         first = first_call()
         second = started[0].result(timeout=20)
     return first, second
 
 
-def _capture(fn):
-    try:
-        return fn()
-    except Exception as exc:  # noqa: BLE001 - the outcome is the assertion
-        return exc
+def _two(eng, slug="proj-r"):
+    create_project(eng, slug, "R", current_version="1.0.0")
+    return _add(eng, "a", slug), _add(eng, "b", slug)
 
 
+@pytest.mark.parametrize("order", ["1.1.0 first", "1.1 first"])
 def test_racing_releases_of_one_version_with_different_sets_one_wins(
-    concurrent_engine, monkeypatch,
+    concurrent_engine, monkeypatch, lock_probe, order,
 ):
     eng = concurrent_engine
-    create_project(eng, "proj-r", "R", current_version="1.0.0")
-    a = _add(eng, "a", "proj-r")
-    b = _add(eng, "b", "proj-r")
-    first, second = _race(
-        monkeypatch, eng,
-        lambda: release_entries(eng, "proj-r", "1.1.0", entry_ids=[a]),
-        lambda: release_entries(eng, "proj-r", "1.1", entry_ids=[b]),
-    )
-    assert first["release"]["entry_ids"] == [a]
+    a, b = _two(eng)
+    calls = {"1.1.0": lambda: release_entries(eng, "proj-r", "1.1.0", entry_ids=[a]),
+             "1.1": lambda: release_entries(eng, "proj-r", "1.1", entry_ids=[b])}
+    winner, loser = ("1.1.0", "1.1") if order == "1.1.0 first" else ("1.1", "1.1.0")
+    win_ids = [a] if winner == "1.1.0" else [b]
+    lose_id = b if winner == "1.1.0" else a
+    first, second = _race(monkeypatch, lock_probe, calls[winner], calls[loser])
+    assert first["release"]["entry_ids"] == win_ids
     assert isinstance(second, ValueError), second
     assert "different set" in str(second)
     [record] = _live_records(eng, "proj-r")
-    assert record["entry_ids"] == [a]
+    assert record["entry_ids"] == win_ids and record["version"] == winner
     carrying = {e["id"]: e["version"] for e in list_entries(eng, "proj-r")}
-    assert carrying == {a: "1.1.0", b: None}, "the loser stamped nothing"
+    assert carrying == {win_ids[0]: winner, lose_id: None}, "the loser stamped nothing"
+    assert get_project(eng, "proj-r")["current_version"] == winner
 
 
+@pytest.mark.parametrize("order", ["1.5 first", "v1.5.0 first"])
 def test_racing_releases_of_one_version_with_the_same_set_share_one_record(
-    concurrent_engine, monkeypatch,
+    concurrent_engine, monkeypatch, lock_probe, order,
 ):
     eng = concurrent_engine
-    create_project(eng, "proj-r", "R", current_version="1.0.0")
-    a = _add(eng, "a", "proj-r")
+    a, b = _two(eng)
+    spellings = ("1.5", "v1.5.0") if order == "1.5 first" else ("v1.5.0", "1.5")
     first, second = _race(
-        monkeypatch, eng,
-        lambda: release_entries(eng, "proj-r", "1.5"),
-        lambda: release_entries(eng, "proj-r", "v1.5.0"),
+        monkeypatch, lock_probe,
+        lambda: release_entries(eng, "proj-r", spellings[0]),
+        lambda: release_entries(eng, "proj-r", spellings[1]),
     )
     assert not isinstance(second, Exception), second
     assert second["released"] == 0
     assert second["release"] == first["release"]
     assert len(_live_records(eng, "proj-r")) == 1
-    assert [e["version"] for e in list_entries(eng, "proj-r")] == ["1.5"]
-    assert first["release"]["entry_ids"] == [a]
+    stored = normalize_version(spellings[0])
+    assert [e["version"] for e in list_entries(eng, "proj-r")] == [stored, stored]
+    assert first["release"]["entry_ids"] == [a, b]
 
 
-def test_lower_version_released_during_a_higher_one_is_refused_not_a_rewind(
-    concurrent_engine, monkeypatch,
+@pytest.mark.parametrize("order", ["higher first", "lower first"])
+def test_racing_releases_of_two_versions_never_rewind(
+    concurrent_engine, monkeypatch, lock_probe, order,
 ):
+    """Higher first: the lower one is refused (no rewind, nothing written by
+    it). Lower first: the higher one follows it — both recorded, in order."""
     eng = concurrent_engine
-    create_project(eng, "proj-r", "R", current_version="1.0.0")
-    a = _add(eng, "a", "proj-r")
-    first, second = _race(
-        monkeypatch, eng,
-        lambda: release_entries(eng, "proj-r", "1.2.0", entry_ids=[a]),
-        lambda: release_entries(eng, "proj-r", "1.1.0", entry_ids=[]),
-    )
-    assert isinstance(second, ValueError), second
-    assert "lower than the current version 1.2.0" in str(second)
+    a, b = _two(eng)
+    higher = lambda: release_entries(eng, "proj-r", "1.2.0", entry_ids=[a])
+    lower = lambda: release_entries(eng, "proj-r", "1.1.0", entry_ids=[b])
+    if order == "higher first":
+        _, second = _race(monkeypatch, lock_probe, higher, lower)
+        assert isinstance(second, ValueError), second
+        assert "lower than the current version 1.2.0" in str(second)
+        assert [r["version"] for r in _live_records(eng, "proj-r")] == ["1.2.0"]
+        assert {e["id"]: e["version"] for e in list_entries(eng, "proj-r")} == {
+            a: "1.2.0", b: None}, "the refused lower release stamped nothing"
+    else:
+        _, second = _race(monkeypatch, lock_probe, lower, higher)
+        assert not isinstance(second, Exception), second
+        assert [r["version"] for r in _live_records(eng, "proj-r")] == ["1.1.0", "1.2.0"]
+        assert {e["id"]: e["version"] for e in list_entries(eng, "proj-r")} == {
+            a: "1.2.0", b: "1.1.0"}
     assert get_project(eng, "proj-r")["current_version"] == "1.2.0"
-    assert [r["version"] for r in _live_records(eng, "proj-r")] == ["1.2.0"]
-    assert first["release"]["entry_ids"] == [a]
 
 
 # ── ledger invariant across a release history ────────────────────────────────

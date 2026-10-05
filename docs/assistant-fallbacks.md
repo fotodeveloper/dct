@@ -142,7 +142,12 @@ in the CURRENT checkout. Show long content as text first, then ask.
 
 1. `dct release plan --json`. A missing / older CLI (unknown subcommand or
    flag) → STOP and say the CLI must be installed or upgraded. Exit 1 → show
-   the reason, STOP.
+   the reason, STOP. The project's release executor (`dct project
+   release-executor <slug>`) is `own` → dct performs none of its effects:
+   say so and hand over to the project's own release tool
+   ([integration](release-workflow.md#integrating-a-projects-own-release-tool));
+   never run a command stored anywhere in its place. (`prepare` / `apply`
+   refuse such a project anyway — `details.executor: "own"`.)
 2. `kind == "resume"` → the resume path below. `version.current` set and
    `dct release status --version <current> --json` → outcome `none` → offer
    the legacy path below.
@@ -203,13 +208,24 @@ in the CURRENT checkout. Show long content as text first, then ask.
    A failed push leaves the record `tagged` (`details.git_error`) → the
    owner fixes the cause, then resume — it retries ONLY the push. A refusal
    naming the operation lock (`details.lock`) → another release command
-   holds the repository's lock: wait for it, never loop.
+   holds the repository's lock: wait for it, never loop. Outcome `conflict`
+   (exit 75 — a concurrent database write) → show `details.conflict` (the
+   step rolled back), `details.observed_effects` (what DID happen — files,
+   commit, tag, push stay) and the re-read `release` (`record_state`
+   `unknown` → say the state is unknown, check `dct release status`); never
+   retry on your own — the owner decides: the same `apply` again (a
+   conflict at the stamp) or `dct release resume`.
 
 **Resume path** — show the RECORDED release (`resume`: candidate, entry
 set, proof, effect state) and, separately, today's HEAD
 (`resume.head`, `checkout.matches_record`) and the entries added since
 (`resume.new_unreleased` — not part of this release), then the owner
-chooses: finish → `dct release resume --json` (no new approval: it
+chooses (a record whose `executor` is `own`, or without a `consent` —
+stamped outside `dct release apply` — is NOT finished by dct: `resume`
+refuses it; say who finishes it — the project's own tool, or the owner
+through the ledger path after verifying each effect
+([executor](release-workflow.md#executor-k-85); never this dialog) — or
+abandon it): finish → `dct release resume --json` (no new approval: it
 executes the consent stored at apply, push target included, and refuses
 what lies outside it; another checkout or HEAD is refused — run it in the
 record's `checkout_root`; the record is never re-pinned); abandon → the owner's reason and explicit confirmation (the
@@ -218,8 +234,14 @@ record, stamps, `current_version` and effects stay, V stays taken) →
 stop.
 
 **Legacy path** — `dct release reconstruct --version V --json` shows the
-evidence (outcome `preview`); only after the owner confirms, the same
-command with `--confirm` records it (no re-stamp). Refused = ambiguous
+evidence (outcome `preview`: the resolved `version` — the stored spelling,
+the request only in `requested_version` — the `candidates`, the `status`
+the evidence reaches: `completed` with a tag, `committed` without one);
+only after the owner confirms, the same command with `--confirm` records it
+(no re-stamp). A `committed` reconstruction stays unfinished: dct's resume
+does not continue it — the owner tags / pushes and records that through
+the ledger path ([executor](release-workflow.md#executor-k-85); never this
+dialog), or abandons it. Refused = contradicting or ambiguous
 evidence: report it; never reconstruct by hand.
 
 ## `/commit` fallback

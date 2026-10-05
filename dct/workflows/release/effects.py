@@ -14,8 +14,29 @@ dct.workflows.release.oplock — one per repository: its git common dir, so
 all worktrees and every project of that repository share it; a project
 outside git locks its directory) from before its pre-checks / stamp until
 it returns: prepare, apply (and the alias), resume, attest, abandon,
-reconstruct --confirm. A second one refuses at once; editors and other git
-processes are never blocked by it.
+reconstruct --confirm and the old ledger commands (`clog release-advance` =
+record_progress, `clog release-abandon` = abandon — K-96 D10). A second one
+refuses at once; editors and other git processes are never blocked by it.
+
+The EXECUTOR is explicit (K-85): the project's release_executor ('dct' |
+'own') is copied onto each record at its stamp, and the RECORD decides from
+then on (a later project-setting change never takes over an unfinished
+release). An 'own' project gets no effect from dct — prepare / apply / the
+alias refuse before any write (_refuse_own_executor); resume performs only a
+record with executor 'dct' AND the owner's consent (_check_record_executor —
+an 'own' record, or one stamped outside apply, is refused, never finished
+without a push). The proof layer, attest (a proof-layer commit), the ledger,
+abandon and reconstruct are shared by both executors. Progress writes carry
+the actor: this module advances as 'dct'; record_progress (the ledger path)
+as 'ledger' (core.releases.check_progress_actor).
+
+Every database write runs through _ledger_write (K-88): a lost
+serialization race (db.is_serialization_failure — SQLSTATE 40001 or
+SerializationConflict, never a message match) becomes ReleaseConflict with
+the step whose write was rolled back, the effects THIS run observed (its own
+step log) and the record re-read afterwards ("unknown" if that read fails);
+_conflict_boundary does the same, with the effects unknown, for a race that
+escaped every step-aware write. Nothing is retried automatically.
 
 Stages of one release:
 
@@ -91,6 +112,13 @@ Stages of one release:
      only the push. Without a push target (--no-push, outside git) the
      record goes 'tagged' → 'completed'.
 
+Reconstruction (gather_evidence, K-86 / K-96 D8): the authoritative
+version spelling is resolved FIRST by the shared legacy resolver
+(changelog.version_spelling); release commits on refs and the tag's commit
+are candidates, each verified (one parent, the contract, the section, the
+version files' fields — never a substring, J8); a tag → 'completed', a
+single verified commit without a tag → 'committed'.
+
 Every effect is checked against reality on resume (after the full entry set
 of the record, K-94 B3): present and matching → skipped; missing → performed;
 contradicting → ReleaseRefused, nothing overwritten. Interruption points
@@ -120,15 +148,22 @@ import sqlalchemy as sa
 from dct import paths as dct_paths
 from dct.core import gitinfo
 from dct.core import releases as ledger
-from dct.core.changelog import list_entries, normalize_worktree, release_entries
+from dct.core.changelog import (
+    list_entries,
+    normalize_worktree,
+    release_entries,
+    version_spelling,
+)
 from dct.core.projects import get_project
 from dct.core.version import (
     compare_versions,
+    ensure_version_fits,
     normalize_version,
     read_version_field,
     same_version,
     version_field_reader,
 )
+from dct.db import is_serialization_failure
 from dct.export import export_changelog_md
 from dct.workflows.release import oplock
 from dct.workflows.release import plan as planning
@@ -141,8 +176,20 @@ RESULT_KEYS = (
 )
 OUTCOMES = (
     "completed", "noop", "attested", "abandoned", "preview", "reconstructed",
-    "prepared", "refused", "failed", "found", "none",
+    "prepared", "advanced", "refused", "failed", "conflict", "found", "none",
 )
+# K-88: the exit code of a lost serialization race (sysexits EX_TEMPFAIL —
+# the failed write may succeed when the command is run again; never retried
+# automatically).
+CONFLICT_EXIT_CODE = 75
+# Steps that are effects on the world (the stamp included) — what a conflict
+# report lists as observed; `sync` ran in an isolated copy, `complete` is
+# only a progress write.
+EFFECT_STEPS = ("stamp", "changelog", "version_files", "commit", "index", "tag", "push",
+                "attest")
+# The step whose progress write records each status (advance_release).
+_STATUS_STEP = {"files_written": "files", "committed": "commit", "tagged": "tag",
+                "pushed": "push", "completed": "complete"}
 
 # Where a test (or a debugger) may stop the workflow: before each effect and
 # between each effect and the progress write that records it.
@@ -210,6 +257,105 @@ class ReleaseRefused(RuntimeError):
         self.details = details or {}
         self.steps = steps or []
         self.release = release
+
+
+class ReleaseConflict(ReleaseRefused):
+    """K-88 / K-74: a database write of a release command lost a
+    serialization race (db.is_serialization_failure — SQLSTATE 40001 or the
+    domain SerializationConflict, never matched by message). THAT
+    transaction was rolled back; effects performed before it (files, commit,
+    tag, push) STAY and are listed. Never retried automatically — neither
+    the write nor any effect. `details`: {error, conflict: {step, status},
+    observed_effects (the run's own effect steps, or null = unknown),
+    record_state ("read" | "absent" | "unknown")}; `release` = the record as
+    re-read after the rollback (null when absent or unknown)."""
+
+    exit_code = CONFLICT_EXIT_CODE
+
+
+def _conflict(engine: sa.Engine, slug: str, version: str | None, exc: BaseException, *,
+              step: str, status: str | None, steps: list[dict] | None) -> ReleaseConflict:
+    """The conflict report (K-88), built where the step context is known:
+    the step / status whose write was rolled back, the effects this run
+    observed (`steps`; None = not known at this boundary) and the record
+    RE-READ now — a failing re-read is reported as "unknown", never guessed."""
+    try:
+        record = ledger.get_release(engine, slug, version) if version else \
+            ledger.get_release(engine, slug)
+        state, read_error = ("read" if record is not None else "absent"), None
+    except Exception as read_exc:  # noqa: BLE001 - the state is then unknown
+        record, state, read_error = None, "unknown", str(read_exc)
+    observed = None if steps is None else [
+        dict(s) for s in steps if s["step"] in EFFECT_STEPS and s["result"] != "skipped"]
+    if observed is None:
+        effects_text = "the effects of this run are unknown at this point"
+    elif observed:
+        effects_text = "effects already performed STAY: " + ", ".join(
+            f"{s['step']} ({s['result']})" for s in observed)
+    else:
+        effects_text = "this run performed no effect before it"
+    if state == "read":
+        record_text = f"the record is now '{record['status']}'"
+    elif state == "absent":
+        record_text = "no record exists"
+    else:
+        record_text = f"the record could not be re-read ({read_error}) — its state is UNKNOWN"
+    what = f"the {step} write" + (f" ('{status}')" if status else "")
+    error = (f"a concurrent database transaction conflicted with {what} of "
+             f"{version or 'the release'} (serialization failure) — that write was rolled back "
+             f"and is not recorded; {effects_text}; {record_text}. Nothing is retried "
+             f"automatically: check the state (`dct release status`) and run the command "
+             f"again (or `dct release resume`).")
+    details = {"conflict": {"step": step, "status": status}, "observed_effects": observed,
+               "record_state": state}
+    if read_error is not None:
+        details["record_error"] = read_error
+    out = ReleaseConflict(error, details=details,
+                          steps=[*(steps or []), {"step": step, "result": "conflict"}],
+                          release=record)
+    out.__cause__ = exc
+    return out
+
+
+def _ledger_write(engine: sa.Engine, slug: str, version: str | None, step: str,
+                  write: Callable[[], dict], *, status: str | None = None,
+                  steps: list[dict] | None = None) -> dict:
+    """Run ONE ledger write; a lost serialization race becomes the
+    ReleaseConflict report of THAT step (K-88) — any other error passes."""
+    try:
+        return write()
+    except Exception as exc:
+        if isinstance(exc, ReleaseConflict) or not is_serialization_failure(exc):
+            raise
+        raise _conflict(engine, slug, version, exc, step=step, status=status,
+                        steps=steps) from exc
+
+
+def _conflict_boundary(action: str):
+    """The error boundary of a public effects command (K-88): a
+    serialization failure that escaped every step-aware write (a read, an
+    unexpected path) still becomes a ReleaseConflict — with its effects
+    reported as UNKNOWN (null), never as "nothing written"."""
+    def wrap(fn):
+        import functools
+
+        @functools.wraps(fn)
+        def inner(engine, project_slug, *args, **kwargs):
+            try:
+                return fn(engine, project_slug, *args, **kwargs)
+            except Exception as exc:
+                if isinstance(exc, ReleaseConflict) or not is_serialization_failure(exc):
+                    raise
+                version = kwargs.get("version") or (args[0] if args and isinstance(
+                    args[0], str) else None)
+                try:
+                    version = normalize_version(version) if version else None
+                except ValueError:
+                    version = None
+                raise _conflict(engine, project_slug, version, exc, step=action,
+                                status=None, steps=None) from exc
+        return inner
+    return wrap
 
 
 class SyncFailed(ReleaseRefused):
@@ -744,8 +890,14 @@ class _Run:
         return ReleaseRefused(message, details=details, steps=self.steps, release=self.record)
 
     def advance(self, status: str, **kwargs) -> None:
-        out = ledger.advance_release(self.engine, self.slug, self.record["version"], status,
-                                     **kwargs)
+        """Record verified progress (actor 'dct', K-85); a lost
+        serialization race → ReleaseConflict with this run's steps (K-88)."""
+        version = self.record["version"]
+        out = _ledger_write(
+            self.engine, self.slug, version, _STATUS_STEP.get(status, status),
+            lambda: ledger.advance_release(self.engine, self.slug, version, status,
+                                           actor="dct", **kwargs),
+            status=status, steps=self.steps)
         self.record = out["release"]
 
     @property
@@ -2090,6 +2242,53 @@ def _check_selection_args(action: str, entry_ids, no_entries: bool, plan_digest:
         raise ReleaseRefused(f"--plan-digest must be a lowercase hex SHA-256, got {plan_digest!r}")
 
 
+OWN_EXECUTOR_HINT = (
+    "its effects belong to the project's own release tool: it uses the shared proof layer "
+    "(`dct release plan --json`) and ledger (MCP release_changelog / get_release / "
+    "advance_release / abandon_release) — see docs/release-workflow.md, \"Integrating a "
+    "project's own release tool\"")
+
+
+def _refuse_own_executor(project: dict) -> None:
+    """K-85: a project whose release executor is 'own' gets NO effect from
+    dct (prepare, apply, the `clog release` alias) — refused before any
+    write, pointing to its own integration. The proof layer, attest and the
+    ledger stay shared."""
+    if (project.get("release_executor") or ledger.DEFAULT_EXECUTOR) == "own":
+        raise ReleaseRefused(
+            f"project '{project['slug']}' has release executor 'own' — dct performs none of "
+            f"its release effects (no prepare, stamp, file, commit, tag or push); "
+            f"{OWN_EXECUTOR_HINT}; nothing done. (`dct project release-executor "
+            f"{project['slug']} dct` hands NEW releases to dct.)",
+            details={"executor": "own"})
+
+
+def _check_record_executor(run: _Run) -> None:
+    """K-85 — resume executes only a release dct itself stamped: the
+    RECORD's executor (never today's project setting) must be 'dct' and the
+    record must carry the owner's consent (stamped by `dct release apply`;
+    core.releases.progress_owner). Anything else — an 'own' record, one
+    stamped outside the effects layer (MCP release_changelog, older
+    records, a partial reconstruction: no approved proposal, no push
+    target) — is refused before any effect, never finished without a push."""
+    record = run.record
+    executor = record.get("executor") or ledger.DEFAULT_EXECUTOR
+    if executor == "own":
+        raise run.refuse(
+            f"release {record['version']} is executed by the project's own release tool "
+            f"(executor 'own', recorded at its stamp — a later project-setting change does "
+            f"not take it over) — dct performs and adopts none of its effects; finish it "
+            f"with that tool, or abandon it; {OWN_EXECUTOR_HINT}; nothing done.",
+            executor="own")
+    if record.get("consent") is None:
+        raise run.refuse(
+            f"release {record['version']} was stamped outside `dct release apply` (no "
+            f"recorded consent: no approved version-file proposal, no approved push target) — "
+            f"dct does not perform or adopt its effects; finish them yourself and record the "
+            f"verified progress (`dct clog release-advance`, MCP advance_release), or abandon "
+            f"it; nothing done.", executor=executor, consent=None)
+
+
 def _approved_context(engine: sa.Engine, project_slug: str, located: tuple, *, version,
                       bump_type, entry_ids, no_entries: bool, plan_digest: str | None,
                       strict: bool, cwd: str | None,
@@ -2101,6 +2300,7 @@ def _approved_context(engine: sa.Engine, project_slug: str, located: tuple, *, v
     digest, the entry selection. Returns (run, plan, target version,
     selected ids, the untracked files present now)."""
     project, checkout, project_root = located
+    _refuse_own_executor(project)
     if not project.get("path"):
         # K-95 C1: without a path the absence of a repository is NOT confirmed.
         raise ReleaseRefused(
@@ -2161,7 +2361,9 @@ def _prepared(run: _Run, target: str, plan: dict) -> dict:
     """Build the proposal (isolated sync) and store it as PENDING → the
     prepare result's details."""
     proposal, report = _build_proposal(run, target, plan["snapshot_digest"])
-    stored = ledger.set_pending_proposal(run.engine, run.slug, proposal)
+    stored = _ledger_write(run.engine, run.slug, normalize_version(target), "proposal",
+                           lambda: ledger.set_pending_proposal(run.engine, run.slug, proposal),
+                           steps=run.steps)
     contract = ledger.get_version_files(run.engine, run.slug)["version_files"]
     run.step("proposal", "done", proposal_sha256=stored["proposal_sha256"])
     return {
@@ -2175,6 +2377,7 @@ def _prepared(run: _Run, target: str, plan: dict) -> dict:
     }
 
 
+@_conflict_boundary("prepare")
 def prepare_release(
     engine: sa.Engine,
     project_slug: str,
@@ -2203,7 +2406,8 @@ def prepare_release(
     check_version_file result per file)}. Raises NothingToPrepare (V is
     already recorded, or lower than the current version), SyncFailed (the
     script failed / timed out — exit code = the script's, 124 on timeout)
-    or ReleaseRefused (a pre-check, a script that wrote outside its
+    or ReleaseRefused (a pre-check — also a project whose release executor
+    is 'own', K-85 — a script that wrote outside its
     isolated copy, touched the changelog, deleted / retyped a file, or a
     version file whose version field is not V)."""
     _check_selection_args("prepare", entry_ids, no_entries, plan_digest, strict)
@@ -2323,6 +2527,7 @@ def _alias_approval(run: _Run, target: str, plan: dict) -> str:
         f"nothing released.", **details)
 
 
+@_conflict_boundary("apply")
 def apply_release(
     engine: sa.Engine,
     project_slug: str,
@@ -2383,10 +2588,14 @@ def apply_release(
     contained in the candidate); the target is recorded in the consent and
     is what the push — and every resume — uses (K-97 F4).
 
+    K-85: a project whose release_executor is 'own' is refused before any
+    write (details.executor 'own').
+
     Returns result() with outcome 'completed' or 'noop' (a recorded /
     historical / legacy release — no side effect). Raises ReleaseRefused
-    (nothing done beyond what the result's steps say), SyncFailed (the
-    alias's internal prepare), or gitinfo errors."""
+    (nothing done beyond what the result's steps say), ReleaseConflict (a
+    lost serialization race, K-88 — the effects observed so far listed),
+    SyncFailed (the alias's internal prepare), or gitinfo errors."""
     if confirm is not True:
         raise ReleaseRefused("apply needs --confirm (it stamps, writes, commits, tags and "
                              "pushes)")
@@ -2438,8 +2647,8 @@ def _apply(engine, project_slug, located, *, version, bump_type, entry_ids, no_e
         raise ReleaseRefused(
             f"HEAD moved since the plan was derived for the candidate {checkout['head']} — "
             f"nothing released; plan again.", details={"candidate": checkout["head"]})
-    try:
-        stamped = release_entries(
+    def stamp() -> dict:
+        return release_entries(
             engine, project_slug, target, entry_ids=ids,
             candidate_sha=checkout["head"] if checkout else None,
             checkout_root=checkout["repo_root"] if checkout else None, proof=proof,
@@ -2453,6 +2662,10 @@ def _apply(engine, project_slug, located, *, version, bump_type, entry_ids, no_e
             manifest={"untracked_baseline": sorted(pre_untracked)}
             if consent and checkout else None,
             consume_proposal=consent is not None)
+
+    try:
+        stamped = _ledger_write(engine, project_slug, normalize_version(target), "stamp", stamp,
+                                steps=run.steps)
     except ValueError as exc:
         raise run.refuse(str(exc)) from None
     details = {"requested_version": target, "previous_version": plan["version"]["current"],
@@ -2505,6 +2718,7 @@ def _check_record_scope(run: _Run) -> None:
                 outside_consent=outside)
 
 
+@_conflict_boundary("resume")
 def resume_release(
     engine: sa.Engine,
     project_slug: str,
@@ -2512,8 +2726,10 @@ def resume_release(
     cwd: str | None = None,
     on_point: Callable[[str], None] | None = None,
 ) -> dict:
-    """Finish the unfinished release record (`dct release resume`): verify
-    the record's FULL entry set first (K-94 B3) and that its consent names
+    """Finish the unfinished release record (`dct release resume`): only a
+    record dct executes (K-85: executor 'dct' AND a recorded consent —
+    _check_record_executor; anything else is refused before any effect);
+    verify the record's FULL entry set first (K-94 B3) and that its consent names
     its proposal, then the checkout against the record (same checkout
     root; HEAD == candidate before the commit, the release commit or a
     descendant after it — K-51; never re-pinned), then check each effect
@@ -2530,6 +2746,7 @@ def resume_release(
         if run.record is None:
             run.warnings.append("no unfinished release — nothing to resume")
             return _finish("resume", run, "noop")
+        _check_record_executor(run)
         _check_record_scope(run)
         _check_record_location(run)
         if run.repo and _operation_in_progress(run.repo):
@@ -2538,6 +2755,7 @@ def resume_release(
         return _finish("resume", run, "completed")
 
 
+@_conflict_boundary("abandon")
 def abandon(engine: sa.Engine, project_slug: str, version: str, reason: str, *,
             confirm: bool = False) -> dict:
     """`dct release abandon` — core abandon_release (K-60): the record ends
@@ -2548,7 +2766,10 @@ def abandon(engine: sa.Engine, project_slug: str, version: str, reason: str, *,
         raise ReleaseRefused(f"Project '{project_slug}' not found")
     try:
         with _operation(project, None, "abandon"):
-            out = ledger.abandon_release(engine, project_slug, version, reason, confirm=confirm)
+            out = _ledger_write(
+                engine, project_slug, _normalized_or_none(version), "abandon",
+                lambda: ledger.abandon_release(engine, project_slug, version, reason,
+                                               confirm=confirm), steps=[])
     except ValueError as exc:
         raise ReleaseRefused(str(exc)) from None
     record = out["release"]
@@ -2556,6 +2777,46 @@ def abandon(engine: sa.Engine, project_slug: str, version: str, reason: str, *,
                   version=record["version"], release=record, details={"updated": out["updated"]})
 
 
+def _normalized_or_none(version: str | None) -> str | None:
+    try:
+        return normalize_version(version) if version else None
+    except ValueError:
+        return None
+
+
+@_conflict_boundary("advance")
+def record_progress(engine: sa.Engine, project_slug: str, version: str, status: str, *,
+                    release_commit_sha: str | None = None) -> dict:
+    """`dct clog release-advance` (K-96 D10) — the LEDGER path of a release
+    dct does not execute (an 'own' record, or one stamped outside `dct
+    release apply`): core advance_release with actor 'ledger' (its state
+    machine, write-once and B1 rules; a record dct executes is refused —
+    `dct release resume` records its progress), under the project operation
+    lock like every other mutating release path. The caller reports what
+    IT verified (a status is never proof for dct). Returns result() with
+    outcome 'advanced' or 'noop' and details {updated, previous_status}."""
+    project = get_project(engine, project_slug)
+    if project is None:
+        raise ReleaseRefused(f"Project '{project_slug}' not found")
+    try:
+        with _operation(project, None, "advance"):
+            before = ledger.get_release(engine, project_slug, version)
+            out = _ledger_write(
+                engine, project_slug, _normalized_or_none(version), "advance",
+                lambda: ledger.advance_release(engine, project_slug, version, status,
+                                               release_commit_sha=release_commit_sha,
+                                               actor="ledger"),
+                status=status, steps=[])
+    except ValueError as exc:
+        raise ReleaseRefused(str(exc)) from None
+    record = out["release"]
+    return result("advance", project_slug, "advanced" if out["updated"] else "noop",
+                  version=record["version"], release=record,
+                  details={"updated": out["updated"],
+                           "previous_status": before["status"] if before else None})
+
+
+@_conflict_boundary("attest")
 def attest(
     engine: sa.Engine,
     project_slug: str,
@@ -2650,119 +2911,252 @@ def _release_commits(repo: str, version: str) -> list[str]:
     return sorted(set(found))
 
 
+def _equivalent_pattern(version: str) -> re.Pattern:
+    """V as a whole version token in ANY spelling equivalent to it under the
+    version contract (1.1 ↔ 1.1.0, optional leading v) — for reading
+    legacy artifacts written before one spelling was authoritative."""
+    spellings = {version}
+    if re.fullmatch(r"\d+\.\d+", version):
+        spellings.add(version + ".0")
+    match = re.fullmatch(r"(\d+\.\d+)\.0", version)
+    if match:
+        spellings.add(match.group(1))
+    alternatives = "|".join(re.escape(v) for v in sorted(spellings, key=len, reverse=True))
+    return re.compile(r"(?<![0-9A-Za-z.])v?(?:" + alternatives + r")(?![0-9A-Za-z]|\.[0-9])")
+
+
+def _legacy_version_file(rel: str, base: bytes | None, data: bytes | None, version: str,
+                         *, git: bool) -> dict:
+    """K-96 D9 / J8 for a reconstruction — the version FIELD (a file dct has
+    a reader for) must be V (same_version); any other file: in git the lines
+    the release commit changed must each hold V (any equivalent spelling),
+    outside git at least one line must. Never a substring search. →
+    {path, check, …}; ValueError (the reason) otherwise."""
+    if data is None:
+        raise ValueError(f"{rel} is missing")
+    if version_field_reader(rel) is not None:
+        return check_version_file(rel, base, data, version)
+    try:
+        lines = data.decode("utf-8").splitlines()
+        old = (base or b"").decode("utf-8").splitlines() if git else []
+    except UnicodeDecodeError:
+        raise ValueError(f"{rel} is not UTF-8 text and dct has no version reader for it") \
+            from None
+    pattern = _equivalent_pattern(version)
+    if not git:
+        if not any(pattern.search(line) for line in lines):
+            raise ValueError(f"{rel} holds no line with {version}")
+        return {"path": rel, "check": "lines_with_version", "changed_lines": None}
+    changed, bad = 0, []
+    for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(a=old, b=lines,
+                                                       autojunk=False).get_opcodes():
+        if tag == "equal":
+            continue
+        if j1 == j2:
+            bad.append(f"line(s) {i1 + 1}-{i2} removed")
+        for line in lines[j1:j2]:
+            changed += 1
+            if not pattern.search(line):
+                bad.append(line)
+    if bad or not changed:
+        raise ValueError(f"{rel}: every line the release commit changed must hold {version} — "
+                         + ("; ".join(repr(b) for b in bad[:5]) if bad else "nothing changed"))
+    return {"path": rel, "check": "lines_with_version", "changed_lines": changed}
+
+
+def _legacy_section(run: _Run, version: str, ids: list[int], data: bytes | None) -> dict:
+    """F holds the V section (any equivalent label) EXACTLY once, its body
+    equal to the database render of the entries → the manifest's changelog
+    {path, sha256, section_date}; ReleaseRefused otherwise."""
+    try:
+        text = data.decode("utf-8", "strict") if data is not None else None
+    except UnicodeDecodeError:
+        raise ReleaseRefused(f"{run.changelog_rel} is not UTF-8 text") from None
+    blocks = _version_blocks(text, version) if text is not None else []
+    if len(blocks) != 1:
+        raise ReleaseRefused(f"{run.changelog_rel} holds {len(blocks)} {version} sections")
+    block = text[blocks[0][1]:blocks[0][2]]
+    header = block.split("\n", 1)[0].rstrip("\r")
+    date = header.rsplit(" - ", 1)[-1].strip() if " - " in header else None
+    stored = {"version": normalize_version(blocks[0][0]), "entry_ids": ids,
+              "created_at": date or datetime.now(UTC).date().isoformat()}
+    try:
+        section, _ = render_section(run.engine, run.slug, stored)
+    except ReleaseRefused as exc:
+        raise ReleaseRefused(f"the section cannot be rendered: {exc}") from None
+    if _norm_block(block).split("\n", 1)[-1] != _norm_block(section).split("\n", 1)[-1]:
+        raise ReleaseRefused(f"the {version} section of {run.changelog_rel} differs from the "
+                             f"database's entries")
+    return {"path": run.changelog_rel, "sha256": _sha256(data), "section_date": date}
+
+
+def _verify_release_candidate(run: _Run, repo: str, commit: str, version: str,
+                              ids: list[int], contract: list[str] | None) -> dict:
+    """D8 — ONE candidate release commit, verified on its own evidence:
+    subject `release: v<V>` (any equivalent spelling), exactly one parent
+    (the candidate), the paths it changed besides F = the version-file
+    contract (when one exists), F at the commit holding the V section once
+    (the database's entries), each changed version file passing the D9
+    contract against the parent. → {candidate_sha, manifest};
+    ReleaseRefused (the reason) otherwise."""
+    match = _RELEASE_SUBJECT_RE.match(_subject(repo, commit))
+    if not match or not _same_label(match.group(1), version):
+        raise ReleaseRefused(f"its subject is not `release: v{version}`")
+    parents = _parents(repo, commit)
+    if len(parents) != 1:
+        raise ReleaseRefused(f"it has {len(parents)} parents — the candidate is ambiguous")
+    parent = parents[0]
+    changed = sorted(_diff_names(repo, parent, commit) - {run.changelog_rel})
+    if contract is not None and changed != contract:
+        raise ReleaseRefused(f"it changed {changed} but the version-file contract is "
+                             f"{contract}")
+    manifest: dict = {"tree": _tree(repo, commit)}
+    if run.changelog_rel:
+        manifest["changelog"] = _legacy_section(
+            run, version, ids, gitinfo.git_read_blob(repo, commit, run.changelog_rel))
+    files = []
+    for rel in changed:
+        data = gitinfo.git_read_blob(repo, commit, rel)
+        try:
+            _legacy_version_file(rel, gitinfo.git_read_blob(repo, parent, rel), data, version,
+                                 git=True)
+        except ValueError as exc:
+            raise ReleaseRefused(f"version file {rel}: {exc}") from None
+        files.append({"path": rel, "sha256": _sha256(data)})
+    manifest["version_files"] = files
+    return {"candidate_sha": parent, "manifest": manifest}
+
+
 def gather_evidence(engine: sa.Engine, project_slug: str, version: str, *,
                     cwd: str | None = None) -> dict:
     """Read-only evidence of a legacy release of `version` WITHOUT a record
-    (K-60). Refuses (ReleaseRefused) on ANY ambiguity — never guesses:
-    a record exists; no entry carries V and it is not current_version;
-    several release commits or tags pointing elsewhere; a release commit
-    without a tag or a tag without the release commit; a release commit
-    that is a merge; the changelog section missing / doubled / different
-    from the database render; version files that do not contain V or
-    differ from the project's contract. Returns {version, entry_ids,
+    (K-60, K-86, K-96 D8). Refuses (ReleaseRefused) on ANY contradiction —
+    never guesses.
+
+    1. The AUTHORITATIVE spelling first (K-86): changelog.version_spelling —
+       the shared resolver core's reconstruct_release uses (the first-stamped
+       entry's spelling, else current_version); the requested V is only
+       reported (`requested_version`), every comparison is same_version, and
+       files, section, tag and record all refer to that resolved version. It
+       must fit the schema (ensure_version_fits, K-87). No entry carries V
+       and it is not current_version → refused.
+    2. Git (D8): commits titled `release: v<V>` (any equivalent spelling, any
+       local ref) and the commit the tags of V point at are CANDIDATES, each
+       verified on its own (_verify_release_candidate: subject, one parent,
+       the changed paths vs the contract, the section once with the
+       database's entries, each version file's FIELD / changed lines — J8:
+       never a substring). Tags of V must all point at ONE commit. With a
+       tag: that commit must verify → status 'completed'. Without a tag:
+       exactly one verified candidate → status 'committed' (the evidence
+       ends at the commit); none or several → refused.
+    3. Without git: F as found and the contract's files (field / a line
+       holding V) → 'completed'.
+
+    Returns {version (authoritative), requested_version, spellings (the
+    equivalence map {stored spelling: [entry ids]}), entry_ids,
     candidate_sha, release_commit_sha, tag, checkout_root, manifest,
-    status, without_git}."""
-    version = normalize_version(version)
+    status, without_git, candidates ([{commit, verified, reason}], git
+    only)}."""
+    requested = normalize_version(version)
     project, checkout, project_root = _locate(engine, project_slug, cwd)
-    if ledger.get_release(engine, project_slug, version) is not None:
-        raise ReleaseRefused(f"version {version} already has a release record — nothing to "
+    if ledger.get_release(engine, project_slug, requested) is not None:
+        raise ReleaseRefused(f"version {requested} already has a release record — nothing to "
                              f"reconstruct")
-    entries = list_entries(engine, project_slug, version=version)
-    ids = sorted(e["id"] for e in entries)
-    current = project.get("current_version")
-    if not ids and not same_version(current, version):
-        raise ReleaseRefused(f"no entry carries {version} and it is not the current version "
-                             f"({current}) — the database does not prove this release")
+    try:
+        spelling = version_spelling(engine, project_slug, requested)
+    except ValueError as exc:
+        raise ReleaseRefused(str(exc)) from None
+    if spelling["authoritative"] is None:
+        raise ReleaseRefused(
+            f"no entry carries {requested} and it is not the current version "
+            f"({project.get('current_version')}) — the database does not prove this release")
+    version = normalize_version(spelling["authoritative"])
+    try:
+        ensure_version_fits(version)
+    except ValueError as exc:
+        raise ReleaseRefused(str(exc)) from None
+    ids = sorted(e["id"] for e in list_entries(engine, project_slug, version=version))
     run = _Run(engine, project_slug, project, checkout, project_root, on_point=None)
     contract = ledger.get_version_files(engine, project_slug)["version_files"]
-    evidence = {"version": version, "entry_ids": ids, "candidate_sha": None,
+    evidence = {"version": version, "requested_version": requested,
+                "spellings": spelling["spellings"], "entry_ids": ids, "candidate_sha": None,
                 "release_commit_sha": None, "tag": None, "checkout_root": None,
                 "without_git": checkout is None, "status": "completed"}
-    manifest: dict = {}
     if checkout is None:
         if not project_root:
             raise ReleaseRefused("the project has no path — no artifact can be verified")
-        def read(rel: str) -> bytes | None:
-            return _read_bytes(run.abspath(rel))
-        files = contract or []
-    else:
-        repo = checkout["repo_root"]
-        commits = _release_commits(repo, version)
-        tags = _version_tags(repo, version)
-        tag_commits = sorted({t["commit"] for t in tags})
-        if len(commits) != 1:
-            raise ReleaseRefused(
-                f"{len(commits)} commits titled `release: v{version}` — "
-                f"{'none' if not commits else 'ambiguous'}; refused, never guessed.",
-                details={"release_commits": commits})
-        commit = commits[0]
-        if tag_commits != [commit]:
-            raise ReleaseRefused(
-                f"the tag(s) of {version} ({', '.join(t['name'] for t in tags) or 'none'}) do "
-                f"not point exactly at the release commit {commit} — refused.",
-                details={"tags": tags, "release_commit": commit})
-        parents = _parents(repo, commit)
-        if len(parents) != 1:
-            raise ReleaseRefused(f"the release commit {commit} has {len(parents)} parents — "
-                                 f"the candidate is ambiguous; refused.")
-        evidence.update(candidate_sha=parents[0], release_commit_sha=commit,
-                        tag=next((t["name"] for t in tags if t["name"] == f"v{version}"),
-                                 tags[0]["name"]),
-                        checkout_root=repo)
-        manifest["tree"] = _tree(repo, commit)
-        def read(rel: str, _commit: str = commit) -> bytes | None:
-            return gitinfo.git_read_blob(repo, _commit, rel)
-        changed = sorted(_diff_names(repo, parents[0], commit) - {run.changelog_rel})
-        if contract is not None and changed != contract:
-            raise ReleaseRefused(
-                f"the release commit changed {changed} but the version-file contract is "
-                f"{contract} — refused.", details={"changed": changed, "contract": contract})
-        files = changed
-    if run.changelog_rel:
-        data = read(run.changelog_rel)
-        text = data.decode("utf-8", "strict") if data is not None else None
-        blocks = _version_blocks(text, version) if text is not None else []
-        if len(blocks) != 1:
-            raise ReleaseRefused(f"{run.changelog_rel} holds {len(blocks)} {version} sections — "
-                                 f"refused.")
-        block = text[blocks[0][1]:blocks[0][2]]
-        header = block.split("\n", 1)[0].rstrip("\r")
-        date = header.rsplit(" - ", 1)[-1].strip() if " - " in header else None
-        stored = {"version": blocks[0][0], "entry_ids": ids,
-                  "created_at": date or datetime.now(UTC).date().isoformat()}
+        manifest: dict = {}
+        if run.changelog_rel:
+            manifest["changelog"] = _legacy_section(
+                run, version, ids, _read_bytes(run.abspath(run.changelog_rel)))
+        files, bad = [], []
+        for rel in contract or []:
+            data = _read_bytes(run.abspath(rel))
+            try:
+                _legacy_version_file(rel, None, data, version, git=False)
+            except ValueError as exc:
+                bad.append(f"{rel}: {exc}")
+                continue
+            files.append({"path": rel, "sha256": _sha256(data)})
+        if bad:
+            raise ReleaseRefused(f"version files without {version}: {'; '.join(bad)} — refused.",
+                                 details={"missing": bad})
+        manifest["version_files"] = files
+        evidence["manifest"] = manifest
+        return evidence
+    repo = checkout["repo_root"]
+    tags = _version_tags(repo, version)
+    tag_commits = sorted({t["commit"] for t in tags})
+    if len(tag_commits) > 1:
+        raise ReleaseRefused(
+            f"the tags of {version} point at different commits "
+            f"({', '.join(t['name'] + '→' + t['commit'] for t in tags)}) — a contradiction; "
+            f"refused, never guessed.", details={"tags": tags})
+    tagged = tag_commits[0] if tag_commits else None
+    pool = sorted(set(_release_commits(repo, version)) | ({tagged} if tagged else set()))
+    candidates, verified = [], {}
+    for sha in pool:
         try:
-            section, _ = render_section(engine, project_slug, {
-                **stored, "version": normalize_version(blocks[0][0])})
+            verified[sha] = _verify_release_candidate(run, repo, sha, version, ids, contract)
+            candidates.append({"commit": sha, "verified": True, "reason": None})
         except ReleaseRefused as exc:
-            raise ReleaseRefused(f"the section cannot be rendered: {exc}") from None
-        body = _norm_block(block).split("\n", 1)[-1]
-        if body != _norm_block(section).split("\n", 1)[-1]:
-            raise ReleaseRefused(f"the {version} section of {run.changelog_rel} differs from the "
-                                 f"database's entries — refused.")
-        manifest["changelog"] = {"path": run.changelog_rel, "sha256": _sha256(data),
-                                 "section_date": date}
-    missing, version_files = [], []
-    for rel in files:
-        data = read(rel)
-        if data is None or version.encode("utf-8") not in data:
-            missing.append(rel)
-        else:
-            version_files.append({"path": rel, "sha256": _sha256(data)})
-    if missing:
-        raise ReleaseRefused(f"version files without {version}: {', '.join(missing)} — refused.",
-                             details={"missing": missing})
-    manifest["version_files"] = version_files
-    evidence["manifest"] = manifest
+            candidates.append({"commit": sha, "verified": False, "reason": str(exc)})
+    reasons = "; ".join(f"{c['commit'][:12]}: {c['reason']}" for c in candidates
+                        if not c["verified"])
+    if tagged is not None:
+        if tagged not in verified:
+            raise ReleaseRefused(
+                f"the tag(s) {', '.join(t['name'] for t in tags)} of {version} point at "
+                f"{tagged}, which is not a verifiable release commit ({reasons}) — refused.",
+                details={"tags": tags, "candidates": candidates})
+        commit, status = tagged, "completed"
+    else:
+        if len(verified) != 1:
+            what = "none of the candidates verifies" if not verified else \
+                f"{len(verified)} verified release commits — ambiguous"
+            raise ReleaseRefused(
+                f"no tag of {version}, and {what} ({len(pool)} candidate(s) titled `release: "
+                f"v{version}`{'; ' + reasons if reasons else ''}) — refused, never guessed.",
+                details={"candidates": candidates})
+        commit, status = next(iter(verified)), "committed"
+    found = verified[commit]
+    evidence.update(
+        candidate_sha=found["candidate_sha"], release_commit_sha=commit, checkout_root=repo,
+        status=status, manifest=found["manifest"], candidates=candidates,
+        tag=None if tagged is None else next(
+            (t["name"] for t in tags if t["name"] == f"v{version}"), tags[0]["name"]))
     return evidence
 
 
+@_conflict_boundary("reconstruct")
 def reconstruct(engine: sa.Engine, project_slug: str, version: str, *,
                 confirm: bool = False, cwd: str | None = None) -> dict:
     """`dct release reconstruct` (K-60): gather_evidence (read-only) and,
     only with confirm=True, core reconstruct_release with exactly that
     evidence (no re-stamp) — gathered and recorded under the project
-    operation lock (K-96 D7; the preview takes no lock). Outcome 'preview'
-    (nothing written) or 'reconstructed'."""
+    operation lock (K-96 D7; the preview takes no lock). Usable by both
+    executors (K-85: it performs no effect). Outcome 'preview' (nothing
+    written) or 'reconstructed'."""
     if not confirm:
         evidence = gather_evidence(engine, project_slug, version, cwd=cwd)
         return result("reconstruct", project_slug, "preview", version=evidence["version"],
@@ -2775,12 +3169,13 @@ def reconstruct(engine: sa.Engine, project_slug: str, version: str, *,
 def _reconstruct(engine, project_slug: str, version: str, *, cwd) -> dict:
     evidence = gather_evidence(engine, project_slug, version, cwd=cwd)
     try:
-        record = ledger.reconstruct_release(
+        record = _ledger_write(engine, project_slug, evidence["version"], "reconstruct",
+                               lambda: ledger.reconstruct_release(
             engine, project_slug, evidence["version"], entry_ids=evidence["entry_ids"],
             candidate_sha=evidence["candidate_sha"],
             release_commit_sha=evidence["release_commit_sha"], manifest=evidence["manifest"],
             status=evidence["status"], confirm=True, checkout_root=evidence["checkout_root"],
-            without_git=evidence["without_git"])
+            without_git=evidence["without_git"]), steps=[])
     except ValueError as exc:
         raise ReleaseRefused(str(exc)) from None
     return result("reconstruct", project_slug, "reconstructed", version=record["version"],

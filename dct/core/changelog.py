@@ -939,6 +939,15 @@ def resolve_version_spelling(conn: sa.Connection, project_id: int, version: str)
     }
 
 
+def version_spelling(engine: sa.Engine, project_slug: str, version: str) -> dict:
+    """resolve_version_spelling for `project_slug` in ONE consistent read
+    snapshot (read-only; also on a read-only engine) — the shared resolver
+    the effects layer's reconstruction asks BEFORE it verifies any artifact
+    (K-86). ValueError on an unsupported version or an unknown project."""
+    with project_transaction(engine, project_slug) as (conn, pid):
+        return resolve_version_spelling(conn, pid, version)
+
+
 def _entries_of_version(conn: sa.Connection, project_id: int, version: str) -> list[int]:
     """Ids of the live entries of the project that already carry `version`
     (under the version contract — a legacy `v1.1.0` row matches `1.1.0`)."""

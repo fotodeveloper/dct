@@ -1271,6 +1271,15 @@ def release_changelog(
     sets version + released_at and creates the record with status 'stamped'
     — the workflow then moves it forward with advance_release.
 
+    Who performs the effects (K-85, J4): a record stamped HERE carries no
+    consent and no approved version-file proposal, so `dct release resume`
+    never performs or adopts its effects — the caller's own tool (the
+    project's release_executor "own" is the explicit setting for it)
+    performs and verifies them and reports each with advance_release, or
+    the record is ended with abandon_release. dct's own effects (changelog
+    file, version files, release commit, tag, push) start from `dct release
+    plan` / `prepare` / `apply`, never from this tool.
+
     Returns: {"project", "version" (requested, normalized), "current_version"
         (after the call), "mode":
         "all"|"selected"|"version_only", "entry_ids" (the selected ids — in mode
@@ -1407,7 +1416,12 @@ def advance_release(
 ) -> dict:
     """Record verified progress of a release — move its record FORWARD and/or
     record the effects the workflow verified. The server never checks files
-    or git: the caller reports what IT verified.
+    or git: the caller reports what IT verified. This is the ledger path of
+    a project's OWN release tool and of records stamped outside `dct
+    release apply` (release_changelog): a release dct executes — executor
+    "dct" AND a recorded consent (stamped by `dct release apply`) — is
+    refused here; `dct release resume` records its progress after
+    verifying each effect (K-85).
 
     Call it after each release step is DONE and verified (also when a resumed
     run finds the effect already present): files_written after the changelog
@@ -1453,8 +1467,10 @@ def advance_release(
         release_commit_sha, 'committed'+ without a release commit (or with
         one / a git-only status on a "without_git" record), a
         manifest key recorded with a different value or a malformed
-        manifest, an invalid SHA, an unsupported version format, tool-call
-        markup, or an unresolvable project. Nothing is written on error.
+        manifest, a record dct executes (executor "dct" with a consent —
+        "… recorded only by `dct release resume` …"), an invalid SHA, an
+        unsupported version format, tool-call markup, or an unresolvable
+        project. Nothing is written on error.
     """
     if (err := _reject_toolcall_markup(
         version=version, status=status, release_commit_sha=release_commit_sha,
@@ -1468,6 +1484,7 @@ def advance_release(
         out = core_advance_release(
             _get_engine(), project_slug, version, status,
             release_commit_sha=release_commit_sha or None, manifest=manifest,
+            actor="ledger",
         )
         return _release_ack(project_slug, out)
     except Exception as e:

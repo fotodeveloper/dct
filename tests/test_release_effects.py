@@ -703,18 +703,13 @@ def test_reconstruct_with_clean_evidence(engine, legacy):
     assert git(repo, "status", "--porcelain") == ""
 
 
-@pytest.mark.parametrize("ambiguity", [
-    "second_release_commit", "missing_tag", "section_mismatch", "version_file_without_v",
-])
+# K-96 D8: a second commit titled like the release (it fails verification)
+# and a missing tag (a 'committed' reconstruction) are no longer refusals —
+# tests/test_release_reconstruct.py pins both.
+@pytest.mark.parametrize("ambiguity", ["section_mismatch", "version_file_without_v"])
 def test_reconstruct_refuses_ambiguous_evidence(engine, legacy, ambiguity):
     repo, a, candidate, _ = legacy
-    if ambiguity == "second_release_commit":
-        git(repo, "checkout", "-q", "-b", "other", candidate)
-        commit(repo, "release: v1.1.0\n", "g.txt")
-        git(repo, "checkout", "-q", "main")
-    elif ambiguity == "missing_tag":
-        git(repo, "tag", "-d", "v1.1.0")
-    elif ambiguity == "section_mismatch":
+    if ambiguity == "section_mismatch":
         with engine.begin() as conn:
             conn.execute(changelog_entries.update().where(changelog_entries.c.id == a)
                          .values(entry="something else"))

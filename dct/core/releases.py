@@ -108,6 +108,11 @@ GIT_ONLY_STATUSES = frozenset({"committed", "tagged", "pushed"})
 # project's own release tool. The project setting is projects.release_executor.
 EXECUTORS = ("dct", "own")
 DEFAULT_EXECUTOR = "dct"
+# Who records PROGRESS on a record (advance_release `actor`, K-85 / K-96
+# D10): 'dct' = the effects layer (after verifying each effect itself),
+# 'ledger' = a caller reporting what IT verified (MCP advance_release, `dct
+# clog release-advance` — the path of a project's own tool).
+ACTORS = ("dct", "ledger")
 
 _SHA_RE = re.compile(r"[0-9a-fA-F]{7,64}", re.ASCII)
 _COMMITTED = RELEASE_FLOW.index("committed")
@@ -430,6 +435,45 @@ def validate_executor(executor: str) -> str:
             f"release executor must be one of {', '.join(EXECUTORS)}, got {executor!r}"
         )
     return executor
+
+
+def progress_owner(record: Mapping) -> str:
+    """Who executes the release of `record` (K-85, the RECORD decides —
+    never today's project setting): 'dct' when its executor is 'dct' (NULL
+    on records older than the field counts as 'dct') AND it carries the
+    owner's consent (it was stamped by `dct release apply`); else 'ledger' —
+    an 'own' record, or one stamped outside the effects layer (MCP
+    release_changelog, older records, a partial reconstruction): its
+    effects are performed and verified by whoever reports them through the
+    ledger. `record` is a record dict (get_release) or a releases row."""
+    get = record.get if isinstance(record, Mapping) else lambda k: getattr(record, k)
+    executor = get("executor") or DEFAULT_EXECUTOR
+    return "dct" if executor == "dct" and get("consent") is not None else "ledger"
+
+
+def check_progress_actor(record: Mapping, actor: str) -> None:
+    """K-85 / K-96 D10 — refuse a progress write by the wrong actor
+    (ACTORS): a release dct executes is advanced only by the effects layer
+    (`dct release resume` verifies each effect), any other only through the
+    ledger path. ValueError otherwise."""
+    if actor not in ACTORS:
+        raise ValueError(f"actor must be one of {', '.join(ACTORS)}, got {actor!r}")
+    get = record.get if isinstance(record, Mapping) else lambda k: getattr(record, k)
+    owner = progress_owner(record)
+    if actor == owner:
+        return
+    if owner == "dct":
+        raise ValueError(
+            f"Release {get('version')} is executed by dct (stamped by `dct release apply` "
+            f"with the owner's consent) — its progress is recorded only by `dct release "
+            f"resume`, which verifies each effect; never by hand; nothing written."
+        )
+    raise ValueError(
+        f"Release {get('version')} is not executed by dct (executor "
+        f"'{get('executor') or DEFAULT_EXECUTOR}', "
+        f"{'no recorded consent' if get('consent') is None else 'own tool'}) — dct records "
+        f"no progress on it; nothing written."
+    )
 
 
 _HEX64_RE = re.compile(r"[0-9a-f]{64}", re.ASCII)
@@ -861,6 +905,7 @@ def advance_release(
     consent: Mapping | None = None,
     proposal: Mapping | None = None,
     render: Mapping | None = None,
+    actor: str | None = None,
 ) -> dict:
     """Record verified progress: move the release record of `version` along
     the state machine and/or record the effects the workflow verified.
@@ -890,6 +935,13 @@ def advance_release(
       write-once: recorded when the record has none, the stored value again
       is a confirmation, a different one raises ValueError (check_unchanged).
       The executor is fixed at stamp time and never accepted here.
+    - `actor` (K-85 / K-96 D10, ACTORS): 'dct' (the effects layer) or
+      'ledger' (MCP advance_release, `dct clog release-advance` — a caller
+      reporting its own verified effects); checked against the RECORD
+      (check_progress_actor) before anything else, also for a repeat: a
+      record dct executes (progress_owner 'dct') accepts only 'dct', every
+      other record only 'ledger'. None = not checked (core callers and
+      tests that drive the ledger directly).
 
     Returns {"release": <record>, "updated": bool} — `updated` False when
     nothing changed (idempotent repeat).
@@ -909,8 +961,12 @@ def advance_release(
         "proposal": validate_proposal(proposal),
         "render": validate_render(render),
     }
+    if actor is not None and actor not in ACTORS:
+        raise ValueError(f"actor must be one of {', '.join(ACTORS)}, got {actor!r}")
     with project_transaction(engine, project_slug, write=True) as (conn, pid):
         row = _require_record(conn, pid, project_slug, version)
+        if actor is not None:
+            check_progress_actor(row, actor)
         moves = check_transition(row.status, status)
         final = status if moves else row.status
         values: dict = {}
