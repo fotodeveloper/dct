@@ -1,24 +1,40 @@
 # Client integrations
 
-DCT stores work state independently of the client. Claude Code and Codex use
-the same MCP tools, database and composed session workflows.
+DCT lets a session query the work left to do, its acceptance checkpoints,
+recorded decisions and the next handoff. The database is the shared execution
+ledger; a client integration supplies installation, workflow instructions and,
+where supported, hooks. A working MCP connection does not establish all three.
+
+## Release availability
+
+The published PyPI release **1.5.0** includes the common CLI/MCP tools and the
+established Claude Code integration. This guide also describes **unreleased
+development changes**: `dct integrate`, `dct doctor`, Codex workflow skills and
+experimental native Codex hooks. Those additions are not installed by
+`uv tool install 'dctracker[mcp]'` from PyPI 1.5.0.
+
+To try the new commands, use a checkout containing the integration changes:
 
 ```sh
-uv tool install 'dctracker[mcp]'
-# or: pipx install 'dctracker[mcp]'
-# or, inside a virtual environment: pip install 'dctracker[mcp]'
+uv tool install --editable '/path/to/dct[mcp]'
 dct integrate install codex
 dct integrate status codex --json
 dct doctor --client codex --json
 ```
 
-Integration commands never initialize or migrate the database. Configure DCT
-using its existing config commands; normal tracking operations bootstrap the
-database as usual. The existing interactive `dct init` remains compatible and
+For a published installation, use `dct init` for the existing Claude setup or
+register `dct server` manually in another client's MCP configuration. Do not
+interpret the development matrix below as a claim about PyPI 1.5.0.
+
+Integration commands never initialize or migrate the database. Use the default
+SQLite configuration or create `dct.toml` as described in the
+[configuration reference](architecture.md). Register a project if it is not
+already tracked with `dct project add myproj /path/to/myproj`; normal tracking
+operations bootstrap the database as usual. The existing interactive `dct init` remains compatible and
 installs Claude Code. `dct integrate install claude` explicitly installs its
 MCP, skills, hooks and managed instructions.
 
-## Codex
+## Codex: supported explicit workflows in development builds
 
 The adapter configures `dct server` in `$CODEX_HOME/config.toml` (default
 `~/.codex/config.toml`), installs `pickup`, `handoff`, `track` and `clog` in
@@ -38,11 +54,22 @@ A nonempty `AGENTS.override.md` takes precedence over `AGENTS.md`; doctor
 reports this as an error. Merge needed override instructions manually before
 removing or emptying the override. Repair does not modify that user-owned file.
 
-Codex supports explicit skills and native hook definitions for changelog checks,
-stop reminders, apply-patch autoscan and plan-snapshot mirroring. The runtime
+The four explicit skills (`pickup`, `handoff`, `track`, `clog`) are the supported
+Codex workflow surface in this checkout. Their session-resumption behavior has
+[separate acceptance evidence](codex-acceptance.md).
+
+### Experimental native hooks
+
+Native hook definitions cover changelog checks, stop reminders, apply-patch
+autoscan and conditional plan-snapshot mirroring. The runtime
 bridge translates Codex payloads and reuses shared DCT policies. After explicit
 installation, review and trust the definitions through Codex `/hooks`; files
-alone do not establish active hooks. See the [hook guide](hooks.md) for platform
+alone do not establish active hooks. Runtime validation currently targets the
+local POSIX client. Plan mirroring also requires the host to expose and emit
+`update_plan`; its emission has not been demonstrated in the tested
+noninteractive Sol configuration. A plan written in conversation is not a native
+plan event. Mirroring keeps an append-only history of observed steps and source
+statuses, not live or bidirectional checkpoint synchronization. See the [hook guide](hooks.md) for platform
 dependencies, supported events, ownership and limitations. Official host documentation:
 [MCP](https://learn.chatgpt.com/docs/extend/mcp?surface=cli) and
 [skills](https://learn.chatgpt.com/docs/build-skills).
@@ -93,14 +120,25 @@ upgrades, model calls or network requests.
 
 ## Capability matrix
 
-| Capability | Claude Code | Codex | Generic MCP client |
+This matrix describes the development checkout. **Established** is the existing
+Claude integration; **supported** denotes the packaged explicit Codex workflows;
+**experimental** requires the stated native-host conditions; **generic** denotes
+manual protocol integration, without a claim of client-specific acceptance.
+
+| Capability | Claude Code — established | Codex — development | Other clients — generic MCP |
 |---|---|---|---|
-| Shared tracking/session MCP tools | Yes | Yes | Yes |
-| Integration installer | Yes | Yes | Manual |
-| Managed workflow skills | Existing collection | pickup, handoff, track, clog | Host-dependent |
-| Task mirror/autoscan/changelog hooks | Claude events | Native events; explicit trust required | Host-dependent |
-| Managed instructions | CLAUDE.md | AGENTS.md | Manual |
-| Integration diagnostics | Yes | Yes | Core runtime checks |
+| Shared tracking/session MCP tools | Available | Available | Manual stdio registration; host-dependent discovery |
+| Integration installer | `init`; new `integrate` commands in development | `integrate install/repair` | Manual |
+| Managed workflow skills | Existing collection | Supported: pickup, handoff, track, clog | Supply client-specific instructions manually |
+| Changelog checks / stop reminders | Claude hooks | Experimental native hooks; review/trust and dependencies required | No packaged adapter |
+| Plan-file autoscan | Claude edit/write events | Experimental `apply_patch` events; shell edits need explicit rescan | CLI rescan or MCP `ingest_plan_file` |
+| Native plan mirroring | Claude TaskCreate/TodoWrite | Experimental and conditional on actual `update_plan` events | No packaged mirror |
+| Managed instructions | CLAUDE.md | AGENTS.md; conflicts reported | Manual |
+| Integration diagnostics | Development `doctor` | Development `doctor`; runtime trust checked separately | Core runtime checks only |
+
+Hook installation and trust are separate from explicit skills. Treat each
+client/host version as its own integration surface; do not infer hook parity
+from a successful MCP call.
 
 Record real-client acceptance and benchmarks separately from unit/protocol
 tests. A working MCP connection alone does not establish skill or hook behavior.

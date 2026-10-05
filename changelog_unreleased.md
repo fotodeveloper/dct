@@ -18,6 +18,7 @@
 
 ## Changed
 
+- Describe DCT as queryable work state, distinguish released and development client capabilities, and document contributor sign-off and project identity guidance (#415).
 - Refresh only detected client integrations on upgrade; retain existing instruction and hook opt-ins.
 - Default new plan-classification configurations to local rules; honor explicit command providers and legacy settings without requiring Claude for basic ingestion (#432, partial).
 - Refresh the supported dependency baseline and resolver lock, including MCP 2.2, SQLAlchemy 2.0.52, psycopg 3.3.5, Markdown 3.10.3 and Ruff 0.16.7 (#687).
