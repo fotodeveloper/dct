@@ -26,7 +26,13 @@ Reverts (K-68): a commit whose subject starts `Revert "` or `Reapply "`
 (git >= 2.43 names a revert of a revert "Reapply") AND that carries git's
 standard column-0 line `This reverts commit <sha>.` (or `…, reversing` for
 a merge) reverts <sha>. Both conditions are required, so prose that merely
-mentions a revert is not one.
+mentions a revert is not one. A revert of a MERGE (K-82) neutralizes the
+commits the merge brought in relative to the mainline parent its message
+names (`…, reversing changes made to <P>.` — P must be exactly one real
+parent of the merge); a missing, edited or contradicting mainline, or a
+partial revert (its change is not the exact inverse of the reverted one),
+leaves the touched entries 'unconfirmed' — no automatic proof, never a
+guess (plan.revert_scopes verifies this in git).
 """
 
 from __future__ import annotations
@@ -46,8 +52,10 @@ LOST_LINE_RE = re.compile(r"^[ \t]+Changelog: ([0-9]+(?:, [0-9]+)*)[ \t]*$", re.
 
 _REVERT_SUBJECT_RE = re.compile(r'^(?:Revert|Reapply) "', re.ASCII)
 _REVERTS_LINE_RE = re.compile(
-    r"^This reverts commit ([0-9a-fA-F]{7,64})(?:\.|, reversing\b)", re.MULTILINE | re.ASCII
+    r"^This reverts commit ([0-9a-fA-F]{7,64})(?:\.|, reversing)", re.MULTILINE | re.ASCII
 )
+# The rest of git's merge form: `…, reversing\nchanges made to <P>.`
+_MAINLINE_RE = re.compile(r"\s+changes made to ([0-9a-fA-F]{7,64})\.", re.ASCII)
 _MERGE_PR_RE = re.compile(r"^Merge pull request #([0-9]+) ", re.ASCII)
 _SUFFIX_PR_RE = re.compile(r"\(#([0-9]+)\)\s*$", re.ASCII)
 LOCAL_SQUASH_MARKER = "Squashed commit of the following:"
@@ -107,24 +115,18 @@ def lost_trailer_ids(message: str) -> set[int]:
     return ids
 
 
-def revert_target(message: str) -> str | None:
-    """The (possibly abbreviated, lowercased) SHA a standard git revert
-    message reverts, or None when `message` is not one."""
-    subject = (message or "").split("\n", 1)[0]
-    if not _REVERT_SUBJECT_RE.match(subject):
-        return None
-    match = _REVERTS_LINE_RE.search(message)
-    return match.group(1).lower() if match else None
-
-
 def merge_pr(subject: str) -> int | None:
-    """N of a hosted merge subject `Merge pull request #N from …`."""
+    """N of a hosted merge subject `Merge pull request #N from …` — the
+    only PR number the proof layer records (K-89/K-90), and only for a
+    REAL merge commit (the caller checks the parents)."""
     match = _MERGE_PR_RE.match(subject or "")
     return int(match.group(1)) if match else None
 
 
 def suffix_pr(subject: str) -> int | None:
-    """N of a hosted squash / rebase subject ending `(#N)`."""
+    """N of a subject ending `(#N)` — a hosted squash / rebase PR number OR
+    an issue reference: a heuristic signal (K-95 C4), never proof and never
+    a recorded PR number."""
     match = _SUFFIX_PR_RE.search(subject or "")
     return int(match.group(1)) if match else None
 
@@ -144,7 +146,45 @@ def squash_signals(commit: Commit) -> list[str]:
     return signals
 
 
-# ── reverts (K-68) ───────────────────────────────────────────────────────────
+# ── reverts (K-68, K-82) ─────────────────────────────────────────────────────
+
+
+@dataclass(frozen=True)
+class RevertRef:
+    """What a standard git revert message states: the reverted commit as
+    written (`target`, lowercased, possibly abbreviated) and, for git's
+    merge form `This reverts commit <M>, reversing changes made to <P>.`,
+    the mainline parent P (`mainline`; None when the merge form is absent or
+    its `changes made to` part cannot be read). `merge_form` is True when
+    the message uses the `, reversing` form at all."""
+
+    target: str
+    mainline: str | None
+    merge_form: bool
+
+
+def parse_revert(message: str) -> RevertRef | None:
+    """The RevertRef of a standard revert message, None when `message` is
+    not one (subject `Revert "` / `Reapply "` AND the column-0 line)."""
+    subject = (message or "").split("\n", 1)[0]
+    if not _REVERT_SUBJECT_RE.match(subject):
+        return None
+    match = _REVERTS_LINE_RE.search(message)
+    if match is None:
+        return None
+    merge_form = match.group(0).endswith("reversing")
+    mainline = None
+    if merge_form:
+        tail = _MAINLINE_RE.match(message, match.end())
+        mainline = tail.group(1).lower() if tail else None
+    return RevertRef(match.group(1).lower(), mainline, merge_form)
+
+
+def revert_target(message: str) -> str | None:
+    """The (possibly abbreviated, lowercased) SHA a standard git revert
+    message reverts, or None when `message` is not one."""
+    ref = parse_revert(message)
+    return ref.target if ref else None
 
 
 @dataclass
@@ -153,54 +193,74 @@ class RevertAnalysis:
 
     `reverts`: one report per revert commit — {sha, target (as written),
     target_sha (resolved full SHA or None), status: 'in_range' |
-    'outside_range' | 'ambiguous', effective (False when itself reverted),
-    affected (commits it neutralizes, merge reverts include the commits the
-    merge introduced)}.
+    'outside_range' | 'ambiguous' | 'unconfirmed', mainline (the merge
+    parent the revert keeps, full SHA, or None), reason (why 'unconfirmed',
+    else None), effective (False when itself reverted), affected (commits
+    it neutralizes — for an unconfirmed revert the commits it MAY touch)}.
     `neutralized`: commit SHA → the effective revert SHAs neutralizing it.
+    `unconfirmed`: commit SHA → the effective UNCONFIRMED reverts that may
+    touch it (K-82: no automatic proof, never guessed).
     """
 
     reverts: list[dict] = field(default_factory=list)
     neutralized: dict[str, list[str]] = field(default_factory=dict)
+    unconfirmed: dict[str, list[str]] = field(default_factory=dict)
 
 
 def analyze_reverts(
-    commits: Iterable[Commit], introduced: Mapping[str, Iterable[str]] | None = None
+    commits: Iterable[Commit], scopes: Mapping[str, Mapping] | None = None
 ) -> RevertAnalysis:
     """Resolve every standard revert in `commits` (the range) — deterministic.
 
     - The target must be a commit OF THE RANGE: a full SHA, or an
       abbreviation matching exactly one range commit. Otherwise the revert
       is reported ('outside_range' / 'ambiguous') and changes nothing.
-    - A revert of a merge commit M also neutralizes the commits M brought in
-      (`introduced[M]`, computed by the caller from git).
+    - `scopes` (revert SHA → {affected, confirmed, reason, mainline}) is
+      what the caller verified in git (plan.revert_scopes, K-82): the
+      commits the revert neutralizes relative to the mainline parent its
+      message names, and whether it is a FULL revert. Without a scope a
+      revert of an ordinary commit neutralizes exactly its target; a revert
+      of a merge (or one in the merge form) is 'unconfirmed' — the mainline
+      is never guessed.
+    - A confirmed revert neutralizes its `affected` commits; an unconfirmed
+      one marks them `unconfirmed` (their proof needs the owner).
     - Chains: a commit is neutralized when at least one EFFECTIVE revert
       targets it, and a revert is effective when it is not neutralized
       itself — so a revert of a revert restores the original proof, a third
-      revert removes it again, and so on.
+      revert removes it again, and so on. A reverted unconfirmed revert
+      marks nothing.
     """
     commits = list(commits)
     shas = [c.sha for c in commits]
     by_sha = {c.sha: c for c in commits}
-    introduced = introduced or {}
+    scopes = scopes or {}
     reports: list[dict] = []
     reverters: dict[str, list[str]] = {}
+    doubters: dict[str, list[str]] = {}
     for commit in commits:
-        target = revert_target(commit.message)
-        if target is None:
+        ref = parse_revert(commit.message)
+        if ref is None:
             continue
-        matches = [sha for sha in shas if sha.startswith(target)]
-        report = {"sha": commit.sha, "target": target, "target_sha": None,
-                  "status": "outside_range", "effective": True, "affected": []}
+        matches = [sha for sha in shas if sha.startswith(ref.target)]
+        report = {"sha": commit.sha, "target": ref.target, "target_sha": None,
+                  "status": "outside_range", "mainline": None, "reason": None,
+                  "effective": True, "affected": []}
         if len(matches) > 1:
             report["status"] = "ambiguous"
         elif matches:
             resolved = matches[0]
-            affected = [resolved]
-            if by_sha[resolved].is_merge:
-                affected += [s for s in introduced.get(resolved, ()) if s in by_sha and s != resolved]
-            report.update(target_sha=resolved, status="in_range", affected=sorted(set(affected)))
-            for sha in report["affected"]:
-                reverters.setdefault(sha, []).append(commit.sha)
+            scope = scopes.get(commit.sha)
+            if scope is None:
+                plain = not by_sha[resolved].is_merge and not ref.merge_form
+                scope = {"affected": [resolved], "confirmed": plain, "mainline": None,
+                         "reason": None if plain else "no_scope"}
+            affected = sorted(set(scope["affected"]) & set(by_sha) | {resolved})
+            report.update(target_sha=resolved, affected=affected, mainline=scope["mainline"],
+                          status="in_range" if scope["confirmed"] else "unconfirmed",
+                          reason=None if scope["confirmed"] else scope["reason"])
+            sink = reverters if scope["confirmed"] else doubters
+            for sha in affected:
+                sink.setdefault(sha, []).append(commit.sha)
         reports.append(report)
 
     memo: dict[str, bool] = {}
@@ -220,6 +280,10 @@ def analyze_reverts(
     for sha, revs in reverters.items():
         if neutralized(sha):
             analysis.neutralized[sha] = sorted(r for r in revs if not neutralized(r))
+    for sha, revs in doubters.items():
+        live = sorted(r for r in revs if not neutralized(r))
+        if live and sha not in analysis.neutralized:
+            analysis.unconfirmed[sha] = live
     return analysis
 
 
@@ -229,10 +293,13 @@ def analyze_reverts(
 @dataclass
 class RangeProof:
     """Per entry id: `proving` (commits that still prove it, oldest first),
-    `reverted` (proving commits neutralized → the effective revert SHAs)."""
+    `reverted` (proving commits neutralized → the effective revert SHAs),
+    `unconfirmed` (proving commits an unconfirmed revert may touch → those
+    reverts, K-82)."""
 
     proving: dict[int, list[str]] = field(default_factory=dict)
     reverted: dict[int, dict[str, list[str]]] = field(default_factory=dict)
+    unconfirmed: dict[int, dict[str, list[str]]] = field(default_factory=dict)
     analysis: RevertAnalysis = field(default_factory=RevertAnalysis)
 
     def proven(self) -> set[int]:
@@ -240,17 +307,21 @@ class RangeProof:
 
 
 def range_proof(
-    commits: Iterable[Commit], introduced: Mapping[str, Iterable[str]] | None = None
+    commits: Iterable[Commit], scopes: Mapping[str, Mapping] | None = None
 ) -> RangeProof:
-    """Evaluate the proof of every id cited in `commits` (oldest first)."""
+    """Evaluate the proof of every id cited in `commits` (oldest first);
+    `scopes` as in analyze_reverts."""
     commits = list(commits)
-    analysis = analyze_reverts(commits, introduced)
+    analysis = analyze_reverts(commits, scopes)
     out = RangeProof(analysis=analysis)
     for commit in commits:
         for entry_id in sorted(proven_ids(commit)):
             out.proving.setdefault(entry_id, [])
             if commit.sha in analysis.neutralized:
                 out.reverted.setdefault(entry_id, {})[commit.sha] = analysis.neutralized[commit.sha]
+            elif commit.sha in analysis.unconfirmed:
+                out.unconfirmed.setdefault(entry_id, {})[commit.sha] = \
+                    analysis.unconfirmed[commit.sha]
             else:
                 out.proving[entry_id].append(commit.sha)
     return out

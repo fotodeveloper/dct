@@ -332,6 +332,25 @@ def git_commit_proving(repo, entry_id: int, path: str = "proof.txt") -> str:
     return git(repo, "rev-parse", "HEAD")
 
 
+def approved_plan_digest(engine, slug: str, cwd, **kw) -> str:
+    """The snapshot_digest of `dct release plan` for the selection an apply
+    call is about to use (K-80: apply requires the APPROVED digest) — the
+    tests' stand-in for the owner reading and approving the plan. A plan
+    without a snapshot (a resume plan) or one that cannot be built yields a
+    digest that matches nothing (apply then refuses for its own reason)."""
+    from dct.core.gitinfo import CheckoutVerificationError
+    from dct.workflows.release import build_plan
+
+    selection = {k: kw[k] for k in ("version", "bump_type", "entry_ids", "no_entries") if k in kw}
+    if selection.get("entry_ids") is not None:
+        selection["entry_ids"] = list(selection["entry_ids"])
+    try:
+        digest = build_plan(engine, slug, cwd=str(cwd), **selection)["snapshot_digest"]
+    except (ValueError, CheckoutVerificationError):
+        digest = None
+    return digest or "0" * 64
+
+
 def make_git_repo(path, branch: str = "main"):
     """A git repo at `path` on `branch` with one commit; returns the realpath."""
     path.mkdir(parents=True, exist_ok=True)

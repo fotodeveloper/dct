@@ -154,7 +154,17 @@ Outcome `refused` → show `details.error` and return to Step 4.
 
 ### Step 6: Confirm, then apply
 
-Show the summary and wait for the owner's yes:
+First bind the decision — the plan of exactly this version and selection
+(K-80; the approval is of THIS snapshot):
+
+```bash
+dct release plan --version 1.1.0 --entries 12,13,15,16,17 --json
+dct release plan --version 1.1.0 --no-entries --json               # version-only
+```
+
+Build the summary from THAT plan's `snapshot` (candidate, selected ids,
+proof) and keep its `snapshot_digest`. Show the summary and wait for the
+owner's yes:
 
 ```
 Release proj-a 1.1.0?
@@ -174,9 +184,14 @@ Release proj-a 1.1.0?
   changes; it will stop after the sync and show the list.
 
 ```bash
-dct release apply --version 1.1.0 --entries 12,13,15,16,17 --confirm --json
-dct release apply --version 1.1.0 --no-entries --confirm --json   # version-only
+dct release apply --version 1.1.0 --entries 12,13,15,16,17 --plan-digest <snapshot_digest> --confirm --json
+dct release apply --version 1.1.0 --no-entries --plan-digest <snapshot_digest> --confirm --json   # version-only
 ```
+
+A refusal saying the context "differs from the approved plan" (HEAD moved,
+an entry was added or edited, the selection or version differs) → show
+`details.snapshot`, re-run the plan and ask again; never pass a new digest
+the owner has not seen.
 
 **First release, the refusal with `details.proposed_version_files`:** the
 record is `stamped`, the changelog file is written, nothing is committed. Show
@@ -222,9 +237,12 @@ the tag publishes the package.
 
 ## Resume path
 
-Show the record (`version`, `status`, `entry_ids`, `candidate_sha`,
-`checkout_root`, `release_commit_sha`, `created_at`) and the plan's
-`checkout.matches_record`, then ask: `"Finish release v<version>"` /
+Show the RECORDED release from the plan's `resume` (`version`, `status`,
+`candidate_sha`, `entry_ids`, `proof`, `effects`, `release_commit_sha`) —
+the resume continues exactly that, it is never recomputed on today's HEAD —
+and, SEPARATELY, today's `resume.head` (`checkout.matches_record`) and the
+entries added since (`resume.new_unreleased`: not part of this release),
+then ask: `"Finish release v<version>"` /
 `"Abandon release v<version>"` / `"Stop"`.
 
 - **Finish** → `dct release resume --json`. The workflow checks the record

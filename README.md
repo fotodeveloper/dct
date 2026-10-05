@@ -294,7 +294,8 @@ dct clog export --project myproj --output changelog.md
 # Release workflow (each subcommand also takes --json)
 dct release plan --patch              # Read-only: proven / unproven entries, range, index state
 dct release attest --entries 16 --confirm             # Empty attestation commit for unproven entries
-dct release apply --patch --entries 12,15 --confirm   # Stamp, changelog, version sync, commit, tag
+dct release plan --patch --entries 12,15 --json       # The snapshot to approve (snapshot_digest)
+dct release apply --patch --entries 12,15 --plan-digest <digest> --confirm  # Stamp, changelog, sync, commit, tag
 dct release resume                    # Finish an interrupted release (verifies every effect)
 dct release abandon --version 1.1 --reason "broken build" --confirm
 dct release reconstruct --version 1.0 --confirm       # Record a release made before release records

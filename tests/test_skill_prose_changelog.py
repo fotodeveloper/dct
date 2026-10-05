@@ -207,6 +207,7 @@ def test_release_dialog_passes_the_owners_decisions_as_flags(text):
     assert applies, "no complete `dct release apply …` invocation"
     for flags in applies:
         assert "--version" in flags and "--confirm" in flags
+        assert "--plan-digest" in flags  # K-80: the approved snapshot
         assert ("--entries" in flags) != ("--no-entries" in flags)
         assert not {"--patch", "--minor", "--major"} & set(flags)  # V computed once
     abandons = [flags for sub, flags in calls if sub == "abandon" and flags]
@@ -384,7 +385,8 @@ def test_own_release_tool_integration_uses_the_real_ledger_parameters():
 
     doc = _workflow_doc()
     integration = doc[doc.index("### Integrating a project's own release tool"):]
-    assert "dct release plan --version V --json" in integration
+    assert "dct release plan --version V --entries <ids> --json" in integration
+    assert "snapshot_digest" in integration  # K-80: re-plan before the stamp
     call = re.search(r"release_changelog\(([^)]*)\)", integration, re.DOTALL).group(1)
     named = set(re.findall(r"(\w+)=", call))
     assert {"version", "entry_ids", "candidate_sha", "checkout_root", "proof"} <= named

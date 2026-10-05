@@ -104,7 +104,7 @@ entries proven that way. Reverts keep git's standard `Revert "…"` message.
 If pre-commit hook rejects: fix underlying issue, re-stage, **NEW commit** (never `--amend`, never `--no-verify`).
 
 **Releasing** — "release" / "bump version" / "ship it"
-→ `/release` — a dialog over the local workflow: `dct release plan --json` (range, proof per entry, unproven entries, collective attestation proposals) → the owner decides attest / correct / withdraw / keep and the version → `dct release attest` / `dct release apply --version V --entries … --confirm` (stamp, changelog section, version files, `release: vX.Y.Z` commit, tag — each verified and recorded by the workflow; an unfinished release → `dct release resume` or `abandon`). Never pushed automatically.
+→ `/release` — a dialog over the local workflow: `dct release plan --json` (range, proof per entry, unproven entries, collective attestation proposals) → the owner decides attest / correct / withdraw / keep and the version → `dct release attest` / `dct release plan --version V --entries … --json` (the snapshot the owner approves) → `dct release apply --version V --entries … --plan-digest <snapshot_digest> --confirm` (stamp, changelog section, version files, `release: vX.Y.Z` commit, tag — each verified and recorded by the workflow; an unfinished release → `dct release resume` or `abandon`). Never pushed automatically.
 
 **Session end** — "handoff" / "end session" / "wrap up" / "next session"
 → `/handoff` (flag sprint items, optionally write handoff prompt).

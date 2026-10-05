@@ -15,8 +15,8 @@ from conftest import git, make_git_repo, run_cli
 
 from dct.core.changelog import add_entry, delete_entry, release_entries
 from dct.core.gitinfo import NotACheckoutError
-from dct.core.projects import create_project
-from dct.core.releases import set_version_files
+from dct.core.projects import create_project, set_version
+from dct.core.releases import abandon_release, set_version_files
 from dct.db import metadata
 from dct.workflows.release import (
     CANDIDATE_KEYS,
@@ -86,7 +86,10 @@ def test_merge_commit_proves_with_merge_and_pr_provenance(engine, repo):
     row = by_id(plan)[e1]
     assert row["commits"] == [proving]
     assert row["merge_commit"] == merge and row["pr"] == 7
-    assert plan["proof"] == {str(e1): {"commits": [proving], "merge_commit": merge, "pr": 7}}
+    assert plan["proof"] == {str(e1): {
+        "commits": [proving], "merge_commit": merge, "pr": 7, "source": "introducing_merge",
+        "ambiguous": False, "associations": [
+            {"merge_commit": merge, "pr": 7, "source": "introducing_merge", "certain": True}]}}
     assert plan["range"]["base_tag"] == "v1.0.0" and not plan["range"]["confirm_required"]
 
 
@@ -117,8 +120,12 @@ def test_hosted_squash_keeping_messages_is_proven_by_column_zero_lines(engine, r
         f"* fix: part two\n\nChangelog: {e2}, {e3}\n\nCo-Authored-By: X <x@example.com>\n"))
     rows = by_id(plan_of(engine, repo))
     for e in (e1, e2, e3):
-        assert rows[e]["commits"] == [squash] and rows[e]["pr"] == 12
+        # K-95 C4: the `(#12)` suffix may be an issue — listed as an
+        # uncertain association, never the entry's PR number.
+        assert rows[e]["commits"] == [squash] and rows[e]["pr"] is None
         assert rows[e]["merge_commit"] is None
+        assert rows[e]["associations"] == [
+            {"merge_commit": None, "pr": 12, "source": "subject_suffix", "certain": False}]
 
 
 def test_quoted_bulleted_indented_and_inline_lines_never_prove(engine, repo):
@@ -225,7 +232,7 @@ def test_prose_mentioning_a_revert_is_not_a_revert(engine, repo):
 def test_nearest_ancestor_tag_on_a_maintenance_branch_requires_confirmation(engine, repo):
     commit(repo, "feat: 1.1 work\n", "main.txt")
     git(repo, "tag", "v1.1.0")
-    release_entries(engine, "proj-r", "1.1.0", entry_ids=[])  # current_version 1.1.0
+    set_version(engine, "proj-r", "1.1.0")  # (a record would make a resume plan, K-95 C5)
     git(repo, "checkout", "-q", "-b", "maint/1.0", "v1.0.0")
     commit(repo, "fix: backport\n", "maint.txt")
     git(repo, "tag", "v1.0.1")
@@ -285,6 +292,7 @@ def test_foreign_citations_are_reported_never_proven(engine, repo):
     foreign = add_entry(engine, "proj-o", "added", "theirs")["id"]
     released = entry(engine, "proj-r", "old")
     release_entries(engine, "proj-r", "1.0.1", entry_ids=[released])
+    abandon_release(engine, "proj-r", "1.0.1", "test: no unfinished record", confirm=True)
     deleted = entry(engine, "proj-r", "gone")
     delete_entry(engine, "proj-r", deleted)
     mine = entry(engine, "proj-r", "mine")
@@ -476,6 +484,7 @@ PINNED_PLAN_KEYS = [
     "schema_version", "project", "kind", "version", "checkout", "unfinished_release",
     "range", "entries", "foreign_citations", "reverts", "squash_commits",
     "attestation_groups", "proof", "index", "version_files", "warnings",
+    "resume", "snapshot", "snapshot_digest",
 ]
 PINNED_CANDIDATE_KEYS = [
     "schema_version", "project", "checkout", "range", "confirmed", "uncertain",
@@ -489,12 +498,17 @@ def test_json_documents_keep_their_top_level_keys(cli_engine, repo, monkeypatch,
     monkeypatch.chdir(repo)
     run_cli(monkeypatch, ["release", "plan", "-P", "proj-r", "--patch", "--json"])
     plan = json.loads(capsys.readouterr().out)
-    assert list(plan) == PINNED_PLAN_KEYS and plan["schema_version"] == 1
+    assert list(plan) == PINNED_PLAN_KEYS and plan["schema_version"] == 2
     assert plan["version"] == {"current": "1.0.0", "target": "1.0.1", "bump": "patch"}
     assert set(plan["entries"]) == {"proven", "unproven"}
     assert set(plan["range"]) == {
-        "candidate_sha", "base_tag", "base_sha", "base_version", "expected_tag",
-        "confirm_required", "approximate", "since", "revs", "display", "commit_count"}
+        "candidate_sha", "base_tag", "base_sha", "base_version", "base_distance",
+        "alternatives", "expected_tag", "confirm_required", "approximate", "since", "revs",
+        "display", "below_scan", "commit_count"}
+    assert set(plan["snapshot"]) == {
+        "project", "version", "current_version", "git", "repo_root", "checkout_root",
+        "project_root", "candidate_sha", "range", "selected_ids", "proof", "entries"}
+    assert len(plan["snapshot_digest"]) == 64 and plan["resume"] is None
     run_cli(monkeypatch, ["clog", "candidates", "-P", "proj-r", "--json"])
     assert list(json.loads(capsys.readouterr().out)) == PINNED_CANDIDATE_KEYS
 

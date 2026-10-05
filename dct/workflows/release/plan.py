@@ -6,14 +6,21 @@ release tool performs the effects.
 
 build_plan(engine, project, ...) answers, for the release candidate (the
 full HEAD of a STRICTLY verified checkout, K-52):
-  - range (K-71): from the nearest release tag that is an ancestor of the
-    candidate — see resolve_range for the exact rule — or, without one, the
-    approximate `--since` window;
-  - proof per commit (proof.py rules), reverts (K-68), squash signals and
-    the collective attestation proposals (K-69), provenance (K-70);
+  - range (K-71, K-83): from the graph-nearest release tag that is an
+    ancestor of the candidate — see resolve_range for the exact rule — or,
+    without one, the approximate `--since` window;
+  - proof per commit (proof.py rules), reverts with the merge mainline
+    their message names (K-68, K-82 — revert_scopes), squash signals and
+    the collective attestation proposals (K-69), provenance from ONE
+    recognition per proving commit (K-70, K-89);
   - classification of every unreleased entry: proven | unproven with a
     reason; foreign citations; the index state (K-50, read part); the
-    version-file contract (K-73).
+    version-file contract (K-73);
+  - the SNAPSHOT (K-80) — the immutable approved context (candidate, base,
+    V, selection, proof, entry states) and its digest, which `dct release
+    apply --plan-digest` re-derives for the candidate it pins. A resume
+    plan (K-95 C5) shows the recorded release instead and computes nothing
+    on today's HEAD.
 commit_candidates(engine, project, ...) gives /commit its candidate lists
 (K-53): confirmed (client provenance of THIS checkout) vs uncertain.
 
@@ -24,14 +31,17 @@ meaning changes). Schema: docs/release-workflow.md.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 import re
+from collections import deque
 from datetime import UTC, date, datetime, timedelta
 
 import sqlalchemy as sa
 
 from dct.core import gitinfo
-from dct.core.changelog import list_entries, normalize_worktree
+from dct.core.changelog import entry_state_digest, list_entries, normalize_worktree
 from dct.core.projects import get_project
 from dct.core.releases import get_release, get_version_files, validate_proof
 from dct.core.version import (
@@ -39,7 +49,6 @@ from dct.core.version import (
     normalize_version,
     same_version,
     storable_version,
-    version_key,
 )
 from dct.db import changelog_entries, projects
 from dct.workflows.release.proof import (
@@ -48,24 +57,28 @@ from dct.workflows.release.proof import (
     RangeProof,
     lost_trailer_ids,
     merge_pr,
+    parse_revert,
     proven_ids,
     range_proof,
-    revert_target,
     squash_signals,
     suffix_pr,
 )
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 PLAN_KEYS = (
     "schema_version", "project", "kind", "version", "checkout", "unfinished_release",
     "range", "entries", "foreign_citations", "reverts", "squash_commits",
     "attestation_groups", "proof", "index", "version_files", "warnings",
+    "resume", "snapshot", "snapshot_digest",
 )
 CANDIDATE_KEYS = (
     "schema_version", "project", "checkout", "range", "confirmed", "uncertain",
     "other_branch", "already_proven", "staged_files", "warnings",
 )
-UNPROVEN_REASONS = ("no_trailer", "reverted", "below_range", "squash_suspected", "no_git")
+UNPROVEN_REASONS = (
+    "no_trailer", "reverted", "revert_unconfirmed", "below_range", "squash_suspected",
+    "no_git", "no_path",
+)
 
 _LOG_FORMAT = "%x1e%H%x1f%P%x1f" + TRAILER_FORMAT + "%x1f%B"
 _FULL_SHA_RE = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", re.ASCII)
@@ -133,23 +146,60 @@ def release_tags(cwd: str, candidate: str) -> list[dict]:
     return sorted(tags, key=lambda t: t["name"])
 
 
-def _pick_base(tags: list[dict], current: str | None) -> dict | None:
-    """The NEAREST release tag (K-71) — deterministic rule: the ancestor tag
-    with the HIGHEST version under the version contract (the never-rewind
-    order, so a maintenance branch cut from v1.5.0 with v1.5.1 picks
-    v1.5.1). Ties (1.5 / v1.5.0 naming the same version): the exact name
-    `v<current_version>` when that is the version, else a `v`-prefixed name,
-    else the lowest name."""
-    if not tags:
-        return None
-    top = max(version_key(t["version"]) for t in tags)
-    tied = [t for t in tags if version_key(t["version"]) == top]
+def ancestor_distances(cwd: str, candidate: str, targets: set[str]) -> dict[str, int]:
+    """The minimum number of PARENT EDGES from `candidate` to each commit of
+    `targets` that is an ancestor of it (or the candidate itself, 0) — a
+    breadth-first search over `git rev-list --parents <candidate>` (K-83).
+    Not `rev-list --count TAG..candidate`: in a history with merges that
+    counts commits, not the graph distance."""
+    if not targets:
+        return {}
+    _, out = gitinfo.git_read(cwd, "rev-list", "--parents", candidate, "--")
+    parents: dict[str, list[str]] = {}
+    for line in out.splitlines():
+        shas = line.split()
+        if shas:
+            parents[shas[0]] = shas[1:]
+    found: dict[str, int] = {}
+    seen = {candidate}
+    queue = deque([(candidate, 0)])
+    while queue and len(found) < len(targets):
+        sha, distance = queue.popleft()
+        if sha in targets:
+            found[sha] = distance
+        for parent in parents.get(sha, ()):
+            if parent not in seen:
+                seen.add(parent)
+                queue.append((parent, distance + 1))
+    return found
+
+
+def _pick_base(
+    tags: list[dict], current: str | None, distances: dict[str, int],
+) -> tuple[dict | None, list[dict]]:
+    """(base, alternatives) — the NEAREST release tag (K-71/K-83): the
+    ancestor tag with the fewest parent edges from the candidate
+    (`distances`). Ties at that distance (several names on one commit, or
+    tags on different commits equally far) — one deterministic choice: the
+    exact name `v<current_version>`, then a tag naming the current version
+    in another spelling, then a `v`-prefixed name, then the lowest name;
+    every other tag at the same distance is returned in `alternatives`
+    (sorted by name). Semantic versions are only compared, never ranked
+    here (the highest version is NOT preferred)."""
+    placed = [{**t, "distance": distances[t["sha"]]} for t in tags if t["sha"] in distances]
+    if not placed:
+        return None, []
+    nearest = min(t["distance"] for t in placed)
+    tied = [t for t in placed if t["distance"] == nearest]
     expected = f"v{current}" if current else None
 
     def rank(tag: dict) -> tuple:
-        return (tag["name"] != expected, not tag["name"].startswith(("v", "V")), tag["name"])
+        return (tag["name"] != expected, not same_version(tag["version"], current),
+                not tag["name"].startswith(("v", "V")), tag["name"])
 
-    return min(tied, key=rank)
+    base = min(tied, key=rank)
+    alternatives = sorted((t for t in tied if t is not base), key=lambda t: t["name"])
+    return base, alternatives
 
 
 def _since_value(created: datetime) -> str:
@@ -161,23 +211,27 @@ def resolve_range(
     cwd: str, candidate: str, current_version: str | None,
     oldest_unreleased: datetime | None,
 ) -> dict:
-    """The proof range of `candidate` (K-71).
+    """The proof range of `candidate` (K-71, K-83).
 
-    - base = _pick_base over the ancestor release tags; the range is
-      `<base>..<candidate>`. `confirm_required` is True when the base is not
-      the tag of the project's current_version (`v<current>`, compared under
-      the version contract) — the plan shows it and the owner confirms.
+    - base = _pick_base over the ancestor release tags (graph distance from
+      the candidate); the range is `<base>..<candidate>`.
+      `confirm_required` is True when the base is not the tag of the
+      project's current_version (compared under the version contract) or
+      when another tag on a DIFFERENT commit is equally near — the plan
+      shows it (`alternatives`) and the owner confirms.
     - No ancestor release tag: the approximate window `--since=<oldest
       unreleased entry's created_at − 1 day> <candidate>` with
       `approximate=True` (a warning is added by the caller); without
       unreleased entries the range is empty.
-    Returns {candidate_sha, base_tag, base_sha, base_version, expected_tag
-    ({name, exists, ancestor} or None without a current_version),
-    confirm_required, approximate, since, revs (git log arguments, None =
-    empty range), display}.
+    Returns {candidate_sha, base_tag, base_sha, base_version, base_distance,
+    alternatives ([{name, sha, version, distance}]), expected_tag ({name,
+    exists, ancestor} or None without a current_version), confirm_required,
+    approximate, since, revs (git log arguments, None = empty range),
+    display, below_scan (set by build_plan)}.
     """
     tags = release_tags(cwd, candidate)
-    base = _pick_base(tags, current_version)
+    distances = ancestor_distances(cwd, candidate, {t["sha"] for t in tags})
+    base, alternatives = _pick_base(tags, current_version, distances)
     expected = None
     if current_version:
         name = f"v{current_version}"
@@ -188,13 +242,18 @@ def resolve_range(
         expected = {"name": name, "exists": exists, "ancestor": ancestor}
     rng = {
         "candidate_sha": candidate, "base_tag": None, "base_sha": None, "base_version": None,
+        "base_distance": None, "alternatives": [],
         "expected_tag": expected, "confirm_required": False, "approximate": False,
-        "since": None, "revs": None, "display": None,
+        "since": None, "revs": None, "display": None, "below_scan": None,
     }
     if base is not None:
         rng.update(
             base_tag=base["name"], base_sha=base["sha"], base_version=base["version"],
-            confirm_required=not same_version(base["version"], current_version),
+            base_distance=base["distance"],
+            alternatives=[{k: t[k] for k in ("name", "sha", "version", "distance")}
+                          for t in alternatives],
+            confirm_required=not same_version(base["version"], current_version)
+            or any(t["sha"] != base["sha"] for t in alternatives),
             revs=[f"{base['sha']}..{candidate}"], display=f"{base['name']}..{candidate}",
         )
         return rng
@@ -219,10 +278,81 @@ def first_parent_merges(cwd: str, revs: list[str]) -> tuple[list[Commit], dict[s
     return line, merged_by
 
 
-def introduced_by(cwd: str, merge: Commit) -> list[str]:
-    """Commits a merge brought in: `git rev-list <M> ^<first parent>`, minus M."""
-    _, out = gitinfo.git_read(cwd, "rev-list", merge.sha, f"^{merge.parents[0]}", "--")
+def introduced_by(cwd: str, merge: Commit, parent: str | None = None) -> list[str]:
+    """Commits a merge brought in relative to `parent` (default: its first
+    parent): `git rev-list <M> ^<parent>`, minus M."""
+    base = parent or merge.parents[0]
+    _, out = gitinfo.git_read(cwd, "rev-list", merge.sha, f"^{base}", "--")
     return [sha for sha in out.split() if sha != merge.sha]
+
+
+def _change(cwd: str, old: str, new: str) -> str:
+    """The change from tree-ish `old` to `new` without positions or blob
+    ids (`git diff-tree -p -U0`, `index` and `@@` lines dropped) — equal for
+    a revert and the inverse of what it reverts even when later commits
+    moved the lines."""
+    _, out = gitinfo.git_read(cwd, "diff-tree", "-p", "-U0", "--no-renames", "--no-color",
+                              "--full-index", old, new, "--")
+    return "\n".join(line for line in out.splitlines()
+                     if not line.startswith(("index ", "@@")))
+
+
+def revert_scopes(cwd: str, commits: list[Commit]) -> dict[str, dict]:
+    """K-82 — for every standard revert of the range whose target is a
+    range commit: {affected, confirmed, reason, mainline} for
+    proof.analyze_reverts.
+
+    - Target an ordinary commit T: affected [T]; the message must not use
+      git's merge form (reason 'mainline_on_non_merge').
+    - Target a merge M: the message must name the mainline P (`…, reversing
+      changes made to <P>.`) and P must match EXACTLY ONE real parent of M
+      (reasons 'no_mainline', 'mainline_not_a_parent',
+      'mainline_ambiguous'); affected = M + `rev-list M ^P` — the commits
+      the revert removes, never a fixed parent 1. Without a usable mainline
+      every commit M brought in relative to ANY parent is affected (which
+      side was reverted is unknown).
+    - The revert must be FULL: its own change equals the inverse of the
+      reverted one (T → T's parent, or M → P); else reason 'partial' (a
+      conflict resolved differently, an edited revert).
+    A revert that is not confirmed neutralizes nothing; its affected
+    entries get no automatic proof (reason 'revert_unconfirmed')."""
+    shas = [c.sha for c in commits]
+    by_sha = {c.sha: c for c in commits}
+    scopes: dict[str, dict] = {}
+    for commit in commits:
+        ref = parse_revert(commit.message)
+        if ref is None:
+            continue
+        matches = [sha for sha in shas if sha.startswith(ref.target)]
+        if len(matches) != 1:
+            continue
+        target = by_sha[matches[0]]
+        scope = {"affected": [target.sha], "confirmed": False, "reason": None, "mainline": None}
+        inverse_of = None
+        if target.is_merge:
+            mains = [p for p in target.parents if ref.mainline and p.startswith(ref.mainline)]
+            if len(mains) == 1:
+                scope["mainline"] = inverse_of = mains[0]
+                scope["affected"] += introduced_by(cwd, target, mains[0])
+            else:
+                scope["reason"] = ("no_mainline" if not ref.mainline else
+                                   "mainline_ambiguous" if mains else "mainline_not_a_parent")
+                for parent in target.parents:
+                    scope["affected"] += introduced_by(cwd, target, parent)
+        elif ref.merge_form:
+            scope["reason"] = "mainline_on_non_merge"
+        elif len(target.parents) == 1:
+            inverse_of = target.parents[0]
+        else:
+            scope["reason"] = "partial"  # a root commit: no parent to compare with
+        if inverse_of is not None:
+            full = len(commit.parents) == 1 and \
+                _change(cwd, commit.parents[0], commit.sha) == _change(cwd, target.sha, inverse_of)
+            scope["confirmed"] = full
+            scope["reason"] = None if full else "partial"
+        scope["affected"] = sorted(set(scope["affected"]))
+        scopes[commit.sha] = scope
+    return scopes
 
 
 def _branch_tips(cwd: str, branch: str) -> list[str]:
@@ -398,22 +528,46 @@ def _artifacts(project: dict, checkout: dict, version_files: list[str] | None) -
 
 
 def _provenance(proving: list[str], by_sha: dict[str, Commit], merged_by: dict[str, str]) -> dict:
-    """{commits, merge_commit, pr} of a proven entry (K-70): the first
-    proving commit (oldest first) brought in by a first-parent merge names
-    the merge; the PR comes from that merge's `Merge pull request #N`
-    subject, else from a proving commit's `… (#N)` subject."""
-    merge_commit = pr = None
+    """{commits, merge_commit, pr, source, ambiguous, associations} of a
+    proven entry (K-70, K-89). Per proving commit ONE recognition: a proving
+    commit that is itself a real merge names ITSELF (`own_merge`); else the
+    first-parent merge that brought it in (`introducing_merge`). The PR is
+    the `Merge pull request #N` subject of THAT merge — never borrowed from
+    another commit. A `… (#N)` subject suffix may be an issue number: it is
+    listed as an uncertain association (`subject_suffix`, certain False),
+    never the entry's `pr` (K-95 C4). Several different merge associations
+    → `ambiguous`, merge_commit / pr null — never one picked."""
+    associations: list[dict] = []
+
+    def add(item: dict) -> None:
+        if item not in associations:
+            associations.append(item)
+
     for sha in proving:
-        if sha in merged_by:
-            merge_commit = merged_by[sha]
-            pr = merge_pr(by_sha[merge_commit].subject) if merge_commit in by_sha else None
-            break
-    if pr is None:
-        for sha in proving:
-            pr = suffix_pr(by_sha[sha].subject)
-            if pr is not None:
-                break
-    return {"commits": list(proving), "merge_commit": merge_commit, "pr": pr}
+        commit = by_sha[sha]
+        if commit.is_merge:
+            add({"merge_commit": sha, "pr": merge_pr(commit.subject), "source": "own_merge",
+                 "certain": True})
+        elif sha in merged_by:
+            merge = merged_by[sha]
+            subject = by_sha[merge].subject if merge in by_sha else ""
+            add({"merge_commit": merge, "pr": merge_pr(subject), "source": "introducing_merge",
+                 "certain": True})
+        suffix = None if commit.is_merge else suffix_pr(commit.subject)
+        if suffix is not None:
+            add({"merge_commit": None, "pr": suffix, "source": "subject_suffix",
+                 "certain": False})
+    merges = [a for a in associations if a["source"] != "subject_suffix"]
+    distinct = {(a["merge_commit"], a["pr"]) for a in merges}
+    chosen = merges[0] if len(distinct) == 1 else None
+    return {
+        "commits": list(proving),
+        "merge_commit": chosen["merge_commit"] if chosen else None,
+        "pr": chosen["pr"] if chosen else None,
+        "source": chosen["source"] if chosen else None,
+        "ambiguous": len(distinct) > 1,
+        "associations": associations,
+    }
 
 
 def _squash_report(commit: Commit, signals: list[str]) -> dict:
@@ -487,6 +641,82 @@ def _attestation_groups(
     return {eid: index[b] for eid, b in membership.items()}, ordered
 
 
+def _canonical(value) -> str:
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+
+def snapshot_digest(snapshot: dict) -> str:
+    """SHA-256 (hex) of the snapshot's canonical JSON (sorted keys, compact
+    separators, UTF-8) — the value `dct release apply --plan-digest` takes."""
+    return hashlib.sha256(_canonical(snapshot).encode("utf-8")).hexdigest()
+
+
+def _selection(plan: dict, entry_ids, no_entries: bool) -> list[int]:
+    """The ids the snapshot binds: [] for version-only, the given ids, or —
+    by default — every id the plan proves (plus, for a project CONFIRMED
+    outside git, every unreleased entry: K-63, the owner's choice)."""
+    if no_entries:
+        return []
+    if entry_ids is not None:
+        return sorted(set(entry_ids))
+    ids = {e["id"] for e in plan["entries"]["proven"]}
+    ids |= {e["id"] for e in plan["entries"]["unproven"] if e["reason"] == "no_git"}
+    return sorted(ids)
+
+
+def _snapshot(plan: dict, entries: list[dict], selected: list[int]) -> dict:
+    """The IMMUTABLE approved context of one release (K-80): the checkout
+    (repository, checkout root, project root), the full candidate SHA, the
+    range base, the current and the target version, the selected ids, their
+    proof (the map the stamp stores) and the state digest of EVERY
+    unreleased entry the plan saw (core.changelog.entry_state_digest — an
+    entry added, edited or removed after the plan changes it)."""
+    checkout = plan["checkout"]
+    rng = plan["range"]
+    return {
+        "project": plan["project"],
+        "version": plan["version"]["target"],
+        "current_version": plan["version"]["current"],
+        "git": checkout["git"],
+        "repo_root": checkout.get("repo_root"),
+        "checkout_root": normalize_worktree(checkout.get("repo_root")),
+        "project_root": checkout.get("project_root"),
+        "candidate_sha": checkout.get("candidate_sha"),
+        "range": None if rng is None else {
+            k: rng[k] for k in ("base_tag", "base_sha", "approximate", "since", "revs")},
+        "selected_ids": selected,
+        "proof": {str(i): plan["proof"][str(i)] for i in selected if str(i) in plan["proof"]},
+        "entries": {str(e["id"]): entry_state_digest(e) for e in entries},
+    }
+
+
+_EFFECT_ORDER = ("stamped", "files_written", "committed", "tagged", "pushed", "completed")
+
+
+def _resume_section(record: dict, head: str | None, views: list[dict]) -> dict:
+    """K-95 C5 — what a resume continues: the RECORDED candidate, entry
+    set, proof and effect state (by status), never recomputed on today's
+    HEAD; the current HEAD and the unreleased entries added since are shown
+    beside it, separately."""
+    rank = _EFFECT_ORDER.index(record["status"]) if record["status"] in _EFFECT_ORDER else -1
+    candidate = record.get("candidate_sha")
+    return {
+        "version": record["version"],
+        "status": record["status"],
+        "candidate_sha": candidate,
+        "checkout_root": record.get("checkout_root"),
+        "release_mode": record.get("release_mode"),
+        "entry_ids": list(record.get("entry_ids") or []),
+        "proof": record.get("proof") or {},
+        "release_commit_sha": record.get("release_commit_sha"),
+        "manifest": record.get("manifest"),
+        "effects": {status: rank >= i for i, status in enumerate(_EFFECT_ORDER)},
+        "head": head,
+        "head_is_candidate": None if head is None or not candidate else head == candidate,
+        "new_unreleased": views,
+    }
+
+
 def build_plan(
     engine: sa.Engine,
     project_slug: str,
@@ -494,9 +724,21 @@ def build_plan(
     version: str | None = None,
     bump_type: str | None = None,
     cwd: str | None = None,
+    entry_ids=None,
+    no_entries: bool = False,
+    pinned_checkout: dict | None = None,
 ) -> dict:
     """The release plan of `project_slug` for the checkout at `cwd` (default:
     the process cwd) — read-only (see module doc). Keys: PLAN_KEYS.
+
+    `entry_ids` / `no_entries` choose the selection the SNAPSHOT binds
+    (default: every proven id); `snapshot` + `snapshot_digest` are the
+    approved context `dct release apply --plan-digest` re-derives (K-80).
+    `pinned_checkout` (the effects layer): the checkout dict the caller
+    already verified (verify_release_checkout, its `head` = THE candidate)
+    — the plan then never reads HEAD again. A resume plan (an unfinished
+    record exists, K-95 C5) shows the record in `resume` and computes no
+    range / proof on today's HEAD (`snapshot` null).
 
     Raises ValueError (unknown project, bad version / bump),
     gitinfo.NotACheckoutError / CheckoutVerificationError (the checkout
@@ -506,6 +748,8 @@ def build_plan(
     project = get_project(engine, project_slug)
     if project is None:
         raise ValueError(f"Project '{project_slug}' not found")
+    if entry_ids is not None and no_entries:
+        raise ValueError("entry_ids and no_entries are mutually exclusive")
     current = project.get("current_version")
     target = _target_version(current, version, bump_type)
     warnings: list[str] = []
@@ -530,35 +774,65 @@ def build_plan(
         unfinished_release=_jsonable(unfinished), foreign_citations=[], reverts=[],
         squash_commits=[], attestation_groups=[], proof={}, warnings=warnings,
         version_files=_jsonable(get_version_files(engine, project_slug)),
+        entries={"proven": [], "unproven": []},
     )
 
     path = project.get("path")
-    checkout = gitinfo.verify_release_checkout(path, cwd) if path else None
+    if pinned_checkout is not None:
+        checkout = pinned_checkout
+    else:
+        # K-95 C1: no_git only for a path CONFIRMED outside every repository
+        # (verify_release_checkout → None); a detection error raises.
+        checkout = gitinfo.verify_release_checkout(path, cwd) if path else None
     if checkout is None:
-        plan["checkout"] = {"git": False, "reason": "no_path" if not path else "not_a_repository",
+        reason = "no_path" if not path else "no_git"
+        plan["checkout"] = {"git": False,
+                            "reason": "no_path" if not path else "not_a_repository",
                             "project_root": path}
-        plan["entries"] = {"proven": [], "unproven": [
-            {**v, "reason": "no_git"} for v in views]}
-        warnings.append("no git checkout — entries cannot be proven by commits")
+        warnings.append("the project has no registered path — its checkout cannot be verified"
+                        if not path else "no git checkout — entries cannot be proven by commits")
+        if unfinished:
+            plan["resume"] = _jsonable(_resume_section(unfinished, None, views))
+            return plan
+        plan["entries"] = {"proven": [], "unproven": [{**v, "reason": reason} for v in views]}
+        if path:
+            plan["snapshot"] = _snapshot(plan, entries, _selection(plan, entry_ids, no_entries))
+            plan["snapshot_digest"] = snapshot_digest(plan["snapshot"])
         return plan
 
-    root, candidate = checkout["repo_root"], checkout["head"]
+    root, head = checkout["repo_root"], checkout["head"]
     branch = _current_branch(root)
     plan["checkout"] = {
         "git": True, "repo_root": root, "project_root": checkout["project_root"],
-        "candidate_sha": candidate, "branch": branch, "detached": branch is None,
+        "candidate_sha": head, "head": head, "branch": branch, "detached": branch is None,
     }
+    index_artifacts = _artifacts(project, checkout, (plan["version_files"] or {}).get("version_files"))
     if unfinished:
+        recorded = unfinished.get("candidate_sha")
+        plan["checkout"]["candidate_sha"] = recorded
         plan["checkout"]["matches_record"] = {
-            "candidate_sha": unfinished.get("candidate_sha") == candidate,
+            "candidate_sha": recorded == head,
             "checkout_root": unfinished.get("checkout_root") in (None, normalize_worktree(root)),
         }
+        if recorded != head:
+            warnings.append(
+                f"HEAD {head[:12]} is not the recorded candidate "
+                f"{(recorded or '-')[:12]} — the resume continues the RECORDED release; "
+                f"nothing is recomputed on the current HEAD")
+        plan["resume"] = _jsonable(_resume_section(unfinished, head, views))
+        plan["index"] = index_state(root, index_artifacts)
+        return plan
 
+    candidate = head
     oldest = min((e["created_at"] for e in entries if e.get("created_at")), default=None)
     rng = resolve_range(root, candidate, current, oldest)
     if rng["confirm_required"]:
+        tied = [a["name"] for a in rng["alternatives"] if a["sha"] != rng["base_sha"]]
         warnings.append(
-            f"the proof range starts at {rng['base_tag']}, not at v{current} — confirm it")
+            f"the proof range starts at {rng['base_tag']}"
+            + (f", equally near: {', '.join(tied)}" if tied else "")
+            + (f", not at v{current}" if not same_version(rng["base_version"], current) else "")
+            + " — confirm it")
     if rng["approximate"]:
         warnings.append(
             "no release tag is an ancestor of the candidate — the range is the approximate "
@@ -569,19 +843,26 @@ def build_plan(
     commits = read_commits(root, *rng["revs"]) if rng["revs"] else []
     by_sha = {c.sha: c for c in commits}
     _, merged_by = first_parent_merges(root, rng["revs"]) if rng["revs"] else ([], {})
-    introduced = {c.sha: introduced_by(root, c) for c in commits
-                  if c.is_merge and any(_is_revert_of(o, c.sha) for o in commits)}
-    proof: RangeProof = range_proof(commits, introduced)
+    proof: RangeProof = range_proof(commits, revert_scopes(root, commits))
     plan["reverts"] = proof.analysis.reverts
     for report in plan["reverts"]:
-        if report["status"] != "in_range":
+        if report["status"] == "unconfirmed":
+            warnings.append(
+                f"revert {report['sha'][:12]} of {report['target']} is not a confirmed full "
+                f"revert ({report['reason']}) — the entries it may touch have no automatic "
+                f"proof; confirm them (attest) or correct the history")
+        elif report["status"] != "in_range":
             warnings.append(
                 f"revert {report['sha'][:12]} targets {report['target']} — "
                 f"{report['status'].replace('_', ' ')}; not applied")
 
     below: dict[int, list[str]] = {}
     if rng["base_sha"] and oldest is not None:
-        for commit in read_commits(root, f"--since={_since_value(oldest)}", rng["base_sha"]):
+        # K-95 C3: a BOUNDED diagnostic scan below the base — "not found in
+        # the scanned window" never means "not in history".
+        since = _since_value(oldest)
+        rng["below_scan"] = {"since": since, "until": rng["base_sha"], "bounded": True}
+        for commit in read_commits(root, f"--since={since}", rng["base_sha"]):
             for entry_id in proven_ids(commit):
                 below.setdefault(entry_id, []).append(commit.sha)
 
@@ -599,6 +880,10 @@ def build_plan(
             prov = _provenance(proving, by_sha, merged_by)
             proof_map[entry_id] = prov
             proven.append({**view, **prov})
+        elif entry_id in proof.unconfirmed:
+            doubted = proof.unconfirmed[entry_id]
+            unproven.append({**view, "reason": "revert_unconfirmed", "commits": sorted(doubted),
+                             "reverted_by": sorted({r for rs in doubted.values() for r in rs})})
         elif entry_id in proof.reverted:
             reverted = proof.reverted[entry_id]
             unproven.append({**view, "reason": "reverted", "commits": sorted(reverted),
@@ -617,9 +902,10 @@ def build_plan(
     unproven.sort(key=lambda e: e["id"])
 
     cited = {i: shas for i, shas in proof.proving.items() if i not in unreleased_ids and shas}
-    for i, reverted in proof.reverted.items():
-        if i not in unreleased_ids and i not in cited:
-            cited[i] = sorted(reverted)
+    for doubted in (proof.reverted, proof.unconfirmed):
+        for i, shas in doubted.items():
+            if i not in unreleased_ids and i not in cited:
+                cited[i] = sorted(shas)
     plan.update(
         range=rng,
         entries={"proven": proven, "unproven": unproven},
@@ -627,16 +913,18 @@ def build_plan(
         squash_commits=[{k: v for k, v in s.items() if k != "message"} for s in squashes],
         attestation_groups=groups,
         proof=validate_proof(proof_map) or {},
-        index=index_state(root, _artifacts(
-            project, checkout, (plan["version_files"] or {}).get("version_files"))),
+        index=index_state(root, index_artifacts),
     )
     plan["range"]["commit_count"] = len(commits)
+    selected = _selection(plan, entry_ids, no_entries)
+    outside = [i for i in selected if str(i) not in plan["proof"]]
+    if outside:
+        warnings.append(
+            f"the selection holds ids the plan does not prove: "
+            f"{', '.join(f'#{i}' for i in outside)} — apply refuses them")
+    plan["snapshot"] = _snapshot(plan, entries, selected)
+    plan["snapshot_digest"] = snapshot_digest(plan["snapshot"])
     return plan
-
-
-def _is_revert_of(commit: Commit, sha: str) -> bool:
-    target = revert_target(commit.message)
-    return bool(target) and sha.startswith(target)
 
 
 # ── /commit candidates (K-53) ────────────────────────────────────────────────
@@ -647,12 +935,13 @@ def commit_candidates(engine: sa.Engine, project_slug: str, *, cwd: str | None =
     the process cwd) — read-only, best-effort location (resolve_checkout).
 
     - confirmed: unreleased entries with CLIENT provenance whose branch is
-      the current branch and whose worktree is this checkout's toplevel (or
-      not recorded);
+      the current branch and whose worktree is this checkout's toplevel;
     - uncertain: entries with server-detected or no provenance — whatever
       branch / worktree they store (the worktree filter never removes them,
       K-53); on a detached HEAD also every client entry of this checkout
-      (no confirmed list, `checkout.detached` True). Never attached
+      (no confirmed list, `checkout.detached` True); a client entry of the
+      current branch whose worktree is NOT recorded (`no_worktree`, K-95
+      C2 — a candidate to compare with the diff). Never attached
       automatically: match them against `staged_files` and confirm them
       (update_changelog branch + worktree) first;
     - other_branch: client entries of THIS worktree recorded on another
@@ -694,9 +983,7 @@ def commit_candidates(engine: sa.Engine, project_slug: str, *, cwd: str | None =
             rng = resolve_range(toplevel, head, project.get("current_version"), oldest)
             result["range"] = rng
             commits = read_commits(toplevel, *rng["revs"]) if rng["revs"] else []
-            introduced = {c.sha: introduced_by(toplevel, c) for c in commits
-                          if c.is_merge and any(_is_revert_of(o, c.sha) for o in commits)}
-            proven = range_proof(commits, introduced).proven()
+            proven = range_proof(commits, revert_scopes(toplevel, commits)).proven()
         except gitinfo.CheckoutVerificationError as exc:
             warnings.append(f"the range could not be read ({exc}) — proven ids not excluded")
         try:
@@ -717,6 +1004,11 @@ def commit_candidates(engine: sa.Engine, project_slug: str, *, cwd: str | None =
         elif detached:
             result["uncertain"].append(
                 {**view, "uncertain": True, "uncertain_reason": "detached_head"})
+        elif entry.get("branch") == branch and entry.get("worktree") is None:
+            # K-95 C2: the branch matches but the checkout is not recorded —
+            # a candidate to compare with the diff, never confirmed.
+            result["uncertain"].append(
+                {**view, "uncertain": True, "uncertain_reason": "no_worktree"})
         elif entry.get("branch") == branch:
             result["confirmed"].append(view)
         else:

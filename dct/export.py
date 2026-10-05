@@ -1,5 +1,6 @@
 """Export changelog entries to Keep a Changelog markdown format."""
 
+import json
 from collections import defaultdict
 from datetime import UTC, datetime
 
@@ -33,6 +34,16 @@ def export_changelog_md(
     stored spelling of the version's first-stamped entry (earliest
     released_at, NULL last, ties → lowest id; a legacy release keeps its own
     spelling — nothing is invented, nothing is rewritten).
+
+    PR references (K-90, opt-in): an entry of a version whose release
+    record was stamped with `render.pr_refs` true (the project's
+    `changelog_pr_refs` at stamp time, persisted on the record) ends with
+    ` (#N)` — N from THAT record's stored proof map, only when unambiguous
+    (core.releases.proof_pr). Never a dct id, never a branch name; a
+    version without a record (legacy) or stamped with the setting off is
+    rendered as it always was, so turning the setting on never rewrites
+    released history. The full render and the single-version render share
+    this ONE rule (_render_version_block).
     """
     from dct.core.changelog import stored_spellings
 
@@ -51,11 +62,13 @@ def export_changelog_md(
             q = q.where(changelog_entries.c.version.in_(stored_spellings(conn, pid, version)))
         q = q.order_by(changelog_entries.c.released_at.desc().nulls_first(), changelog_entries.c.created_at)
         rows = [row_to_dict(r) for r in conn.execute(q)]
-        recorded = list(conn.execute(
-            sa.select(releases.c.version).where(
+        record_rows = conn.execute(
+            sa.select(releases.c.version, releases.c.render, releases.c.proof).where(
                 releases.c.project_id == pid, releases.c.deleted_at.is_(None)
             ).order_by(releases.c.id)
-        ).scalars())
+        ).all()
+    recorded = [r.version for r in record_rows]
+    refs_by_version = {_identity(r.version): _pr_refs(r.render, r.proof) for r in record_rows}
 
     category_order = ["added", "changed", "fixed", "removed"]
 
@@ -71,7 +84,9 @@ def export_changelog_md(
         if not released:
             return ""
         block: list[str] = []
-        _render_version_block(_spelling(released[0], recorded), released[0], category_order, block)
+        entries = released[0]
+        _render_version_block(_spelling(entries, recorded), entries, category_order, block,
+                              refs_by_version.get(_identity(entries[0]["version"])))
         return "\n".join(block)
 
     lines = ["# Changelog\n", ""]
@@ -85,7 +100,8 @@ def export_changelog_md(
     # Released versions (sorted by released_at of each version's first entry, desc)
     released_groups = [entries for key, entries in versions.items() if key is not None]
     for entries in sorted(released_groups, key=lambda e: e[0].get("released_at") or "", reverse=True):
-        _render_version_block(_spelling(entries, recorded), entries, category_order, lines)
+        _render_version_block(_spelling(entries, recorded), entries, category_order, lines,
+                              refs_by_version.get(_identity(entries[0]["version"])))
 
     return "\n".join(lines)
 
@@ -113,13 +129,33 @@ def _spelling(entries: list[dict], recorded: list[str]) -> str:
     return spelling_rule(recorded, entries)
 
 
+def _pr_refs(render, proof) -> dict[int, int]:
+    """entry id → PR number of ONE release record (K-90): empty unless the
+    record's persisted `render.pr_refs` is true; only unambiguous PRs of
+    its stored proof map (core.releases.proof_pr)."""
+    from dct.core.releases import proof_pr
+
+    def load(value):
+        return json.loads(value) if isinstance(value, str) else value
+
+    render, proof = load(render), load(proof)
+    if not isinstance(render, dict) or render.get("pr_refs") is not True:
+        return {}
+    refs = {}
+    for key in proof or {}:
+        if key.isdigit() and (pr := proof_pr(proof, int(key))) is not None:
+            refs[int(key)] = pr
+    return refs
+
+
 def _render_version_block(
-    version: str, entries: list[dict], category_order: list[str], lines: list[str]
+    version: str, entries: list[dict], category_order: list[str], lines: list[str],
+    refs: dict[int, int] | None = None,
 ) -> None:
     """Append a `## [version] - DATE` header (date from the first entry's
-    released_at, or today when unreleased) followed by its category sections.
-    Shared by the full-file render and the single-version render so the two
-    paths can never drift apart."""
+    released_at, or today when unreleased) followed by its category sections
+    (`refs`: entry id → PR number, K-90). Shared by the full-file render and
+    the single-version render so the two paths can never drift apart."""
     released_at = entries[0].get("released_at")
     if released_at:
         date_str = released_at.strftime("%Y-%m-%d") if hasattr(released_at, "strftime") else str(released_at)[:10]
@@ -127,10 +163,13 @@ def _render_version_block(
         date_str = datetime.now(UTC).date().isoformat()
     lines.append(f"## [{version}] - {date_str}")
     lines.append("")
-    _render_version_entries(entries, category_order, lines)
+    _render_version_entries(entries, category_order, lines, refs)
 
 
-def _render_version_entries(entries: list[dict], category_order: list[str], lines: list[str]) -> None:
+def _render_version_entries(
+    entries: list[dict], category_order: list[str], lines: list[str],
+    refs: dict[int, int] | None = None,
+) -> None:
     by_category: dict[str, list[dict]] = defaultdict(list)
     for e in entries:
         by_category[e["category"]].append(e)
@@ -144,5 +183,7 @@ def _render_version_entries(entries: list[dict], category_order: list[str], line
             entry_text = e["entry"]
             if e.get("component"):
                 entry_text = f"{entry_text} ({e['component']})"
+            if refs and e["id"] in refs:
+                entry_text = f"{entry_text} (#{refs[e['id']]})"
             lines.append(f"- {entry_text}")
         lines.append("")

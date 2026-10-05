@@ -19,7 +19,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
-from conftest import git, make_git_repo, run_cli
+from conftest import approved_plan_digest, git, make_git_repo, run_cli
 
 from dct.core.changelog import add_entry, list_entries
 from dct.core.projects import create_project, get_project
@@ -124,8 +124,17 @@ def record_date(engine, version="1.1.0") -> str:
 
 
 def apply(engine, repo, **kw):
+    """apply_release with the digest of the plan for the same selection (the
+    owner's approval, K-80) unless the test passes its own."""
     kw.setdefault("confirm", True)
+    if "plan_digest" not in kw and not kw.get("strict"):
+        kw["plan_digest"] = approved_plan_digest(engine, SLUG, repo, **kw)
     return apply_release(engine, SLUG, cwd=str(repo), **kw)
+
+
+def cli_digest(engine, repo, version: str, entries: list[int] | None) -> list[str]:
+    kw = {"entry_ids": entries} if entries is not None else {"no_entries": True}
+    return ["--plan-digest", approved_plan_digest(engine, SLUG, repo, version=version, **kw)]
 
 
 def resume(engine, repo, **kw):
@@ -189,7 +198,8 @@ def test_apply_performs_and_verifies_every_effect(engine, proj):
                                                   "complete"]
     record = assert_released(engine, repo, candidate, [a])
     assert record["proof"] == {str(a): {"commits": [candidate], "merge_commit": None,
-                                        "pr": None}}
+                                        "pr": None, "source": None, "ambiguous": False,
+                                        "associations": []}}
     assert sync_runs(log) == ["1.1.0"]
     json.dumps(out)  # JSON-native
 
@@ -682,8 +692,7 @@ def test_release_of_a_project_without_git(engine, tmp_path):
     (plain / "changelog.md").write_text(HISTORY)
     create_project(engine, slug=SLUG, name="P", path=str(plain), current_version="1.0.0")
     a = add_entry(engine, SLUG, "added", "feature a")["id"]
-    out = apply_release(engine, SLUG, version="1.1.0", entry_ids=[a], confirm=True,
-                        cwd=str(tmp_path))
+    out = apply(engine, tmp_path, version="1.1.0", entry_ids=[a])
     assert out["outcome"] == "completed"
     record = get_release(engine, SLUG, "1.1.0")
     assert record["candidate_sha"] is None and record["release_commit_sha"] is None
@@ -715,7 +724,8 @@ def test_cli_apply_json_document(engine, cli_proj, monkeypatch, capsys):
     repo, _ = cli_proj
     a = proven(engine, repo, "feature a")
     run_cli(monkeypatch, ["release", "apply", "-P", SLUG, "--version", "1.1.0",
-                          "--entries", str(a), "--confirm", "--json"])
+                          "--entries", str(a), "--confirm", "--json",
+                          *cli_digest(engine, repo, "1.1.0", [a])])
     doc = json.loads(capsys.readouterr().out)
     assert tuple(doc) == RESULT_KEYS and doc["outcome"] == "completed"
     assert doc["release"]["status"] == "completed"
@@ -726,7 +736,8 @@ def test_cli_apply_needs_confirm_and_an_explicit_selection(engine, cli_proj, mon
     a = proven(engine, repo, "feature a")
     assert _exit(monkeypatch, ["release", "apply", "-P", SLUG, "--version", "1.1.0"]) == 2
     assert _exit(monkeypatch, ["release", "apply", "-P", SLUG, "--version", "1.1.0",
-                               "--entries", str(a), "--json"]) == 1
+                               "--entries", str(a), "--json",
+                               *cli_digest(engine, repo, "1.1.0", [a])]) == 1
     doc = json.loads(capsys.readouterr().out)
     assert doc["outcome"] == "refused" and "--confirm" in doc["details"]["error"]
     assert get_release(engine, SLUG, "1.1.0") is None
@@ -768,7 +779,8 @@ def test_cli_sync_failure_exits_with_the_scripts_code(engine, cli_proj, monkeypa
     git(repo, "commit", "-qam", "chore: broken sync")
     a = proven(engine, repo, "feature a")
     assert _exit(monkeypatch, ["release", "apply", "-P", SLUG, "--version", "1.1.0",
-                               "--entries", str(a), "--confirm", "--json"]) == 3
+                               "--entries", str(a), "--confirm", "--json",
+                               *cli_digest(engine, repo, "1.1.0", [a])]) == 3
     doc = json.loads(capsys.readouterr().out)
     assert doc["outcome"] == "failed" and doc["release"]["status"] == "stamped"
 

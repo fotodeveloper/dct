@@ -373,7 +373,7 @@ releases = sa.Table(
     sa.Column("checkout_root", sa.String(500)),  # normalize_worktree
     sa.Column("release_commit_sha", sa.String(64)),
     sa.Column("manifest", sa.Text),  # JSON object, NULL = no effect recorded yet
-    sa.Column("proof", sa.Text),  # JSON object {entry id: {commits, merge_commit, pr}}
+    sa.Column("proof", sa.Text),  # JSON {entry id: {commits, merge_commit, pr[, source, ambiguous, associations]}}
     sa.Column("status", sa.String(16), nullable=False),
     sa.Column("created_at", sa.DateTime, nullable=False, server_default=sa.text("CURRENT_TIMESTAMP")),
     sa.Column("updated_at", sa.DateTime, nullable=False, server_default=sa.text("CURRENT_TIMESTAMP")),

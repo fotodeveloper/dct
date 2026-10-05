@@ -95,9 +95,12 @@ def test_unparseable_legacy_version_matches_only_itself(engine):
 # ── the full v1.6.0 flow: core + CLI + export ────────────────────────────────
 
 
-def test_v_prefixed_release_flow_core_cli_export(cli_engine, monkeypatch, capsys):
+def test_v_prefixed_release_flow_core_cli_export(cli_engine, tmp_path, monkeypatch, capsys):
     engine = cli_engine
-    create_project(engine, slug="proj-v", name="V", current_version="1.5.0")
+    # A path CONFIRMED outside git (K-95 C1: a pathless project is refused).
+    (tmp_path / "plain").mkdir()
+    create_project(engine, slug="proj-v", name="V", path=str(tmp_path / "plain"),
+                   current_version="1.5.0")
     a = add_entry(engine, "proj-v", "added", "shipped in 1.6")["id"]
     # A legacy row of the SAME version in yet another spelling (pre-contract).
     legacy = add_entry(engine, "proj-v", "fixed", "legacy v-spelled row")["id"]

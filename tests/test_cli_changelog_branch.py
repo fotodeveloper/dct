@@ -7,10 +7,25 @@ import shutil
 from pathlib import Path
 
 import pytest
-from conftest import git, git_commit_proving, make_git_repo, run_cli
+from conftest import (
+    approved_plan_digest,
+    git,
+    git_commit_proving,
+    make_git_repo,
+    run_cli,
+)
 
 from dct.core.changelog import add_entry, list_entries, release_entries
 from dct.core.projects import create_project, get_project
+
+
+def _plain(tmp_path) -> str:
+    """A directory CONFIRMED outside git (K-95 C1: a project without a
+    registered path cannot be released through the effects layer)."""
+    plain = tmp_path / "plain-v"
+    plain.mkdir(exist_ok=True)
+    return str(plain)
+
 
 needs_git = pytest.mark.skipif(shutil.which("git") is None, reason="git not available")
 
@@ -90,8 +105,9 @@ def test_list_branch_filter_and_branch_column(mixed, monkeypatch, capsys):
 
 
 @pytest.fixture
-def versioned(cli_engine):
-    create_project(cli_engine, slug="proj-v", name="V", current_version="1.0.0")
+def versioned(cli_engine, tmp_path):
+    create_project(cli_engine, slug="proj-v", name="V", path=_plain(tmp_path),
+                   current_version="1.0.0")
     ids = [add_entry(cli_engine, "proj-v", "added", f"e{i}")["id"] for i in range(3)]
     return cli_engine, ids
 
@@ -108,15 +124,17 @@ def test_release_entries_stamps_only_the_selection(versioned, monkeypatch, capsy
 
 
 def test_release_no_entries_is_version_only_even_with_nothing_unreleased(
-        cli_engine, monkeypatch, capsys):
-    create_project(cli_engine, slug="proj-v", name="V", current_version="1.0.0")
+        cli_engine, tmp_path, monkeypatch, capsys):
+    create_project(cli_engine, slug="proj-v", name="V", path=_plain(tmp_path),
+                   current_version="1.0.0")
     run_cli(monkeypatch, ["clog", "release", "-P", "proj-v", "--minor", "--no-entries"])
     assert "mode: version_only" in capsys.readouterr().out
     assert get_project(cli_engine, "proj-v")["current_version"] == "1.1.0"
 
 
-def test_release_all_guard_still_refuses_an_empty_release(cli_engine, monkeypatch, capsys):
-    create_project(cli_engine, slug="proj-v", name="V", current_version="1.0.0")
+def test_release_all_guard_still_refuses_an_empty_release(cli_engine, tmp_path, monkeypatch, capsys):
+    create_project(cli_engine, slug="proj-v", name="V", path=_plain(tmp_path),
+                   current_version="1.0.0")
     assert _exit_code(monkeypatch, ["clog", "release", "-P", "proj-v", "--patch"]) == 1
     assert "No unreleased entries" in capsys.readouterr().err
     assert get_project(cli_engine, "proj-v")["current_version"] == "1.0.0"
@@ -241,8 +259,9 @@ def test_release_historical_retry_leaves_version_files_untouched(
     head = git(main, "rev-parse", "HEAD")
     capsys.readouterr()
 
+    digest = approved_plan_digest(engine, "proj-g", main, version="1.1.0", entry_ids=[1])
     run_cli(monkeypatch, ["release", "apply", "-P", "proj-g", "--version", "1.1.0",
-                          "--entries", "1", "--confirm"])  # exits 0
+                          "--entries", "1", "--confirm", "--plan-digest", digest])  # exits 0
     out = capsys.readouterr().out
     assert "1.1.0 already released" in out
     assert "current version: 1.2.0" in out

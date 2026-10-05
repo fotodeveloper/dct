@@ -1172,7 +1172,8 @@ def _apply_from_args(args, *, strict: bool) -> None:
         engine, project_slug, version=version, bump_type=None if version else args.bump,
         entry_ids=entry_ids, no_entries=args.no_entries,
         confirm=True if strict else args.confirm,
-        confirm_version_files=args.confirm_version_files, strict=strict))
+        confirm_version_files=args.confirm_version_files, strict=strict,
+        plan_digest=None if strict else args.plan_digest))
     if as_json:
         return
     details = out["details"]
@@ -1196,14 +1197,20 @@ def cmd_clog_release(args):
     guessed: unproven entries (no --entries = every unreleased entry, all
     of which must be proven), a proof range that does not start at
     v<current_version>, the first release's version-file set without
-    --confirm-version-files. Effects, order and verification: see
+    --confirm-version-files. No --plan-digest: the plan is derived inside
+    the call for the candidate it pins, and the stamp is bound to it the
+    same way (K-80/K-81). Effects, order and verification: see
     dct.workflows.release.effects.
     """
     _apply_from_args(args, strict=True)
 
 
 def cmd_release_apply(args):
-    """`dct release apply` — one release from a fresh plan (effects layer)."""
+    """`dct release apply` — one release from the APPROVED plan (effects
+    layer, K-80): --plan-digest is the snapshot_digest of `dct release plan`
+    with the same version and selection; the plan is re-derived for the
+    candidate apply pins and a different snapshot is refused before any
+    write."""
     _apply_from_args(args, strict=False)
 
 
@@ -1416,9 +1423,11 @@ def cmd_release_plan(args):
 
     engine = _get_readonly_engine()
     project_slug = args.project or _detect_project(engine)
+    entry_ids = None if args.no_entries else _release_ids(args.entries)
     try:
         plan = build_plan(engine, project_slug, version=args.version or None,
-                          bump_type=None if args.version else args.bump)
+                          bump_type=None if args.version else args.bump,
+                          entry_ids=entry_ids, no_entries=args.no_entries)
     except Exception as e:
         _proof_layer_error(e)
     if args.json:
@@ -1431,8 +1440,18 @@ def cmd_release_plan(args):
         rec = plan["unfinished_release"]
         print(f"  unfinished release {rec['version']}: {rec['status']} — resume or abandon it")
     checkout = plan["checkout"]
+    resume = plan["resume"]
     if not checkout["git"]:
         print(f"  checkout: none ({checkout['reason']})")
+    elif resume is not None:
+        # K-95 C5: the RECORDED release first; today's HEAD separately.
+        print(f"  recorded candidate: {resume['candidate_sha'] or '-'} — entries "
+              f"{', '.join(f'#{i}' for i in resume['entry_ids']) or '(version-only)'}; "
+              f"status {resume['status']}")
+        done = [k for k, v in resume["effects"].items() if v]
+        print(f"  effects recorded: {', '.join(done) or '-'}")
+        print(f"  current HEAD: {resume['head']} on {checkout['branch'] or '(detached HEAD)'}"
+              f"{'' if resume['head_is_candidate'] else ' — NOT the recorded candidate'}")
     else:
         print(f"  candidate: {checkout['candidate_sha']} on "
               f"{checkout['branch'] or '(detached HEAD)'} in {checkout['repo_root']}")
@@ -1440,11 +1459,22 @@ def cmd_release_plan(args):
         print(f"  range: {rng['display'] or '(empty)'} — {rng['commit_count']} commits"
               f"{' [confirm the base]' if rng['confirm_required'] else ''}"
               f"{' [approximate]' if rng['approximate'] else ''}")
+        for alt in rng["alternatives"]:
+            print(f"    equally near: {alt['name']} ({alt['sha'][:12]})")
+    if resume is not None:
+        new = resume["new_unreleased"]
+        print(f"New unreleased entries since the record ({len(new)}) — not part of it:")
+        for entry in new:
+            _print_entry_line(entry, "")
+        for warning in plan["warnings"]:
+            print(f"  ⚠ {warning}", file=sys.stderr)
+        return
     proven, unproven = plan["entries"]["proven"], plan["entries"]["unproven"]
     print(f"Proven ({len(proven)}):")
     for entry in proven:
         merge = f" via {entry['merge_commit'][:12]}" if entry["merge_commit"] else ""
         pr = f" (#{entry['pr']})" if entry["pr"] else ""
+        pr += " [several merges — ambiguous]" if entry.get("ambiguous") else ""
         _print_entry_line(entry, f" ← {', '.join(c[:12] for c in entry['commits'])}{merge}{pr}")
     print(f"Unproven ({len(unproven)}):")
     for entry in unproven:
@@ -1465,6 +1495,10 @@ def cmd_release_plan(args):
               f"{' — release artifacts changed: ' + ', '.join(dirty) if dirty else ''}")
     files = (plan["version_files"] or {}).get("version_files")
     print(f"Version files: {', '.join(files) if files else '(not learned yet)' if files is None else '(none)'}")
+    if plan["snapshot"] is not None:
+        selected = plan["snapshot"]["selected_ids"]
+        print(f"Snapshot: {', '.join(f'#{i}' for i in selected) or '(version-only)'} → "
+              f"{plan['version']['target'] or '-'}; plan digest {plan['snapshot_digest']}")
     for warning in plan["warnings"]:
         print(f"  ⚠ {warning}", file=sys.stderr)
 
@@ -2664,6 +2698,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_rel_plan_v.add_argument("--patch", dest="bump", action="store_const", const="patch")
     p_rel_plan_v.add_argument("--minor", dest="bump", action="store_const", const="minor")
     p_rel_plan_v.add_argument("--major", dest="bump", action="store_const", const="major")
+    p_rel_plan_sel = p_rel_plan.add_mutually_exclusive_group()
+    p_rel_plan_sel.add_argument(
+        "--entries", help="Comma-separated entry ids the snapshot binds (default: every "
+                          "proven id)")
+    p_rel_plan_sel.add_argument(
+        "--no-entries", action="store_true", help="Bind a version-only release")
     p_rel_plan.add_argument("--json", action="store_true", help="Stable JSON document")
     p_rel_status = p_release_sub.add_parser(
         "status", help="Show a release record (alias of `clog release-status`)")
@@ -2694,6 +2734,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_rel_apply_sel.add_argument(
         "--no-entries", action="store_true", help="Version-only release")
     p_rel_apply.add_argument("--confirm", action="store_true", help="Required")
+    p_rel_apply.add_argument(
+        "--plan-digest", required=True,
+        help="Required: the snapshot_digest of the approved `dct release plan --version V "
+             "--entries … --json` (the release is refused when the re-derived plan differs)")
     p_rel_apply.add_argument(
         "--confirm-version-files", action="store_true",
         help="First release: confirm the files the version sync changed as the "

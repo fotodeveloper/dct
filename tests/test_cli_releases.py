@@ -12,6 +12,15 @@ from dct.core.changelog import add_entry, list_entries, release_entries
 from dct.core.projects import create_project, get_project
 from dct.core.releases import advance_release, get_release
 
+
+def _plain(tmp_path) -> str:
+    """A directory CONFIRMED outside git (K-95 C1: a project without a
+    registered path cannot be released through the effects layer)."""
+    plain = tmp_path / "plain-v"
+    plain.mkdir(exist_ok=True)
+    return str(plain)
+
+
 needs_git = pytest.mark.skipif(shutil.which("git") is None, reason="git not available")
 
 
@@ -64,12 +73,15 @@ def test_release_from_a_linked_worktree_pins_that_checkout(
     assert git(wt, "rev-parse", "v1.1.0") == rec["release_commit_sha"]
 
 
-def test_release_of_a_project_without_path_pins_nothing(cli_engine, monkeypatch):
+def test_release_of_a_project_without_path_is_refused(cli_engine, monkeypatch, capsys):
+    """K-95 C1: without a registered path the absence of a repository is not
+    CONFIRMED — the effects layer refuses instead of recording a
+    without_git release; nothing is stamped."""
     create_project(cli_engine, slug="proj-v", name="V", current_version="1.0.0")
-    add_entry(cli_engine, "proj-v", "added", "a")
-    run_cli(monkeypatch, ["clog", "release", "-P", "proj-v", "1.1.0"])
-    rec = get_release(cli_engine, "proj-v", "1.1.0")
-    assert rec["candidate_sha"] is None and rec["checkout_root"] is None
+    eid = add_entry(cli_engine, "proj-v", "added", "a")["id"]
+    assert _exit_code(monkeypatch, ["clog", "release", "-P", "proj-v", "1.1.0"]) == 1
+    assert "no registered path" in capsys.readouterr().err
+    _assert_nothing_released(cli_engine, "proj-v", eid)
 
 
 @needs_git
@@ -146,8 +158,9 @@ def test_release_of_a_project_whose_directory_is_gone_is_refused(
     _assert_nothing_released(cli_engine, "proj-p", eid)
 
 
-def test_release_with_an_unfinished_record_points_to_resume(cli_engine, monkeypatch, capsys):
-    create_project(cli_engine, slug="proj-v", name="V", current_version="1.0.0")
+def test_release_with_an_unfinished_record_points_to_resume(cli_engine, tmp_path, monkeypatch, capsys):
+    create_project(cli_engine, slug="proj-v", name="V", path=_plain(tmp_path),
+                   current_version="1.0.0")
     add_entry(cli_engine, "proj-v", "added", "a")
     release_entries(cli_engine, "proj-v", "1.1.0")
     advance_release(cli_engine, "proj-v", "1.1.0", "committed", release_commit_sha="1234567")
@@ -156,8 +169,9 @@ def test_release_with_an_unfinished_record_points_to_resume(cli_engine, monkeypa
     assert "release 1.1.0 is unfinished (committed)" in err and "dct release resume" in err
 
 
-def test_release_rerun_of_a_completed_release_is_a_noop(cli_engine, monkeypatch, capsys):
-    create_project(cli_engine, slug="proj-v", name="V", current_version="1.0.0")
+def test_release_rerun_of_a_completed_release_is_a_noop(cli_engine, tmp_path, monkeypatch, capsys):
+    create_project(cli_engine, slug="proj-v", name="V", path=_plain(tmp_path),
+                   current_version="1.0.0")
     a = add_entry(cli_engine, "proj-v", "added", "a")["id"]
     release_entries(cli_engine, "proj-v", "1.1.0")
     advance_release(cli_engine, "proj-v", "1.1.0", "completed", release_commit_sha="1234567")
@@ -166,8 +180,9 @@ def test_release_rerun_of_a_completed_release_is_a_noop(cli_engine, monkeypatch,
     assert "already released" in out and "release record 1.1.0: completed" in out
 
 
-def test_release_rerun_with_a_different_set_exits_nonzero(cli_engine, monkeypatch, capsys):
-    create_project(cli_engine, slug="proj-v", name="V", current_version="1.0.0")
+def test_release_rerun_with_a_different_set_exits_nonzero(cli_engine, tmp_path, monkeypatch, capsys):
+    create_project(cli_engine, slug="proj-v", name="V", path=_plain(tmp_path),
+                   current_version="1.0.0")
     a = add_entry(cli_engine, "proj-v", "added", "a")["id"]
     add_entry(cli_engine, "proj-v", "added", "b")
     release_entries(cli_engine, "proj-v", "1.1.0", entry_ids=[a])

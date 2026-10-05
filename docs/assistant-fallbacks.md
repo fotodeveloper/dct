@@ -79,8 +79,10 @@ computed read-only by two commands whose JSON schemas, range rule (K-71),
 revert rule (K-68), squash heuristic and its limits (K-69) and provenance
 (K-70) are documented in [release-workflow.md](release-workflow.md):
 
-- `dct release plan [-P slug] [--version V | --patch|--minor|--major] --json`
-  — the release plan of the current checkout. No side effects.
+- `dct release plan [-P slug] [--version V | --patch|--minor|--major]
+  [--entries <ids> | --no-entries] --json` — the release plan of the
+  current checkout; its `snapshot` / `snapshot_digest` is what the owner
+  approves (K-80). No side effects.
 - `dct clog candidates [-P slug] --json` — `/commit`'s candidates:
   `confirmed` vs `uncertain`, minus the ids the range already proves, plus
   the staged file list.
@@ -158,11 +160,15 @@ in the CURRENT checkout. Show long content as text first, then ask.
    number) — `V` computed ONCE.
 6. Attest when chosen: `dct release attest --entries <ids> --confirm --json`,
    then `dct release plan --version V --json` again (the candidate changed).
-7. Confirm the summary. No entries → explicit version-only consent (the
-   `since=last_release` anchor does not move; a full export omits V), then
-   `--no-entries`. Then
-   `dct release apply --version V --entries <ids> --confirm --json`
-   (or `--no-entries`).
+7. Bind the decision: `dct release plan --version V --entries <ids> --json`
+   (or `--no-entries`) — the snapshot of exactly this candidate, version
+   and selection. Confirm the summary from THAT plan. No entries → explicit
+   version-only consent (the `since=last_release` anchor does not move; a
+   full export omits V). Then
+   `dct release apply --version V --entries <ids> --plan-digest <snapshot_digest> --confirm --json`
+   (or `--no-entries`). A refusal "differs from the approved plan" (HEAD,
+   entries, selection, version or proof changed) → show it, plan again,
+   ask again — never retry with a new digest unasked.
 8. First release (`version_files.version_files` null): apply stops after the
    sync with `details.proposed_version_files`; show the list; only on the
    owner's yes `dct release resume --confirm-version-files --json`.
@@ -174,8 +180,11 @@ in the CURRENT checkout. Show long content as text first, then ask.
    `details.current_version` separately. The tag is local; pushing is the
    owner's action.
 
-**Resume path** — show the record and `checkout.matches_record`, then the
-owner chooses: finish → `dct release resume --json` (another checkout or
+**Resume path** — show the RECORDED release (`resume`: candidate, entry
+set, proof, effect state) and, separately, today's HEAD
+(`resume.head`, `checkout.matches_record`) and the entries added since
+(`resume.new_unreleased` — not part of this release), then the owner
+chooses: finish → `dct release resume --json` (another checkout or
 HEAD is refused — run it in the record's `checkout_root`; the record is never
 re-pinned); abandon → the owner's reason and explicit confirmation (the
 record, stamps, `current_version` and effects stay, V stays taken) →

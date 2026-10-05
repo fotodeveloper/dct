@@ -16,6 +16,8 @@ the STORED branch exactly whatever its source, while `include_unbranched`
 treats a server-detected row like an unbranched one.
 """
 
+import hashlib
+import json
 import ntpath
 import posixpath
 import re
@@ -388,6 +390,79 @@ def _dedupe_ids(entry_ids: Iterable[int]) -> list[int]:
     return ids
 
 
+# The release-material state of an entry (K-80/K-81): what the changelog
+# renders plus whether it is released. A change of any of these between an
+# approved plan and its stamp requires a new plan.
+ENTRY_STATE_FIELDS = ("id", "category", "entry", "component", "version")
+
+
+def entry_state_digest(entry: Mapping) -> str:
+    """SHA-256 (hex) of the canonical JSON of ENTRY_STATE_FIELDS of one
+    entry (a list_entries dict or a row mapping) — the ONE fingerprint the
+    release plan's snapshot and the stamp transaction compare."""
+    state = {name: entry.get(name) for name in ENTRY_STATE_FIELDS}
+    data = json.dumps(state, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return hashlib.sha256(data.encode("utf-8")).hexdigest()
+
+
+_DIGEST_RE = re.compile(r"[0-9a-f]{64}", re.ASCII)
+
+
+def _validate_expected_entries(expected: Mapping | None) -> dict[int, str] | None:
+    if expected is None:
+        return None
+    if not isinstance(expected, Mapping):
+        raise TypeError("expected_entries must be an object {entry id: state digest}")
+    out: dict[int, str] = {}
+    for raw, digest in expected.items():
+        key = str(raw)
+        if isinstance(raw, bool) or not key.isascii() or not key.isdigit() or int(key) <= 0:
+            raise ValueError(f"expected_entries keys must be entry ids, got {raw!r}")
+        if not isinstance(digest, str) or not _DIGEST_RE.fullmatch(digest):
+            raise ValueError(f"expected_entries[{key}] must be a lowercase hex SHA-256")
+        out[int(key)] = digest
+    return out
+
+
+def _check_plan_binding(
+    conn: sa.Connection, pid: int, to_stamp: list[int],
+    stampable: list[int] | None, expected: dict[int, str] | None,
+) -> None:
+    """K-80/K-81, inside the stamp transaction and before any write: the
+    live unreleased entries must still be EXACTLY the ones the approved plan
+    saw, in the same state (`expected`), and only `stampable` ids (approved
+    AND proven by that plan) may receive a new stamp. An entry already
+    carrying the version is not stamped again (the legacy set — checked by
+    the caller as a whole)."""
+    if expected is not None:
+        c = changelog_entries.c
+        live = {
+            row.id: entry_state_digest(row._mapping)
+            for row in conn.execute(
+                sa.select(*(getattr(c, name) for name in ENTRY_STATE_FIELDS)).where(
+                    c.project_id == pid, c.version.is_(None), c.deleted_at.is_(None)))
+        }
+        added = sorted(set(live) - set(expected))
+        removed = sorted(set(expected) - set(live))
+        changed = sorted(i for i in set(live) & set(expected) if live[i] != expected[i])
+        if added or removed or changed:
+            parts = [f"{label}: {', '.join(f'#{i}' for i in ids)}"
+                     for label, ids in (("added", added), ("changed", changed),
+                                        ("removed or released", removed)) if ids]
+            raise ValueError(
+                f"the unreleased changelog entries changed since the approved plan "
+                f"({'; '.join(parts)}) — run the plan again and approve it; nothing released."
+            )
+    if stampable is not None:
+        outside = sorted(set(to_stamp) - set(stampable))
+        if outside:
+            raise ValueError(
+                f"entries the approved plan does not prove: "
+                f"{', '.join(f'#{i}' for i in outside)} — only approved, proven entries get a "
+                f"new stamp; run the plan again; nothing released."
+            )
+
+
 def release_entries(
     engine: sa.Engine,
     project_slug: str,
@@ -402,6 +477,8 @@ def release_entries(
     consent: Mapping | None = None,
     proposal: Mapping | None = None,
     render: Mapping | None = None,
+    stampable_ids: Iterable[int] | None = None,
+    expected_entries: Mapping | None = None,
 ) -> dict:
     """Stamp changelog entries with a version, set the project's current_version
     and write the durable release record (K-41) — ONE transaction.
@@ -453,6 +530,15 @@ def release_entries(
     record predates them (stored NULL — nothing to contradict; such a
     record stays unverified). candidate_sha is not re-checked (K-61: never
     re-pinned).
+    K-80/K-81 plan binding (the effects layer; None = not bound):
+    `stampable_ids` — the ids an approved plan selected AND proved; any
+    other id that would receive a NEW stamp raises ValueError (an entry
+    already carrying V is the legacy set, not stamped again). A missing id
+    is never "left to core": it needs a new plan. `expected_entries` —
+    {entry id: core.changelog.entry_state_digest} of EVERY live unreleased
+    entry the plan saw; the transaction recomputes it and any entry added,
+    edited, released or removed since raises ValueError. Both are checked
+    inside the stamp transaction, before any write.
 
     The call's RESOLVED SET: 'selected' → the given ids; 'version_only' → [];
     'all' → the live entries already carrying V plus every unreleased entry.
@@ -516,6 +602,8 @@ def release_entries(
     }
     root = normalize_worktree(checkout_root)
     ensure_fits(release_records.releases, {"checkout_root": root})
+    stampable = None if stampable_ids is None else _dedupe_ids(stampable_ids)
+    expected = _validate_expected_entries(expected_entries)
     ids = None if entry_ids is None else _dedupe_ids(entry_ids)
     mode = "all" if ids is None else ("version_only" if not ids else "selected")
     c = changelog_entries.c
@@ -620,6 +708,7 @@ def release_entries(
                     f"nothing released."
                 )
         release_records.check_proof_scope(proof_map, resolved)
+        _check_plan_binding(conn, pid, to_stamp, stampable, expected)
         if current and compare_versions(version, current) < 0:
             raise ValueError(
                 f"Version {version} is lower than the current version {current} of "

@@ -275,17 +275,61 @@ def _entry_id(raw) -> int:
     return value
 
 
+PROOF_SOURCES = ("own_merge", "introducing_merge")
+ASSOCIATION_SOURCES = (*PROOF_SOURCES, "subject_suffix")
+ASSOCIATIONS_MAX = 50
+_PROOF_KEYS = frozenset({"commits", "merge_commit", "pr", "source", "ambiguous", "associations"})
+
+
+def _pr_number(value, field: str) -> int | None:
+    if value is not None and (isinstance(value, bool) or not isinstance(value, int) or value <= 0):
+        raise ValueError(f"{field} must be a positive integer, got {value!r}")
+    return value
+
+
+def _associations(raw, entry: int) -> list[dict]:
+    field = f"proof[{entry}].associations"
+    if isinstance(raw, (str, bytes)) or not isinstance(raw, (list, tuple)):
+        raise TypeError(f"{field} must be a list")
+    if len(raw) > ASSOCIATIONS_MAX:
+        raise ValueError(f"{field} holds more than {ASSOCIATIONS_MAX} items")
+    out = []
+    for i, item in enumerate(raw):
+        where = f"{field}[{i}]"
+        _object(item, where, {"merge_commit", "pr", "source", "certain"},
+                {"merge_commit", "pr", "source", "certain"})
+        if item["source"] not in ASSOCIATION_SOURCES:
+            raise ValueError(f"{where}.source must be one of {', '.join(ASSOCIATION_SOURCES)}")
+        if not isinstance(item["certain"], bool):
+            raise TypeError(f"{where}.certain must be true or false")
+        out.append({"merge_commit": validate_sha(item["merge_commit"], f"{where}.merge_commit"),
+                    "pr": _pr_number(item["pr"], f"{where}.pr"),
+                    "source": item["source"], "certain": item["certain"]})
+    return out
+
+
 def validate_proof(proof: Mapping | None) -> dict | None:
-    """The proof map (K-70) in its canonical form, or None for None / {}.
+    """The proof map (K-70, K-89) in its canonical form, or None for None / {}.
 
     Input: {entry id (int or digit string): <proof>} where <proof> is either
     a non-empty list of proving commit SHAs (shorthand) or an object
     {"commits": [sha, ...] (non-empty), "merge_commit": sha | null,
-    "pr": positive int | null}. Stored as {"<id>": {"commits": [sorted,
-    deduplicated, lowercased], "merge_commit": ..., "pr": ...}}. Any other
-    shape raises ValueError. Entries without a commit proof (e.g. attested)
-    are simply absent from the map. A non-object map / proof value or a
-    bool key raises TypeError."""
+    "pr": positive int | null} with the optional provenance keys of the
+    release plan (K-89): "source" ("own_merge" — the proving commit is
+    itself the merge | "introducing_merge" | null; the merge_commit / pr
+    pair comes from that ONE recognition), "ambiguous" (bool — several
+    different merge associations: merge_commit and pr must then be null)
+    and "associations" ([{merge_commit, pr, source ('own_merge' |
+    'introducing_merge' | 'subject_suffix'), certain (bool)}], at most
+    ASSOCIATIONS_MAX — every recognition, a `(#N)` subject suffix listed as
+    uncertain, never as `pr`). Stored as {"<id>": {"commits": [sorted,
+    deduplicated, lowercased], "merge_commit": ..., "pr": ...[, the optional
+    keys given]}}. Any other shape — or a contradiction (ambiguous with a
+    merge_commit / pr, a source without a merge_commit) — raises ValueError.
+    Entries without a commit proof (e.g. attested) are simply absent from
+    the map. A non-object map / proof value / association, a non-list
+    `associations`, a non-bool `ambiguous` / `certain` or a bool key raises
+    TypeError."""
     if proof is None:
         return None
     if not isinstance(proof, Mapping):
@@ -300,7 +344,7 @@ def validate_proof(proof: Mapping | None) -> dict | None:
                 f"proof[{entry}] must be a list of commit SHAs or an object "
                 f"{{commits, merge_commit, pr}}"
             )
-        unknown = set(raw) - {"commits", "merge_commit", "pr"}
+        unknown = set(raw) - _PROOF_KEYS
         if unknown:
             raise ValueError(f"proof[{entry}] has unknown keys: {', '.join(sorted(unknown))}")
         commits = raw.get("commits")
@@ -309,20 +353,46 @@ def validate_proof(proof: Mapping | None) -> dict | None:
         shas = sorted({validate_sha(sha, f"proof[{entry}].commits") or "" for sha in commits})
         if "" in shas:
             raise ValueError(f"proof[{entry}].commits must not contain an empty SHA")
-        pr = raw.get("pr")
-        if pr is not None and (isinstance(pr, bool) or not isinstance(pr, int) or pr <= 0):
-            raise ValueError(f"proof[{entry}].pr must be a positive integer, got {pr!r}")
         if str(entry) in out:
             raise ValueError(f"proof names entry {entry} twice")
-        out[str(entry)] = {
+        item = {
             "commits": shas,
             "merge_commit": validate_sha(raw.get("merge_commit"), f"proof[{entry}].merge_commit"),
-            "pr": pr,
+            "pr": _pr_number(raw.get("pr"), f"proof[{entry}].pr"),
         }
+        if "source" in raw:
+            if raw["source"] is not None and raw["source"] not in PROOF_SOURCES:
+                raise ValueError(f"proof[{entry}].source must be one of "
+                                 f"{', '.join(PROOF_SOURCES)} or null")
+            if raw["source"] is not None and item["merge_commit"] is None:
+                raise ValueError(f"proof[{entry}].source names a merge but merge_commit is null")
+            item["source"] = raw["source"]
+        if "ambiguous" in raw:
+            if not isinstance(raw["ambiguous"], bool):
+                raise TypeError(f"proof[{entry}].ambiguous must be true or false")
+            if raw["ambiguous"] and (item["merge_commit"] or item["pr"] or raw.get("source")):
+                raise ValueError(f"proof[{entry}] is ambiguous but names a merge_commit / pr / "
+                                 f"source — contradiction")
+            item["ambiguous"] = raw["ambiguous"]
+        if "associations" in raw:
+            item["associations"] = _associations(raw["associations"], entry)
+        out[str(entry)] = item
     if not out:
         return None
     ensure_json_fits(out, "proof", PROOF_MAX_BYTES)
     return out
+
+
+def proof_pr(proof: Mapping | None, entry_id: int) -> int | None:
+    """The PR number the changelog may render for `entry_id` (K-90): the
+    stored map's `pr` when it is set and the map does not mark the entry
+    ambiguous — never a heuristic number (the plan never stores one as
+    `pr`, K-95 C4)."""
+    item = (proof or {}).get(str(entry_id))
+    if not isinstance(item, Mapping) or item.get("ambiguous"):
+        return None
+    pr = item.get("pr")
+    return pr if isinstance(pr, int) and not isinstance(pr, bool) and pr > 0 else None
 
 
 def check_proof_scope(proof: dict | None, entry_ids: Iterable[int]) -> None:

@@ -1228,8 +1228,14 @@ def release_changelog(
         proof: Optional proof map for the audit trail — JSON object
             {"<entry id>": ["<proving commit sha>", ...]} or
             {"<entry id>": {"commits": [...], "merge_commit": "<sha>" | null,
-            "pr": <int> | null}}; every named entry must be in the release
-            set. Stored in a NEW record only and immutable: a re-run
+            "pr": <int> | null}} — plus, as `dct release plan` emits them,
+            the optional "source" ("own_merge" | "introducing_merge" | null),
+            "ambiguous" (bool; true → merge_commit and pr must be null) and
+            "associations" ([{merge_commit, pr, source, certain}]). `pr` is
+            the PR linked to the entry — the changelog renders it as `(#N)`
+            when the project's changelog_pr_refs was on at stamp time — never
+            a heuristic `(#N)` subject suffix; every named entry must be in
+            the release set. Stored in a NEW record only and immutable: a re-run
             returning an existing record with a DIFFERENT map — or with a
             map when the record has none — is an error, the identical map
             is the no-op. Entries without a commit proof are simply absent.
@@ -1348,7 +1354,8 @@ def get_release(project: str = "", version: str = "") -> dict:
         checkout_root (absolute path or null), release_commit_sha (the
         verified release commit, or null before 'committed'), manifest
         (object of the verified artifacts with content hashes, or null),
-        proof (object entry id → {commits, merge_commit, pr}, or null),
+        proof (object entry id → {commits, merge_commit, pr[, source,
+        ambiguous, associations]}, or null),
         status, created_at, updated_at, completed_at, abandoned_at (ISO
         datetimes or null), abandon_reason (text or null), release_mode
         ("git" | "without_git" — the verified mode; only "without_git"

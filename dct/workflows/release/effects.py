@@ -10,10 +10,15 @@ never runs this code (K-72: it never verifies files).
 
 Order of effects of one release (apply; resume continues from the record):
 
-  1. pre-checks — strict checkout (K-52), no unfinished record, clean index
-     and work tree (K-50), the requested set ⊆ the plan's proven ids;
-  2. stamp — core release_entries (the record, status 'stamped'); from here
-     the record's `version` is the spelling of every artifact (K-55);
+  1. pre-checks — strict checkout (K-52; a registered path), no unfinished
+     record, clean index and work tree (K-50); the plan re-derived FOR THE
+     PINNED CANDIDATE must match the approved snapshot digest (K-80); the
+     requested set ⊆ the plan's proven ids; HEAD unchanged right before the
+     stamp;
+  2. stamp — core release_entries (the record, status 'stamped'), bound to
+     the plan inside its transaction (K-81: stampable_ids, expected_entries);
+     from here the record's `version` is the spelling of every artifact
+     (K-55);
   3. changelog file F — the expected content is DETERMINISTIC: the
      candidate commit's F + the V section rendered from the database and
      the record (date = the record's created_at, K-32);
@@ -96,6 +101,7 @@ RELEASE_SUBJECT = "release: v{version}"
 _MARKER_RE = re.compile(r"^## \[([^\]\r\n]*)\]")
 _RELEASE_SUBJECT_RE = re.compile(r"^release: (\S+)$")
 _IN_PROGRESS = ("MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "rebase-merge", "rebase-apply")
+_DIGEST_RE = re.compile(r"[0-9a-f]{64}", re.ASCII)
 
 
 class ReleaseRefused(RuntimeError):
@@ -953,8 +959,9 @@ def _entry_selection(slug: str, plan: dict, target: str, entry_ids, no_entries: 
     if not ids:
         raise ReleaseRefused("--entries is empty — use --no-entries for a version-only release")
     # Ids the plan does not list at all (unknown, foreign, deleted, released)
-    # go to core's STRICT validation — an entry already carrying V is legal
-    # there (K-61), every other one is refused before anything is written.
+    # go to core's STRICT validation — the stamp transaction admits a NEW
+    # stamp only for the plan's proven ids (stampable_ids, K-81); the one
+    # exception is an entry already carrying V (the legacy set, K-61).
     bad = [i for i in ids if i in unproven]
     if bad:
         listing = ", ".join(f"#{i} ({unproven[i]})" for i in bad)
@@ -976,10 +983,25 @@ def apply_release(
     confirm: bool = False,
     confirm_version_files: bool = False,
     strict: bool = False,
+    plan_digest: str | None = None,
     cwd: str | None = None,
     on_point: Callable[[str], None] | None = None,
 ) -> dict:
-    """One release from a fresh plan (`dct release apply`), see module doc.
+    """One release from the APPROVED plan (`dct release apply`), see module doc.
+
+    K-80: `plan_digest` is the `snapshot_digest` of the plan the owner
+    approved (`dct release plan --version V --entries … --json`; required
+    unless `strict`). The candidate is read ONCE (the strict checkout's
+    HEAD) and the plan is re-derived FOR THAT CANDIDATE with the same
+    version and selection — never on a HEAD read later; a snapshot that
+    differs from the approved digest (another HEAD, range base, entry set
+    or entry state, selection, version or proof) is refused before any
+    database write. HEAD is checked again right before the stamp; the stamp
+    itself binds the plan (core release_entries `stampable_ids` /
+    `expected_entries`, K-81: only approved, proven ids get a new stamp; an
+    entry added, edited or removed since the plan refuses inside the stamp
+    transaction). A HEAD move after the stamp never re-pins the record: the
+    effects refuse (they run on the recorded candidate only).
 
     `entry_ids` (owner-chosen ids, each proven by the plan or already
     carrying V) or `no_entries=True` (version-only) — one is required unless
@@ -995,7 +1017,19 @@ def apply_release(
         raise ReleaseRefused("apply needs --confirm (it stamps, writes, commits and tags)")
     if entry_ids is not None and no_entries:
         raise ReleaseRefused("--entries and --no-entries are mutually exclusive")
+    if plan_digest is None and not strict:
+        raise ReleaseRefused(
+            "apply needs --plan-digest <snapshot_digest> of the plan the owner approved "
+            "(`dct release plan --version V --entries … --json`); nothing released.")
+    if plan_digest is not None and not _DIGEST_RE.fullmatch(plan_digest):
+        raise ReleaseRefused(f"--plan-digest must be a lowercase hex SHA-256, got {plan_digest!r}")
     project, checkout, project_root = _locate(engine, project_slug, cwd)
+    if not project.get("path"):
+        # K-95 C1: without a path the absence of a repository is NOT confirmed.
+        raise ReleaseRefused(
+            f"project '{project_slug}' has no registered path — its checkout cannot be "
+            f"verified (a project outside git must be CONFIRMED outside git); register the "
+            f"path first; nothing released.")
     run = _Run(engine, project_slug, project, checkout, project_root, on_point=on_point,
                confirm_version_files=confirm_version_files)
     unfinished = ledger.get_release(engine, project_slug)
@@ -1010,13 +1044,23 @@ def apply_release(
             project, checkout, ledger.get_version_files(engine, project_slug)["version_files"]))
         pre_untracked = set(state["untracked"])
     try:
-        plan = planning.build_plan(engine, project_slug, version=version, bump_type=bump_type,
-                                   cwd=cwd)
+        plan = planning.build_plan(
+            engine, project_slug, version=version, bump_type=bump_type, cwd=cwd,
+            entry_ids=None if entry_ids is None else list(entry_ids), no_entries=no_entries,
+            pinned_checkout=checkout)
     except ValueError as exc:
         raise ReleaseRefused(str(exc)) from None
     target = plan["version"]["target"]
     if not target:
         raise ReleaseRefused("Provide a version or --patch/--minor/--major")
+    if plan_digest is not None and plan["snapshot_digest"] != plan_digest:
+        raise ReleaseRefused(
+            "the release context differs from the approved plan (HEAD, range base, "
+            "unreleased entries, selection, version or proof changed) — run `dct release "
+            "plan … --json` again, review it and approve its snapshot_digest; nothing "
+            "released.",
+            details={"approved_digest": plan_digest, "derived_digest": plan["snapshot_digest"],
+                     "snapshot": plan["snapshot"]})
     if strict and plan["range"] and plan["range"]["confirm_required"]:
         raise ReleaseRefused(
             f"the proof range starts at {plan['range']['base_tag']}, not at "
@@ -1024,9 +1068,18 @@ def apply_release(
             f"after reviewing `dct release plan`; nothing released.")
     run.warnings.extend(plan["warnings"])
     ids = _entry_selection(project_slug, plan, target, entry_ids, no_entries, strict)
-    proof = {str(i): plan["proof"][str(i)] for i in ids if str(i) in plan["proof"]} or None
+    snapshot = plan["snapshot"]
+    proof = {str(i): snapshot["proof"][str(i)] for i in ids if str(i) in snapshot["proof"]} \
+        or None
+    stampable = [i for i in ids if str(i) in snapshot["proof"]]
+    if not checkout:  # K-63: a project CONFIRMED outside git — the owner's selection
+        stampable = list(ids)
     before = ledger.get_release(engine, project_slug, target)
     _point(on_point, "before_stamp")
+    if checkout and _head(checkout["repo_root"]) != checkout["head"]:
+        raise ReleaseRefused(
+            f"HEAD moved since the plan was derived for the candidate {checkout['head']} — "
+            f"nothing released; plan again.", details={"candidate": checkout["head"]})
     try:
         stamped = release_entries(
             engine, project_slug, target, entry_ids=ids,
@@ -1034,7 +1087,8 @@ def apply_release(
             checkout_root=checkout["repo_root"] if checkout else None, proof=proof,
             # K-94 B1: _locate verified the checkout strictly — None means the
             # project is CONFIRMED outside git (a detection error refuses).
-            release_mode="git" if checkout else "without_git")
+            release_mode="git" if checkout else "without_git",
+            stampable_ids=stampable, expected_entries=snapshot["entries"])
     except ValueError as exc:
         raise ReleaseRefused(str(exc)) from None
     details = {"requested_version": target, "previous_version": plan["version"]["current"],
@@ -1137,7 +1191,7 @@ def attest(
         raise ReleaseRefused(f"release {unfinished['version']} is unfinished — resume or "
                              f"abandon it before attesting (its candidate is pinned)")
     repo = checkout["repo_root"]
-    plan = planning.build_plan(engine, project_slug, cwd=cwd)
+    plan = planning.build_plan(engine, project_slug, cwd=cwd, pinned_checkout=checkout)
     unproven = {e["id"] for e in plan["entries"]["unproven"]}
     bad = [i for i in ids if i not in unproven]
     if bad:
