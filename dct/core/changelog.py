@@ -7,7 +7,6 @@ new entry (used by the MCP server and the CLI alike); `release_entries` can
 stamp an explicit set of entry ids instead of every unreleased entry.
 """
 
-import os
 from collections.abc import Iterable
 from datetime import UTC, datetime
 
@@ -16,6 +15,13 @@ import sqlalchemy as sa
 from dct.core.limits import ensure_fits
 from dct.core.projects import resolve_project_id
 from dct.core.text import item_label
+from dct.core.version import (
+    bump,
+    compare_versions,
+    normalize_version,
+    parse_version,
+    same_version,
+)
 from dct.db import changelog_entries, items, project_transaction, projects, row_to_dict
 
 VALID_CATEGORIES = {"added", "changed", "fixed", "removed"}
@@ -51,28 +57,6 @@ def _fits(column: str, value: str | None) -> str | None:
     return value
 
 
-def detect_checkout(engine: sa.Engine, project_slug: str, cwd: str) -> dict | None:
-    """git_context(cwd) when its worktree lies inside the project's path, else None.
-
-    Both sides are realpath-canonical. A project without a registered path, an
-    unknown slug, a directory outside git, or a checkout OUTSIDE the project
-    (the MCP server started elsewhere, a worktree created outside the repo)
-    all give None — git context that cannot be tied to the project is unknown.
-    """
-    from dct.core.gitinfo import git_context
-    from dct.core.projects import _path_is_within
-
-    path = _project_path(engine, project_slug)
-    if not path:
-        return None
-    context = git_context(cwd)
-    if context is None:
-        return None
-    if not _path_is_within(os.path.realpath(context["worktree"]), os.path.realpath(path)):
-        return None
-    return context
-
-
 def resolve_branch_fields(
     engine: sa.Engine,
     project_slug: str,
@@ -80,6 +64,7 @@ def resolve_branch_fields(
     branch: str | None = None,
     worktree: str | None = None,
     cwd: str | None = None,
+    use_process_cwd: bool = False,
     detected_source: str = "client",
 ) -> dict:
     """Decide `{branch, worktree, branch_source}` for a NEW entry (#801, C3).
@@ -88,11 +73,21 @@ def resolve_branch_fields(
       with branch_source='client'; an over-long explicit value is REFUSED
       (ValueError from ensure_fits, never truncated). A value not given stays
       NULL — explicit values are never mixed with detected ones.
-    - Neither given: detect via `detect_checkout(cwd)` (git context tied to
-      the project's path) and mark it `detected_source` — 'server' for the
-      MCP server's own cwd, 'client' for the CLI (which runs in the caller's
+    - Neither given: detect via gitinfo.resolve_checkout(project path, cwd)
+      (K-34) — `cwd` must be a checkout of the SAME repository as the
+      project's registered path (same git common dir: the main checkout or
+      any linked worktree, also one outside the registered path; never a
+      nested foreign repo or a submodule). Stored: `branch` of that checkout
+      and `worktree` = its repo root (the checkout toplevel, also for a
+      monorepo subproject). Marked `detected_source` — 'server' for the MCP
+      server's own cwd, 'client' for the CLI (which runs in the caller's
       directory). An auto-detected value that is too long becomes NULL (it
       never blocks the entry). No usable context → all three NULL.
+    - `cwd` None and `use_process_cwd` → the process cwd, read only when
+      detection actually runs; a deleted cwd means no context. `cwd` None
+      without the flag → no detection.
+    The project itself is never inferred here: this ties git context to an
+    ALREADY RESOLVED project slug.
     """
     if detected_source not in BRANCH_SOURCES:
         raise ValueError(f"Invalid branch_source: '{detected_source}'. Valid: {', '.join(BRANCH_SOURCES)}")
@@ -100,12 +95,16 @@ def resolve_branch_fields(
         values = {"branch": branch or None, "worktree": worktree or None}
         ensure_fits(changelog_entries, values)
         return {**values, "branch_source": "client"}
-    context = detect_checkout(engine, project_slug, cwd) if cwd else None
+    context = None
+    if cwd or use_process_cwd:
+        from dct.core.gitinfo import resolve_checkout
+
+        context = resolve_checkout(_project_path(engine, project_slug), cwd or None)
     if context is None:
         return {"branch": None, "worktree": None, "branch_source": None}
     detected = {
         "branch": _fits("branch", context["branch"]),
-        "worktree": _fits("worktree", context["worktree"]),
+        "worktree": _fits("worktree", context["repo_root"]),
     }
     if detected["branch"] is None and detected["worktree"] is None:
         return {**detected, "branch_source": None}
@@ -258,19 +257,6 @@ def count_unreleased(
         return result.scalar() or 0
 
 
-def _version_key(version: str) -> tuple[int, ...] | None:
-    """Comparable form of a version (trailing zeros dropped), None if unparsable."""
-    from dct.core.version import parse_version
-
-    try:
-        parts = list(parse_version(version))
-    except (ValueError, AttributeError):
-        return None
-    while len(parts) > 1 and parts[-1] == 0:
-        parts.pop()
-    return tuple(parts)
-
-
 def _dedupe_ids(entry_ids: Iterable[int]) -> list[int]:
     ids: list[int] = []
     for raw in entry_ids:
@@ -288,35 +274,50 @@ def release_entries(
     *,
     bump_type: str | None = None,
     entry_ids: Iterable[int] | None = None,
+    require_entries: bool = False,
 ) -> dict:
     """Stamp changelog entries with a version and set the project's current_version.
 
     Exactly one of `version` / `bump_type` (patch | minor | major, bumped from
-    current_version INSIDE the project write transaction). `entry_ids`:
+    current_version INSIDE the project write transaction). Versions follow the
+    ONE contract of dct.core.version (K-44): X.Y or X.Y.Z, a leading `v` is
+    accepted and NORMALIZED AWAY before any comparison and before storing
+    (`v1.6.0` is stored as `1.6.0`); any other format raises ValueError
+    ("Unsupported version ...") and nothing is written. `entry_ids`:
       - None → every unreleased entry of the project (legacy, mode 'all');
       - []   → stamp nothing, only set the version (mode 'version_only');
       - list → exactly those entries (mode 'selected'); STRICT — an unknown,
         foreign or soft-deleted id, or one already released in ANOTHER
         version, raises ValueError and nothing is written; a non-int id raises
         TypeError. Duplicates are ignored.
+    `require_entries` (mode 'all' only — the CLI's consent rule, K-31): when
+    nothing is unreleased and the call is not a no-op, raise ValueError
+    instead of silently performing a version-only release (that one needs
+    entry_ids=[] explicitly).
 
-    Order of checks (K-20): (1) nothing left to stamp — every selected entry
-    already carries V ('selected'), current_version already V
-    ('version_only'), or both ('all') → no-op, NO write at all; (2) V lower
-    than current_version (compared only when both parse) → refused, releases
-    never rewind; (3) stamp the not-yet-stamped entries (version, released_at,
-    updated_at) and set current_version = V.
+    Order of checks (K-20): (1) nothing left to stamp → no-op, NO write at
+    all: every selected entry already carries V ('selected'); current_version
+    already V ('version_only'); nothing unreleased AND V is current_version or
+    a version live entries of the project already carry — a historical retry
+    ('all'). A historical no-op leaves current_version untouched, so the
+    result's `current_version` differs from `version`. (2) V lower than
+    current_version → refused, releases never rewind (applied whenever
+    current_version parses; a legacy unparseable current_version is not
+    compared). (3) stamp the not-yet-stamped entries (version, released_at,
+    updated_at) and set current_version = V. Versions are equal when their
+    components match after dropping trailing zeros (1.5 == 1.5.0).
 
-    Returns {version, current_version, mode, entry_ids, released (count newly
-    stamped), already_released (selected ids that already had V)}, plus
-    `warning` in mode 'all' when the stamped entries span several branches
-    (NULL counts as its own value).
+    Returns {version (requested, normalized), current_version (after the
+    call), mode, entry_ids, released (count newly stamped), already_released
+    (selected ids that already had V)}, plus `warning` in mode 'all' when the
+    stamped entries span several branches (NULL counts as its own value).
     """
-    from dct.core.sprints import _validate_project_rows_conn
-    from dct.core.version import bump
+    from dct.core.records import validate_project_rows
 
     if bool(version) == bool(bump_type):
         raise ValueError("Provide exactly one of version or bump_type (patch/minor/major)")
+    if version:
+        version = normalize_version(version)
     ids = None if entry_ids is None else _dedupe_ids(entry_ids)
     mode = "all" if ids is None else ("version_only" if not ids else "selected")
     c = changelog_entries.c
@@ -332,6 +333,7 @@ def release_entries(
                 )
             version = bump(current, bump_type)
         assert version is not None
+        is_current = same_version(current, version)
 
         already: list[int] = []
         branches: set[str | None] = set()
@@ -344,25 +346,36 @@ def release_entries(
             to_stamp = [r.id for r in rows]
             branches = {r.branch for r in rows}
             selected = to_stamp
-            nothing_to_do = not to_stamp and current == version
+            nothing_to_do = not to_stamp and (
+                is_current or _version_was_released(conn, pid, version)
+            )
+            if not to_stamp and not nothing_to_do and require_entries:
+                raise ValueError(
+                    f"No unreleased entries for '{project_slug}' — a version-only "
+                    f"release of {version} must be explicit (entry_ids=[] / "
+                    f"--no-entries); nothing released."
+                )
         elif mode == "version_only":
             to_stamp, selected = [], []
-            nothing_to_do = current == version
+            nothing_to_do = is_current
         else:
-            _validate_project_rows_conn(
+            validate_project_rows(
                 conn, changelog_entries, pid, ids, "changelog entry", "nothing released."
             )
             stamped = dict(conn.execute(
                 sa.select(c.id, c.version).where(c.id.in_(ids))
             ).all())
-            foreign = {i: stamped[i] for i in ids if stamped[i] not in (None, version)}
+            foreign = {
+                i: stamped[i] for i in ids
+                if stamped[i] is not None and not same_version(stamped[i], version)
+            }
             if foreign:
                 listing = ", ".join(f"#{i} ({v})" for i, v in sorted(foreign.items()))
                 raise ValueError(
                     f"Changelog entries already released in another version: {listing} "
                     f"— released entries are history; nothing released."
                 )
-            already = [i for i in ids if stamped[i] == version]
+            already = [i for i in ids if stamped[i] is not None]
             to_stamp = [i for i in ids if stamped[i] is None]
             selected = ids
             nothing_to_do = not to_stamp
@@ -378,8 +391,7 @@ def release_entries(
         if nothing_to_do:
             return result
 
-        new_key, current_key = _version_key(version), _version_key(current or "")
-        if new_key is not None and current_key is not None and new_key < current_key:
+        if current and _parses(current) and compare_versions(version, current) < 0:
             raise ValueError(
                 f"Version {version} is lower than the current version {current} of "
                 f"'{project_slug}' — releases never rewind; nothing released."
@@ -412,6 +424,26 @@ def release_entries(
                 f"Pass entry_ids to release only the entries proven to be in this release."
             )
         return result
+
+
+def _parses(version: str) -> bool:
+    try:
+        parse_version(version)
+    except ValueError:
+        return False
+    return True
+
+
+def _version_was_released(conn: sa.Connection, project_id: int, version: str) -> bool:
+    """Whether a live entry of the project already carries `version` (under
+    the version contract — a legacy `v1.1.0` row matches `1.1.0`)."""
+    c = changelog_entries.c
+    released = conn.execute(
+        sa.select(c.version).distinct().where(
+            c.project_id == project_id, c.version.is_not(None), c.deleted_at.is_(None)
+        )
+    ).scalars()
+    return any(same_version(v, version) for v in released)
 
 
 def _entry_state_error(conn: sa.Connection, project_id: int, entry_id: int) -> ValueError:

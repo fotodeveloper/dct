@@ -18,7 +18,7 @@ import time
 from pathlib import Path
 
 from dct.assets import hooks_dir
-from dct.core.gitinfo import git_context
+from dct.core.gitinfo import git_toplevel
 
 MAX_INPUT = 2 * 1024 * 1024
 MAX_PATCH = 1024 * 1024
@@ -107,10 +107,13 @@ def _shell_contexts(payload: dict, cwd: Path) -> list[tuple[Path, str]]:
 
 
 def _worktree_root(cwd: Path) -> Path:
-    """Bound autoscan ownership to this Git worktree, or cwd outside Git."""
-    context = git_context(cwd)
-    if context is not None:
-        root = Path(context["worktree"])
+    """Bound autoscan ownership to this Git worktree, or cwd outside Git.
+
+    Needs only the toplevel: exactly one git process, no branch read (K-35).
+    """
+    toplevel = git_toplevel(cwd)
+    if toplevel is not None:
+        root = Path(toplevel)
         if cwd.resolve().is_relative_to(root):
             return root
     return cwd.resolve()

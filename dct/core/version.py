@@ -1,24 +1,89 @@
-"""Version bump + autodetect logic — supports X.Y and X.Y.Z formats."""
+"""Version contract + autodetect logic (K-44).
+
+ONE contract for every version dct stores or computes: `X.Y` or `X.Y.Z` with
+ASCII decimal components, optionally prefixed by `v`/`V` and surrounded by
+whitespace. `normalize_version` strips the prefix and whitespace (and leading
+zeros of each component) — callers store the NORMALIZED form, so a later bump
+and a `v$CUR` tag never see `vv1.6.0`. Anything else is refused with
+ValueError("Unsupported version ...") — never silently skipped.
+
+`detect_version` is separate: it reports whatever a project file says (raw)
+and never raises.
+"""
 
 import json
+import re
 import tomllib
 from pathlib import Path
 
+_VERSION_RE = re.compile(r"[vV]?([0-9]+)\.([0-9]+)(?:\.([0-9]+))?", re.ASCII)
+SUPPORTED_FORMATS = "X.Y or X.Y.Z (optional leading 'v')"
+
 
 def parse_version(version: str) -> tuple[int, ...]:
-    parts = version.strip().split(".")
-    return tuple(int(p) for p in parts)
+    """`(X, Y)` or `(X, Y, Z)` for a supported version; ValueError otherwise.
+
+    Surrounding whitespace and one leading `v`/`V` are accepted.
+    """
+    match = _VERSION_RE.fullmatch(version.strip()) if isinstance(version, str) else None
+    if match is None:
+        raise ValueError(f"Unsupported version {version!r} — expected {SUPPORTED_FORMATS}")
+    return tuple(int(part) for part in match.groups() if part is not None)
 
 
 def format_version(parts: tuple[int, ...]) -> str:
     return ".".join(str(p) for p in parts)
 
 
-def bump(current: str, bump_type: str) -> str:
-    """Bump version string by type (patch/minor/major).
+def normalize_version(version: str) -> str:
+    """The canonical stored form: `v1.6.0` → `1.6.0`, ` 0.18 ` → `0.18`.
 
-    Supports both X.Y (two-part) and X.Y.Z (three-part) formats.
-    Two-part versions get a patch level on patch bump: 0.18 → 0.18.1
+    Raises ValueError for an unsupported format (see module docstring).
+    """
+    return format_version(parse_version(version))
+
+
+def version_key(version: str) -> tuple[int, ...]:
+    """Comparable form: trailing zero components dropped, so 1.5 == 1.5.0.
+
+    Raises ValueError for an unsupported format.
+    """
+    parts = list(parse_version(version))
+    while len(parts) > 1 and parts[-1] == 0:
+        parts.pop()
+    return tuple(parts)
+
+
+def compare_versions(a: str, b: str) -> int:
+    """-1 / 0 / 1 as `a` is lower / equal / higher than `b` (1.5 == 1.5.0).
+
+    Raises ValueError when either side is unsupported.
+    """
+    ka, kb = version_key(a), version_key(b)
+    return (ka > kb) - (ka < kb)
+
+
+def same_version(a: str | None, b: str | None) -> bool:
+    """Equal under the contract (1.5 == 1.5.0 == v1.5); never raises.
+
+    When either side is not a supported version (a legacy stored value), falls
+    back to exact string equality; None equals only None.
+    """
+    if a is None or b is None:
+        return a is b
+    try:
+        return version_key(a) == version_key(b)
+    except ValueError:
+        return a == b
+
+
+def bump(current: str, bump_type: str) -> str:
+    """Bump version string by type (patch/minor/major); result is normalized.
+
+    Supports both X.Y (two-part) and X.Y.Z (three-part) formats, with an
+    optional leading `v` on `current` (dropped from the result).
+    Two-part versions get a patch level on patch bump: 0.18 → 0.18.1.
+    Raises ValueError on an invalid bump type or an unsupported `current`.
     """
     if bump_type not in ("patch", "minor", "major"):
         raise ValueError(f"Invalid bump type: '{bump_type}'. Valid: patch, minor, major")

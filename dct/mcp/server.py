@@ -1011,9 +1011,11 @@ def add_changelog(
             Either given → both stored as passed (a missing one stays null),
             branch_source='client'; an over-long value is REFUSED, never
             truncated. Neither given → detected from this server's cwd, kept
-            only when that checkout lies inside the project's registered path
-            (branch_source='server'); otherwise, outside git, or detached HEAD
-            (branch only) → null.
+            only when that cwd is a checkout of the SAME git repository as the
+            project's registered path (main checkout or any linked worktree;
+            never a nested foreign repo or a submodule) — worktree = that
+            checkout's toplevel, branch_source='server'; otherwise, outside
+            git, or a deleted cwd → null; detached HEAD → branch null only.
 
     Returns: slim ack {id, project, category, component, branch, branch_source}
         — `project` is the resolved slug; component / branch / branch_source may
@@ -1028,8 +1030,6 @@ def add_changelog(
         source_lines=source_lines, branch=branch, worktree=worktree,
     )):
         return err
-    import os
-
     from dct.core.changelog import add_entry, resolve_branch_fields
 
     kwargs: dict = {}
@@ -1044,7 +1044,7 @@ def add_changelog(
         assert project_slug is not None
         kwargs.update(resolve_branch_fields(
             engine, project_slug, branch=branch or None, worktree=worktree or None,
-            cwd=os.getcwd(), detected_source="server",
+            use_process_cwd=True, detected_source="server",
         ))
         row = add_entry(engine, project_slug, category, entry, **kwargs)
         return {
@@ -1147,9 +1147,11 @@ def release_changelog(
 
     Args:
         project: Slug. Empty = auto-detect from CWD.
-        version: Explicit version like "0.2.0". Takes precedence over bump_type.
-            Pass it explicitly when RETRYING a release (a retried bump would
-            bump again).
+        version: Explicit version like "0.2.0" — X.Y or X.Y.Z; a leading "v"
+            is accepted and normalized away before comparing and storing
+            ("v0.2.0" is stored as "0.2.0"); any other format is refused.
+            Takes precedence over bump_type. Pass it explicitly when RETRYING
+            a release (a retried bump would bump again).
         bump_type: patch / minor / major — bumped from the project's current_version.
         entry_ids: JSON array of changelog entry ids (e.g. [12, 15]) — NOT a CSV
             string. Omitted/null (default) = every unreleased entry of the
@@ -1161,18 +1163,24 @@ def release_changelog(
 
     Idempotent: when nothing is left to stamp — every selected entry already
     carries the version ('selected'), current_version already equals it
-    ('version_only'), or both ('all') — the call is a no-op and writes nothing.
-    Never rewinds: a version lower than current_version is refused (compared
-    when both parse as dotted numbers). Stamping sets version + released_at.
+    ('version_only'), or nothing is unreleased and the version is the current
+    one or one live entries already carry ('all', a historical retry) — the
+    call is a no-op and writes nothing; after a historical no-op the returned
+    current_version differs from version. Never rewinds: a version lower than
+    current_version is refused (whenever current_version parses; 1.5 ==
+    1.5.0). Stamping sets version + released_at.
 
-    Returns: {"project", "version", "current_version" (after the call), "mode":
+    Returns: {"project", "version" (requested, normalized), "current_version"
+        (after the call), "mode":
         "all"|"selected"|"version_only", "entry_ids" (the selected ids — in mode
         'all' the ones stamped), "released" (count newly stamped),
         "already_released" (selected ids that already had this version)} plus
         "warning" in mode 'all' when the stamped entries span several branches
         (null branch counted as its own). {"error": "..."} on failure — neither
         version nor bump_type; bump_type with no current_version; an invalid
-        bump_type; a version lower than current_version; an invalid entry id;
+        bump_type; an unsupported version format (requested, or the
+        current_version a bump starts from); a version lower than
+        current_version; an invalid entry id;
         or an unresolvable project. Nothing is written on error.
     """
     from dct.core.changelog import release_entries

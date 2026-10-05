@@ -152,6 +152,69 @@ def test_resolve_over_long_detected_branch_becomes_null_never_blocks(engine, tmp
     add_entry(engine, "proj-g", "added", "still stored", **out)
 
 
+@needs_git
+def test_resolve_detects_a_linked_worktree_outside_the_project_path(engine, tmp_path):
+    """K-34: same repository (git common dir), not "inside projects.path"."""
+    root = make_git_repo(tmp_path / "repo")
+    linked = tmp_path / "elsewhere" / "wt"
+    git(root, "worktree", "add", "-q", "-b", "feat/out", str(linked))
+    create_project(engine, slug="proj-g", name="G", path=root)
+    assert resolve_branch_fields(engine, "proj-g", cwd=str(linked), detected_source="client") == {
+        "branch": "feat/out", "worktree": str(linked.resolve()), "branch_source": "client"}
+
+
+@needs_git
+def test_resolve_ignores_a_nested_foreign_repo_inside_the_project(engine, tmp_path):
+    root = make_git_repo(tmp_path / "repo")
+    nested = make_git_repo(tmp_path / "repo" / "vendor" / "lib", branch="feat/vendor")
+    create_project(engine, slug="proj-g", name="G", path=root)
+    assert resolve_branch_fields(engine, "proj-g", cwd=nested, detected_source="server") == {
+        "branch": None, "worktree": None, "branch_source": None}
+
+
+@needs_git
+def test_resolve_monorepo_subproject_stores_the_checkout_root(engine, tmp_path):
+    root = make_git_repo(tmp_path / "mono", branch="main")
+    app = tmp_path / "mono" / "packages" / "app"
+    app.mkdir(parents=True)
+    create_project(engine, slug="proj-g", name="G", path=str(app))
+    out = resolve_branch_fields(engine, "proj-g", cwd=root, detected_source="server")
+    assert out == {"branch": "main", "worktree": root, "branch_source": "server"}
+
+
+@needs_git
+def test_resolve_process_cwd_is_read_only_when_detection_is_needed(engine, tmp_path, monkeypatch):
+    from dct.core import gitinfo
+
+    root = make_git_repo(tmp_path / "repo", branch="feat/x")
+    create_project(engine, slug="proj-g", name="G", path=root)
+
+    def boom():
+        raise AssertionError("getcwd must not be read")
+
+    monkeypatch.setattr(gitinfo.os, "getcwd", boom)
+    out = resolve_branch_fields(engine, "proj-g", branch="feat/y", use_process_cwd=True)
+    assert out == {"branch": "feat/y", "worktree": None, "branch_source": "client"}
+    monkeypatch.undo()
+    monkeypatch.chdir(root)
+    assert resolve_branch_fields(engine, "proj-g", use_process_cwd=True,
+                                 detected_source="server")["branch"] == "feat/x"
+
+
+@needs_git
+def test_resolve_deleted_process_cwd_is_no_context(engine, tmp_path, monkeypatch):
+    import os
+
+    root = make_git_repo(tmp_path / "repo")
+    create_project(engine, slug="proj-g", name="G", path=root)
+    gone = tmp_path / "repo" / "gone"
+    gone.mkdir()
+    monkeypatch.chdir(gone)
+    os.rmdir(gone)
+    assert resolve_branch_fields(engine, "proj-g", use_process_cwd=True) == {
+        "branch": None, "worktree": None, "branch_source": None}
+
+
 # ── C4: filters + label ───────────────────────────────────────────────────────
 
 
@@ -524,3 +587,97 @@ def test_delete_entry_soft_deletes_and_stamps_updated_at(proj):
     assert row.updated_at is not None
     with pytest.raises(ValueError, match="not found"):
         delete_entry(proj, "proj-a", eid)  # second delete: already deleted
+
+
+# ── K-44: release_entries uses the one version contract ──────────────────────
+
+
+def test_release_v_prefixed_lower_version_is_refused(proj):
+    with proj.begin() as conn:
+        conn.execute(projects.update().values(current_version="1.5.0"))
+    _add(proj, "a")
+    before = _snapshot(proj)
+    with pytest.raises(ValueError, match="lower than the current version 1.5.0"):
+        release_entries(proj, "proj-a", "v1.4.0")
+    assert _snapshot(proj) == before
+
+
+def test_release_v_prefixed_version_is_stored_normalized_and_bumps_cleanly(proj):
+    with proj.begin() as conn:
+        conn.execute(projects.update().values(current_version="1.5.0"))
+    a = _add(proj, "a")
+    out = release_entries(proj, "proj-a", "v1.6.0")
+    assert out["version"] == out["current_version"] == "1.6.0"
+    assert get_project(proj, "proj-a")["current_version"] == "1.6.0"
+    assert [e["id"] for e in list_entries(proj, "proj-a", version="1.6.0")] == [a]
+    _add(proj, "b")
+    assert release_entries(proj, "proj-a", bump_type="patch")["current_version"] == "1.6.1"
+
+
+@pytest.mark.parametrize("bad", ["1.6.0-rc1", "1", "1.6.0.1", "latest", "vv1.6"])
+@pytest.mark.parametrize("entry_ids", [None, [], "selected"])
+def test_release_malformed_version_is_refused_without_writes(proj, bad, entry_ids):
+    a = _add(proj, "a")
+    selection = [a] if entry_ids == "selected" else entry_ids
+    before = _snapshot(proj)
+    with pytest.raises(ValueError, match="Unsupported version"):
+        release_entries(proj, "proj-a", bad, entry_ids=selection)
+    assert _snapshot(proj) == before
+
+
+def test_release_bump_of_unsupported_current_is_refused_without_writes(proj):
+    with proj.begin() as conn:
+        conn.execute(projects.update().values(current_version="2026-rc"))
+    _add(proj, "a")
+    before = _snapshot(proj)
+    with pytest.raises(ValueError, match="Unsupported version"):
+        release_entries(proj, "proj-a", bump_type="patch")
+    assert _snapshot(proj) == before
+
+
+def test_release_v_prefixed_retry_of_the_current_version_is_a_noop(proj):
+    _add(proj, "a")
+    release_entries(proj, "proj-a", "1.1.0")
+    before = _snapshot(proj)
+    out = release_entries(proj, "proj-a", "v1.1.0")
+    assert _snapshot(proj) == before
+    assert (out["version"], out["current_version"], out["released"]) == ("1.1.0", "1.1.0", 0)
+
+
+@pytest.mark.parametrize("retry,requested", [
+    ("1.1.0", "1.1.0"), ("v1.1.0", "1.1.0"), ("1.1", "1.1")])
+def test_release_all_historical_retry_writes_nothing(proj, retry, requested):
+    """Release 1.1.0, then 1.2.0, retry 1.1.0 in mode 'all' with nothing
+    unreleased: a no-op that keeps current_version, never a rewind."""
+    _add(proj, "a")
+    release_entries(proj, "proj-a", "1.1.0")
+    _add(proj, "b")
+    release_entries(proj, "proj-a", "1.2.0")
+    before = _snapshot(proj)
+    out = release_entries(proj, "proj-a", retry)
+    assert _snapshot(proj) == before
+    assert out["released"] == 0
+    assert out["current_version"] == "1.2.0"
+    assert out["version"] == requested
+
+
+def test_release_all_never_released_lower_version_is_still_a_rewind(proj):
+    """Nothing unreleased + a LOWER version no entry carries is a rewind
+    attempt (a typo), not a historical retry."""
+    _add(proj, "a")
+    release_entries(proj, "proj-a", "1.2.0")
+    before = _snapshot(proj)
+    with pytest.raises(ValueError, match="lower than the current version"):
+        release_entries(proj, "proj-a", "1.1.5")
+    assert _snapshot(proj) == before
+
+
+def test_release_all_with_require_entries_refuses_an_implicit_version_only(proj):
+    """K-31: the CLI's consent rule — mode 'all' with nothing to stamp and a
+    NEW version would silently become a version-only release."""
+    before = _snapshot(proj)
+    with pytest.raises(ValueError, match="No unreleased entries"):
+        release_entries(proj, "proj-a", "1.1.0", require_entries=True)
+    assert _snapshot(proj) == before
+    # The no-op retry of the current version stays allowed under the flag.
+    assert release_entries(proj, "proj-a", "1.0.0", require_entries=True)["released"] == 0

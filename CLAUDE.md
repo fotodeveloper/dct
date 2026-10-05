@@ -67,7 +67,12 @@ dct/core/handoff.py      — Session handoffs (cross-session prompt ledger)
 dct/core/decisions.py    — ADR / sprint-amendment / open-question records
 dct/core/tags.py         — Global tag dictionary + item_tags links (similarity
                            guard, merge)
-dct/core/version.py      — Version bump + project-file autodetect
+dct/core/version.py      — Version contract (parse / normalize / compare / bump,
+                           X.Y | X.Y.Z, leading v dropped) + project-file autodetect
+dct/core/gitinfo.py      — Git readers (toplevel / branch / common dir) +
+                           resolve_checkout: same-repo checkout of a project
+                           (repo root vs project root)
+dct/core/records.py      — Shared STRICT project-row id validator
 dct/core/checkpoints.py  — Item checkpoint helpers
 dct/core/ids.py          — ULID generation
 dct/core/plans/          — Plans subsystem: parser.py (pure MD parser),

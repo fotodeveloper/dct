@@ -941,8 +941,6 @@ def cmd_pickup(args):
 # ── Changelog commands ────────────────────────────────────────────────────────
 
 def cmd_clog_add(args):
-    import os
-
     from dct.core.changelog import add_entry, resolve_branch_fields
 
     engine = _get_engine()
@@ -960,7 +958,7 @@ def cmd_clog_add(args):
         # caller's own → branch_source='client' either way.
         kwargs.update(resolve_branch_fields(
             engine, project_slug, branch=args.branch, worktree=args.worktree,
-            cwd=os.getcwd(), detected_source="client",
+            use_process_cwd=True, detected_source="client",
         ))
         e = add_entry(engine, project_slug, args.category, args.entry, **kwargs)
         where = f" @ {e['branch']}" if e.get("branch") else ""
@@ -1011,32 +1009,83 @@ def cmd_clog_count(args):
     print(count)
 
 
-def _release_checkout_root(project: dict) -> str | None:
-    """Root to run the version-sync script from: the CURRENT checkout's toplevel
-    when it lies inside the project path (a release from a linked worktree must
-    not write into the main checkout), else the registered project path."""
-    import os
+_VERSION_SYNC_SCRIPTS = ("scripts/dct-version-sync.sh", "scripts/version-sync.sh")
 
-    from dct.core.gitinfo import git_context
-    from dct.core.projects import _path_is_within
+
+def _release_project_root(project: dict) -> str | None:
+    """Directory the version-sync script is looked up in and RUN FROM (K-34).
+
+    - Registered path inside git: the caller's cwd must be a checkout of the
+      SAME repository (gitinfo.resolve_checkout — main checkout or any linked
+      worktree, never a nested foreign repo or a submodule); the result is
+      that checkout's `project_root` (a monorepo subproject maps to the same
+      subdirectory of the current worktree). Not a checkout, or the cwd no
+      longer exists → SystemExit(1) BEFORE anything is stamped: a mutating
+      release never silently switches to the main checkout.
+    - Registered path outside git: the registered path (legacy behaviour).
+    - No registered path: None (no version-sync).
+    """
+    from dct.core.gitinfo import git_toplevel, resolve_checkout
 
     path = project.get("path")
     if not path:
         return None
-    context = git_context(os.getcwd())
-    if context and _path_is_within(
-        os.path.realpath(context["worktree"]), os.path.realpath(path)
-    ):
-        return context["worktree"]
-    return path
+    if git_toplevel(path) is None:
+        return path
+    checkout = resolve_checkout(path)
+    if checkout is None:
+        print(
+            f"✗ The current directory is not a checkout of project '{project['slug']}' "
+            f"({path}) — run `dct clog release` from the project's main checkout or "
+            f"one of its linked worktrees; nothing released.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    return checkout["project_root"]
 
 
-def cmd_clog_release(args):
+def _run_version_sync(root: str, version: str) -> None:
+    """Run the first version-sync script found under `root`, from `root`.
+
+    A non-zero exit stops the CLI with that exit code (the DB release is
+    already recorded — re-running the same version resumes the sync).
+    """
     import os
     import subprocess
 
-    from dct.core.changelog import count_unreleased, release_entries
+    for sync_path in _VERSION_SYNC_SCRIPTS:
+        full_path = os.path.join(root, sync_path)
+        if not os.path.isfile(full_path):
+            continue
+        print(f"  Running {sync_path}...")
+        code = subprocess.run(["bash", full_path, version], cwd=root, check=False).returncode
+        if code != 0:
+            print(
+                f"✗ version-sync script failed (exit {code}): {sync_path} in {root}. "
+                f"The database release of {version} is recorded — fix the script and "
+                f"re-run `dct clog release {version}` to finish the sync.",
+                file=sys.stderr,
+            )
+            sys.exit(code)
+        return
+
+
+def cmd_clog_release(args):
+    """`dct clog release` — stamp entries (core release_entries), then sync files.
+
+    Checks that conflict with idempotency are left to core (K-31): a retry of
+    a released version is a no-op there. The only CLI-side consent rule is
+    `require_entries` — mode 'all' with nothing unreleased refuses unless the
+    call is a no-op; a version-only release needs `--no-entries`. The
+    checkout is verified BEFORE stamping (_release_project_root). Version-sync
+    runs only when the project's current_version equals the requested version
+    after the call — a real release, a version-only release, or an explicit
+    resume of the current version (released=0) — never for a historical no-op
+    (requested version != current_version).
+    """
+    from dct.core.changelog import release_entries
     from dct.core.projects import get_project
+    from dct.core.version import same_version
 
     engine = _get_engine()
     project_slug = args.project or _detect_project(engine)
@@ -1054,44 +1103,39 @@ def cmd_clog_release(args):
     if not project:
         print(f"✗ Project '{project_slug}' not found", file=sys.stderr)
         sys.exit(1)
-    if not args.version and not project.get("current_version"):
-        print(f"✗ No current version for '{project_slug}'. Use explicit version: dct clog release {project_slug} 0.1.0", file=sys.stderr)
-        sys.exit(1)
-
-    # The guard covers the SELECTED set: all unreleased entries (legacy) —
-    # an explicit --entries list is non-empty by construction and validated
-    # strictly by core; --no-entries is a deliberate version-only release.
-    if entry_ids is None and count_unreleased(engine, project_slug) == 0:
-        print(f"✗ No unreleased entries for '{project_slug}'", file=sys.stderr)
-        sys.exit(1)
+    root = _release_project_root(project)
 
     try:
         result = release_entries(
             engine, project_slug, args.version or None,
             bump_type=None if args.version else args.bump, entry_ids=entry_ids,
+            require_entries=entry_ids is None,
         )
     except Exception as e:
         print(f"✗ Error: {e}", file=sys.stderr)
         sys.exit(1)
 
-    version = result["version"]
+    version, current = result["version"], result["current_version"]
+    previous = project.get("current_version")
     if args.bump and not args.version:
-        print(f"  {project['current_version']} → {version} ({args.bump})")
-    print(f"✓ Released {result['released']} entries as {version} (mode: {result['mode']})")
+        print(f"  {previous} → {version} ({args.bump})")
+    if result["released"] or not same_version(previous, current):
+        print(f"✓ Released {result['released']} entries as {version} "
+              f"(mode: {result['mode']}) — current version: {current}")
+    else:
+        print(f"✓ {version} already released — nothing to stamp "
+              f"(mode: {result['mode']}); current version: {current}")
     if result["already_released"]:
         print(f"  already in {version}: {len(result['already_released'])} "
               f"({', '.join(f'#{i}' for i in result['already_released'])})")
     if result.get("warning"):
         print(f"  ⚠ {result['warning']}", file=sys.stderr)
 
-    root = _release_checkout_root(project)
+    if not same_version(current, version):
+        print(f"  version-sync skipped: {version} is not the current version ({current})")
+        return
     if root:
-        for sync_path in ["scripts/dct-version-sync.sh", "scripts/version-sync.sh"]:
-            full_path = os.path.join(root, sync_path)
-            if os.path.isfile(full_path):
-                print(f"  Running {sync_path}...")
-                subprocess.run(["bash", full_path, version], check=False)
-                break
+        _run_version_sync(root, version)
 
 
 def cmd_clog_update(args):
@@ -2126,8 +2170,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_clog_count.add_argument("--project", "-P")
     _add_branch_filters(p_clog_count)
 
-    p_clog_release = p_clog_sub.add_parser("release", help="Release: bump version and stamp changelog")
-    p_clog_release.add_argument("version", nargs="?")
+    p_clog_release = p_clog_sub.add_parser(
+        "release",
+        help="Release: bump version and stamp changelog (run from a checkout of the project)")
+    p_clog_release.add_argument(
+        "version", nargs="?", help="X.Y or X.Y.Z (a leading v is dropped)")
     p_clog_release.add_argument("--project", "-P")
     p_clog_bump = p_clog_release.add_mutually_exclusive_group()
     p_clog_bump.add_argument("--patch", dest="bump", action="store_const", const="patch")

@@ -175,8 +175,10 @@ def test_release_from_a_linked_worktree_runs_that_checkouts_sync_script(
 
 
 @needs_git
-def test_release_outside_the_project_runs_the_registered_path_script(
-        cli_engine, monkeypatch, tmp_path):
+def test_release_outside_the_project_checkout_is_refused_before_stamping(
+        cli_engine, monkeypatch, tmp_path, capsys):
+    """K-34/K-31: a mutating release never silently switches to the main
+    checkout when the caller is not in a checkout of the project's repo."""
     main = make_git_repo(tmp_path / "repo")
     _sync_script(Path(main))
     other = make_git_repo(tmp_path / "other")
@@ -185,9 +187,177 @@ def test_release_outside_the_project_runs_the_registered_path_script(
     add_entry(cli_engine, "proj-g", "added", "e")
 
     monkeypatch.chdir(other)
-    run_cli(monkeypatch, ["clog", "release", "-P", "proj-g", "1.1.0"])
-    assert (Path(main) / "synced-version").read_text().strip() == "1.1.0"
+    assert _exit_code(monkeypatch, ["clog", "release", "-P", "proj-g", "1.1.0"]) == 1
+    assert "not a checkout of project 'proj-g'" in capsys.readouterr().err
+    assert get_project(cli_engine, "proj-g")["current_version"] == "1.0.0"
+    assert all(r["version"] is None for r in _rows(cli_engine, "proj-g").values())
+    assert not (Path(main) / "synced-version").exists()
     assert not (Path(other) / "synced-version").exists()
+
+
+def _relative_sync_script(root: Path) -> None:
+    """A sync script that writes a RELATIVE file — it lands in the script's cwd."""
+    scripts = root / "scripts"
+    scripts.mkdir(parents=True, exist_ok=True)
+    (scripts / "dct-version-sync.sh").write_text('#!/bin/bash\necho "$1" > VERSION\n')
+
+
+@pytest.fixture
+def gitproj(cli_engine, tmp_path):
+    main = make_git_repo(tmp_path / "repo")
+    _relative_sync_script(Path(main))
+    create_project(cli_engine, slug="proj-g", name="G", path=main, current_version="1.0.0")
+    return cli_engine, Path(main)
+
+
+@needs_git
+def test_release_sync_script_runs_from_the_project_root_not_the_subdirectory(
+        gitproj, monkeypatch):
+    engine, main = gitproj
+    add_entry(engine, "proj-g", "added", "e")
+    sub = main / "src" / "deep"
+    sub.mkdir(parents=True)
+    monkeypatch.chdir(sub)
+    run_cli(monkeypatch, ["clog", "release", "-P", "proj-g", "1.1.0"])
+    assert (main / "VERSION").read_text().strip() == "1.1.0"
+    assert not (sub / "VERSION").exists()
+
+
+@needs_git
+def test_release_historical_retry_leaves_version_files_untouched(
+        gitproj, monkeypatch, capsys):
+    engine, main = gitproj
+    monkeypatch.chdir(main)
+    add_entry(engine, "proj-g", "added", "a")
+    run_cli(monkeypatch, ["clog", "release", "-P", "proj-g", "1.1.0"])
+    add_entry(engine, "proj-g", "added", "b")
+    run_cli(monkeypatch, ["clog", "release", "-P", "proj-g", "1.2.0"])
+    assert (main / "VERSION").read_text().strip() == "1.2.0"
+    capsys.readouterr()
+
+    run_cli(monkeypatch, ["clog", "release", "-P", "proj-g", "1.1.0"])  # exits 0
+    out = capsys.readouterr().out
+    assert "1.1.0 already released" in out
+    assert "current version: 1.2.0" in out
+    assert "version-sync skipped" in out
+    assert (main / "VERSION").read_text().strip() == "1.2.0"
+    assert get_project(engine, "proj-g")["current_version"] == "1.2.0"
+
+
+@needs_git
+def test_release_resume_of_the_current_version_reruns_the_sync(gitproj, monkeypatch, capsys):
+    """A crash after the DB stamp: re-running the CURRENT version with nothing
+    left to stamp (released=0) must still finish the version-sync step."""
+    engine, main = gitproj
+    add_entry(engine, "proj-g", "added", "a")
+    release_entries(engine, "proj-g", "1.1.0")  # DB done, files never synced
+    monkeypatch.chdir(main)
+    run_cli(monkeypatch, ["clog", "release", "-P", "proj-g", "1.1.0"])
+    out = capsys.readouterr().out
+    assert "1.1.0 already released" in out
+    assert "Running scripts/dct-version-sync.sh" in out
+    assert (main / "VERSION").read_text().strip() == "1.1.0"
+
+
+@needs_git
+def test_release_version_only_runs_the_sync(gitproj, monkeypatch, capsys):
+    _, main = gitproj
+    monkeypatch.chdir(main)
+    run_cli(monkeypatch, ["clog", "release", "-P", "proj-g", "--minor", "--no-entries"])
+    out = capsys.readouterr().out
+    assert "Released 0 entries as 1.1.0 (mode: version_only)" in out
+    assert (main / "VERSION").read_text().strip() == "1.1.0"
+
+
+@needs_git
+def test_release_failing_sync_script_exits_nonzero(cli_engine, monkeypatch, tmp_path, capsys):
+    main = Path(make_git_repo(tmp_path / "repo"))
+    (main / "scripts").mkdir()
+    (main / "scripts" / "dct-version-sync.sh").write_text("#!/bin/bash\nexit 3\n")
+    create_project(cli_engine, slug="proj-g", name="G", path=str(main), current_version="1.0.0")
+    add_entry(cli_engine, "proj-g", "added", "a")
+    monkeypatch.chdir(main)
+    assert _exit_code(monkeypatch, ["clog", "release", "-P", "proj-g", "1.1.0"]) == 3
+    err = capsys.readouterr().err
+    assert "version-sync script failed (exit 3)" in err
+    assert "re-run" in err
+
+
+@needs_git
+@pytest.mark.parametrize("kind", ["nested", "submodule"])
+def test_release_from_a_nested_repo_or_submodule_is_refused(
+        gitproj, monkeypatch, tmp_path, capsys, kind):
+    engine, main = gitproj
+    add_entry(engine, "proj-g", "added", "a")
+    if kind == "nested":
+        inner = Path(make_git_repo(main / "vendor" / "lib"))
+    else:
+        lib = make_git_repo(tmp_path / "lib")
+        git(main, "-c", "protocol.file.allow=always", "submodule", "add", "-q", lib, "sub")
+        inner = main / "sub"
+    _relative_sync_script(inner)
+    monkeypatch.chdir(inner)
+    assert _exit_code(monkeypatch, ["clog", "release", "-P", "proj-g", "1.1.0"]) == 1
+    assert "not a checkout" in capsys.readouterr().err
+    assert not (inner / "VERSION").exists()
+    assert not (main / "VERSION").exists()
+    assert get_project(engine, "proj-g")["current_version"] == "1.0.0"
+
+
+@needs_git
+def test_release_monorepo_subproject_syncs_in_the_worktree_subdirectory(
+        cli_engine, monkeypatch, tmp_path):
+    main = Path(make_git_repo(tmp_path / "mono"))
+    _relative_sync_script(main / "packages" / "app")
+    git(main, "add", ".")
+    git(main, "commit", "-q", "-m", "app")
+    linked = tmp_path / "wt-mono"
+    git(main, "worktree", "add", "-q", "-b", "feat/app", str(linked))
+    create_project(cli_engine, slug="proj-m", name="M",
+                   path=str(main / "packages" / "app"), current_version="1.0.0")
+    add_entry(cli_engine, "proj-m", "added", "a")
+    monkeypatch.chdir(linked)
+    run_cli(monkeypatch, ["clog", "release", "-P", "proj-m", "1.1.0"])
+    assert (linked / "packages" / "app" / "VERSION").read_text().strip() == "1.1.0"
+    assert not (main / "packages" / "app" / "VERSION").exists()
+    assert not (linked / "VERSION").exists()
+
+
+@needs_git
+def test_release_from_a_deleted_cwd_is_refused(gitproj, monkeypatch, capsys):
+    import os
+
+    engine, main = gitproj
+    add_entry(engine, "proj-g", "added", "a")
+    gone = main / "gone"
+    gone.mkdir()
+    monkeypatch.chdir(gone)
+    os.rmdir(gone)
+    assert _exit_code(monkeypatch, ["clog", "release", "-P", "proj-g", "1.1.0"]) == 1
+    assert "not a checkout" in capsys.readouterr().err
+    assert get_project(engine, "proj-g")["current_version"] == "1.0.0"
+    assert not (main / "VERSION").exists()
+
+
+def test_release_project_path_outside_git_keeps_the_registered_path(
+        cli_engine, monkeypatch, tmp_path):
+    plain = tmp_path / "plain"
+    _relative_sync_script(plain)
+    create_project(cli_engine, slug="proj-p", name="P", path=str(plain), current_version="1.0.0")
+    add_entry(cli_engine, "proj-p", "added", "a")
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    monkeypatch.chdir(elsewhere)
+    run_cli(monkeypatch, ["clog", "release", "-P", "proj-p", "1.1.0"])
+    assert (plain / "VERSION").read_text().strip() == "1.1.0"
+    assert not (elsewhere / "VERSION").exists()
+
+
+def test_release_v_prefixed_version_is_reported_normalized(versioned, monkeypatch, capsys):
+    engine, _ = versioned
+    run_cli(monkeypatch, ["clog", "release", "-P", "proj-v", "v1.1.0"])
+    assert "as 1.1.0" in capsys.readouterr().out
+    assert get_project(engine, "proj-v")["current_version"] == "1.1.0"
 
 
 # ── clog update / delete ──────────────────────────────────────────────────────

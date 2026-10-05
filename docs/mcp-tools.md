@@ -49,7 +49,11 @@ Project registration, rename, version, and changelog-location changes are **CLI-
 
 Entries carry the git `branch` / `worktree` they were written on (`branch_source`
 = `client` when the caller supplied them, `server` when the MCP server detected
-them in its own cwd; null = unknown).
+them in its own cwd; null = unknown). Detection keeps a cwd only when it is a
+checkout of the SAME git repository as the project's registered path (same git
+common dir — main checkout or any linked worktree, never a nested foreign repo
+or a submodule); `worktree` is that checkout's toplevel. It does not identify
+the project of a worktree outside the registered path — pass `project`.
 
 | Tool | Purpose |
 |---|---|

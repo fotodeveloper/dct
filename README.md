@@ -285,7 +285,7 @@ dct clog add added "New Python parser support" --project myproj
 dct clog list --project myproj --unreleased
 dct clog count --project myproj       # Used by hooks
 dct clog count --branch feat/x --include-unbranched   # This branch + unbranched
-dct clog release 1.1 --project myproj # Stamp unreleased → 1.1
+dct clog release 1.1 --project myproj # Stamp unreleased → 1.1 (run from a checkout of the project)
 dct clog release --patch --entries 12,15              # Stamp only these entries
 dct clog update 12 --branch feat/x    # Amend an unreleased entry
 dct clog delete 12                    # Soft-delete an unreleased entry

@@ -33,6 +33,7 @@ import sqlalchemy as sa
 
 from dct.core.items import TERMINAL_STATUSES, _item_to_dict, _membership_count_exprs
 from dct.core.projects import resolve_project_id
+from dct.core.records import validate_project_rows
 from dct.core.tags import tags_for_items_conn
 from dct.db import item_sprints, items, project_transaction, row_to_dict, sprints
 
@@ -558,45 +559,11 @@ def ensure_current_sprint(
         return _ensure_current_sprint_conn(conn, project_id, name)
 
 
-def _validate_project_rows_conn(
-    conn: sa.Connection,
-    table: sa.Table,
-    project_id: int,
-    ids: list[int],
-    noun: str,
-    consequence: str = "nothing changed.",
-) -> set[int]:
-    """STRICT id validation for any project-scoped ledger table (K-8, #413).
-
-    Return the set of ids that are live rows of `table` in this project; raise
-    ValueError "Unknown <noun> id(s) for this project: [...] — <consequence>"
-    listing any that are not (foreign, unknown, soft-deleted). `table` must
-    carry `project_id` and `deleted_at` columns.
-    """
-    if not ids:
-        return set()
-    valid = set(
-        conn.execute(
-            sa.select(table.c.id).where(
-                table.c.project_id == project_id,
-                table.c.id.in_(ids),
-                table.c.deleted_at.is_(None),
-            )
-        ).scalars()
-    )
-    unknown = set(ids) - valid
-    if unknown:
-        raise ValueError(
-            f"Unknown {noun} id(s) for this project: {sorted(unknown)} — {consequence}"
-        )
-    return valid
-
-
 def _validate_project_items_conn(
     conn: sa.Connection, project_id: int, ids: list[int]
 ) -> set[int]:
     """STRICT item-id validation for sprint membership writes (K-8, #413)."""
-    return _validate_project_rows_conn(
+    return validate_project_rows(
         conn, items, project_id, ids, "item",
         "sprint membership unchanged. Pass only live items of the project.",
     )
