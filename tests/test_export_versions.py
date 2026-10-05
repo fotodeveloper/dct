@@ -21,7 +21,7 @@ from conftest import run_cli
 
 from dct.core.changelog import add_entry, list_entries, release_entries
 from dct.core.projects import create_project, get_project
-from dct.core.releases import get_release
+from dct.core.releases import get_release, set_version_files
 from dct.db import changelog_entries
 from dct.export import export_changelog_md
 
@@ -101,6 +101,7 @@ def test_v_prefixed_release_flow_core_cli_export(cli_engine, tmp_path, monkeypat
     (tmp_path / "plain").mkdir()
     create_project(engine, slug="proj-v", name="V", path=str(tmp_path / "plain"),
                    current_version="1.5.0")
+    set_version_files(engine, "proj-v", [], confirm=True)  # confirmed: no version files
     a = add_entry(engine, "proj-v", "added", "shipped in 1.6")["id"]
     # A legacy row of the SAME version in yet another spelling (pre-contract).
     legacy = add_entry(engine, "proj-v", "fixed", "legacy v-spelled row")["id"]

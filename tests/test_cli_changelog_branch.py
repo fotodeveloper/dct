@@ -17,6 +17,7 @@ from conftest import (
 
 from dct.core.changelog import add_entry, list_entries, release_entries
 from dct.core.projects import create_project, get_project
+from dct.core.releases import get_release, set_version_files
 
 
 def _plain(tmp_path) -> str:
@@ -108,6 +109,9 @@ def test_list_branch_filter_and_branch_column(mixed, monkeypatch, capsys):
 def versioned(cli_engine, tmp_path):
     create_project(cli_engine, slug="proj-v", name="V", path=_plain(tmp_path),
                    current_version="1.0.0")
+    # K-76 / D4: no version-sync script — the confirmed contract is "no
+    # version files", so the alias auto-approves the (empty) proposal.
+    set_version_files(cli_engine, "proj-v", [], confirm=True)
     ids = [add_entry(cli_engine, "proj-v", "added", f"e{i}")["id"] for i in range(3)]
     return cli_engine, ids
 
@@ -127,6 +131,7 @@ def test_release_no_entries_is_version_only_even_with_nothing_unreleased(
         cli_engine, tmp_path, monkeypatch, capsys):
     create_project(cli_engine, slug="proj-v", name="V", path=_plain(tmp_path),
                    current_version="1.0.0")
+    set_version_files(cli_engine, "proj-v", [], confirm=True)  # confirmed: no version files
     run_cli(monkeypatch, ["clog", "release", "-P", "proj-v", "--minor", "--no-entries"])
     assert "mode: version_only" in capsys.readouterr().out
     assert get_project(cli_engine, "proj-v")["current_version"] == "1.1.0"
@@ -177,18 +182,29 @@ def _sync_script(checkout: Path) -> None:
 
 @needs_git
 def test_release_from_a_linked_worktree_runs_that_checkouts_sync_script(
-        cli_engine, monkeypatch, tmp_path, git_identity):
+        cli_engine, monkeypatch, tmp_path, capsys, git_identity):
+    """The CANDIDATE's script (the linked worktree's commit) runs — isolated
+    (K-76); the first release shows the proposal and is approved by its
+    digest; the approved file lands in THAT checkout only."""
+    import json
+
     main = make_git_repo(tmp_path / "repo")
     linked = tmp_path / "repo" / ".worktrees" / "wt"
     git(main, "worktree", "add", "-q", "-b", "feat/wt", str(linked))
-    _sync_script(Path(main))
     _sync_script(linked)
+    git(linked, "add", "scripts")
+    git(linked, "commit", "-q", "-m", "chore: sync script")
     create_project(cli_engine, slug="proj-g", name="G", path=main, current_version="1.0.0")
     eid = add_entry(cli_engine, "proj-g", "added", "e")["id"]
     git_commit_proving(linked, eid)
 
     monkeypatch.chdir(linked)
-    run_cli(monkeypatch, ["clog", "release", "--patch", "--confirm-version-files"])
+    assert _exit_code(monkeypatch, ["clog", "release", "--patch", "--json"]) == 1
+    refused = json.loads(capsys.readouterr().out)["details"]
+    assert refused["proposal"]["paths"] == ["synced-version"]
+    assert not (linked / "synced-version").exists()  # the sync ran isolated
+    run_cli(monkeypatch, ["clog", "release", "--patch", "--proposal-digest",
+                          refused["proposal_sha256"]])
     assert (linked / "synced-version").read_text().strip() == "1.0.1"
     assert not (Path(main) / "synced-version").exists()
     assert git(linked, "show", "--name-only", "--format=", "HEAD").split() == [
@@ -225,9 +241,14 @@ def _relative_sync_script(root: Path) -> None:
 
 @pytest.fixture
 def gitproj(cli_engine, tmp_path):
+    """A repo with a COMMITTED relative sync script (the candidate's script
+    runs, K-76) and the confirmed contract ["VERSION"]."""
     main = make_git_repo(tmp_path / "repo")
     _relative_sync_script(Path(main))
+    git(main, "add", "scripts")
+    git(main, "commit", "-q", "-m", "chore: sync script")
     create_project(cli_engine, slug="proj-g", name="G", path=main, current_version="1.0.0")
+    set_version_files(cli_engine, "proj-g", ["VERSION"], confirm=True)
     return cli_engine, Path(main)
 
 
@@ -239,8 +260,7 @@ def test_release_sync_script_runs_from_the_project_root_not_the_subdirectory(
     sub = main / "src" / "deep"
     sub.mkdir(parents=True)
     monkeypatch.chdir(sub)
-    run_cli(monkeypatch, ["clog", "release", "-P", "proj-g", "1.1.0",
-                          "--confirm-version-files"])
+    run_cli(monkeypatch, ["clog", "release", "-P", "proj-g", "1.1.0"])
     assert (main / "VERSION").read_text().strip() == "1.1.0"
     assert not (sub / "VERSION").exists()
 
@@ -251,8 +271,7 @@ def test_release_historical_retry_leaves_version_files_untouched(
     engine, main = gitproj
     monkeypatch.chdir(main)
     git_commit_proving(main, add_entry(engine, "proj-g", "added", "a")["id"])
-    run_cli(monkeypatch, ["clog", "release", "-P", "proj-g", "1.1.0",
-                          "--confirm-version-files"])
+    run_cli(monkeypatch, ["clog", "release", "-P", "proj-g", "1.1.0"])
     git_commit_proving(main, add_entry(engine, "proj-g", "added", "b")["id"])
     run_cli(monkeypatch, ["clog", "release", "-P", "proj-g", "1.2.0"])
     assert (main / "VERSION").read_text().strip() == "1.2.0"
@@ -271,29 +290,31 @@ def test_release_historical_retry_leaves_version_files_untouched(
 
 
 @needs_git
-def test_release_resume_of_the_current_version_reruns_the_sync(
+def test_release_resume_of_a_record_without_an_approved_proposal_is_refused(
         gitproj, monkeypatch, capsys, git_identity):
-    """A crash after the DB stamp: `release resume` of the CURRENT version
-    with nothing left to stamp (released=0) still finishes the sync."""
+    """K-76: a record stamped outside the effects layer (here core
+    release_entries; e.g. MCP release_changelog) carries no approved
+    proposal — `release resume` never runs the sync after the stamp, so it
+    refuses and writes nothing (abandon it)."""
     engine, main = gitproj
-    git(main, "add", "scripts")  # without a recorded untracked baseline every
-    git(main, "commit", "-q", "-m", "chore: sync script")  # untracked file counts
     git_commit_proving(main, add_entry(engine, "proj-g", "added", "a")["id"])
     release_entries(engine, "proj-g", "1.1.0", candidate_sha=git(main, "rev-parse", "HEAD"),
-                    checkout_root=str(main))  # DB done, files never synced
+                    checkout_root=str(main))  # DB done, files never written
     monkeypatch.chdir(main)
-    run_cli(monkeypatch, ["release", "resume", "-P", "proj-g", "--confirm-version-files"])
-    out = capsys.readouterr().out
-    assert "sync: done (script=scripts/dct-version-sync.sh)" in out
-    assert (main / "VERSION").read_text().strip() == "1.1.0"
+    assert _exit_code(monkeypatch, ["release", "resume", "-P", "proj-g"]) == 1
+    assert "no approved version-file proposal" in capsys.readouterr().err
+    assert not (main / "VERSION").exists()
+    assert get_release(engine, "proj-g", "1.1.0")["status"] == "stamped"
+    assert _exit_code(monkeypatch, ["release", "resume", "-P", "proj-g",
+                                    "--confirm-version-files"]) == 1
+    assert "dct release prepare" in capsys.readouterr().err  # the removed flag refuses
 
 
 @needs_git
 def test_release_version_only_runs_the_sync(gitproj, monkeypatch, capsys, git_identity):
     _, main = gitproj
     monkeypatch.chdir(main)
-    run_cli(monkeypatch, ["clog", "release", "-P", "proj-g", "--minor", "--no-entries",
-                          "--confirm-version-files"])
+    run_cli(monkeypatch, ["clog", "release", "-P", "proj-g", "--minor", "--no-entries"])
     out = capsys.readouterr().out
     assert "Released 0 entries as 1.1.0 (mode: version_only)" in out
     assert (main / "VERSION").read_text().strip() == "1.1.0"
@@ -305,13 +326,16 @@ def test_release_failing_sync_script_exits_nonzero(
     main = Path(make_git_repo(tmp_path / "repo"))
     (main / "scripts").mkdir()
     (main / "scripts" / "dct-version-sync.sh").write_text("#!/bin/bash\nexit 3\n")
+    git(main, "add", "scripts")
+    git(main, "commit", "-q", "-m", "chore: broken sync")
     create_project(cli_engine, slug="proj-g", name="G", path=str(main), current_version="1.0.0")
     git_commit_proving(main, add_entry(cli_engine, "proj-g", "added", "a")["id"])
     monkeypatch.chdir(main)
     assert _exit_code(monkeypatch, ["clog", "release", "-P", "proj-g", "1.1.0"]) == 3
     err = capsys.readouterr().err
     assert "version-sync script failed (exit 3)" in err
-    assert "dct release resume" in err
+    assert "dct release prepare" in err  # nothing stamped: prepare again
+    assert get_release(cli_engine, "proj-g", "1.1.0") is None
 
 
 @needs_git
@@ -346,10 +370,10 @@ def test_release_monorepo_subproject_syncs_in_the_worktree_subdirectory(
     git(main, "worktree", "add", "-q", "-b", "feat/app", str(linked))
     create_project(cli_engine, slug="proj-m", name="M",
                    path=str(main / "packages" / "app"), current_version="1.0.0")
+    set_version_files(cli_engine, "proj-m", ["packages/app/VERSION"], confirm=True)
     git_commit_proving(linked, add_entry(cli_engine, "proj-m", "added", "a")["id"])
     monkeypatch.chdir(linked)
-    run_cli(monkeypatch, ["clog", "release", "-P", "proj-m", "1.1.0",
-                          "--confirm-version-files"])
+    run_cli(monkeypatch, ["clog", "release", "-P", "proj-m", "1.1.0"])
     assert (linked / "packages" / "app" / "VERSION").read_text().strip() == "1.1.0"
     assert not (main / "packages" / "app" / "VERSION").exists()
     assert not (linked / "VERSION").exists()
@@ -377,6 +401,8 @@ def test_release_project_path_outside_git_keeps_the_registered_path(
     plain = tmp_path / "plain"
     _relative_sync_script(plain)
     create_project(cli_engine, slug="proj-p", name="P", path=str(plain), current_version="1.0.0")
+    # D5: outside git the version-file set is a CONFIRMED contract.
+    set_version_files(cli_engine, "proj-p", ["VERSION"], confirm=True)
     add_entry(cli_engine, "proj-p", "added", "a")
     elsewhere = tmp_path / "elsewhere"
     elsewhere.mkdir()

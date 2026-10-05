@@ -1156,10 +1156,26 @@ def _run_effects(action: str, project_slug: str, as_json: bool, call) -> dict:
     sys.exit(code)
 
 
+REMOVED_CONFIRM_VERSION_FILES = (
+    "--confirm-version-files was removed (K-76): the version-file set is no longer "
+    "confirmed after the stamp. Run `dct release prepare --version V (--entries … | "
+    "--no-entries) --plan-digest D`, review the proposed files and pass its "
+    "proposal_sha256 as --proposal-digest; nothing released.")
+
+
+def _refuse_removed_flag(args) -> None:
+    """The removed --confirm-version-files (kept as a hidden, refusing flag so
+    an old invocation gets the new procedure instead of a usage error)."""
+    if getattr(args, "confirm_version_files", False):
+        print(f"✗ {REMOVED_CONFIRM_VERSION_FILES}", file=sys.stderr)
+        sys.exit(1)
+
+
 def _apply_from_args(args, *, strict: bool) -> None:
     """`dct release apply` and its alias `dct clog release` (strict)."""
     from dct.workflows.release.effects import apply_release
 
+    _refuse_removed_flag(args)
     engine = _get_engine()
     project_slug = args.project or _detect_project(engine)
     version = getattr(args, "version", None) or None
@@ -1171,9 +1187,9 @@ def _apply_from_args(args, *, strict: bool) -> None:
     out = _run_effects("apply", project_slug, as_json, lambda: apply_release(
         engine, project_slug, version=version, bump_type=None if version else args.bump,
         entry_ids=entry_ids, no_entries=args.no_entries,
-        confirm=True if strict else args.confirm,
-        confirm_version_files=args.confirm_version_files, strict=strict,
-        plan_digest=None if strict else args.plan_digest))
+        confirm=True if strict else args.confirm, strict=strict,
+        plan_digest=None if strict else args.plan_digest,
+        proposal_digest=args.proposal_digest))
     if as_json:
         return
     details = out["details"]
@@ -1192,26 +1208,73 @@ def cmd_clog_release(args):
     """`dct clog release` — an alias of `dct release apply` (K-72).
 
     Flags map 1:1 (version or --patch/--minor/--major, --entries /
-    --no-entries, --confirm-version-files); running the command is the
+    --no-entries, --proposal-digest); running the command is the
     confirmation. Decisions that need the owner are REFUSED instead of
     guessed: unproven entries (no --entries = every unreleased entry, all
     of which must be proven), a proof range that does not start at
-    v<current_version>, the first release's version-file set without
-    --confirm-version-files. No --plan-digest: the plan is derived inside
-    the call for the candidate it pins, and the stamp is bound to it the
-    same way (K-80/K-81). Effects, order and verification: see
+    v<current_version>, a version-file proposal that is not the confirmed
+    contract (a first release, a contract change — K-76: the alias
+    prepares inside the call and shows the proposal; approve it with
+    --proposal-digest). No --plan-digest: the plan is derived inside the
+    call for the candidate it pins, and the stamp is bound to it the same
+    way (K-80/K-81). Effects, order and verification: see
     dct.workflows.release.effects.
     """
     _apply_from_args(args, strict=True)
 
 
 def cmd_release_apply(args):
-    """`dct release apply` — one release from the APPROVED plan (effects
-    layer, K-80): --plan-digest is the snapshot_digest of `dct release plan`
-    with the same version and selection; the plan is re-derived for the
-    candidate apply pins and a different snapshot is refused before any
-    write."""
+    """`dct release apply` — one release from the APPROVED plan and the
+    APPROVED proposal (effects layer, K-80 / K-76): --plan-digest is the
+    snapshot_digest of `dct release plan` with the same version and
+    selection; the plan is re-derived for the candidate apply pins and a
+    different snapshot is refused before any write. --proposal-digest is the
+    proposal_sha256 of `dct release prepare` (required for a new release)."""
     _apply_from_args(args, strict=False)
+
+
+def cmd_release_prepare(args):
+    """`dct release prepare` — the PREPARE stage before the stamp (K-76):
+    the version-sync script runs once, isolated (a temporary worktree of
+    the pinned candidate, or a copy of a project outside git), and its
+    result is stored as the project's pending version-file proposal for the
+    owner to approve (`apply --proposal-digest`). Nothing is stamped."""
+    from dct.workflows.release.effects import prepare_release
+
+    engine = _get_engine()
+    project_slug = args.project or _detect_project(engine)
+    version = args.version or None
+    if not version and not args.bump:
+        print("✗ Provide a version or --patch/--minor/--major", file=sys.stderr)
+        sys.exit(1)
+    entry_ids = None if args.no_entries else _release_ids(args.entries)
+    out = _run_effects("prepare", project_slug, args.json, lambda: prepare_release(
+        engine, project_slug, version=version, bump_type=None if version else args.bump,
+        entry_ids=entry_ids, no_entries=args.no_entries, plan_digest=args.plan_digest))
+    if args.json:
+        return
+    details = out["details"]
+    contract = details["contract"]
+    proposal = details["proposal"]
+    print(f"✓ Prepared {out['version']} — version files: "
+          f"{', '.join(proposal['paths']) or '(none)'}")
+    if contract["change"]:
+        print(f"  contract: {contract['confirmed'] if contract['confirmed'] is not None else '(not learned yet)'}"
+              f" → {contract['proposed']} — approving the proposal records it")
+    for check in details["checks"]:
+        extra = check.get("value") or f"{check.get('changed_lines')} changed line(s)"
+        print(f"  {check['path']}: {check['check']} ({extra})")
+    sync = details["sync"]
+    if sync and sync["output"]:
+        dropped = sync["output_dropped_bytes"]
+        print(f"  sync output ({sync['output_bytes']} bytes"
+              f"{f', {dropped} dropped' if dropped else ''}):")
+        for line in sync["output"].splitlines():
+            print(f"    {line}")
+    print(f"  proposal digest {details['proposal_sha256']}")
+    print(f"  next: dct release apply --version {out['version']} … --plan-digest "
+          f"{details['plan_digest']} --proposal-digest {details['proposal_sha256']} --confirm")
+    _print_effects(out)
 
 
 def cmd_release_resume(args):
@@ -1220,8 +1283,9 @@ def cmd_release_resume(args):
 
     engine = _get_engine()
     project_slug = args.project or _detect_project(engine)
+    _refuse_removed_flag(args)
     out = _run_effects("resume", project_slug, args.json, lambda: resume_release(
-        engine, project_slug, confirm_version_files=args.confirm_version_files))
+        engine, project_slug))
     if args.json:
         return
     if out["outcome"] == "noop":
@@ -1499,6 +1563,10 @@ def cmd_release_plan(args):
         selected = plan["snapshot"]["selected_ids"]
         print(f"Snapshot: {', '.join(f'#{i}' for i in selected) or '(version-only)'} → "
               f"{plan['version']['target'] or '-'}; plan digest {plan['snapshot_digest']}")
+        print(f"Next: dct release prepare --version {plan['version']['target'] or 'V'} "
+              f"{'--entries ' + ','.join(map(str, selected)) if selected else '--no-entries'} "
+              f"--plan-digest {plan['snapshot_digest']} — runs the version sync isolated and "
+              f"shows the version files for approval (K-76)")
     for warning in plan["warnings"]:
         print(f"  ⚠ {warning}", file=sys.stderr)
 
@@ -2600,7 +2668,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_clog_release = p_clog_sub.add_parser(
         "release",
-        help="Release (alias of `release apply`): stamp, changelog, sync, commit, tag")
+        help="Release (alias of `release prepare` + `release apply`): isolated sync, stamp, "
+             "changelog, version files, commit, tag")
     p_clog_release.add_argument(
         "version", nargs="?", help="X.Y or X.Y.Z (a leading v is dropped)")
     p_clog_release.add_argument("--project", "-P")
@@ -2615,15 +2684,19 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-entries", action="store_true",
         help="Version-only release: stamp no entries, only set the version")
     p_clog_release.add_argument(
-        "--confirm-version-files", action="store_true",
-        help="First release: confirm the files the version sync changed as the "
-             "project's version-file contract")
+        "--proposal-digest",
+        help="The proposal_sha256 of `dct release prepare` (or of this command's own "
+             "refusal) — approves that version-file proposal")
+    p_clog_release.add_argument(
+        "--confirm-version-files", action="store_true", help=argparse.SUPPRESS)
+    p_clog_release.add_argument("--json", action="store_true", help="Stable JSON document")
     p_clog_release.epilog = (
-        "Alias of `dct release apply` (running it is the confirmation): stamp, "
-        "changelog file, version sync, release commit and tag, each verified. "
-        "Refuses — instead of guessing — when the owner must decide: entries "
-        "without proof, a proof range not starting at v<current_version>, the "
-        "first release's version files without --confirm-version-files.")
+        "Alias of `dct release prepare` + `dct release apply` (running it is the "
+        "confirmation): the version sync runs isolated, then stamp, changelog file, the "
+        "approved version files, release commit and tag, each verified. Refuses — instead "
+        "of guessing — when the owner must decide: entries without proof, a proof range not "
+        "starting at v<current_version>, version files that are not the confirmed contract "
+        "(a first release or a change: approve the shown proposal with --proposal-digest).")
 
     p_clog_rstatus = p_clog_sub.add_parser(
         "release-status",
@@ -2685,10 +2758,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_clog_export.add_argument("--output", "-o")
 
     # release (the release workflow, K-72): plan = layer 1 (read-only proof),
-    # attest / apply / resume / abandon / reconstruct = layer 3 (effects)
+    # attest / prepare / apply / resume / abandon / reconstruct = layer 3 (effects)
     p_release = sub.add_parser(
-        "release", help="Release workflow: plan (read-only), attest, apply, resume, abandon, "
-                        "reconstruct, status")
+        "release", help="Release workflow: plan (read-only), attest, prepare, apply, resume, "
+                        "abandon, reconstruct, status")
     p_release_sub = p_release.add_subparsers(dest="release_command")
     p_rel_plan = p_release_sub.add_parser(
         "plan", help="Show the release plan of the current checkout — no side effects")
@@ -2721,7 +2794,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_rel_attest.add_argument("--json", action="store_true", help="Stable JSON document")
 
     p_rel_apply = p_release_sub.add_parser(
-        "apply", help="Release: stamp, changelog file, version sync, commit, tag (verified)")
+        "apply", help="Release: stamp, changelog file, the approved version files, commit, "
+                      "tag (verified)")
     p_rel_apply.add_argument("--project", "-P")
     p_rel_apply_v = p_rel_apply.add_mutually_exclusive_group()
     p_rel_apply_v.add_argument("--version", help="Target version (X.Y or X.Y.Z)")
@@ -2739,17 +2813,45 @@ def build_parser() -> argparse.ArgumentParser:
         help="Required: the snapshot_digest of the approved `dct release plan --version V "
              "--entries … --json` (the release is refused when the re-derived plan differs)")
     p_rel_apply.add_argument(
-        "--confirm-version-files", action="store_true",
-        help="First release: confirm the files the version sync changed as the "
-             "project's version-file contract")
+        "--proposal-digest",
+        help="Required for a new release: the proposal_sha256 of the approved `dct release "
+             "prepare` (same version, selection and plan digest)")
+    p_rel_apply.add_argument(
+        "--confirm-version-files", action="store_true", help=argparse.SUPPRESS)
     p_rel_apply.add_argument("--json", action="store_true", help="Stable JSON document")
+
+    p_rel_prepare = p_release_sub.add_parser(
+        "prepare", help="Run the version sync isolated and store the version-file proposal "
+                        "for approval (before the stamp; nothing stamped)")
+    p_rel_prepare.add_argument("--project", "-P")
+    p_rel_prepare_v = p_rel_prepare.add_mutually_exclusive_group()
+    p_rel_prepare_v.add_argument("--version", help="Target version (X.Y or X.Y.Z)")
+    p_rel_prepare_v.add_argument("--patch", dest="bump", action="store_const", const="patch")
+    p_rel_prepare_v.add_argument("--minor", dest="bump", action="store_const", const="minor")
+    p_rel_prepare_v.add_argument("--major", dest="bump", action="store_const", const="major")
+    p_rel_prepare_sel = p_rel_prepare.add_mutually_exclusive_group(required=True)
+    p_rel_prepare_sel.add_argument(
+        "--entries", help="Comma-separated entry ids — each proven by the plan")
+    p_rel_prepare_sel.add_argument(
+        "--no-entries", action="store_true", help="Version-only release")
+    p_rel_prepare.add_argument(
+        "--plan-digest", required=True,
+        help="Required: the snapshot_digest of the approved `dct release plan` (same version "
+             "and selection)")
+    p_rel_prepare.add_argument("--json", action="store_true", help="Stable JSON document")
+    p_rel_prepare.epilog = (
+        "Effects: runs scripts/dct-version-sync.sh (or scripts/version-sync.sh) of the "
+        "candidate ONCE with V in a temporary detached worktree (a project outside git: in a "
+        "temporary copy of its directory) — never in your checkout, which is verified "
+        "unchanged afterwards; writes the expected blobs into the repository's object "
+        "database (outside git: dct's release blob store) and the pending proposal into the "
+        "database. Nothing is stamped, committed or tagged.")
 
     p_rel_resume = p_release_sub.add_parser(
         "resume", help="Finish the unfinished release (verifies every effect first)")
     p_rel_resume.add_argument("--project", "-P")
     p_rel_resume.add_argument(
-        "--confirm-version-files", action="store_true",
-        help="First release: confirm the files the version sync changed")
+        "--confirm-version-files", action="store_true", help=argparse.SUPPRESS)
     p_rel_resume.add_argument("--json", action="store_true", help="Stable JSON document")
 
     p_rel_abandon = p_release_sub.add_parser(
@@ -3051,6 +3153,7 @@ RELEASE_COMMAND_MAP = {
     "status": cmd_clog_release_status,
     "attest": cmd_release_attest,
     "apply": cmd_release_apply,
+    "prepare": cmd_release_prepare,
     "resume": cmd_release_resume,
     "abandon": cmd_release_abandon,
     "reconstruct": cmd_release_reconstruct,

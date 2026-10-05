@@ -9,8 +9,8 @@ The release workflow is layered (K-72):
    effects.
 2. **Ledger layer** — core / MCP: `release_changelog`, `get_release`,
    `advance_release` (`dct/core/releases.py`).
-3. **Effects layer** — `dct release attest / apply / resume / abandon /
-   reconstruct` (changelog file, version files, release commit, tag), the
+3. **Effects layer** — `dct release attest / prepare / apply / resume /
+   abandon / reconstruct` (changelog file, version files, release commit, tag), the
    default behind `/release` ([below](#the-effects-layer)). A project with its
    own release tool replaces only this layer: it verifies its own effects and
    reports progress through `advance_release`.
@@ -40,7 +40,7 @@ confirmed (K-95 C1), and `apply` refuses it.
 
 `--entries` / `--no-entries` choose the selection the **snapshot** binds
 (default: every proven id — plus, outside git, every entry). The snapshot is
-what the owner approves: `dct release apply` requires its `snapshot_digest`
+what the owner approves: `dct release prepare` and `apply` require its `snapshot_digest`
 (below).
 
 | key | content |
@@ -210,15 +210,97 @@ taken as proof. Nothing is pushed. The MCP server never runs this code.
 
 ### Commands
 
+The ONE path of a release: `plan` (read-only, approve its
+`snapshot_digest`) → `prepare` (the isolated version sync — approve its
+`proposal_sha256`, which shows the file list / contract BEFORE the stamp,
+K-97 F3) → `apply` → `resume` after an interruption.
+
 | command | effect |
 | --- | --- |
 | `dct release attest --entries 16,17 --confirm` | the EMPTY attestation commit on the current branch (or detached HEAD): subject `chore: attest changelog entries`, final paragraph `Changelog: <ids ascending>`. Only ids the plan lists as unproven; refused when anything is staged, an operation (merge, rebase, cherry-pick, revert) is in progress, or a release is unfinished. The candidate changes; no record exists yet. |
-| `dct release apply [--version V \| --patch \| --minor \| --major] (--entries … \| --no-entries) --plan-digest D --confirm [--confirm-version-files]` | one release from the APPROVED plan (K-80): `D` = the `snapshot_digest` of `dct release plan` with the SAME version and selection — steps 1-6 below |
-| `dct release resume [--confirm-version-files]` | finishes the unfinished record (table below) |
+| `dct release prepare [--version V \| --patch \| --minor \| --major] (--entries … \| --no-entries) --plan-digest D [--json]` | the PREPARE stage (K-76, [below](#prepare-dct-release-prepare-k-76)): the version-sync script runs ONCE, isolated, and its result becomes the project's PENDING version-file proposal; outcome `prepared` with `proposal_sha256`. Nothing is stamped. |
+| `dct release apply [--version V \| --patch \| --minor \| --major] (--entries … \| --no-entries) --plan-digest D --proposal-digest P --confirm` | one release from the APPROVED plan (K-80) and the APPROVED proposal (K-76): `D` = the `snapshot_digest` of `dct release plan`, `P` = the `proposal_sha256` of `dct release prepare`, both with the SAME version and selection — steps 1-6 below. A re-run of a recorded / historical release needs no `P` (no-op). |
+| `dct release resume` | finishes the unfinished record (table below) |
 | `dct release abandon --version V --reason "…" --confirm` | core `abandon_release`: the record ends `abandoned`; stamps, `current_version` and every effect stay; V stays taken |
 | `dct release reconstruct --version V [--confirm]` | a legacy release WITHOUT a record: evidence is gathered read-only and shown; `--confirm` records it (core `reconstruct_release`, no re-stamp) |
 | `dct release status [--version V]` | the record (read-only) |
-| `dct clog release [V] [--patch …] [--entries … \| --no-entries] [--confirm-version-files]` | alias of `apply`; running it is the confirmation (no `--plan-digest`: the plan is derived inside the call for the candidate it pins, with the same stamp binding). Without `--entries` it releases every unreleased entry — all must be proven. Refused instead of guessed: unproven entries, a proof range that needs confirmation (`range.confirm_required`), the first release's version files without `--confirm-version-files`. |
+| `dct clog release [V] [--patch …] [--entries … \| --no-entries] [--proposal-digest P] [--json]` | alias of `prepare` + `apply`; running it is the confirmation (no `--plan-digest`: the plan is derived inside the call for the candidate it pins, with the same stamp binding). Without `--entries` it releases every unreleased entry — all must be proven. Without `--proposal-digest` it prepares inside the call and proceeds only when the proposal's files EQUAL the confirmed contract; a first release (also an empty contract, D4) or a contract change is refused with the proposal shown (it stays pending) — re-run with `--proposal-digest P`. Refused instead of guessed: unproven entries, a proof range that needs confirmation (`range.confirm_required`). |
+
+`--confirm-version-files` was removed (K-76): it approved whatever result
+happened to be present after the stamp. It survives as a hidden flag of
+`apply`, `resume` and `clog release` that REFUSES (exit 1) and names the
+prepare procedure.
+
+### Prepare (`dct release prepare`, K-76)
+
+An explicit EFFECTS stage before the stamp — not part of the read-only plan:
+
+1. **The same pre-checks as apply** — strict checkout, no unfinished
+   record, clean index and work tree, the plan re-derived for the pinned
+   candidate must equal `--plan-digest`, the selection proven. A version
+   that already has a record, or is lower than `current_version`, has
+   nothing to prepare (refused).
+2. **The script of the CANDIDATE** — `scripts/dct-version-sync.sh` (else
+   `scripts/version-sync.sh`) under the project root, as the candidate
+   commit holds it (an untracked script is refused: the release runs only
+   what its candidate holds). No script → an EMPTY proposal (approved the
+   same way, D4).
+3. **The isolated run** — a temporary linked worktree DETACHED at the
+   candidate, under the system temp directory (outside the checkout; the
+   repository's hooks are disabled for this internal checkout via
+   `core.hooksPath`), `bash <script> <V>` with cwd = the project root
+   inside it, its own process group, stdin closed, GIT_* location
+   variables dropped. Timeout `effects.SYNC_TIMEOUT_SECONDS` (300 s): the
+   whole process group is stopped (SIGTERM, SIGKILL after
+   `SYNC_KILL_GRACE_SECONDS`) before the command returns — also anything
+   the script left running after a normal exit. Captured stdout + stderr:
+   the first `SYNC_OUTPUT_MAX_BYTES` (64 KiB), the rest counted
+   (`output_dropped_bytes`). A non-zero exit → outcome `failed` with the
+   script's exit code (124 on timeout); nothing stamped, no proposal. The
+   worktree is removed (`git worktree remove --force` + `git worktree
+   prune`) in every case. A script that needs untracked or ignored files
+   of the real checkout (a local venv, …) fails there — reported as such,
+   never retried in place.
+4. **The checkout is verified unchanged** — HEAD, every ref, the index,
+   the status and the bytes of every untracked file; a script that wrote
+   outside its worktree is refused with what changed (`checkout_changed`) —
+   dct restores nothing.
+5. **The proposal** — the changes are staged in the TEMPORARY worktree's
+   own index (`git add -A`; ignored files stay out; blobs land in the
+   repository's object database) and compared with the candidate:
+   exact paths, `base_blobs` (the candidate's blob, null = absent),
+   `expected_blobs`, the script's identity + sha256, `candidate_sha`,
+   `version`, `plan_digest`, `release_mode`, and the changelog BASELINE
+   (`changelog`: path, base blob, base sha256). Refused: a script that
+   modified the changelog file (dct writes it — K-77 / D2, checked on the
+   real result), deleted / retyped a file or changed only a mode, or a
+   version file breaking the **version-file contract** (K-96 D9): a file
+   dct has a reader for (`core.version.VERSION_FIELD_READERS`, by name:
+   `VERSION`, `pyproject.toml` `[project].version`, `package.json`
+   `.version`, `Cargo.toml` `[package].version`, `tauri.conf.json`) must
+   have its version FIELD equal to V (`same_version`) — a file holding V
+   elsewhere but another version field is refused; any other file may
+   change only lines holding V as a whole version token (at least one, no
+   line only removed). The proposal is stored as the project's PENDING
+   proposal (`projects.release_proposal`, `core.releases.set_pending_proposal`
+   — a new prepare replaces it; pending is not approval).
+6. **Outside git** (a project CONFIRMED outside git — D5, an explicit
+   `without_git` proposal, never a Git proof): the same on a temporary COPY
+   of the project directory (bounded: `COPY_MAX_FILES` 20000 files /
+   `COPY_MAX_BYTES` 256 MiB, special files refused); every file of the
+   directory must be byte-identical afterwards; blob ids are SHA-256 of the
+   content, kept in dct's release blob store
+   (`<data dir>/release-blobs`, `dct.paths.release_store_dir`) — the
+   approved version files AND the changelog baseline (content + sha256, or
+   "absent"), so a resume can rebuild and verify F (K-78).
+
+Result `details`: `{proposal, proposal_sha256, plan_digest, entry_ids,
+contract: {confirmed, proposed, change}, sync: null | {exit_code,
+timed_out, output, output_bytes, output_dropped_bytes, stopped_processes,
+duration_seconds}, checks: [{path, check: "version_field", value} | {path,
+check: "lines_with_version", changed_lines}]}`. `contract.change` is true
+for a first release (`confirmed` null) and for a changed set — approving
+`P` approves that contract too; it is recorded with the stamp.
 
 ### Order of effects (`apply`)
 
@@ -236,56 +318,69 @@ taken as proof. Nothing is pushed. The MCP server never runs this code.
    The requested ids must be proven by the plan (an id the plan reports as
    unproven is never stamped; attest it first). Entries of a project
    confirmed outside git have no commit proof — they are released as the
-   owner selects them (K-63). Version-only only with `--no-entries`. Right
-   before the stamp HEAD must still be the candidate (else refused, nothing
-   stamped).
+   owner selects them (K-63). Version-only only with `--no-entries`.
+   **The approved proposal** (K-76): `--proposal-digest` must name the
+   project's PENDING proposal (a newer prepare voids an older digest),
+   prepared for this candidate, version, plan digest and mode (`mismatch`);
+   the script must be unchanged (identity + sha256); every proposal path
+   must still hold its base content (outside git also F its baseline —
+   `changed`); every expected blob must still be available (`git cat-file
+   -e`; a blob pruned by `git gc` → prepare again). Right before the stamp
+   HEAD must still be the candidate (else refused, nothing stamped).
 2. **Stamp** — `release_entries(V, entry_ids, proof=<snapshot proof map>,
    candidate_sha=<the pinned candidate>, checkout_root=<repo root>,
    stampable_ids=<the selected ids the plan proves>,
-   expected_entries=<snapshot.entries>)`. K-81, inside the stamp
-   transaction and before any write: only `stampable_ids` get a NEW stamp
-   (an id the plan does not list — unknown, added later — is refused; the
-   one exception is a live entry of the project already carrying the same
-   V, the legacy set, which is never stamped again), and the live
-   unreleased entries must be exactly the snapshot's, in the same state —
-   an entry added, edited or removed since the plan refuses ("run the plan
-   again"); entries, `current_version` and the records stay untouched.
-   A HEAD move after the stamp never re-pins the record: the effects run
-   on the recorded candidate only and refuse elsewhere. No SQL transaction
-   spans the git reads. From here
-   the record's `version` is the spelling of every artifact (K-55); the
-   requested V is only reported. The untracked files present before the
-   release are recorded in the manifest (`untracked_baseline`) — they are
-   never version files, also on a resume. A recorded / historical / legacy
-   release returns outcome `noop` with no side effect.
+   expected_entries=<snapshot.entries>, consent=<the approval>,
+   manifest={untracked_baseline}, consume_proposal=True)`. K-81, inside the
+   stamp transaction and before any write: only `stampable_ids` get a NEW
+   stamp (an id the plan does not list — unknown, added later — is
+   refused; the one exception is a live entry of the project already
+   carrying the same V, the legacy set, which is never stamped again), and
+   the live unreleased entries must be exactly the snapshot's, in the same
+   state — an entry added, edited or removed since the plan refuses ("run
+   the plan again"). K-76 / D3 / D4, in the SAME transaction: the pending
+   proposal must still be the approved one; it becomes the record's
+   `proposal`, `consent` = `{version, entry_ids, candidate_sha,
+   proposal_sha256, render, push_target: null}` (R7c-2 fills the push
+   target), the project's version-file contract becomes the proposal's
+   paths (history kept — a first contract, an empty one or a change), the
+   pending proposal is cleared and the untracked files present before the
+   release are recorded as `manifest.untracked_baseline` — never consent to
+   include them. Any refusal writes NOTHING (entries, `current_version`,
+   record, contract and the pending proposal stay). A HEAD move after the
+   stamp never re-pins the record: the effects run on the recorded
+   candidate only and refuse elsewhere. No SQL transaction spans the git
+   reads. From here the record's `version` is the spelling of every
+   artifact (K-55); the requested V is only reported. A recorded /
+   historical / legacy release returns outcome `noop` with no side effect.
 3. **Changelog file F** (`<project root>/<changelog_path>`, only when the
-   project manages its changelog — the plan's artifact rule). The expected
-   content is deterministic: the CANDIDATE commit's F + the V section
-   rendered from the database export of the record's version and headed
-   `## [<record version>] - <record created_at date, UTC>` (also on a
-   resume) — the ONE renderer of the export (`export_changelog_md`), so the
+   project manages its changelog — `manages_changelog`, the plan's
+   artifact rule, D2). The expected content is deterministic: F's BASELINE
+   (the candidate commit's F; outside git the copy persisted at prepare —
+   K-78, the current file is never its own proof) + the V section rendered
+   from the database export of the record's version and headed `##
+   [<record version>] - <record created_at date, UTC>` (also on a resume)
+   — the ONE renderer of the export (`export_changelog_md`), so the
    record's persisted `render` decides the PR references (K-90, below); a
-   version-only release gets `- Version-only release — no
-   changelog entries.`. Existing F: the section is inserted above the first
-   `## [` line, every earlier byte stays, one section more, V exactly once;
-   F already holding the IDENTICAL V section → unchanged; any other V
-   section → refused. Bootstrap (no F in the candidate): the full export
-   without Unreleased, with the section of V exactly once. The work-tree F
-   must equal the candidate's F (→ written, atomically) or the expected
-   content (→ verified); anything else is a contradiction — not
-   overwritten. A project without git has no candidate: F is used as found
-   when it holds no V section, or must hold exactly the expected one.
-4. **Version sync** — `scripts/dct-version-sync.sh` (else
-   `scripts/version-sync.sh`) under the project root, run as `bash <script>
-   <V>` with cwd = project root, ONLY while `current_version` is the
-   record's version; a non-zero exit stops (exit code = the script's,
-   nothing advanced). Changed files = staged + unstaged + new untracked
-   paths vs HEAD, minus `untracked_baseline`, minus F. The project's
-   version-file contract (K-73): none yet → the changed set is the
-   proposal — refused unless `--confirm-version-files`, then stored
-   (`set_version_files(confirm=True)`); with a contract the changed set must
-   equal it exactly. Every version file must contain the record's version
-   string. The manifest is recorded with `files_written`:
+   version-only release gets `- Version-only release — no changelog
+   entries.`. Existing F: the section is inserted above the first `## [`
+   line, every earlier byte stays, one section more, V exactly once; F
+   already holding the IDENTICAL V section → unchanged; any other V
+   section → refused. Bootstrap (no F in the baseline): the full export
+   without Unreleased, with the section of V exactly once.
+4. **Version files** — the script is NEVER run after the stamp: the
+   APPROVED expected blobs are written (`git cat-file --filters`; outside
+   git from the blob store), each with `_write_atomic`. **Content-verified
+   retry** (K-75): BEFORE anything is written every artifact (F included)
+   is classified — its current content is the baseline (→ written), the
+   approved content (→ kept) or anything else (→ refused: nothing written,
+   the index untouched, `foreign` names the paths; never restored
+   automatically — restore or finish the file yourself, or abandon).
+   **One consistent read** (K-77): afterwards the FULL artifact set is
+   read ONCE and every hash, every blob id and the expected tree are
+   computed from that one read; F must equal its expected content and
+   every version file its approved blob — a mismatch refuses and records
+   nothing. Then the manifest is recorded with `files_written`:
    `{changelog: {path, sha256, section_date}, version_files: [{path,
    sha256}], tree, untracked_baseline}` (paths repo-root-relative; for a
    project without git relative to the project root and without `tree`).
@@ -313,16 +408,20 @@ taken as proof. Nothing is pushed. The MCP server never runs this code.
 
 ### Resume and interruptions
 
-`resume` first checks the record against the checkout (K-51): the record's
-`checkout_root` must be THIS checkout (another worktree → refused, the
-record is never re-pinned), a git record needs its candidate and checkout,
-no operation may be in progress. Then, by status:
+`resume` first verifies the record's FULL entry set (K-94 B3,
+`core.releases.verify_release_entry_set`: exactly the live entries carrying
+its version — a mismatch refuses before any effect and is never repaired by
+widening the record) and that its consent names its proposal; then the
+record against the checkout (K-51): the record's `checkout_root` must be
+THIS checkout (another worktree → refused, the record is never re-pinned), a
+git record needs its candidate and checkout, no operation may be in
+progress. Then, by status:
 
 | status | HEAD must be | what resume does |
 | --- | --- | --- |
-| `stamped` | the candidate | index: nothing staged or conflicted; unstaged only F and contract files (any while no contract exists). F: verified / written / contradiction (step 3); the sync is re-run (a legal retry on the candidate); version files and manifest as in step 4 |
+| `stamped` | the candidate | index: nothing staged or conflicted; unstaged only F and the proposal's files. A record without an approved proposal (stamped outside the effects layer, or before K-76) is refused — the sync is never run after the stamp; abandon it. Otherwise steps 3-4: each artifact classified (baseline → written, approved → kept, else refused with nothing written), the approved blobs written, the full set verified from one read, the manifest recorded |
 | `files_written` | the candidate — or the release commit itself (its only parent is the candidate, its tree is `manifest.tree`, its subject `release: v<V>`), which is adopted | every manifest file must still hold its recorded hash (a reverted version file → refused, not overwritten); then step 5 |
-| `committed` | the release commit or a descendant | the release commit is verified (tree = `manifest.tree`, parent = candidate); step 6. The sync is never re-run. |
+| `committed` | the release commit or a descendant | the release commit is verified (tree = `manifest.tree`, parent = candidate); step 6 |
 | `tagged` | the release commit or a descendant | the tag must point at the release commit; `completed` |
 | `pushed` | the release commit or a descendant | as `tagged` (the push itself is not repeated); `completed` |
 | `completed` / `abandoned` | — | no unfinished record: outcome `noop`, no side effect |
@@ -330,14 +429,17 @@ no operation may be in progress. Then, by status:
 Interruption points (`effects.INTERRUPTION_POINTS`, the `on_point` hook of
 `apply_release` / `resume_release`) — a crash at each one is resumed by
 `resume` exactly once (one section, one release commit, one tag; the sync
-re-run only for `after_sync`):
+never re-run):
 
 | point | state left behind |
 | --- | --- |
-| `before_stamp` | nothing (no record — run `apply` again) |
-| `after_stamp` | record `stamped` (+ `untracked_baseline`) |
-| `before_changelog` / `after_changelog` | F not written / written; `stamped` |
-| `before_sync` / `after_sync` | sync not run / run and verified; `stamped` |
+| `before_stamp` | nothing (no record; the pending proposal stays — run `apply` again) |
+| `after_stamp` | record `stamped` (+ proposal, consent, `untracked_baseline`, the learned contract — one transaction) |
+| `before_changelog` | every artifact classified; nothing written; `stamped` |
+| `after_changelog` | F written; no version file written; `stamped` |
+| `before_version_files` | as `after_changelog` |
+| `after_version_file` | ONE more version file written (fires after each write); `stamped` |
+| `after_version_files` | every artifact written; not verified, not `files_written` |
 | `after_files_written` | manifest recorded; no commit |
 | `after_stage` | artifacts staged in the real index; no commit |
 | `after_commit` | release commit created, HEAD moved; not `committed` (adopted on resume) |
@@ -345,10 +447,9 @@ re-run only for `after_sync`):
 | `after_tag` | tag created; not `tagged` |
 | `after_tagged` | not `completed` |
 
-A crash between the stamp and the `untracked_baseline` write leaves a record
-without a baseline: a resume of a FIRST release then counts every untracked
-file as changed (each must contain V, so local junk is refused rather than
-learned).
+A user edit between runs inside an artifact (a version file or F) is
+neither the baseline nor the approved content: the resume refuses and
+leaves the files and the index exactly as they are.
 
 ### Reconstruct (`dct release reconstruct`, K-60)
 
@@ -371,17 +472,17 @@ One shape, `effects.RESULT_KEYS` (pinned by
 | key | content |
 | --- | --- |
 | `schema_version` | `1` |
-| `action` | `apply`, `resume`, `attest`, `abandon`, `reconstruct`, `status` |
+| `action` | `prepare`, `apply`, `resume`, `attest`, `abandon`, `reconstruct`, `status` |
 | `project` | slug |
-| `outcome` | `completed`, `noop`, `attested`, `abandoned`, `preview`, `reconstructed`, `found` / `none` (status), `refused`, `failed` (version-sync script) |
+| `outcome` | `completed`, `noop`, `attested`, `abandoned`, `preview`, `reconstructed`, `prepared`, `found` / `none` (status), `refused`, `failed` (the version-sync script in prepare: non-zero exit or timeout) |
 | `version` | the record's version (authoritative spelling) or null |
 | `release` | the record (`core.releases.RECORD_FIELDS`) or null |
-| `steps` | `[{step, result, …}]` — step ∈ `stamp`, `changelog`, `sync`, `version_files`, `files`, `commit`, `tag`, `complete`, `attest`; result ∈ `done`, `verified`, `skipped`, `adopted`, `learned` |
+| `steps` | `[{step, result, …}]` — step ∈ `sync`, `proposal` (prepare, and the `clog release` alias), `stamp`, `changelog`, `version_files`, `files`, `commit`, `tag`, `complete`, `attest`; result ∈ `done`, `verified`, `skipped`, `adopted`, `approved` |
 | `warnings` | human-readable strings |
-| `details` | apply: `{requested_version, previous_version, bump, entry_ids, mode, released, current_version}`; attest: `{previous_head, head, entry_ids}`; abandon: `{updated}`; reconstruct: `{evidence: {version, entry_ids, candidate_sha, release_commit_sha, tag, checkout_root, manifest, status, without_git}}`; refused / failed: the reason (`error`) plus the refusal's data (e.g. `staged`, `unproven`, `proposed_version_files`, `foreign_paths`, `foreign_content`, `changed`, `contract`, `exit_code`) |
+| `details` | prepare: see [Prepare](#prepare-dct-release-prepare-k-76); apply: `{requested_version, previous_version, bump, entry_ids, mode, released, current_version}`; attest: `{previous_head, head, entry_ids}`; abandon: `{updated}`; reconstruct: `{evidence: {version, entry_ids, candidate_sha, release_commit_sha, tag, checkout_root, manifest, status, without_git}}`; refused / failed: the reason (`error`) plus the refusal's data (e.g. `staged`, `unproven`, `proposal` / `proposal_sha256` / `contract` (the alias), `mismatch`, `checkout_changed`, `foreign`, `foreign_paths`, `foreign_content`, `changed`, `path`, `sync`, `exit_code`) |
 
 Exit codes: 0 success (also `noop`), 1 refused, the script's own code when
-the version sync fails, 2 for a usage error.
+the version sync fails in prepare (124 on timeout), 2 for a usage error.
 
 ## The release ledger (record fields)
 
@@ -406,7 +507,7 @@ and a refusal writes nothing.
 | `manifest` | JSON object of the verified artifacts (e.g. `changelog`, `version_files`, `tree`, `untracked_baseline`) | write-once per key; the MERGED manifest ≤ 64 KiB |
 | `proof` | `{"<entry id>": {commits, merge_commit, pr}}` (K-70) | written with the stamp; a re-run passing a different map is refused (K-94 B2) |
 | `consent` | what the owner approved (K-97 F4): `{version, entry_ids, candidate_sha, proposal_sha256, render, push_target: {remote, url, branch, tag} \| null}` — a resume compares its own scope with it | write-once |
-| `proposal` | the approved version-file proposal (K-76): `{paths, base_blobs: {path: blob \| null}, expected_blobs: {path: blob}, script: {identity, sha256} \| null, candidate_sha}`; `consent.proposal_sha256` = `proposal_digest(proposal)` (SHA-256 of its canonical JSON) | write-once |
+| `proposal` | the approved version-file proposal (K-76): `{paths, base_blobs: {path: blob \| null}, expected_blobs: {path: blob}, script: {identity, sha256} \| null, candidate_sha, version, plan_digest, release_mode, changelog: {path, base_blob, base_sha256} \| null}` (the last four: the release context it is bound to; blob ids are git blob ids, or SHA-256 of the content in dct's release blob store for `without_git`); `consent.proposal_sha256` = `proposal_digest(proposal)` (SHA-256 of its canonical JSON). Written by the stamp that consumed the project's PENDING proposal | write-once |
 | `render` | the changelog render settings of THIS release (K-90): `{"pr_refs": bool}` — defaults to the project's `changelog_pr_refs` at stamp time, so a later preference change cannot alter the expected hashes | write-once |
 | `completed_at`, `abandoned_at`, `abandon_reason` | terminal stamps; the FIRST abandon reason stays — the same reason again is a no-op, a different one is refused (K-94 B5) | set once |
 
@@ -451,7 +552,11 @@ resolved spelling and checks that FINAL value against the schema's width
 
 **Project settings**: `release_executor` (`dct` default \| `own`; `dct
 project release-executor <slug> own|dct`) and `changelog_pr_refs` (default
-off; `dct project changelog-pr-refs <slug> on|off`).
+off; `dct project changelog-pr-refs <slug> on|off`). **Pending proposal**:
+`projects.release_proposal` — the canonical JSON of the latest `dct release
+prepare` (`core.releases.set_pending_proposal` / `get_pending_proposal`),
+replaced by a new prepare, consumed and cleared by the stamp that names its
+digest (`release_entries(consume_proposal=True)`).
 
 **PR references in the changelog** (K-90, opt-in): with `changelog_pr_refs`
 on at stamp time the record's `render` is `{"pr_refs": true}` and every
@@ -483,7 +588,7 @@ The three layers (K-72) and who may use them:
 | --- | --- | --- |
 | 1 proof | `dct release plan --json`, `dct clog candidates --json` | every project — read-only, no side effects |
 | 2 ledger | MCP / core `release_changelog`, `get_release`, `advance_release`, `abandon_release` | the effects layer, or a project's own release tool |
-| 3 effects | `dct release attest / apply / resume / abandon / reconstruct` | the default behind `/release` for projects without their own tool |
+| 3 effects | `dct release attest / prepare / apply / resume / abandon / reconstruct` | the default behind `/release` for projects without their own tool |
 
 The skills of both clients only run the dialog over layers 1 and 3; the MCP
 process never verifies files (it runs in its own directory, not in the

@@ -133,8 +133,9 @@ release but cannot verify the changelog file, the version files, the commit
 or the tag. A project with its OWN release tool integrates as described in
 [release-workflow.md](release-workflow.md#integrating-a-projects-own-release-tool).
 
-The assistant never edits the changelog file, never runs version sync, never
-commits, tags or pushes for the release and never calls `advance_release` —
+The assistant never edits the changelog file, never runs the version sync
+itself, never commits, tags or pushes for the release and never calls
+`advance_release` —
 the workflow performs, verifies and records every effect. Run every command
 in the CURRENT checkout. Show long content as text first, then ask.
 
@@ -164,19 +165,31 @@ in the CURRENT checkout. Show long content as text first, then ask.
    (or `--no-entries`) — the snapshot of exactly this candidate, version
    and selection. Confirm the summary from THAT plan. No entries → explicit
    version-only consent (the `since=last_release` anchor does not move; a
-   full export omits V). Then
-   `dct release apply --version V --entries <ids> --plan-digest <snapshot_digest> --confirm --json`
+   full export omits V).
+8. Prepare the files (K-76, before anything is stamped):
+   `dct release prepare --version V --entries <ids> --plan-digest <snapshot_digest> --json`
+   (or `--no-entries`). It runs the project's version-sync script once in
+   an isolated temporary worktree (outside git: a temporary copy) and
+   changes nothing in the checkout. Show `details.proposal.paths`, the
+   `checks`, `details.contract` (`change: true` = a first release or a
+   changed version-file contract — say so explicitly; an empty list is a
+   contract too) and the sync output; the owner approves THAT list.
+   `failed` → the script failed or timed out (show `details.sync`): fix
+   it, prepare again. `refused` → show the reason (e.g. the script wrote
+   outside its worktree or touched the changelog), STOP.
+9. Only on the owner's yes:
+   `dct release apply --version V --entries <ids> --plan-digest <snapshot_digest> --proposal-digest <proposal_sha256> --confirm --json`
    (or `--no-entries`). A refusal "differs from the approved plan" (HEAD,
-   entries, selection, version or proof changed) → show it, plan again,
-   ask again — never retry with a new digest unasked.
-8. First release (`version_files.version_files` null): apply stops after the
-   sync with `details.proposed_version_files`; show the list; only on the
-   owner's yes `dct release resume --confirm-version-files --json`.
-9. Read the result: `completed`; `noop` (already released — nothing done);
+   entries, selection, version or proof changed) or one voiding the
+   proposal (another candidate / version / plan, a changed script or
+   baseline, a newer prepare) → show it, plan / prepare again, ask again —
+   never retry with a new digest unasked.
+10. Read the result: `completed`; `noop` (already released — nothing done);
    `refused` (show `details`, only the listed `steps` happened; an
-   unfinished `release` → resume path); `failed` (the version-sync script —
-   fix it, then resume). Report the requested version
-   (`details.requested_version`), the record's `version` and
+   unfinished `release` → resume path; `foreign` = a file differs from both
+   its baseline and the approved content — nothing was overwritten, the
+   owner restores or finishes it, then resume). Report the requested
+   version (`details.requested_version`), the record's `version` and
    `details.current_version` separately. The tag is local; pushing is the
    owner's action.
 

@@ -22,7 +22,7 @@ Register dct once and it is available in every Claude Code session. Opening a ne
 SQLAlchemy Core tables (not the ORM) with a `deleted_at` column for soft deletes (ledger pattern — nothing is ever hard-deleted). 14 tables:
 
 **Core**:
-- `projects` — slug, name, path, current_version, manages_changelog, changelog_path, version_files / version_files_confirmed_at / version_files_history (K-73: the owner-confirmed JSON list of repo-relative files a release must change; NULL = not learned; every replaced list is appended to the history), release_executor (K-85: `dct` default \| `own`; `dct project release-executor`), changelog_pr_refs (K-90: render `(#N)` PR references, default off; `dct project changelog-pr-refs`)
+- `projects` — slug, name, path, current_version, manages_changelog, changelog_path, version_files / version_files_confirmed_at / version_files_history (K-73: the owner-confirmed JSON list of repo-relative files a release must change; NULL = not learned; every replaced list is appended to the history), release_executor (K-85: `dct` default \| `own`; `dct project release-executor`), changelog_pr_refs (K-90: render `(#N)` PR references, default off; `dct project changelog-pr-refs`), release_proposal (K-76: the PENDING version-file proposal of `dct release prepare` — canonical JSON, replaced by a new prepare, consumed and cleared by the stamp that approves it; NULL = nothing prepared)
 - `items` — project_id, type, title, short_title (nullable 50-char label, #817), priority, status, component, source_file, source_lines, resolution, tags (**DEPRECATED** — see below). Sprint membership is **not** a column: `in_current_sprint` is derived at read time from `item_sprints` (#216 dropped the legacy boolean).
 - `item_notes` — item_id, note (append-only)
 - `item_checkpoints` — item_id, text, status, kind, sort_order
@@ -58,6 +58,7 @@ Full DDL lives in:
 - `migrations/007_releases.sql`
 - `migrations/008_release_ledger.sql`
 - `migrations/009_release_ledger_fields.sql`
+- `migrations/010_release_pending_proposal.sql`
 
 At runtime, the engine creates every MISSING table with all its indexes (`_create_missing_tables` — race-safe against a concurrent bootstrap: a duplicate table / index / relation error rolls the attempt back, the whole schema of those tables is re-checked and finished, at most `SCHEMA_CREATE_ATTEMPTS` tries, any other error propagates; tables that already exist are left to the explicit blocks below — except the release-ledger tables (`INDEX_HEALED_TABLES`, K-93 A2), whose missing required indexes every bootstrap completes, warning once instead of failing when existing rows violate a unique index) plus an idempotent `_apply_schema_updates()` that:
 - adds later columns in place (e.g. `item_checkpoints.kind` for gate checkpoints; new columns go through the duplicate-safe `_add_column_if_missing` — `ADD COLUMN IF NOT EXISTS` under a 5 s `lock_timeout` on PostgreSQL, a re-checked "duplicate column" error on SQLite),

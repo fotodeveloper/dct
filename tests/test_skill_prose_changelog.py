@@ -188,7 +188,7 @@ def test_every_named_workflow_command_and_flag_exists_in_the_cli(text):
 def test_release_skill_and_fallback_drive_the_same_workflow_commands():
     """K-72: the skill and the authoritative fallback describe ONE dialog over
     the same commands — every effects / proof subcommand of the CLI."""
-    effects = {"plan", "attest", "apply", "resume", "abandon", "reconstruct", "status"}
+    effects = {"plan", "attest", "prepare", "apply", "resume", "abandon", "reconstruct", "status"}
     assert effects <= set(_cli()["release"])
     for text in (_skill("release"), _release_fallback()):
         named = {sub for group, sub, _ in _commands(text) if group == "release"}
@@ -208,14 +208,20 @@ def test_release_dialog_passes_the_owners_decisions_as_flags(text):
     for flags in applies:
         assert "--version" in flags and "--confirm" in flags
         assert "--plan-digest" in flags  # K-80: the approved snapshot
+        assert "--proposal-digest" in flags  # K-76: the approved version-file proposal
         assert ("--entries" in flags) != ("--no-entries" in flags)
         assert not {"--patch", "--minor", "--major"} & set(flags)  # V computed once
+    prepares = [flags for sub, flags in calls if sub == "prepare" and len(flags) > 1]
+    assert prepares, "no complete `dct release prepare …` invocation (K-76)"
+    for flags in prepares:
+        assert "--version" in flags and "--plan-digest" in flags
+        assert ("--entries" in flags) != ("--no-entries" in flags)
     abandons = [flags for sub, flags in calls if sub == "abandon" and flags]
     assert abandons and all({"--version", "--reason", "--confirm"} <= set(f) for f in abandons)
     attests = [flags for sub, flags in calls if sub == "attest" and flags]
     assert attests and all({"--entries", "--confirm"} <= set(f) for f in attests)
     flat = " ".join(text().split())
-    assert "--confirm-version-files" in flat
+    assert "--confirm-version-files" not in flat  # removed (K-76): it refuses now
     # The flags the dialog relies on are really required / present.
     cli = _cli()["release"]
     required = {a.option_strings[0] for a in cli["abandon"]._actions if a.required}

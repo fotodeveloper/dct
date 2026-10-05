@@ -776,7 +776,7 @@ NEW_COLUMNS = {
     "releases": ["release_commit_sha", "manifest", "proof", "abandoned_at", "abandon_reason",
                  "release_mode", "executor", "consent", "proposal", "render"],
     "projects": ["version_files", "version_files_confirmed_at", "version_files_history",
-                 "release_executor", "changelog_pr_refs"],
+                 "release_executor", "changelog_pr_refs", "release_proposal"],
 }
 
 

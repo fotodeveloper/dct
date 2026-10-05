@@ -99,6 +99,15 @@ def default_db_path() -> Path:
     return new
 
 
+def release_store_dir() -> Path:
+    """dct's content-addressed store of release artifacts for projects
+    CONFIRMED outside git (K-76 / K-78: the approved version-file contents
+    and the changelog baseline a resume compares against) —
+    <data dir>/release-blobs; DCT_DATA_DIR wins, as for the database."""
+    env = os.environ.get("DCT_DATA_DIR")
+    return (Path(env) if env else data_dir()) / "release-blobs"
+
+
 def sqlite_url(path: PurePath | str) -> str:
     # Honor the caller's flavour instead of re-wrapping: PurePath() re-flavours
     # a PureWindowsPath to PurePosixPath on POSIX hosts, where the drive then

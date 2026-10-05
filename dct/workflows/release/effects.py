@@ -1,6 +1,6 @@
 """The release EFFECTS layer (K-72 layer 3) — the default executable release
-workflow behind `/release`: `dct release attest / apply / resume / abandon /
-reconstruct` (and `dct clog release`, an alias of apply).
+workflow behind `/release`: `dct release attest / prepare / apply / resume /
+abandon / reconstruct` (and `dct clog release`, an alias of prepare + apply).
 
 ONE implementation for the CLI and both clients' skills (they only run the
 dialog, K-49): every effect is performed by this module and VERIFIED against
@@ -8,24 +8,56 @@ reality before the ledger (dct.core.releases) records the progress — a
 status is never taken as proof that an effect happened. The MCP process
 never runs this code (K-72: it never verifies files).
 
-Order of effects of one release (apply; resume continues from the record):
+Stages of one release:
 
-  1. pre-checks — strict checkout (K-52; a registered path), no unfinished
-     record, clean index and work tree (K-50); the plan re-derived FOR THE
-     PINNED CANDIDATE must match the approved snapshot digest (K-80); the
-     requested set ⊆ the plan's proven ids; HEAD unchanged right before the
-     stamp;
+  0. prepare (`dct release prepare`, K-76) — an explicit EFFECTS stage
+     BEFORE the stamp, not part of the read-only plan: the same pre-checks
+     and candidate pinning as apply (the plan re-derived for the pinned
+     checkout must match --plan-digest); the project's version-sync script
+     runs ONCE with V, ISOLATED — in a temporary git worktree detached at
+     the candidate (hooks disabled for that internal checkout), or, for a
+     project CONFIRMED outside git, in a temporary copy of its directory —
+     never in the user's checkout, under a timeout with bounded captured
+     output and the whole process group stopped before it returns (K-96
+     D9). The user's checkout must be unchanged afterwards (HEAD, refs,
+     index, status, the bytes of untracked files; outside git every file) —
+     a script that wrote outside its isolated copy is refused. From the
+     isolated result it builds the PROPOSAL (core.releases.validate_proposal:
+     exact changed paths, base / expected blobs, script identity + sha256,
+     candidate, version, plan digest, the changelog baseline), checks each
+     file's version FIELD (core.version readers; a file without a reader may
+     change only lines holding V), refuses a script that touched the
+     changelog file (K-77 / D2) or deleted / retyped a file, and stores it
+     as the project's PENDING proposal (core.releases.set_pending_proposal).
+     Expected blobs live in the repository's object database (`git add` in
+     the temporary worktree) or, outside git, in dct's release blob store
+     (dct.paths.release_store_dir). Nothing is stamped.
+  1. pre-checks of apply — strict checkout (K-52; a registered path), no
+     unfinished record, clean index and work tree (K-50); the plan
+     re-derived FOR THE PINNED CANDIDATE must match the approved snapshot
+     digest (K-80); the requested set ⊆ the plan's proven ids; the approved
+     proposal (--proposal-digest) must be the pending one, bound to the
+     same candidate, version and plan digest, with the script and the
+     baseline unchanged; HEAD unchanged right before the stamp;
   2. stamp — core release_entries (the record, status 'stamped'), bound to
-     the plan inside its transaction (K-81: stampable_ids, expected_entries);
+     the plan inside its transaction (K-81: stampable_ids, expected_entries)
+     and consuming the approved proposal in the SAME transaction
+     (consume_proposal: the record's proposal + consent, the learned
+     version-file contract, the untracked baseline — K-76, K-96 D3/D4);
      from here the record's `version` is the spelling of every artifact
      (K-55);
-  3. changelog file F — the expected content is DETERMINISTIC: the
-     candidate commit's F + the V section rendered from the database and
-     the record (date = the record's created_at, K-32);
-  4. version sync — the project's script, only while current_version is
-     the record's version (K-31); the changed files must equal the
-     project's version-file contract (K-73, learned once at the first
-     release with --confirm-version-files) and contain V; the manifest
+  3. changelog file F — the script is NEVER run again after the stamp; F's
+     expected content is DETERMINISTIC: F's baseline (the candidate's blob;
+     outside git the copy persisted at prepare, K-78) + the V section
+     rendered from the database and the record (date = the record's
+     created_at, K-32);
+  4. version files — the approved expected blobs are written; every
+     artifact (F included) is classified BEFORE anything is written (K-75:
+     the baseline → written, the approved content → kept, anything else →
+     refused with NOTHING written and the index untouched — never restored
+     automatically); afterwards the full artifact set is read ONCE and
+     every hash and the expected tree are computed from that one read and
+     checked against the approved content (K-77) before the manifest
      {changelog, version_files, tree} is recorded with 'files_written';
   5. commit — the expected tree (candidate tree + exactly the manifest
      blobs) is built in a TEMPORARY index; the real index is checked for
@@ -36,32 +68,44 @@ Order of effects of one release (apply; resume continues from the record):
   6. tag `v<V>` (lightweight) at the verified release commit → 'tagged',
      then 'completed'. Nothing is pushed.
 
-Every effect is checked against reality on resume: present and matching →
-skipped; missing → performed; contradicting → ReleaseRefused, nothing
-overwritten. Interruption points (INTERRUPTION_POINTS) let tests stop the
-workflow before each effect and between each effect and its progress write.
-Schema of the results and the interruption / resume table:
-docs/release-workflow.md.
+Every effect is checked against reality on resume (after the full entry set
+of the record, K-94 B3): present and matching → skipped; missing → performed;
+contradicting → ReleaseRefused, nothing overwritten. Interruption points
+(INTERRUPTION_POINTS) let tests stop the workflow before each effect and
+between each effect and its progress write. Schema of the results and the
+interruption / resume table: docs/release-workflow.md.
 """
 
 from __future__ import annotations
 
+import contextlib
+import difflib
 import hashlib
 import os
 import re
+import shutil
+import signal
+import stat
 import subprocess
-import sys
 import tempfile
-from collections.abc import Callable, Iterable
+import time
+from collections.abc import Callable, Iterable, Iterator
 from datetime import UTC, datetime
 
 import sqlalchemy as sa
 
+from dct import paths as dct_paths
 from dct.core import gitinfo
 from dct.core import releases as ledger
 from dct.core.changelog import list_entries, normalize_worktree, release_entries
 from dct.core.projects import get_project
-from dct.core.version import normalize_version, same_version
+from dct.core.version import (
+    compare_versions,
+    normalize_version,
+    read_version_field,
+    same_version,
+    version_field_reader,
+)
 from dct.export import export_changelog_md
 from dct.workflows.release import plan as planning
 from dct.workflows.release.proof import proven_ids
@@ -73,7 +117,7 @@ RESULT_KEYS = (
 )
 OUTCOMES = (
     "completed", "noop", "attested", "abandoned", "preview", "reconstructed",
-    "refused", "failed", "found", "none",
+    "prepared", "refused", "failed", "found", "none",
 )
 
 # Where a test (or a debugger) may stop the workflow: before each effect and
@@ -81,10 +125,11 @@ OUTCOMES = (
 INTERRUPTION_POINTS = (
     "before_stamp",          # nothing done yet
     "after_stamp",           # record 'stamped' (the stamp IS its progress write)
-    "before_changelog",
-    "after_changelog",       # F written + verified; no progress write yet
-    "before_sync",
-    "after_sync",            # sync ran + version files verified; not 'files_written'
+    "before_changelog",      # every artifact classified, nothing written
+    "after_changelog",       # F written; no version file written yet
+    "before_version_files",
+    "after_version_file",    # ONE version file written (fires after each write)
+    "after_version_files",   # every artifact written; not verified, not 'files_written'
     "after_files_written",   # manifest recorded; before the commit
     "after_stage",           # artifacts staged in the real index; no commit yet
     "after_commit",          # commit created + HEAD moved + verified; not 'committed'
@@ -98,10 +143,26 @@ VERSION_ONLY_LINE = "- Version-only release — no changelog entries."
 ATTEST_SUBJECT = "chore: attest changelog entries"
 RELEASE_SUBJECT = "release: v{version}"
 
+# The version-sync script (prepare, K-96 D9): wall-clock limit, the grace a
+# stopped process group gets between SIGTERM and SIGKILL, and the cap of the
+# captured output (stdout + stderr; the rest is counted and dropped).
+SYNC_TIMEOUT_SECONDS = 300
+SYNC_KILL_GRACE_SECONDS = 3
+SYNC_OUTPUT_MAX_BYTES = 65536
+SYNC_TIMEOUT_EXIT = 124  # the exit code of a timed-out sync (as timeout(1))
+# Creating / staging the temporary worktree of prepare (a checkout of the
+# whole candidate) may take longer than the ordinary git reads.
+PREPARE_GIT_TIMEOUT_SECONDS = 600
+# A project outside git is prepared on a temporary COPY of its directory —
+# bounded, a larger directory is refused instead of copied.
+COPY_MAX_FILES = 20000
+COPY_MAX_BYTES = 256 * 1024 * 1024
+
 _MARKER_RE = re.compile(r"^## \[([^\]\r\n]*)\]")
 _RELEASE_SUBJECT_RE = re.compile(r"^release: (\S+)$")
 _IN_PROGRESS = ("MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "rebase-merge", "rebase-apply")
 _DIGEST_RE = re.compile(r"[0-9a-f]{64}", re.ASCII)
+_NOT_A_FILE = "<not a regular file>"
 
 
 class ReleaseRefused(RuntimeError):
@@ -120,7 +181,8 @@ class ReleaseRefused(RuntimeError):
 
 
 class SyncFailed(ReleaseRefused):
-    """The version-sync script exited non-zero — nothing advanced."""
+    """The version-sync script exited non-zero or timed out during prepare
+    — nothing was stamped, no proposal stored."""
 
     def __init__(self, message: str, code: int, **kwargs):
         super().__init__(message, **kwargs)
@@ -153,22 +215,23 @@ def _read_bytes(path: str) -> bytes | None:
 
 def _write_atomic(path: str, data: bytes) -> None:
     """Replace `path` with `data` (temp file in the same directory + rename),
-    keeping an existing file's mode; read back and compared."""
+    keeping an existing file's mode (a new file: the default mode); read
+    back and compared."""
     directory = os.path.dirname(path) or "."
     os.makedirs(directory, exist_ok=True)
-    mode = None
     try:
         mode = os.stat(path).st_mode & 0o7777
-    except FileNotFoundError:
-        pass
+    except FileNotFoundError:  # a new file gets the default mode (0666 & ~umask)
+        umask = os.umask(0)
+        os.umask(umask)
+        mode = 0o666 & ~umask
     fd, tmp = tempfile.mkstemp(prefix=".dct-release-", dir=directory)
     try:
         with os.fdopen(fd, "wb") as fh:
             fh.write(data)
             fh.flush()
             os.fsync(fh.fileno())
-        if mode is not None:
-            os.chmod(tmp, mode)
+        os.chmod(tmp, mode)
         os.replace(tmp, path)
     except BaseException:
         if os.path.exists(tmp):
@@ -265,19 +328,27 @@ def _file_mode(repo: str, commit: str, rel: str, absolute: str) -> str:
 
 def expected_tree(repo: str, candidate: str, paths: Iterable[str]) -> str:
     """The tree of the release commit: the candidate's tree with EXACTLY the
-    work-tree content of `paths` (repo-relative) — computed in a temporary
-    index (GIT_INDEX_FILE), so the user's index is never touched here.
-    Blobs are written with `git hash-object -w` (path filters apply, as for
-    `git add`)."""
+    work-tree content of `paths` (repo-relative) — blobs written with `git
+    hash-object -w` (path filters apply, as for `git add`), the tree built
+    by _tree_of_blobs (the user's index is never touched)."""
+    blobs = {}
+    for rel in sorted(paths):
+        _, blob = gitinfo.git_write(repo, "hash-object", "-w", "--", rel)
+        blobs[rel] = blob.strip()
+    return _tree_of_blobs(repo, candidate, blobs)
+
+
+def _tree_of_blobs(repo: str, candidate: str, blobs: dict[str, str]) -> str:
+    """The candidate's tree with each path of `blobs` replaced by / added as
+    that blob — computed in a TEMPORARY index (GIT_INDEX_FILE). The mode is
+    the candidate's, or the work-tree file's for a new path."""
     with tempfile.TemporaryDirectory(prefix="dct-release-index-") as tmp:
         index = os.path.join(tmp, "index")
         gitinfo.git_write(repo, "read-tree", f"{candidate}^{{tree}}", index_file=index)
-        for rel in sorted(paths):
-            absolute = os.path.join(repo, rel)
-            _, blob = gitinfo.git_write(repo, "hash-object", "-w", "--", rel)
-            mode = _file_mode(repo, candidate, rel, absolute)
+        for rel in sorted(blobs):
+            mode = _file_mode(repo, candidate, rel, os.path.join(repo, rel))
             gitinfo.git_write(repo, "update-index", "--add", "--cacheinfo",
-                              f"{mode},{blob.strip()},{rel}", index_file=index)
+                              f"{mode},{blobs[rel]},{rel}", index_file=index)
         _, tree = gitinfo.git_write(repo, "write-tree", index_file=index)
     return tree.strip()
 
@@ -331,10 +402,9 @@ def _locate(engine: sa.Engine, slug: str, cwd: str | None) -> tuple[dict, dict |
 
 
 class _Run:
-    """State of one apply / resume run."""
+    """State of one prepare / apply / resume run."""
 
-    def __init__(self, engine, slug, project, checkout, project_root, *,
-                 on_point, confirm_version_files):
+    def __init__(self, engine, slug, project, checkout, project_root, *, on_point):
         self.engine = engine
         self.slug = slug
         self.project = project
@@ -342,7 +412,6 @@ class _Run:
         self.repo = checkout["repo_root"] if checkout else None
         self.project_root = project_root
         self.on_point = on_point
-        self.confirm_version_files = confirm_version_files
         self.steps: list[dict] = []
         self.warnings: list[str] = []
         self.record: dict | None = None
@@ -363,6 +432,10 @@ class _Run:
     def base(self) -> str:
         """Paths in the manifest are relative to this directory."""
         return self.repo or self.project_root
+
+    @property
+    def mode(self) -> str:
+        return "git" if self.repo else ledger.WITHOUT_GIT
 
     def abspath(self, rel: str) -> str:
         return os.path.join(self.base, *rel.split("/"))
@@ -432,7 +505,7 @@ def _check_record_location(run: _Run) -> None:
             recorded=record["checkout_root"], here=here)
 
 
-# ── step 3: the changelog file ───────────────────────────────────────────────
+# ── the changelog file: its deterministic expected content ───────────────────
 
 
 def _blocks(text: str) -> tuple[str, list[tuple[str, int, int]]]:
@@ -553,188 +626,708 @@ def expected_changelog(engine: sa.Engine, slug: str, record: dict, base: bytes |
             details={"sections": len(existing)})
     return _insert_section(text, section, version).encode("utf-8")
 
-
-def _changelog_base(run: _Run) -> tuple[bytes | None, bool]:
-    """(F before the release, known) — the candidate's blob in git; for a
-    project without git the current file when it holds no V section."""
-    if run.repo:
-        return gitinfo.git_read_blob(run.repo, run.record["candidate_sha"], run.changelog_rel), True
-    current = _read_bytes(run.abspath(run.changelog_rel))
-    if current is None:
-        return None, True
-    try:
-        has_section = bool(_version_blocks(current.decode("utf-8"), run.version))
-    except UnicodeDecodeError:
-        raise run.refuse("the changelog file is not UTF-8 — not touched") from None
-    return (None, False) if has_section else (current, True)
+# ── content identities and approved blobs ────────────────────────────────────
+#
+# A version file's content is named by a git blob id (projects in git: the
+# repository's object database, path filters applied as for `git add`) or by
+# the SHA-256 of its bytes (projects CONFIRMED outside git: dct's release
+# blob store, dct.paths.release_store_dir — content-addressed, read back and
+# re-hashed before use).
 
 
-def _step_changelog(run: _Run) -> dict | None:
-    """Write / verify F; returns the manifest entry {path, sha256,
-    section_date} (None when the project has no changelog artifact)."""
-    if run.changelog_rel is None:
-        run.step("changelog", "skipped", reason="no changelog file managed")
+def _read_regular(path: str) -> bytes | str | None:
+    """The bytes of a regular file, None when nothing exists at `path`, or
+    _NOT_A_FILE (a directory, a symlink, a device …) — never equal to any
+    expected content."""
+    if not os.path.lexists(path):
         return None
-    _point(run.on_point, "before_changelog")
-    path = run.abspath(run.changelog_rel)
-    current = _read_bytes(path)
-    base, known = _changelog_base(run)
-    _, date = render_section(run.engine, run.slug, run.record)
-    try:
-        if known:
-            expected = expected_changelog(run.engine, run.slug, run.record, base)
-        else:  # no git, F already holds a V section: it must be the identical one
-            expected = expected_changelog(run.engine, run.slug, run.record, current)
-    except ReleaseRefused as exc:
-        raise run.refuse(str(exc), path=run.changelog_rel, **exc.details) from None
-    if current == expected:
-        run.step("changelog", "verified", path=run.changelog_rel)
-    elif known and current == base:
-        _write_atomic(path, expected)
-        run.step("changelog", "done", path=run.changelog_rel)
-    else:
-        raise run.refuse(
-            f"{run.changelog_rel} differs from both its content before the release and the "
-            f"expected content (a partial or foreign edit?) — not overwritten; fix it "
-            f"(restore it or finish the {run.version} section exactly) and resume.",
-            path=run.changelog_rel)
-    _point(run.on_point, "after_changelog")
-    return {"path": run.changelog_rel, "sha256": _sha256(expected), "section_date": date}
+    if os.path.islink(path) or not os.path.isfile(path):
+        return _NOT_A_FILE
+    return _read_bytes(path)
 
 
-# ── step 4: version sync + the version-file contract ─────────────────────────
+def _store_path(digest: str) -> str:
+    return os.path.join(dct_paths.release_store_dir(), digest[:2], digest)
 
 
-def _sync_script(project_root: str) -> str | None:
-    for rel in VERSION_SYNC_SCRIPTS:
-        if os.path.isfile(os.path.join(project_root, rel)):
-            return rel
-    return None
+def _store_put(data: bytes) -> str:
+    """Keep `data` in dct's release blob store; returns its SHA-256 (the id)."""
+    digest = _sha256(data)
+    path = _store_path(digest)
+    if _read_bytes(path) != data:
+        _write_atomic(path, data)
+    return digest
 
 
-def _run_sync(run: _Run) -> None:
-    """Run the version-sync script from project_root (cwd = project_root),
-    ONLY while current_version is the record's version (K-31/K-73). A
-    non-zero exit raises SyncFailed (nothing advanced)."""
-    _point(run.on_point, "before_sync")
-    current = get_project(run.engine, run.slug)["current_version"]
-    if not same_version(current, run.version):
-        run.warnings.append(f"version-sync skipped: {run.version} is not the current "
-                            f"version ({current})")
-        run.step("sync", "skipped", reason="not the current version")
-        return
-    script = _sync_script(run.project_root)
-    if script is None:
-        run.step("sync", "skipped", reason="no version-sync script")
-        return
-    proc = subprocess.run(["bash", os.path.join(run.project_root, script), run.version],
-                          cwd=run.project_root, capture_output=True, text=True, check=False)
-    output = (proc.stdout or "") + (proc.stderr or "")
-    if output:
-        print(output, file=sys.stderr, end="" if output.endswith("\n") else "\n")
-    if proc.returncode != 0:
-        raise SyncFailed(
-            f"version-sync script failed (exit {proc.returncode}): {script} in "
-            f"{run.project_root}. Release {run.version} is recorded ({run.record['status']}) "
-            f"— fix the script and run `dct release resume`.",
-            proc.returncode, details={"script": script, "exit_code": proc.returncode},
-            steps=run.steps, release=run.record)
-    run.step("sync", "done", script=script)
+def _store_get(digest: str) -> bytes:
+    path = _store_path(digest)
+    data = _read_bytes(path)
+    if data is None or _sha256(data) != digest:
+        raise ReleaseRefused(
+            f"the approved content {digest} is missing from dct's release blob store "
+            f"({os.path.dirname(os.path.dirname(path))}) — prepare again (or abandon the "
+            f"release); nothing written.", details={"missing_blob": digest})
+    return data
 
 
-def _changed_files(run: _Run, pre_untracked: set[str]) -> list[str]:
-    """Paths changed against HEAD (staged, unstaged, new untracked — minus
-    the untracked files present before the release: the manifest's
-    `untracked_baseline`, recorded with the stamp), without F."""
-    state = planning.index_state(run.repo, [])
-    if state["conflicted"]:
-        raise run.refuse(f"conflicted paths: {', '.join(state['conflicted'])}",
-                         conflicted=state["conflicted"])
-    changed = set(state["staged"]) | set(state["unstaged"]) | (set(state["untracked"]) -
-                                                               pre_untracked)
-    changed.discard(run.changelog_rel)
-    return sorted(changed)
+def _blob_at(repo: str, commit: str, rel: str) -> str | None:
+    """The blob id of the REGULAR file `rel` in `commit`, or None (absent);
+    a symlink / submodule / tree there is refused."""
+    _, out = gitinfo.git_read(repo, "ls-tree", "-z", commit, "--", rel)
+    entry = next((e for e in out.split("\0") if e), None)
+    if entry is None:
+        return None
+    meta, _, name = entry.partition("\t")
+    parts = meta.split()
+    if name != rel or len(parts) != 3 or parts[1] != "blob" or parts[0] not in ("100644",
+                                                                               "100755"):
+        raise ReleaseRefused(f"{rel} in {commit} is not a regular file ({meta}) — refused.")
+    return parts[2].lower()
 
 
-def _version_files(run: _Run, pre_untracked: set[str]) -> list[dict]:
-    """The verified version files [{path, sha256}] (K-73)."""
-    contract = ledger.get_version_files(run.engine, run.slug)["version_files"]
+def _content_id(run: _Run, rel: str) -> str | None:
+    """The id of the CURRENT content of artifact `rel` (git: `git
+    hash-object --path`, nothing written; outside git: SHA-256), None when
+    absent, _NOT_A_FILE when not a regular file."""
+    path = run.abspath(rel)
+    data = _read_regular(path)
+    if not isinstance(data, bytes):
+        return data
     if run.repo is None:
-        if contract is None:
-            run.warnings.append("no git — the version-file set cannot be learned; none recorded")
-            return []
-        files = contract
-    else:
-        changed = _changed_files(run, pre_untracked)
-        if contract is None:
-            if not run.confirm_version_files:
-                raise run.refuse(
-                    f"first release of '{run.slug}': the version sync changed "
-                    f"{', '.join(changed) or 'no files'} — review the list and confirm it as "
-                    f"the project's version-file contract with `dct release resume "
-                    f"--confirm-version-files` (nothing was committed).",
-                    proposed_version_files=changed)
-            ledger.set_version_files(run.engine, run.slug, changed, confirm=True)
-            run.step("version_files", "learned", version_files=changed)
-            files = changed
-        elif changed != contract:
-            raise run.refuse(
-                f"the version sync changed {changed or 'no files'} but the project's "
-                f"version-file contract is {contract} — nothing committed; fix the script or "
-                f"the files and resume.", changed=changed, contract=contract)
-        else:
-            files = contract
-    out, missing = [], []
-    for rel in files:
-        data = _read_bytes(run.abspath(rel))
-        if data is None or run.version.encode("utf-8") not in data:
-            missing.append(rel)
-            continue
-        out.append({"path": rel, "sha256": _sha256(data)})
-    if missing:
+        return _sha256(data)
+    _, out = gitinfo.git_read(run.repo, "hash-object", f"--path={rel}", "--", path)
+    return out.strip().lower()
+
+
+def _id_of_bytes(run: _Run, rel: str, data: bytes) -> str:
+    """The id of `data` as the content of `rel` — computed from THESE bytes
+    (K-77: from the one read), never from a second read of the file. In git
+    the blob is written to the object database (the expected tree needs
+    it)."""
+    if run.repo is None:
+        return _sha256(data)
+    with tempfile.TemporaryDirectory(prefix="dct-release-blob-") as tmp:
+        scratch = os.path.join(tmp, "content")
+        with open(scratch, "wb") as fh:
+            fh.write(data)
+        _, out = gitinfo.git_write(run.repo, "hash-object", "-w", f"--path={rel}", "--", scratch)
+    return out.strip().lower()
+
+
+def _approved_bytes(run: _Run, rel: str, blob: str) -> bytes:
+    """The work-tree bytes of the approved blob of `rel`."""
+    if run.repo is None:
+        return _store_get(blob)
+    try:
+        return gitinfo.git_cat_blob(run.repo, blob, path=rel)
+    except gitinfo.GitReadError as exc:
         raise run.refuse(
-            f"version files without {run.version}: {', '.join(missing)} — nothing committed.",
-            missing=missing)
+            f"the approved blob {blob} of {rel} cannot be read ({exc}) — prepare again (or "
+            f"abandon the release); nothing written.", missing_blob=blob) from None
+
+
+def _blob_available(run: _Run, blob: str) -> bool:
+    if run.repo is None:
+        data = _read_bytes(_store_path(blob))
+        return data is not None and _sha256(data) == blob
+    code, _ = gitinfo.git_read(run.repo, "cat-file", "-e", blob, ok_codes=(0, 1, 128))
+    return code == 0
+
+
+# ── the version-sync script (prepare only, K-96 D9) ──────────────────────────
+
+
+def _sync_env() -> dict[str, str]:
+    """The caller's environment without repository-location variables (a
+    GIT_DIR leaked from a hook must not redirect the script's git calls)."""
+    return {key: value for key, value in os.environ.items()
+            if not key.startswith("GIT_") or key in gitinfo.WRITE_ENV_PASSTHROUGH}
+
+
+def _group_alive(pgid: int) -> bool:
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _stop_group(proc: subprocess.Popen) -> bool:
+    """Stop the script's whole process group (it runs in its own session):
+    SIGTERM, then SIGKILL after SYNC_KILL_GRACE_SECONDS; the script itself
+    is reaped. Returns True when something had to be stopped. Without
+    process groups (Windows) only the script is killed."""
+    if not hasattr(os, "killpg"):
+        stopped = proc.poll() is None
+        if stopped:
+            proc.kill()
+        proc.wait()
+        return stopped
+    pgid = proc.pid
+    stopped = False
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        if proc.poll() is not None and not _group_alive(pgid):
+            break
+        stopped = True
+        with contextlib.suppress(ProcessLookupError, PermissionError):
+            os.killpg(pgid, sig)
+        deadline = time.monotonic() + SYNC_KILL_GRACE_SECONDS
+        while time.monotonic() < deadline:
+            if proc.poll() is not None and not _group_alive(pgid):
+                break
+            time.sleep(0.02)
+    proc.wait()
+    return stopped
+
+
+def run_sync_script(script: str, version: str, cwd: str) -> dict:
+    """Run `bash <script> <version>` in `cwd` — its own session / process
+    group, stdin closed, stdout + stderr captured into ONE temporary file.
+    At most SYNC_TIMEOUT_SECONDS of wall clock; on timeout, and after a
+    normal exit for anything it left running, the whole group is stopped
+    (_stop_group) BEFORE this returns. Returns {exit_code (None on
+    timeout), timed_out, output (the first SYNC_OUTPUT_MAX_BYTES, UTF-8
+    with replacement), output_bytes (total), output_dropped_bytes,
+    stopped_processes, duration_seconds}."""
+    started = time.monotonic()
+    with tempfile.TemporaryFile() as out:
+        try:
+            proc = subprocess.Popen(
+                ["bash", script, version], cwd=cwd, stdin=subprocess.DEVNULL, stdout=out,
+                stderr=subprocess.STDOUT, env=_sync_env(), start_new_session=True)
+        except OSError as exc:
+            raise ReleaseRefused(f"the version-sync script cannot be started: {exc}") from None
+        timed_out = False
+        try:
+            proc.wait(timeout=SYNC_TIMEOUT_SECONDS)
+        except subprocess.TimeoutExpired:
+            timed_out = True
+        stopped = _stop_group(proc)
+        total = out.seek(0, os.SEEK_END)
+        out.seek(0)
+        head = out.read(SYNC_OUTPUT_MAX_BYTES)
+    return {
+        "exit_code": None if timed_out else proc.returncode,
+        "timed_out": timed_out,
+        "output": head.decode("utf-8", "replace"),
+        "output_bytes": total,
+        "output_dropped_bytes": total - len(head),
+        "stopped_processes": stopped,
+        "duration_seconds": round(time.monotonic() - started, 3),
+    }
+
+
+def _sync_failed(run: _Run, script: str, sync: dict) -> SyncFailed:
+    details = {"script": script, "exit_code": sync["exit_code"], "sync": sync}
+    if sync["timed_out"]:
+        return SyncFailed(
+            f"version-sync script timed out after {SYNC_TIMEOUT_SECONDS}s and was stopped "
+            f"(its whole process group): {script} — nothing stamped, no proposal stored; fix "
+            f"the script and run `dct release prepare` again.", SYNC_TIMEOUT_EXIT,
+            details=details, steps=run.steps)
+    return SyncFailed(
+        f"version-sync script failed (exit {sync['exit_code']}): {script} — nothing stamped, "
+        f"no proposal stored; fix the script and run `dct release prepare` again.",
+        sync["exit_code"], details=details, steps=run.steps)
+
+
+# ── the version-file contract (K-96 D9) ──────────────────────────────────────
+
+
+def _version_pattern(version: str) -> re.Pattern:
+    """V as a whole version token (optionally v-prefixed): not inside a
+    longer number or word (1.1.0 does not match 1.1.01 or 21.1.0)."""
+    return re.compile(r"(?<![0-9A-Za-z.])v?" + re.escape(version) + r"(?![0-9A-Za-z]|\.[0-9])")
+
+
+def check_version_file(path: str, base: bytes | None, expected: bytes, version: str) -> dict:
+    """The content contract of ONE version file after the sync (K-96 D9) —
+    never a substring search over the whole file:
+      - a file dct has a version reader for (core.version
+        VERSION_FIELD_READERS, by name: VERSION, pyproject.toml,
+        package.json, Cargo.toml, tauri.conf.json): its version FIELD must
+        be V (same_version) → {path, check: "version_field", value};
+      - any other file (UTF-8 text): every line the sync added or changed
+        (base → expected, line diff) must hold V as a whole version token,
+        at least one such line, no line only removed → {path, check:
+        "lines_with_version", changed_lines}.
+    ValueError (the reason) otherwise."""
+    if version_field_reader(path) is not None:
+        value = read_version_field(path, expected)
+        if value is None:
+            raise ValueError(f"{path} has no version field after the sync")
+        try:
+            matches = same_version(normalize_version(value), version)
+        except ValueError:
+            matches = False
+        if not matches:
+            raise ValueError(f"the version field of {path} is {value!r}, not {version}")
+        return {"path": path, "check": "version_field", "value": value}
+    try:
+        old = (base or b"").decode("utf-8").splitlines()
+        new = expected.decode("utf-8").splitlines()
+    except UnicodeDecodeError:
+        raise ValueError(f"{path} is not UTF-8 text and dct has no version reader for it") \
+            from None
+    pattern, changed, bad = _version_pattern(version), 0, []
+    for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(a=old, b=new,
+                                                       autojunk=False).get_opcodes():
+        if tag == "equal":
+            continue
+        if j1 == j2:
+            bad.append(f"line(s) {i1 + 1}-{i2} removed")
+            continue
+        for line in new[j1:j2]:
+            changed += 1
+            if not pattern.search(line):
+                bad.append(line)
+    if bad or not changed:
+        raise ValueError(
+            f"{path} (no version-field reader): every line the sync changes must hold "
+            f"{version} — " + ("; ".join(repr(b) for b in bad[:5]) if bad else "nothing changed"))
+    return {"path": path, "check": "lines_with_version", "changed_lines": changed}
+
+
+# ── prepare: the isolated run and the proposal (K-76) ────────────────────────
+
+
+def _git_state(repo: str) -> dict:
+    """What the user's checkout must still be after an isolated sync: HEAD,
+    every ref, the index, the status and the bytes of every untracked file."""
+    _, refs = gitinfo.git_read(repo, "for-each-ref", "--format=%(refname) %(objectname)")
+    _, index = gitinfo.git_read(repo, "ls-files", "-s", "-z")
+    _, status = gitinfo.git_read(repo, "status", "--porcelain=v1", "-z", "--untracked-files=all")
+    untracked = {}
+    for token in status.split("\0"):
+        if token.startswith("?? "):
+            data = _read_regular(os.path.join(repo, token[3:]))
+            untracked[token[3:]] = _sha256(data) if isinstance(data, bytes) else str(data)
+    return {"head": _rev(repo, "HEAD"), "refs": refs, "index": index,
+            "status": sorted(t for t in status.split("\0") if t), "untracked": untracked}
+
+
+def _state_diff(before: dict, after: dict) -> dict:
+    out = {}
+    for key in sorted(set(before) | set(after)):
+        old, new = before.get(key), after.get(key)
+        if old == new:
+            continue
+        if isinstance(old, dict) and isinstance(new, dict):
+            out[key] = sorted(k for k in set(old) | set(new) if old.get(k) != new.get(k))
+        elif isinstance(old, list) and isinstance(new, list):
+            out[key] = sorted(set(old) ^ set(new))
+        else:
+            out[key] = {"before": old, "after": new}
     return out
 
 
+def _walk(root: str) -> dict[str, tuple]:
+    """Every entry under `root` (a project CONFIRMED outside git): {rel:
+    ("file", sha256, executable) | ("link", target) | ("other",)} —
+    bounded by COPY_MAX_FILES / COPY_MAX_BYTES (refused beyond)."""
+    entries: dict[str, tuple] = {}
+    files = size = 0
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames.sort()
+        for name in sorted(dirnames + filenames):
+            full = os.path.join(dirpath, name)
+            rel = _rel(os.path.relpath(full, root))
+            st = os.lstat(full)
+            if stat.S_ISDIR(st.st_mode):
+                continue
+            if stat.S_ISLNK(st.st_mode):
+                entries[rel] = ("link", os.readlink(full))
+            elif stat.S_ISREG(st.st_mode):
+                files += 1
+                size += st.st_size
+                if files > COPY_MAX_FILES or size > COPY_MAX_BYTES:
+                    raise ReleaseRefused(
+                        f"the project directory {root} holds more than {COPY_MAX_FILES} files / "
+                        f"{COPY_MAX_BYTES} bytes — it cannot be copied for an isolated version "
+                        f"sync; nothing prepared.", details={"files": files, "bytes": size})
+                entries[rel] = ("file", _sha256(_read_bytes(full)), bool(st.st_mode & 0o111))
+            else:
+                entries[rel] = ("other",)
+    return entries
+
+
+@contextlib.contextmanager
+def _isolated_worktree(repo: str, candidate: str) -> Iterator[str]:
+    """A temporary linked worktree DETACHED at `candidate`, outside the
+    user's checkout (under tempfile); the repository's hooks are disabled
+    for this internal checkout (core.hooksPath = an empty directory — no
+    post-checkout hook runs). Removed afterwards (`git worktree remove
+    --force` + `git worktree prune`), also on failure."""
+    tmp = os.path.realpath(tempfile.mkdtemp(prefix="dct-release-prepare-"))
+    wt, hooks = os.path.join(tmp, "worktree"), os.path.join(tmp, "no-hooks")
+    os.mkdir(hooks)
+    try:
+        gitinfo.git_write(repo, "-c", f"core.hooksPath={hooks}", "worktree", "add", "--detach",
+                          "--quiet", wt, candidate, timeout=PREPARE_GIT_TIMEOUT_SECONDS)
+        yield wt
+    finally:
+        with contextlib.suppress(gitinfo.CheckoutVerificationError):
+            gitinfo.git_write(repo, "worktree", "remove", "--force", "--force", wt)
+        with contextlib.suppress(gitinfo.CheckoutVerificationError):
+            gitinfo.git_write(repo, "worktree", "prune")
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def _worktree_changes(wt: str, candidate: str) -> dict[str, tuple[str, str, str]]:
+    """{repo-relative path: (status, mode, blob)} of everything the sync
+    changed in the temporary worktree against the candidate — staged there
+    with `git add -A` (the TEMPORARY worktree's own index; ignored files
+    stay out; every blob lands in the shared object database)."""
+    gitinfo.git_write(wt, "add", "-A", timeout=PREPARE_GIT_TIMEOUT_SECONDS)
+    _, out = gitinfo.git_read(wt, "diff", "--cached", "--no-renames", "--name-status", "-z",
+                              candidate)
+    tokens = [t for t in out.split("\0") if t]
+    changes = dict(zip(tokens[1::2], tokens[0::2], strict=True))
+    found: dict[str, tuple[str, str, str]] = {}
+    if changes:
+        _, listing = gitinfo.git_read(wt, "ls-files", "-s", "-z", "--", *sorted(changes))
+        for entry in (e for e in listing.split("\0") if e):
+            meta, _, rel = entry.partition("\t")
+            mode, blob, _stage = meta.split()
+            found[rel] = (changes[rel], mode, blob.lower())
+    for rel, status in changes.items():
+        found.setdefault(rel, (status, "", ""))
+    return found
+
+
+def _project_prefix(run: _Run) -> str:
+    rel = _rel(os.path.relpath(run.project_root, run.repo))
+    return "" if rel == "." else rel + "/"
+
+
+def _current_script(run: _Run) -> tuple[str, bytes] | None:
+    """(identity, bytes) of the project's version-sync script: in git the
+    CANDIDATE's file (repo-relative identity — the release runs only what
+    the candidate holds; an untracked script is refused), outside git the
+    file under the project root."""
+    if run.repo is None:
+        for rel in VERSION_SYNC_SCRIPTS:
+            data = _read_regular(os.path.join(run.project_root, rel))
+            if isinstance(data, bytes):
+                return rel, data
+        return None
+    candidate = run.checkout["head"] if run.record is None else run.record["candidate_sha"]
+    prefix = _project_prefix(run)
+    for rel in VERSION_SYNC_SCRIPTS:
+        full = prefix + rel
+        data = gitinfo.git_read_blob(run.repo, candidate, full)
+        if data is not None:
+            return full, data
+        if os.path.lexists(run.abspath(full)):
+            raise run.refuse(
+                f"the version-sync script {full} is not part of the candidate {candidate} "
+                f"(untracked?) — commit it first: a release runs only what its candidate "
+                f"holds; nothing prepared.", script=full)
+    return None
+
+
+def _prepare_git(run: _Run, version: str, script: tuple[str, bytes] | None) -> tuple:
+    """The isolated sync of a project in git → (files, sync, changelog)."""
+    repo, candidate = run.repo, run.checkout["head"]
+    changelog = None
+    if run.changelog_rel:
+        blob = _blob_at(repo, candidate, run.changelog_rel)
+        base = gitinfo.git_read_blob(repo, candidate, run.changelog_rel) if blob else None
+        changelog = {"path": run.changelog_rel, "base_blob": blob,
+                     "base_sha256": _sha256(base) if base is not None else None}
+    if script is None:
+        return {}, None, changelog
+    before = _git_state(repo)
+    prefix = _project_prefix(run)
+    with _isolated_worktree(repo, candidate) as wt:
+        sync = run_sync_script(os.path.join(wt, *script[0].split("/")), version,
+                               os.path.join(wt, *prefix.split("/")) if prefix else wt)
+        changed = _state_diff(before, _git_state(repo))
+        if changed:
+            raise run.refuse(
+                "the version-sync script changed the checkout outside its isolated worktree "
+                f"({', '.join(changed)}) — refused; dct restores nothing: review and undo "
+                "those changes yourself, then fix the script; nothing prepared.",
+                checkout_changed=changed, sync=sync)
+        if sync["exit_code"] != 0:
+            raise _sync_failed(run, script[0], sync)
+        changes = _worktree_changes(wt, candidate)
+    if run.changelog_rel in changes:
+        raise run.refuse(
+            f"the version-sync script modified the changelog file {run.changelog_rel} — dct "
+            f"writes it (manages_changelog); fix the script; nothing prepared.",
+            changelog=run.changelog_rel, sync=sync)
+    files = {}
+    for rel, (status, mode, blob) in sorted(changes.items()):
+        if status not in ("A", "M") or mode not in ("100644", "100755"):
+            raise run.refuse(
+                f"the version-sync script {'deleted' if status == 'D' else 'retyped'} {rel} — "
+                f"only regular files may be added or changed; nothing prepared.",
+                path=rel, status=status, mode=mode)
+        base = _blob_at(repo, candidate, rel)
+        if base == blob:
+            raise run.refuse(f"the version-sync script changed only the mode of {rel} — "
+                             f"refused; nothing prepared.", path=rel)
+        files[rel] = {
+            "base": base, "expected": blob,
+            "base_bytes": gitinfo.git_read_blob(repo, candidate, rel) if base else None,
+            "expected_bytes": gitinfo.git_cat_blob(repo, blob),
+        }
+    return files, sync, changelog
+
+
+def _prepare_plain(run: _Run, version: str, script: tuple[str, bytes] | None) -> tuple:
+    """The isolated sync of a project CONFIRMED outside git — on a temporary
+    COPY of its directory → (files, sync, changelog); every content kept in
+    dct's release blob store."""
+    root = run.project_root
+    changelog = None
+    if run.changelog_rel:
+        data = _read_regular(run.abspath(run.changelog_rel))
+        if data == _NOT_A_FILE:
+            raise run.refuse(f"{run.changelog_rel} is not a regular file — nothing prepared.")
+        digest = _store_put(data) if data is not None else None
+        changelog = {"path": run.changelog_rel, "base_blob": digest, "base_sha256": digest}
+    if script is None:
+        return {}, None, changelog
+    before = _walk(root)
+    others = sorted(rel for rel, entry in before.items() if entry[0] == "other")
+    if others:
+        raise run.refuse(f"special files under the project directory ({', '.join(others[:5])}) "
+                         f"— it cannot be copied for an isolated sync; nothing prepared.")
+    files = {}
+    with tempfile.TemporaryDirectory(prefix="dct-release-prepare-") as tmp:
+        copy = os.path.join(os.path.realpath(tmp), "project")
+        shutil.copytree(root, copy, symlinks=True)
+        sync = run_sync_script(os.path.join(copy, *script[0].split("/")), version, copy)
+        after = _walk(root)
+        if after != before:
+            changed = sorted(k for k in set(before) | set(after) if before.get(k) != after.get(k))
+            raise run.refuse(
+                "the version-sync script changed the project directory outside its isolated "
+                f"copy ({', '.join(changed[:10])}) — refused; dct restores nothing: review and "
+                "undo those changes yourself, then fix the script; nothing prepared.",
+                checkout_changed=changed, sync=sync)
+        if sync["exit_code"] != 0:
+            raise _sync_failed(run, script[0], sync)
+        result_entries = _walk(copy)
+        deleted = sorted(set(before) - set(result_entries))
+        changed = sorted(rel for rel, entry in result_entries.items() if before.get(rel) != entry)
+        if run.changelog_rel in changed or run.changelog_rel in deleted:
+            raise run.refuse(
+                f"the version-sync script modified the changelog file {run.changelog_rel} — dct "
+                f"writes it (manages_changelog); fix the script; nothing prepared.",
+                changelog=run.changelog_rel, sync=sync)
+        bad = deleted + [rel for rel in changed if result_entries[rel][0] != "file"
+                         or (rel in before and before[rel][0] != "file")]
+        if bad:
+            raise run.refuse(
+                f"the version-sync script deleted or retyped {', '.join(bad)} — only regular "
+                f"files may be added or changed; nothing prepared.", paths=bad)
+        for rel in changed:
+            expected = _read_bytes(os.path.join(copy, *rel.split("/")))
+            base = _read_bytes(os.path.join(root, *rel.split("/"))) if rel in before else None
+            files[rel] = {"base": before[rel][1] if rel in before else None,
+                          "expected": _store_put(expected), "base_bytes": base,
+                          "expected_bytes": expected}
+    return files, sync, changelog
+
+
+def _build_proposal(run: _Run, version: str, plan_digest: str) -> tuple[dict, dict]:
+    """Run the sync isolated and build the proposal (validate_proposal) —
+    (proposal, report {sync, checks, script})."""
+    script = _current_script(run)
+    if script is None:
+        run.step("sync", "skipped", reason="no version-sync script")
+    prepare = _prepare_git if run.repo else _prepare_plain
+    files, sync, changelog = prepare(run, version, script)
+    if sync is not None:
+        run.step("sync", "done", script=script[0], isolated=True)
+    checks = []
+    for rel, item in sorted(files.items()):
+        try:
+            checks.append(check_version_file(rel, item["base_bytes"], item["expected_bytes"],
+                                             version))
+        except ValueError as exc:
+            raise run.refuse(f"{exc} — the version sync's result breaks the version-file "
+                             f"contract; nothing prepared.", path=rel, sync=sync) from None
+    proposal = ledger.validate_proposal({
+        "paths": sorted(files),
+        "base_blobs": {rel: item["base"] for rel, item in files.items()},
+        "expected_blobs": {rel: item["expected"] for rel, item in files.items()},
+        "script": None if script is None else {"identity": script[0],
+                                               "sha256": _sha256(script[1])},
+        "candidate_sha": run.checkout["head"] if run.checkout else None,
+        "version": version,
+        "plan_digest": plan_digest,
+        "release_mode": run.mode,
+        "changelog": changelog,
+    })
+    return proposal, {"sync": sync, "checks": checks}
+
+
+# ── steps 3-4: the artifacts — approved content only, the script never runs ──
+
+
+def _record_proposal(run: _Run) -> dict:
+    """The approved proposal of the record, consistent with this run."""
+    proposal = run.record.get("proposal")
+    if proposal is None:
+        raise run.refuse(
+            f"release {run.version} has no approved version-file proposal (stamped outside "
+            f"`dct release apply`, or before K-76) — its files cannot be written without "
+            f"re-running the version sync, which dct never does after the stamp; nothing "
+            f"done (abandon it with `dct release abandon`).")
+    if (proposal.get("release_mode") or run.mode) != run.mode:
+        raise run.refuse(f"the approved proposal of {run.version} is for a "
+                         f"{proposal['release_mode']} release, this checkout is {run.mode} — "
+                         f"nothing done.")
+    if (proposal.get("changelog") or {}).get("path") != run.changelog_rel:
+        raise run.refuse(
+            f"the changelog file of the approved proposal "
+            f"({(proposal.get('changelog') or {}).get('path')}) is not the project's "
+            f"({run.changelog_rel}) — the changelog setting changed since the approval; "
+            f"nothing done.")
+    return proposal
+
+
+def _changelog_baseline(run: _Run, proposal: dict) -> bytes | None:
+    """F's content BEFORE the release (K-78: never the current file): the
+    candidate's blob in git (it must be the approved baseline), outside git
+    the persisted copy in dct's release blob store; None = absent."""
+    approved = proposal["changelog"]
+    if run.repo:
+        candidate = run.record["candidate_sha"]
+        blob = _blob_at(run.repo, candidate, run.changelog_rel)
+        if blob != approved["base_blob"]:
+            raise run.refuse(f"the candidate's {run.changelog_rel} is not the approved baseline "
+                             f"— nothing done.")
+        return gitinfo.git_read_blob(run.repo, candidate, run.changelog_rel) if blob else None
+    if approved["base_blob"] is None:
+        return None
+    return _store_get(approved["base_blob"])
+
+
 def _check_resume_tree(run: _Run) -> None:
-    """Before re-running the file effects of a 'stamped' record: nothing
+    """Before the file effects of a 'stamped' record are retried: nothing
     staged or conflicted; unstaged paths only release artifacts (F and the
-    contract; any path while no contract exists — the sync re-learns it)."""
-    contract = ledger.get_version_files(run.engine, run.slug)["version_files"]
+    approved proposal's files — their CONTENT is checked by _step_files)."""
+    proposal = run.record.get("proposal") or {}
     state = planning.index_state(run.repo, [])
     if state["staged"] or state["conflicted"]:
         raise run.refuse(
             "staged or conflicted paths before the release files were recorded — unstage "
             "them yourself; nothing done.", staged=state["staged"],
             conflicted=state["conflicted"])
-    if contract is not None:
-        allowed = set(contract) | {run.changelog_rel}
-        foreign = sorted(p for p in state["unstaged"] if p not in allowed)
-        if foreign:
-            raise run.refuse(f"foreign changes in the work tree: {', '.join(foreign)} — "
-                             f"nothing done.", foreign=foreign)
+    allowed = set(proposal.get("paths") or ()) | {run.changelog_rel}
+    foreign = sorted(p for p in state["unstaged"] if p not in allowed)
+    if foreign:
+        raise run.refuse(f"foreign changes in the work tree: {', '.join(foreign)} — "
+                         f"nothing done.", foreign=foreign)
 
 
-def _step_files(run: _Run, pre_untracked: set[str]) -> None:
-    """Steps 3-4 for a 'stamped' record → 'files_written' with the manifest."""
-    manifest: dict = {}
-    changelog = _step_changelog(run)
-    if changelog:
-        manifest["changelog"] = changelog
-    if run.project_root:
-        _run_sync(run)
-        manifest["version_files"] = _version_files(run, pre_untracked)
-    else:
-        run.step("sync", "skipped", reason="no project path")
-        manifest["version_files"] = []
+def _verified_manifest(run: _Run, proposal: dict, expected_f: bytes | None) -> dict:
+    """K-77: read the FULL artifact set ONCE and compute every hash and the
+    expected tree from that one read; every artifact must be exactly the
+    approved content (F: its baseline + the rendered section) — a mismatch
+    refuses and records nothing."""
+    rels = ([run.changelog_rel] if run.changelog_rel else []) + list(proposal["paths"])
+    data = {rel: _read_regular(run.abspath(rel)) for rel in rels}
+    ids, bad = {}, []
+    if run.changelog_rel and data[run.changelog_rel] != expected_f:
+        bad.append(run.changelog_rel)
+    for rel in proposal["paths"]:
+        if not isinstance(data[rel], bytes):
+            bad.append(rel)
+            continue
+        ids[rel] = _id_of_bytes(run, rel, data[rel])
+        if ids[rel] != proposal["expected_blobs"][rel]:
+            bad.append(rel)
+    if bad:
+        raise run.refuse(
+            f"after writing, {', '.join(bad)} differ(s) from the approved content (changed "
+            f"meanwhile?) — 'files_written' is NOT recorded and nothing is overwritten; "
+            f"restore the file(s) as approved and resume, or abandon the release.", changed=bad)
+    manifest: dict = {"version_files": [{"path": rel, "sha256": _sha256(data[rel])}
+                                        for rel in sorted(proposal["paths"])]}
+    if run.changelog_rel:
+        _, date = render_section(run.engine, run.slug, run.record)
+        manifest["changelog"] = {"path": run.changelog_rel,
+                                 "sha256": _sha256(data[run.changelog_rel]),
+                                 "section_date": date}
     if run.repo:
-        paths = [m["path"] for m in manifest["version_files"]]
-        if changelog:
-            paths.append(changelog["path"])
-        manifest["tree"] = expected_tree(run.repo, run.record["candidate_sha"], paths)
-    _point(run.on_point, "after_sync")
+        if run.changelog_rel:
+            ids[run.changelog_rel] = _id_of_bytes(run, run.changelog_rel,
+                                                  data[run.changelog_rel])
+        manifest["tree"] = _tree_of_blobs(run.repo, run.record["candidate_sha"], ids)
+    return manifest
+
+
+def _step_files(run: _Run) -> None:
+    """Steps 3-4 for a 'stamped' record → 'files_written' with the manifest.
+
+    K-75: every artifact is CLASSIFIED before anything is written — its
+    current content is the baseline (→ written), the approved content (→
+    kept) or anything else (→ refused: nothing written, the index
+    untouched, never restored automatically). Then F and the approved
+    blobs are written (the script never runs), and the result is verified
+    from one read (K-77)."""
+    proposal = _record_proposal(run)
+    actions: list[tuple[str, str]] = []
+    foreign: list[str] = []
+    expected_f = None
+    if run.changelog_rel:
+        base = _changelog_baseline(run, proposal)
+        try:
+            expected_f = expected_changelog(run.engine, run.slug, run.record, base)
+        except ReleaseRefused as exc:
+            raise run.refuse(str(exc), path=run.changelog_rel, **exc.details) from None
+        current = _read_regular(run.abspath(run.changelog_rel))
+        if current == expected_f:
+            actions.append((run.changelog_rel, "verified"))
+        elif current == base:
+            actions.append((run.changelog_rel, "write"))
+        else:
+            foreign.append(run.changelog_rel)
+    for rel in proposal["paths"]:
+        current = _content_id(run, rel)
+        if current == proposal["expected_blobs"][rel]:
+            actions.append((rel, "verified"))
+        elif current == proposal["base_blobs"][rel]:
+            actions.append((rel, "write"))
+        else:
+            foreign.append(rel)
+    if foreign:
+        raise run.refuse(
+            f"{', '.join(foreign)} differ(s) from both the content before the release and the "
+            f"approved content (a partial or foreign edit?) — not overwritten: nothing "
+            f"written, the index untouched; restore the file(s) yourself (or finish them "
+            f"exactly as approved) and resume, or abandon the release.", foreign=foreign)
+    todo = dict(actions)
+    _point(run.on_point, "before_changelog")
+    if run.changelog_rel:
+        if todo[run.changelog_rel] == "write":
+            _write_atomic(run.abspath(run.changelog_rel), expected_f)
+            run.step("changelog", "done", path=run.changelog_rel)
+        else:
+            run.step("changelog", "verified", path=run.changelog_rel)
+    else:
+        run.step("changelog", "skipped", reason="no changelog file managed")
+    _point(run.on_point, "after_changelog")
+    _point(run.on_point, "before_version_files")
+    written = []
+    for rel in proposal["paths"]:
+        if todo[rel] != "write":
+            continue
+        _write_atomic(run.abspath(rel), _approved_bytes(run, rel, proposal["expected_blobs"][rel]))
+        written.append(rel)
+        _point(run.on_point, "after_version_file")
+    run.step("version_files", "done" if written else "verified", paths=list(proposal["paths"]),
+             written=written)
+    _point(run.on_point, "after_version_files")
+    manifest = _verified_manifest(run, proposal, expected_f)
     run.advance("files_written", manifest=manifest)
     _point(run.on_point, "after_files_written")
 
@@ -754,8 +1347,8 @@ def _verify_manifest_files(run: _Run) -> None:
         entries.append(manifest["changelog"])
     bad = []
     for item in entries:
-        data = _read_bytes(run.abspath(item["path"]))
-        if data is None or _sha256(data) != item["sha256"]:
+        data = _read_regular(run.abspath(item["path"]))
+        if not isinstance(data, bytes) or _sha256(data) != item["sha256"]:
             bad.append(item["path"])
     if bad:
         raise run.refuse(
@@ -884,7 +1477,6 @@ def _continue(run: _Run, *, fresh: bool) -> None:
     """Perform / verify every effect still missing for run.record (`fresh`:
     straight after the stamp of a pre-checked apply; else a resume)."""
     status = run.record["status"]
-    baseline = set((run.record["manifest"] or {}).get("untracked_baseline") or ())
     if run.repo:
         if status == "stamped":
             head = _head(run.repo)
@@ -895,7 +1487,7 @@ def _continue(run: _Run, *, fresh: bool) -> None:
                     head=head, candidate=run.record["candidate_sha"])
             if not fresh:
                 _check_resume_tree(run)
-            _step_files(run, baseline)
+            _step_files(run)
         elif status == "files_written":
             run.step("files", "verified")
         if run.record["status"] == "files_written":
@@ -914,7 +1506,7 @@ def _continue(run: _Run, *, fresh: bool) -> None:
             run.step("tag", "verified")
     else:
         if status == "stamped":
-            _step_files(run, set())
+            _step_files(run)
         else:
             _verify_manifest_files(run)
             run.step("files", "verified")
@@ -928,6 +1520,11 @@ def _finish(action: str, run: _Run, outcome: str, **details) -> dict:
 
 
 # ── public API ───────────────────────────────────────────────────────────────
+
+
+class NothingToPrepare(ReleaseRefused):
+    """prepare has nothing to prepare: the version already has a record, or
+    it is lower than the current version (releases never rewind)."""
 
 
 def _entry_selection(slug: str, plan: dict, target: str, entry_ids, no_entries: bool,
@@ -972,55 +1569,20 @@ def _entry_selection(slug: str, plan: dict, target: str, entry_ids, no_entries: 
     return ids
 
 
-def apply_release(
-    engine: sa.Engine,
-    project_slug: str,
-    *,
-    version: str | None = None,
-    bump_type: str | None = None,
-    entry_ids: Iterable[int] | None = None,
-    no_entries: bool = False,
-    confirm: bool = False,
-    confirm_version_files: bool = False,
-    strict: bool = False,
-    plan_digest: str | None = None,
-    cwd: str | None = None,
-    on_point: Callable[[str], None] | None = None,
-) -> dict:
-    """One release from the APPROVED plan (`dct release apply`), see module doc.
-
-    K-80: `plan_digest` is the `snapshot_digest` of the plan the owner
-    approved (`dct release plan --version V --entries … --json`; required
-    unless `strict`). The candidate is read ONCE (the strict checkout's
-    HEAD) and the plan is re-derived FOR THAT CANDIDATE with the same
-    version and selection — never on a HEAD read later; a snapshot that
-    differs from the approved digest (another HEAD, range base, entry set
-    or entry state, selection, version or proof) is refused before any
-    database write. HEAD is checked again right before the stamp; the stamp
-    itself binds the plan (core release_entries `stampable_ids` /
-    `expected_entries`, K-81: only approved, proven ids get a new stamp; an
-    entry added, edited or removed since the plan refuses inside the stamp
-    transaction). A HEAD move after the stamp never re-pins the record: the
-    effects refuse (they run on the recorded candidate only).
-
-    `entry_ids` (owner-chosen ids, each proven by the plan or already
-    carrying V) or `no_entries=True` (version-only) — one is required unless
-    `strict` (the `clog release` alias: no ids = every unreleased entry, all
-    of which must be proven; a range base other than v<current_version> is
-    refused instead of being confirmed). `confirm=True` is required.
-    `confirm_version_files` confirms the first release's learned
-    version-file set (K-73). Returns result() with outcome 'completed' or
-    'noop' (a recorded / historical / legacy release — no side effect).
-    Raises ReleaseRefused (nothing done beyond what the result's steps
-    say), SyncFailed, or gitinfo errors."""
-    if confirm is not True:
-        raise ReleaseRefused("apply needs --confirm (it stamps, writes, commits and tags)")
+def _approved_context(engine: sa.Engine, project_slug: str, *, action: str, version, bump_type,
+                      entry_ids, no_entries: bool, plan_digest: str | None, strict: bool,
+                      cwd: str | None, on_point) -> tuple[_Run, dict, str, list[int], set[str]]:
+    """The pre-checks shared by prepare and apply (module doc, stage 1):
+    the strict checkout, no unfinished record, a clean index / work tree,
+    the plan re-derived FOR THE PINNED CANDIDATE and compared with the
+    approved digest, the entry selection. Returns (run, plan, target
+    version, selected ids, the untracked files present now)."""
     if entry_ids is not None and no_entries:
         raise ReleaseRefused("--entries and --no-entries are mutually exclusive")
     if plan_digest is None and not strict:
         raise ReleaseRefused(
-            "apply needs --plan-digest <snapshot_digest> of the plan the owner approved "
-            "(`dct release plan --version V --entries … --json`); nothing released.")
+            f"{action} needs --plan-digest <snapshot_digest> of the plan the owner approved "
+            f"(`dct release plan --version V --entries … --json`); nothing released.")
     if plan_digest is not None and not _DIGEST_RE.fullmatch(plan_digest):
         raise ReleaseRefused(f"--plan-digest must be a lowercase hex SHA-256, got {plan_digest!r}")
     project, checkout, project_root = _locate(engine, project_slug, cwd)
@@ -1030,8 +1592,7 @@ def apply_release(
             f"project '{project_slug}' has no registered path — its checkout cannot be "
             f"verified (a project outside git must be CONFIRMED outside git); register the "
             f"path first; nothing released.")
-    run = _Run(engine, project_slug, project, checkout, project_root, on_point=on_point,
-               confirm_version_files=confirm_version_files)
+    run = _Run(engine, project_slug, project, checkout, project_root, on_point=on_point)
     unfinished = ledger.get_release(engine, project_slug)
     if unfinished:
         raise ReleaseRefused(
@@ -1068,6 +1629,230 @@ def apply_release(
             f"after reviewing `dct release plan`; nothing released.")
     run.warnings.extend(plan["warnings"])
     ids = _entry_selection(project_slug, plan, target, entry_ids, no_entries, strict)
+    return run, plan, target, ids, pre_untracked
+
+
+def _newer_than_current(project: dict, target: str) -> bool:
+    current = project.get("current_version")
+    if not current:
+        return True
+    try:
+        return compare_versions(target, current) > 0
+    except ValueError:
+        return False  # an unparseable current version: the stamp refuses it (K-54)
+
+
+def _prepared(run: _Run, target: str, plan: dict) -> dict:
+    """Build the proposal (isolated sync) and store it as PENDING → the
+    prepare result's details."""
+    proposal, report = _build_proposal(run, target, plan["snapshot_digest"])
+    stored = ledger.set_pending_proposal(run.engine, run.slug, proposal)
+    contract = ledger.get_version_files(run.engine, run.slug)["version_files"]
+    run.step("proposal", "done", proposal_sha256=stored["proposal_sha256"])
+    return {
+        "proposal": stored["proposal"],
+        "proposal_sha256": stored["proposal_sha256"],
+        "plan_digest": plan["snapshot_digest"],
+        "contract": {"confirmed": contract, "proposed": stored["proposal"]["paths"],
+                     "change": contract != stored["proposal"]["paths"]},
+        "sync": report["sync"],
+        "checks": report["checks"],
+    }
+
+
+def prepare_release(
+    engine: sa.Engine,
+    project_slug: str,
+    *,
+    version: str | None = None,
+    bump_type: str | None = None,
+    entry_ids: Iterable[int] | None = None,
+    no_entries: bool = False,
+    plan_digest: str | None = None,
+    strict: bool = False,
+    cwd: str | None = None,
+) -> dict:
+    """The PREPARE stage (`dct release prepare`, K-76) — see module doc,
+    stage 0. The same pre-checks, candidate pinning and approved-plan
+    comparison as apply (`plan_digest` required unless `strict`); then the
+    version-sync script runs ONCE with V, isolated (never in the user's
+    checkout; the checkout is verified unchanged afterwards), and the
+    proposal built from its result is stored as the project's PENDING
+    proposal, replacing an earlier one. Nothing is stamped.
+
+    Returns result() with outcome 'prepared' and details {proposal (core
+    validate_proposal), proposal_sha256 (what `apply --proposal-digest`
+    takes), plan_digest, contract {confirmed (the current contract or
+    null), proposed (the proposal's paths), change (bool)}, sync (null
+    without a script, else run_sync_script's report), checks (one
+    check_version_file result per file)}. Raises NothingToPrepare (V is
+    already recorded, or lower than the current version), SyncFailed (the
+    script failed / timed out — exit code = the script's, 124 on timeout)
+    or ReleaseRefused (a pre-check, a script that wrote outside its
+    isolated copy, touched the changelog, deleted / retyped a file, or a
+    version file whose version field is not V)."""
+    run, plan, target, ids, _ = _approved_context(
+        engine, project_slug, action="prepare", version=version, bump_type=bump_type,
+        entry_ids=entry_ids, no_entries=no_entries, plan_digest=plan_digest, strict=strict,
+        cwd=cwd, on_point=None)
+    recorded = ledger.get_release(engine, project_slug, target)
+    if recorded is not None:
+        raise NothingToPrepare(f"{target} already has a release record ({recorded['status']}) "
+                               f"— nothing to prepare.", release=recorded)
+    if run.project.get("current_version") and not _newer_than_current(run.project, target) \
+            and not same_version(run.project["current_version"], target):
+        raise NothingToPrepare(f"{target} is lower than the current version "
+                               f"{run.project['current_version']} — releases never rewind; "
+                               f"nothing to prepare.")
+    details = _prepared(run, target, plan)
+    return result("prepare", project_slug, "prepared", version=target, steps=run.steps,
+                  warnings=run.warnings, details={**details, "entry_ids": ids})
+
+
+def _check_approved_proposal(run: _Run, plan: dict, target: str, approval: str) -> dict:
+    """K-76 — before the stamp: the approved digest names the PENDING
+    proposal, bound to THIS candidate, version, plan digest and mode; the
+    script and the baseline (every proposal path, outside git also the
+    changelog) are unchanged; every expected blob is still available."""
+    hint = "run `dct release prepare …` again, review it and approve its proposal_sha256"
+    pending = ledger.get_pending_proposal(run.engine, run.slug)
+    if pending is None:
+        raise run.refuse(f"no pending version-file proposal for '{run.slug}' — {hint}; nothing "
+                         f"released.", approved=approval)
+    if pending["proposal_sha256"] != approval:
+        raise run.refuse(
+            f"--proposal-digest {approval} is not the pending proposal "
+            f"({pending['proposal_sha256']}) — a newer prepare replaced it, or the digest is "
+            f"wrong; {hint}; nothing released.",
+            approved=approval, pending=pending["proposal_sha256"])
+    proposal = pending["proposal"]
+    now = {"candidate_sha": run.checkout["head"] if run.checkout else None,
+           "version": target, "plan_digest": plan["snapshot_digest"], "release_mode": run.mode}
+    mismatch = {key: {"approved": proposal.get(key), "now": value}
+                for key, value in now.items() if proposal.get(key) != value}
+    if mismatch:
+        raise run.refuse(
+            f"the approved proposal was prepared for another release context "
+            f"({', '.join(mismatch)}) — a changed candidate, version or plan voids the "
+            f"approval; {hint}; nothing released.", mismatch=mismatch)
+    script = _current_script(run)
+    approved_script = proposal.get("script")
+    if (script is None) != (approved_script is None) or (script is not None and (
+            approved_script["identity"] != script[0]
+            or approved_script["sha256"] != _sha256(script[1]))):
+        raise run.refuse(
+            f"the version-sync script changed since the proposal was prepared — the approval "
+            f"is void; {hint}; nothing released.",
+            approved_script=approved_script,
+            script=None if script is None else {"identity": script[0],
+                                                "sha256": _sha256(script[1])})
+    changed = [rel for rel in proposal["paths"]
+               if _content_id(run, rel) != proposal["base_blobs"][rel]]
+    approved_f = proposal.get("changelog")
+    if (approved_f or {}).get("path") != run.changelog_rel:
+        changed.append(f"changelog setting ({run.changelog_rel})")
+    elif approved_f and run.repo is None:
+        current = _read_regular(run.abspath(run.changelog_rel))
+        digest = _sha256(current) if isinstance(current, bytes) else current
+        if digest != approved_f["base_sha256"]:
+            changed.append(run.changelog_rel)
+    if changed:
+        raise run.refuse(
+            f"{', '.join(changed)} changed since the proposal was prepared — the approval is "
+            f"void; {hint}; nothing released.", changed=changed)
+    blobs = list(proposal["expected_blobs"].values())
+    if approved_f and approved_f["base_blob"] and run.repo is None:
+        blobs.append(approved_f["base_blob"])
+    missing = [blob for blob in blobs if not _blob_available(run, blob)]
+    if missing:
+        raise run.refuse(
+            f"approved content is no longer available ({', '.join(missing)}; e.g. pruned "
+            f"by `git gc`) — {hint}; nothing released.", missing_blobs=missing)
+    return proposal
+
+
+def _alias_approval(run: _Run, target: str, plan: dict) -> str:
+    """The `clog release` alias without --proposal-digest: prepare inside
+    the call; the fresh proposal is approved only when its paths EQUAL the
+    project's confirmed contract (the content is checked by the D9 rules
+    and bound to this candidate). A first release or a contract change is
+    refused with the proposal (now pending) — approve it with
+    --proposal-digest."""
+    details = _prepared(run, target, plan)
+    contract = details["contract"]["confirmed"]
+    digest = details["proposal_sha256"]
+    if contract is not None and not details["contract"]["change"]:
+        run.step("proposal", "approved", reason="equals the confirmed version-file contract")
+        return digest
+    what = "first release" if contract is None else "the version-file contract changes"
+    raise run.refuse(
+        f"{what} of '{run.slug}': the version sync changes "
+        f"{', '.join(details['proposal']['paths']) or 'no files'} (confirmed contract: "
+        f"{contract}) — review the proposal and approve it with `--proposal-digest {digest}`; "
+        f"nothing released.", **details)
+
+
+def apply_release(
+    engine: sa.Engine,
+    project_slug: str,
+    *,
+    version: str | None = None,
+    bump_type: str | None = None,
+    entry_ids: Iterable[int] | None = None,
+    no_entries: bool = False,
+    confirm: bool = False,
+    strict: bool = False,
+    plan_digest: str | None = None,
+    proposal_digest: str | None = None,
+    cwd: str | None = None,
+    on_point: Callable[[str], None] | None = None,
+) -> dict:
+    """One release from the APPROVED plan and the APPROVED proposal (`dct
+    release apply`), see module doc.
+
+    K-80: `plan_digest` is the `snapshot_digest` of the plan the owner
+    approved (`dct release plan --version V --entries … --json`; required
+    unless `strict`). The candidate is read ONCE (the strict checkout's
+    HEAD) and the plan is re-derived FOR THAT CANDIDATE with the same
+    version and selection — never on a HEAD read later; a snapshot that
+    differs from the approved digest (another HEAD, range base, entry set
+    or entry state, selection, version or proof) is refused before any
+    database write. HEAD is checked again right before the stamp; the stamp
+    itself binds the plan (core release_entries `stampable_ids` /
+    `expected_entries`, K-81).
+
+    K-76: `proposal_digest` is the `proposal_sha256` of `dct release
+    prepare` for the same version, selection and plan digest — required for
+    a NEW release (a re-run of a recorded / historical release needs none).
+    It must name the project's PENDING proposal, prepared for this
+    candidate, version and plan, with the script and the baseline unchanged
+    (_check_approved_proposal); the stamp consumes it in its transaction
+    (the record's proposal and consent {version, entry_ids, candidate_sha,
+    proposal_sha256, render, push_target: null}, the learned version-file
+    contract, the untracked baseline). After the stamp the script never
+    runs: the approved blobs are written, content-verified (K-75 / K-77).
+
+    `entry_ids` (owner-chosen ids, each proven by the plan or already
+    carrying V) or `no_entries=True` (version-only) — one is required unless
+    `strict` (the `clog release` alias: no ids = every unreleased entry, all
+    of which must be proven; a range base other than v<current_version> is
+    refused instead of being confirmed; without `proposal_digest` it
+    prepares inside the call and proceeds only when the proposal equals the
+    confirmed contract — _alias_approval). `confirm=True` is required.
+    Returns result() with outcome 'completed' or 'noop' (a recorded /
+    historical / legacy release — no side effect). Raises ReleaseRefused
+    (nothing done beyond what the result's steps say), SyncFailed (the
+    alias's internal prepare), or gitinfo errors."""
+    if confirm is not True:
+        raise ReleaseRefused("apply needs --confirm (it stamps, writes, commits and tags)")
+    if proposal_digest is not None and not _DIGEST_RE.fullmatch(proposal_digest):
+        raise ReleaseRefused(
+            f"--proposal-digest must be a lowercase hex SHA-256, got {proposal_digest!r}")
+    run, plan, target, ids, pre_untracked = _approved_context(
+        engine, project_slug, action="apply", version=version, bump_type=bump_type,
+        entry_ids=entry_ids, no_entries=no_entries, plan_digest=plan_digest, strict=strict,
+        cwd=cwd, on_point=on_point)
+    checkout = run.checkout
     snapshot = plan["snapshot"]
     proof = {str(i): snapshot["proof"][str(i)] for i in ids if str(i) in snapshot["proof"]} \
         or None
@@ -1075,6 +1860,17 @@ def apply_release(
     if not checkout:  # K-63: a project CONFIRMED outside git — the owner's selection
         stampable = list(ids)
     before = ledger.get_release(engine, project_slug, target)
+    consent = None
+    if before is None:
+        if proposal_digest is None and strict and _newer_than_current(run.project, target):
+            proposal_digest = _alias_approval(run, target, plan)
+        if proposal_digest is not None:
+            _check_approved_proposal(run, plan, target, proposal_digest)
+        consent = {"version": target, "entry_ids": ids,
+                   "candidate_sha": checkout["head"] if checkout else None,
+                   "proposal_sha256": proposal_digest,
+                   "render": {"pr_refs": bool(run.project.get("changelog_pr_refs"))},
+                   "push_target": None}
     _point(on_point, "before_stamp")
     if checkout and _head(checkout["repo_root"]) != checkout["head"]:
         raise ReleaseRefused(
@@ -1087,10 +1883,16 @@ def apply_release(
             checkout_root=checkout["repo_root"] if checkout else None, proof=proof,
             # K-94 B1: _locate verified the checkout strictly — None means the
             # project is CONFIRMED outside git (a detection error refuses).
-            release_mode="git" if checkout else "without_git",
-            stampable_ids=stampable, expected_entries=snapshot["entries"])
+            release_mode=run.mode,
+            stampable_ids=stampable, expected_entries=snapshot["entries"],
+            # K-76 / K-96 D3: the approved proposal, the consent, the learned
+            # contract and the untracked baseline — atomically with the stamp.
+            consent=consent, render=consent["render"] if consent else None,
+            manifest={"untracked_baseline": sorted(pre_untracked)}
+            if consent and checkout else None,
+            consume_proposal=consent is not None)
     except ValueError as exc:
-        raise ReleaseRefused(str(exc)) from None
+        raise run.refuse(str(exc)) from None
     details = {"requested_version": target, "previous_version": plan["version"]["current"],
                "bump": plan["version"]["bump"], "entry_ids": ids, "mode": stamped["mode"],
                "released": stamped["released"], "current_version": stamped["current_version"]}
@@ -1106,41 +1908,52 @@ def apply_release(
             raise run.refuse(f"release {run.version} is unfinished — run `dct release resume`")
         return _finish("apply", run, "noop", **details)
     run.step("stamp", "done", released=stamped["released"])
-    if checkout:
-        try:  # the pre-sync untracked files are never version files (resume too)
-            run.advance("stamped", manifest={"untracked_baseline": sorted(pre_untracked)})
-        except ValueError as exc:
-            run.warnings.append(f"untracked baseline not recorded ({exc}) — a resume counts "
-                                f"every untracked file as changed by the sync")
     _point(on_point, "after_stamp")
     _check_record_location(run)
     _continue(run, fresh=True)
     return _finish("apply", run, "completed", **details)
 
 
+def _check_record_scope(run: _Run) -> None:
+    """K-94 B3 + K-76 — before any effect of a resume: the record's entry
+    set equals EXACTLY the live entries carrying its version (never
+    repaired by widening the record), and its consent names its proposal."""
+    try:
+        run.record = ledger.verify_release_entry_set(run.engine, run.slug, run.record["version"])
+    except ValueError as exc:
+        raise run.refuse(str(exc)) from None
+    consent, proposal = run.record.get("consent") or {}, run.record.get("proposal")
+    approved = consent.get("proposal_sha256")
+    if approved and (proposal is None or ledger.proposal_digest(proposal) != approved):
+        raise run.refuse(f"release {run.version}: the recorded consent does not name the "
+                         f"recorded proposal — nothing done.")
+
+
 def resume_release(
     engine: sa.Engine,
     project_slug: str,
     *,
-    confirm_version_files: bool = False,
     cwd: str | None = None,
     on_point: Callable[[str], None] | None = None,
 ) -> dict:
     """Finish the unfinished release record (`dct release resume`): verify
-    the checkout against the record (same checkout root; HEAD == candidate
-    before the commit, the release commit or a descendant after it — K-51;
-    never re-pinned), then check each effect against reality and the
-    manifest — present & matching → skipped, missing → performed (a legal
-    retry of an interrupted sync on the candidate included), contradicting
-    → ReleaseRefused without overwriting. No unfinished record → outcome
-    'noop' (completed / abandoned releases have no side effects)."""
+    the record's FULL entry set first (K-94 B3) and that its consent names
+    its proposal, then the checkout against the record (same checkout
+    root; HEAD == candidate before the commit, the release commit or a
+    descendant after it — K-51; never re-pinned), then check each effect
+    against reality and the manifest — present & matching → skipped,
+    missing → performed (the artifacts of a 'stamped' record are the
+    APPROVED blobs, content-verified — the script never runs, K-75),
+    contradicting → ReleaseRefused without overwriting. No unfinished
+    record → outcome 'noop' (completed / abandoned releases have no side
+    effects)."""
     project, checkout, project_root = _locate(engine, project_slug, cwd)
-    run = _Run(engine, project_slug, project, checkout, project_root, on_point=on_point,
-               confirm_version_files=confirm_version_files)
+    run = _Run(engine, project_slug, project, checkout, project_root, on_point=on_point)
     run.record = ledger.get_release(engine, project_slug)
     if run.record is None:
         run.warnings.append("no unfinished release — nothing to resume")
         return _finish("resume", run, "noop")
+    _check_record_scope(run)
     _check_record_location(run)
     if run.repo and _operation_in_progress(run.repo):
         raise run.refuse("a git operation is in progress — finish or abort it first")
@@ -1260,8 +2073,7 @@ def gather_evidence(engine: sa.Engine, project_slug: str, version: str, *,
     if not ids and not same_version(current, version):
         raise ReleaseRefused(f"no entry carries {version} and it is not the current version "
                              f"({current}) — the database does not prove this release")
-    run = _Run(engine, project_slug, project, checkout, project_root, on_point=None,
-               confirm_version_files=False)
+    run = _Run(engine, project_slug, project, checkout, project_root, on_point=None)
     contract = ledger.get_version_files(engine, project_slug)["version_files"]
     evidence = {"version": version, "entry_ids": ids, "candidate_sha": None,
                 "release_commit_sha": None, "tag": None, "checkout_root": None,

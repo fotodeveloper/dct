@@ -134,10 +134,71 @@ def bump(current: str, bump_type: str) -> str:
             return format_version((parts[0], parts[1], 1))
 
 
+def _read_version_file(data: bytes) -> str | None:
+    value = data.decode("utf-8").strip()
+    return value or None
+
+
+def _read_pyproject(data: bytes) -> str | None:
+    return (tomllib.loads(data.decode("utf-8")).get("project") or {}).get("version")
+
+
+def _read_package_json(data: bytes) -> str | None:
+    return json.loads(data.decode("utf-8")).get("version")
+
+
+def _read_cargo(data: bytes) -> str | None:
+    return (tomllib.loads(data.decode("utf-8")).get("package") or {}).get("version")
+
+
+def _read_tauri(data: bytes) -> str | None:
+    loaded = json.loads(data.decode("utf-8"))
+    return loaded.get("version") or (loaded.get("package") or {}).get("version")
+
+
+# The project-file version readers, by file NAME — the ONE implementation
+# behind detect_version (autodetect) and the release effects layer's
+# version-field check (K-96 D9). Each takes the file's bytes and returns its
+# version field (raw — any JSON / TOML value; callers accept only a
+# non-empty str) or None when the file has no such field; malformed content
+# raises (UnicodeDecodeError, tomllib.TOMLDecodeError, json.JSONDecodeError,
+# AttributeError for a non-object document).
+VERSION_FIELD_READERS = {
+    "VERSION": _read_version_file,               # raw single line, stripped
+    "pyproject.toml": _read_pyproject,           # [project].version (PEP 621)
+    "package.json": _read_package_json,          # .version (npm / yarn)
+    "Cargo.toml": _read_cargo,                   # [package].version (rust)
+    "tauri.conf.json": _read_tauri,              # .version (v2) / .package.version (v1)
+}
+# TOMLDecodeError, JSONDecodeError and UnicodeDecodeError are ValueErrors.
+VERSION_FIELD_ERRORS = (ValueError, AttributeError)
+
+
+def version_field_reader(path: str):
+    """The VERSION_FIELD_READERS entry for a (repo-relative or absolute)
+    path, chosen by its file name, or None when dct has no reader for it."""
+    return VERSION_FIELD_READERS.get(Path(path).name)
+
+
+def read_version_field(path: str, data: bytes) -> str | None:
+    """The version field of `data` read as the project file `path`
+    (version_field_reader): a non-empty str, or None when the file holds no
+    such field. Raises ValueError when dct has no reader for the file name
+    or the content is malformed."""
+    reader = version_field_reader(path)
+    if reader is None:
+        raise ValueError(f"no version-field reader for {Path(path).name}")
+    try:
+        value = reader(data)
+    except VERSION_FIELD_ERRORS as exc:
+        raise ValueError(f"{path} cannot be read as {Path(path).name}: {exc}") from None
+    return value if isinstance(value, str) and value else None
+
+
 def detect_version(path: str | Path) -> tuple[str | None, str | None]:
     """Best-effort version detection from common project files.
 
-    Tries in order and returns the first hit:
+    Tries in order and returns the first hit (VERSION_FIELD_READERS):
       1. <path>/VERSION                     — raw single line, stripped
       2. <path>/pyproject.toml              — [project].version (PEP 621)
       3. <path>/package.json                — .version (npm/yarn)
@@ -152,63 +213,15 @@ def detect_version(path: str | Path) -> tuple[str | None, str | None]:
     base = Path(path)
     if not base.is_dir():
         return None, None
-
-    # 1. VERSION (raw text)
-    vf = base / "VERSION"
-    if vf.is_file():
+    for rel in ("VERSION", "pyproject.toml", "package.json", "Cargo.toml",
+                "src-tauri/tauri.conf.json"):
+        candidate = base / rel
+        if not candidate.is_file():
+            continue
         try:
-            v = vf.read_text(encoding="utf-8").strip()
-            if v:
-                return v, "VERSION"
-        except (OSError, UnicodeDecodeError):
-            pass
-
-    # 2. pyproject.toml ([project].version)
-    pp = base / "pyproject.toml"
-    if pp.is_file():
-        try:
-            with open(pp, "rb") as f:
-                data = tomllib.load(f)
-            v = (data.get("project") or {}).get("version")
-            if isinstance(v, str) and v:
-                return v, "pyproject.toml"
-        except (OSError, tomllib.TOMLDecodeError):
-            pass
-
-    # 3. package.json (.version)
-    pj = base / "package.json"
-    if pj.is_file():
-        try:
-            with open(pj, encoding="utf-8") as f:
-                data = json.load(f)
-            v = data.get("version")
-            if isinstance(v, str) and v:
-                return v, "package.json"
-        except (OSError, json.JSONDecodeError, UnicodeDecodeError):
-            pass
-
-    # 4. Cargo.toml ([package].version)
-    ct = base / "Cargo.toml"
-    if ct.is_file():
-        try:
-            with open(ct, "rb") as f:
-                data = tomllib.load(f)
-            v = (data.get("package") or {}).get("version")
-            if isinstance(v, str) and v:
-                return v, "Cargo.toml"
-        except (OSError, tomllib.TOMLDecodeError):
-            pass
-
-    # 5. Tauri — v2 puts version at top level, v1 under .package.version
-    tc = base / "src-tauri" / "tauri.conf.json"
-    if tc.is_file():
-        try:
-            with open(tc, encoding="utf-8") as f:
-                data = json.load(f)
-            v = data.get("version") or (data.get("package") or {}).get("version")
-            if isinstance(v, str) and v:
-                return v, "src-tauri/tauri.conf.json"
-        except (OSError, json.JSONDecodeError, UnicodeDecodeError):
-            pass
-
+            value = read_version_field(rel, candidate.read_bytes())
+        except (OSError, ValueError):
+            continue
+        if value:
+            return value, rel
     return None, None

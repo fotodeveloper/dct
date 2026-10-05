@@ -52,7 +52,12 @@ partial unique index as the last guard.
 
 The project's version-file contract (K-73: which repo files a release must
 change) lives on the project row; get_version_files / set_version_files are
-its readers and writers.
+its readers and writers. So does the PENDING version-file proposal (K-76:
+`projects.release_proposal`, written by `dct release prepare` through
+set_pending_proposal, read by get_pending_proposal) — consumed by the stamp
+that names its digest (changelog.release_entries consume_proposal), which
+records it as the record's `proposal` and its paths as the contract
+(store_version_files) in the stamp transaction.
 """
 
 import json
@@ -477,19 +482,32 @@ def validate_render(render: Mapping | None) -> dict | None:
     return {"pr_refs": pr_refs}
 
 
-PROPOSAL_KEYS = frozenset({"paths", "base_blobs", "expected_blobs", "script", "candidate_sha"})
+PROPOSAL_KEYS = frozenset({
+    "paths", "base_blobs", "expected_blobs", "script", "candidate_sha",
+    "version", "plan_digest", "release_mode", "changelog",
+})
+PROPOSAL_CHANGELOG_KEYS = frozenset({"path", "base_blob", "base_sha256"})
 
 
 def validate_proposal(proposal: Mapping | None) -> dict | None:
     """The approved version-file proposal (K-76) in canonical form, or None.
 
     {"paths": [repo-relative paths] (normalize_version_files; [] = an
-    approved empty contract), "base_blobs": {path: blob sha | null (absent
-    before the sync)}, "expected_blobs": {path: blob sha}, "script": null |
+    approved empty contract), "base_blobs": {path: blob id | null (absent
+    before the sync)}, "expected_blobs": {path: blob id}, "script": null |
     {"identity": str, "sha256": hex SHA-256 | null}, "candidate_sha": sha |
-    null}. base_blobs and expected_blobs name EXACTLY `paths`. Blob ids are
-    hex 7-64 chars (lowercased). ≤ PROPOSAL_MAX_BYTES of canonical JSON.
-    ValueError / TypeError otherwise."""
+    null} plus the release context the proposal is bound to (each optional,
+    null when not given): "version" (normalized V), "plan_digest" (the
+    approved plan's snapshot_digest, hex SHA-256), "release_mode" ('git' |
+    'without_git' — how the blobs are addressed: git blob ids, or the
+    SHA-256 of the content kept in dct's release blob store), "changelog"
+    (the changelog file's BASELINE before the release: {"path" (one
+    normalize_version_files path), "base_blob" (blob id | null = absent),
+    "base_sha256" (hex SHA-256 | null = absent)}, or null when the project
+    has no managed changelog file). base_blobs and expected_blobs name
+    EXACTLY `paths`. Blob ids are hex 7-64 chars (lowercased). ≤
+    PROPOSAL_MAX_BYTES of canonical JSON. ValueError / TypeError
+    otherwise."""
     if proposal is None:
         return None
     _object(proposal, "proposal", set(PROPOSAL_KEYS), {"paths", "base_blobs", "expected_blobs"})
@@ -513,11 +531,31 @@ def validate_proposal(proposal: Mapping | None) -> dict | None:
         _object(script, "proposal.script", {"identity", "sha256"}, {"identity"})
         script = {"identity": _text(script["identity"], "proposal.script.identity", 2000),
                   "sha256": _digest(script.get("sha256"), "proposal.script.sha256")}
+    version = proposal.get("version")
+    if version is not None:
+        version = normalize_version(_text(version, "proposal.version", 50))
+    changelog = proposal.get("changelog")
+    if changelog is not None:
+        _object(changelog, "proposal.changelog", set(PROPOSAL_CHANGELOG_KEYS),
+                set(PROPOSAL_CHANGELOG_KEYS))
+        [path] = normalize_version_files([changelog["path"]])
+        changelog = {
+            "path": path,
+            "base_blob": validate_sha(changelog["base_blob"], "proposal.changelog.base_blob"),
+            "base_sha256": _digest(changelog["base_sha256"], "proposal.changelog.base_sha256"),
+        }
+        if (changelog["base_blob"] is None) != (changelog["base_sha256"] is None):
+            raise ValueError("proposal.changelog: base_blob and base_sha256 are both set "
+                             "(the file existed) or both null (it was absent)")
     out = {
         "paths": paths,
         **blobs,
         "script": script,
         "candidate_sha": validate_sha(proposal.get("candidate_sha"), "proposal.candidate_sha"),
+        "version": version,
+        "plan_digest": _digest(proposal.get("plan_digest"), "proposal.plan_digest"),
+        "release_mode": validate_release_mode(proposal.get("release_mode")),
+        "changelog": changelog,
     }
     ensure_json_fits(out, "proposal", PROPOSAL_MAX_BYTES)
     return out
@@ -1244,24 +1282,82 @@ def set_version_files(
         )
     files = normalize_version_files(paths)
     with project_transaction(engine, project_slug, write=True) as (conn, pid):
-        current = _contract(_contract_row(conn, pid))
-        if current["version_files"] == files:
-            return {**current, "updated": False}
-        now = datetime.now(UTC)
-        history = list(current["history"])
-        if current["version_files"] is not None:
-            confirmed = current["confirmed_at"]
-            history.append({
-                "version_files": current["version_files"],
-                "confirmed_at": confirmed.isoformat() if confirmed else None,
-                "replaced_at": now.isoformat(),
-            })
-        conn.execute(
-            projects.update().where(projects.c.id == pid).values(
-                version_files=json.dumps(files),
-                version_files_confirmed_at=now,
-                version_files_history=json.dumps(history) if history else None,
-                updated_at=now,
-            )
+        updated = store_version_files(conn, pid, files, datetime.now(UTC))
+        return {**_contract(_contract_row(conn, pid)), "updated": updated}
+
+
+def store_version_files(conn: sa.Connection, pid: int, files: list[str], now: datetime) -> bool:
+    """Write the contract `files` (already normalized) on the caller's
+    connection — set_version_files' write, shared with the stamp that
+    approves a proposal (changelog.release_entries consume_proposal, K-76):
+    the same set again is a no-op (False); a different set replaces the
+    contract and appends the previous one to the history ledger (True)."""
+    current = _contract(_contract_row(conn, pid))
+    if current["version_files"] == files:
+        return False
+    history = list(current["history"])
+    if current["version_files"] is not None:
+        confirmed = current["confirmed_at"]
+        history.append({
+            "version_files": current["version_files"],
+            "confirmed_at": confirmed.isoformat() if confirmed else None,
+            "replaced_at": now.isoformat(),
+        })
+    conn.execute(
+        projects.update().where(projects.c.id == pid).values(
+            version_files=json.dumps(files),
+            version_files_confirmed_at=now,
+            version_files_history=json.dumps(history) if history else None,
+            updated_at=now,
         )
-        return {**_contract(_contract_row(conn, pid)), "updated": True}
+    )
+    return True
+
+
+# ── the project's PENDING proposal (K-76) ────────────────────────────────────
+
+
+def _pending(text: str | None) -> dict | None:
+    if text is None:
+        return None
+    proposal = json.loads(text)
+    return {"proposal": proposal, "proposal_sha256": proposal_digest(proposal)}
+
+
+def set_pending_proposal(engine: sa.Engine, project_slug: str, proposal: Mapping) -> dict:
+    """Store `proposal` (validate_proposal — ValueError / TypeError, nothing
+    written) as the project's PENDING version-file proposal — the result of
+    `dct release prepare`, waiting for the owner's approval. A new prepare
+    REPLACES an earlier pending proposal (only the latest one can be
+    approved; its digest differs whenever its content does). Being pending
+    is not an approval: only the stamp that names its digest consumes it
+    (changelog.release_entries consume_proposal). Returns {"proposal",
+    "proposal_sha256"}."""
+    canonical = validate_proposal(proposal)
+    if canonical is None:
+        raise TypeError("proposal must be a JSON object")
+    with project_transaction(engine, project_slug, write=True) as (conn, pid):
+        conn.execute(projects.update().where(projects.c.id == pid).values(
+            release_proposal=_canonical(canonical), updated_at=datetime.now(UTC)))
+    return {"proposal": canonical, "proposal_sha256": proposal_digest(canonical)}
+
+
+def get_pending_proposal(engine: sa.Engine, project_slug: str) -> dict | None:
+    """The project's pending proposal {"proposal", "proposal_sha256"} or
+    None (nothing prepared, or consumed by a stamp). Read-only."""
+    with engine.begin() as conn:
+        pid = resolve_project_id(conn, project_slug)
+        return read_pending_proposal(conn, pid)
+
+
+def read_pending_proposal(conn: sa.Connection, pid: int) -> dict | None:
+    """get_pending_proposal on the caller's connection (the stamp reads it
+    inside its own transaction)."""
+    return _pending(conn.execute(
+        sa.select(projects.c.release_proposal).where(projects.c.id == pid)).scalar())
+
+
+def clear_pending_proposal(conn: sa.Connection, pid: int) -> None:
+    """Drop the pending proposal on the caller's connection (the stamp that
+    consumed it)."""
+    conn.execute(projects.update().where(projects.c.id == pid).values(release_proposal=None))

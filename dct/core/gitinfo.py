@@ -436,6 +436,22 @@ def git_read_blob(cwd: str | os.PathLike[str], commit: str, path: str) -> bytes 
     return result.stdout
 
 
+def git_cat_blob(cwd: str | os.PathLike[str], blob: str, *, path: str | None = None) -> bytes:
+    """The bytes of the blob object `blob` — raw (`git cat-file blob`), or,
+    with `path` (repo-root-relative), as the WORK TREE holds them (`git
+    cat-file --filters --path=<path>`: smudge / eol filters of that path
+    applied, as a checkout would write it). Read-only; GitReadError when
+    the object is missing or the read fails."""
+    cwd = os.fspath(cwd)
+    args = ("cat-file", "--filters", f"--path={path}", blob) if path else ("cat-file", "blob", blob)
+    result = _strict_git(cwd, *args, error=GitReadError, timeout=GIT_READ_TIMEOUT_SECONDS,
+                         global_args=("--no-optional-locks",), binary=True)
+    if result.returncode != 0:
+        detail = result.stderr.decode("utf-8", "replace").strip()
+        raise GitReadError(f"`git {' '.join(args)}` failed in {cwd}: {detail}")
+    return result.stdout
+
+
 # ── the release EFFECTS layer's writer (K-72 layer 3) ────────────────────────
 
 # Identity / config-location variables a WRITE keeps: the commit the effects

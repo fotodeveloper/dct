@@ -1366,7 +1366,8 @@ def get_release(project: str = "", version: str = "") -> dict:
         approved: {version, entry_ids, candidate_sha, proposal_sha256,
         render, push_target} — or null), proposal (object — the approved
         version-file proposal {paths, base_blobs, expected_blobs, script,
-        candidate_sha} — or null), render (object — this release's
+        candidate_sha, version, plan_digest, release_mode, changelog} — or
+        null), render (object — this release's
         changelog render settings {"pr_refs": bool} — or null)}} or
         {"release": null} when there is no such record (no record for that
         version, or no unfinished release). A release made before records

@@ -479,6 +479,8 @@ def release_entries(
     render: Mapping | None = None,
     stampable_ids: Iterable[int] | None = None,
     expected_entries: Mapping | None = None,
+    manifest: Mapping | None = None,
+    consume_proposal: bool = False,
 ) -> dict:
     """Stamp changelog entries with a version, set the project's current_version
     and write the durable release record (K-41) — ONE transaction.
@@ -539,6 +541,20 @@ def release_entries(
     entry the plan saw; the transaction recomputes it and any entry added,
     edited, released or removed since raises ValueError. Both are checked
     inside the stamp transaction, before any write.
+    K-76 / K-96 D3 (the effects layer): `manifest` — the INITIAL manifest of
+    a NEW record (core.releases.validate_manifest; e.g. the
+    `untracked_baseline` recorded atomically with the stamp — ignored when
+    the call returns an existing record). `consume_proposal=True` — a NEW
+    record needs the project's PENDING proposal (core.releases
+    set_pending_proposal, written by `dct release prepare`) whose digest is
+    `consent.proposal_sha256`; in the stamp transaction it becomes the
+    record's `proposal` (a given `proposal` must equal it), the project's
+    version-file contract becomes its `paths` (history kept — a first
+    contract, an empty one or a change, all approved by that digest) and the
+    pending proposal is cleared. No pending proposal, another digest or no
+    consent digest raises ValueError and NOTHING is written (the earlier
+    contract and the pending proposal stay). A no-op (an existing record, a
+    historical retry) never needs it.
 
     The call's RESOLVED SET: 'selected' → the given ids; 'version_only' → [];
     'all' → the live entries already carrying V plus every unreleased entry.
@@ -600,6 +616,8 @@ def release_entries(
         "proposal": release_records.validate_proposal(proposal),
         "render": release_records.validate_render(render),
     }
+    initial_manifest = release_records.validate_manifest(manifest)
+    approval = (given["consent"] or {}).get("proposal_sha256") if consume_proposal else None
     root = normalize_worktree(checkout_root)
     ensure_fits(release_records.releases, {"checkout_root": root})
     stampable = None if stampable_ids is None else _dedupe_ids(stampable_ids)
@@ -721,6 +739,10 @@ def release_entries(
                 f"--no-entries); nothing released."
             )
 
+        if consume_proposal:
+            approved = _approved_proposal(conn, pid, project_slug, approval, given["proposal"])
+            given["proposal"] = approved
+
         now = datetime.now(UTC)
         released = 0
         if to_stamp:
@@ -745,8 +767,11 @@ def release_entries(
             conn, pid, version=version, mode=mode, entry_ids=resolved,
             candidate_sha=sha, checkout_root=root, now=now, proof=proof_map,
             release_mode=given["release_mode"], consent=given["consent"],
-            proposal=given["proposal"], render=given["render"],
+            proposal=given["proposal"], render=given["render"], manifest=initial_manifest,
         )
+        if consume_proposal:
+            release_records.store_version_files(conn, pid, given["proposal"]["paths"], now)
+            release_records.clear_pending_proposal(conn, pid)
         result["released"] = released
         result["current_version"] = version
         if mode == "all" and len(branches) > 1:
@@ -756,6 +781,32 @@ def release_entries(
                 f"Pass entry_ids to release only the entries proven to be in this release."
             )
         return result
+
+
+def _approved_proposal(conn: sa.Connection, pid: int, project_slug: str,
+                       approval: str | None, given: dict | None) -> dict:
+    """The pending proposal the stamp consumes (release_entries
+    consume_proposal, K-76) — read on the stamp's connection; ValueError
+    unless it exists and its digest is `approval`."""
+    from dct.core import releases as release_records
+
+    pending = release_records.read_pending_proposal(conn, pid)
+    hint = (f"run `dct release prepare` for '{project_slug}', review the proposed version "
+            f"files and pass its proposal_sha256 (--proposal-digest); nothing released.")
+    if not approval:
+        raise ValueError(f"A new release needs the approved version-file proposal — {hint}")
+    if pending is None:
+        raise ValueError(f"No pending version-file proposal (none prepared, or already "
+                         f"consumed) — {hint}")
+    if pending["proposal_sha256"] != approval:
+        raise ValueError(
+            f"The approved proposal {approval} is not the pending one "
+            f"({pending['proposal_sha256']}) — a newer prepare replaced it, or the digest "
+            f"is wrong; {hint}")
+    if given is not None and given != pending["proposal"]:
+        raise ValueError("The given proposal differs from the approved pending proposal; "
+                         "nothing released.")
+    return pending["proposal"]
 
 
 def _unsupported_current(project_slug: str, current: str) -> ValueError:

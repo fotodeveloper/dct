@@ -15,7 +15,7 @@ from pathlib import Path
 
 import pytest
 import sqlalchemy as sa
-from conftest import git, make_git_repo, run_cli
+from conftest import approved_proposal_digest, git, make_git_repo, run_cli
 
 from dct.core.changelog import add_entry, release_entries, update_entry
 from dct.core.projects import create_project, get_project
@@ -77,7 +77,15 @@ def digest(engine, repo, **kw) -> str:
 
 
 def apply(engine, repo, **kw):
+    """apply_release; with an approved plan digest also the proposal digest
+    `prepare` stores for it (K-76) — None when prepare refuses (a stale
+    plan: apply then refuses on the plan first)."""
     kw.setdefault("confirm", True)
+    if kw.get("plan_digest") and "proposal_digest" not in kw:
+        selection = {k: kw[k] for k in ("version", "bump_type", "entry_ids", "no_entries")
+                     if k in kw}
+        kw["proposal_digest"] = approved_proposal_digest(
+            engine, SLUG, repo, plan_digest=kw["plan_digest"], **selection)
     return apply_release(engine, SLUG, cwd=str(repo), **kw)
 
 
@@ -237,9 +245,15 @@ def test_cli_plan_digest_then_apply(cli_engine, repo, monkeypatch, capsys):
                               "--entries", str(a), "--confirm"])
     assert exc.value.code == 2  # --plan-digest is required
     capsys.readouterr()
+    run_cli(monkeypatch, ["release", "prepare", "-P", SLUG, "--version", "1.1.0",
+                          "--entries", str(a), "--plan-digest", plan["snapshot_digest"],
+                          "--json"])
+    prepared = json.loads(capsys.readouterr().out)
+    assert prepared["outcome"] == "prepared"
     run_cli(monkeypatch, ["release", "apply", "-P", SLUG, "--version", "1.1.0",
                           "--entries", str(a), "--confirm", "--plan-digest",
-                          plan["snapshot_digest"], "--json"])
+                          plan["snapshot_digest"], "--proposal-digest",
+                          prepared["details"]["proposal_sha256"], "--json"])
     out = json.loads(capsys.readouterr().out)
     assert out["outcome"] == "completed"
 

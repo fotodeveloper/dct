@@ -95,10 +95,11 @@ Each decision is recorded; at the end of Step 2.5, print a short summary:
 
 ### Step 2.6: Probe version-sync script integration
 
-dct's release workflow (`dct release apply`, behind `/release`) runs
-`./scripts/dct-version-sync.sh <version>` (else `./scripts/version-sync.sh`)
-if present, and learns the files it changes as the project's version-file
-contract at the first release (`docs/release-workflow.md`). We want every
+dct's release workflow (`dct release prepare`, behind `/release`) runs the
+committed `./scripts/dct-version-sync.sh <version>` (else
+`./scripts/version-sync.sh`) if present — once, in an isolated temporary
+worktree — and the owner approves the files it changes as the project's
+version-file contract at the first release (`docs/release-workflow.md`). We want every
 registered project to have a version-sync script so `/release` can bump
 project files automatically.
 

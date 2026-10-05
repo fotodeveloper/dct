@@ -89,6 +89,12 @@ projects = sa.Table(
     # K-90: render `(#N)` PR references in the changelog (opt-in, default
     # off); persisted per release in releases.render at stamp time.
     sa.Column("changelog_pr_refs", sa.Boolean, nullable=False, server_default=sa.false()),
+    # K-76: the project's PENDING version-file proposal — canonical JSON of
+    # core.releases.validate_proposal, written by `dct release prepare`
+    # (set_pending_proposal; a new prepare replaces it), consumed and cleared
+    # by the stamp that approves it (release_entries consume_proposal) — it
+    # then lives on as releases.proposal. NULL = nothing prepared.
+    sa.Column("release_proposal", sa.Text),
     sa.Column("created_at", sa.DateTime, nullable=False, server_default=sa.text("CURRENT_TIMESTAMP")),
     sa.Column("updated_at", sa.DateTime, nullable=False, server_default=sa.text("CURRENT_TIMESTAMP")),
     sa.Column("deleted_at", sa.DateTime),
@@ -935,6 +941,7 @@ RELEASE_LEDGER_COLUMNS: dict[str, tuple[tuple[str, str], ...]] = {
         ("version_files_history", "TEXT"),
         ("release_executor", "VARCHAR(8) NOT NULL DEFAULT 'dct'"),
         ("changelog_pr_refs", "BOOLEAN NOT NULL DEFAULT {false}"),
+        ("release_proposal", "TEXT"),
     ),
 }
 

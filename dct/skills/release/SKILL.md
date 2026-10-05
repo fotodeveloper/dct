@@ -110,7 +110,7 @@ Version files: pyproject.toml, proj_a/__init__.py (contract)
 - `foreign_citations`, `reverts` with status `outside_range` or `ambiguous`,
   and every `warnings` line: shown as they are.
 - `version_files.version_files` null → "Version files: to be learned at this
-  first release" (Step 6).
+  first release" (Step 6 — `dct release prepare` shows them for approval).
 
 ### Step 4: The owner's decisions (AskUserQuestion)
 
@@ -179,31 +179,32 @@ Release proj-a 1.1.0?
   release and needs this consent (`--no-entries` states the intent; it is not
   the consent). Say the side effects: the `since=last_release` anchor does not
   move, and a full changelog export omits V. No → stop.
-- **First release** (`version_files.version_files` null): tell the owner that
-  the workflow learns the project's version files from what the version sync
-  changes; it will stop after the sync and show the list.
+Prepare the version files BEFORE anything is stamped (K-76) — the
+version-sync script runs once in an isolated temporary worktree; nothing in
+the checkout changes:
 
 ```bash
-dct release apply --version 1.1.0 --entries 12,13,15,16,17 --plan-digest <snapshot_digest> --confirm --json
-dct release apply --version 1.1.0 --no-entries --plan-digest <snapshot_digest> --confirm --json   # version-only
+dct release prepare --version 1.1.0 --entries 12,13,15,16,17 --plan-digest <snapshot_digest> --json
+dct release prepare --version 1.1.0 --no-entries --plan-digest <snapshot_digest> --json   # version-only
+```
+
+Show `details.proposal.paths` (one per line), `details.checks` and, when
+`details.contract.change` is true (a first release, or the set differs
+from the confirmed contract — an empty list is a contract too), say so;
+ask `"These are the version files"` / `"Not these — stop"`. Outcome
+`failed` → the script failed or timed out (`details.sync`): the owner fixes
+it, prepare again. Only on the owner's yes:
+
+```bash
+dct release apply --version 1.1.0 --entries 12,13,15,16,17 --plan-digest <snapshot_digest> --proposal-digest <proposal_sha256> --confirm --json
+dct release apply --version 1.1.0 --no-entries --plan-digest <snapshot_digest> --proposal-digest <proposal_sha256> --confirm --json   # version-only
 ```
 
 A refusal saying the context "differs from the approved plan" (HEAD moved,
-an entry was added or edited, the selection or version differs) → show
-`details.snapshot`, re-run the plan and ask again; never pass a new digest
-the owner has not seen.
-
-**First release, the refusal with `details.proposed_version_files`:** the
-record is `stamped`, the changelog file is written, nothing is committed. Show
-the list (one path per line) and ask `"These are the version files"` /
-`"Not these — stop"`. Only on the owner's yes:
-
-```bash
-dct release resume --confirm-version-files --json
-```
-
-On "not these": the release stays unfinished — the owner fixes the sync
-script and the next `/release` resumes it, or abandons it (Resume path).
+an entry was added or edited, the selection or version differs) or that
+voids the proposal (another candidate / version / plan, a changed script or
+baseline, a newer prepare) → show `details`, re-run plan / prepare and ask
+again; never pass a digest the owner has not seen.
 
 ### Step 7: Read the result and report
 
@@ -215,9 +216,9 @@ script and the next `/release` resumes it, or abandons it (Resume path).
   (`staged`, `unproven`, `foreign_paths`, `foreign_content`, `changed`,
   `contract`, …). Only the listed `steps` happened. A `release` that is
   unfinished → the **Resume path**.
-- Outcome `failed` → the version-sync script failed (its exit code is the
-  command's): the record stays `stamped`; the owner fixes the script, then
-  the **Resume path**.
+- Outcome `failed` (prepare) → the version-sync script failed or timed out
+  (its exit code is the command's, 124 on timeout): nothing was stamped; the
+  owner fixes the script, then prepare again.
 
 Report the requested version (`details.requested_version`), the record's
 version (`version` — the authoritative spelling of every artifact) and the
@@ -226,7 +227,7 @@ project's `details.current_version` SEPARATELY (K-55 / K-31):
 ```
 ✓ proj-a released: requested 1.1.0 · record 1.1.0 · current_version 1.1.0
   5 entries stamped (#12, #13, #15, #16, #17); attested: #16, #17; left unreleased: #18
-  Steps: stamp done · changelog done · sync done · commit done · tag done · complete done
+  Steps: stamp done · changelog done · version_files done · commit done · tag done · complete done
   Tag v1.1.0: local only
 ```
 
@@ -249,9 +250,10 @@ then ask: `"Finish release v<version>"` /
   against THIS checkout (another worktree or HEAD → refused; the record is
   never re-pinned — run it in the record's `checkout_root`), verifies each
   effect, skips what exists and matches, performs what is missing and refuses
-  on a contradiction without overwriting. Read the result as in Step 7.
-  `--confirm-version-files` only after the owner confirmed a proposed list
-  (Step 6).
+  on a contradiction without overwriting (`foreign`: a file differs from
+  both its baseline and the approved content — the owner restores or
+  finishes it). The version sync is never re-run. Read the result as in
+  Step 7.
 - **Abandon** → ask for the owner's reason (free text), and confirm that the
   record, the stamps, `current_version` and every effect stay and V stays
   taken (the work is released later under a NEW version). Then:
@@ -282,9 +284,9 @@ never reconstruct by hand, never write the record another way.
   keep it. Collective attestation is a proposal the owner confirms.
 - ALWAYS pass `--version V` (computed once) and `--entries` or, with explicit
   consent, `--no-entries`.
-- `--confirm-version-files` only after the owner confirmed the proposed list.
+- `--proposal-digest` only after the owner confirmed the prepared file list.
 - `dct release abandon` only with the owner's reason and explicit
   confirmation.
-- The skill never edits the changelog file, never runs version sync, never
-  commits, tags or pushes for the release and never calls `advance_release`
-  — the workflow does the effects and records them.
+- The skill never edits the changelog file, never runs the version sync
+  itself, never commits, tags or pushes for the release and never calls
+  `advance_release` — the workflow does the effects and records them.

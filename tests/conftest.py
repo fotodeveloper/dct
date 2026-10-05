@@ -351,6 +351,26 @@ def approved_plan_digest(engine, slug: str, cwd, **kw) -> str:
     return digest or "0" * 64
 
 
+def approved_proposal_digest(engine, slug: str, cwd, *, plan_digest: str, **kw) -> str | None:
+    """The proposal_sha256 of `dct release prepare` for the same version,
+    selection and approved plan digest (K-76: apply consumes only the
+    APPROVED proposal) — the tests' stand-in for the owner reviewing the
+    prepared file set. A prepare that is refused (nothing to prepare: the
+    version is already recorded or lower than the current one, the plan
+    digest is stale, …) yields None — apply then decides on its own (a
+    no-op re-run, or a refusal of a new stamp without a proposal)."""
+    from dct.workflows.release.effects import ReleaseRefused, prepare_release
+
+    selection = {k: kw[k] for k in ("version", "bump_type", "entry_ids", "no_entries") if k in kw}
+    if selection.get("entry_ids") is not None:
+        selection["entry_ids"] = list(selection["entry_ids"])
+    try:
+        out = prepare_release(engine, slug, cwd=str(cwd), plan_digest=plan_digest, **selection)
+    except ReleaseRefused:
+        return None
+    return out["details"]["proposal_sha256"]
+
+
 def make_git_repo(path, branch: str = "main"):
     """A git repo at `path` on `branch` with one commit; returns the realpath."""
     path.mkdir(parents=True, exist_ok=True)

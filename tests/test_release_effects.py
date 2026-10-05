@@ -1,9 +1,12 @@
 """The release EFFECTS layer (K-72 layer 3; K-49..K-51, K-31/K-32, K-55,
-K-57, K-60, K-61, K-63, K-73) — the PRODUCTION workflow
+K-57, K-60, K-61, K-63, K-73, K-76) — the PRODUCTION workflow
 (dct.workflows.release.effects) driven on real throwaway git repositories and
-files: stamp → changelog file → version sync → release commit → tag, with
-interruptions injected before every effect and between every effect and its
-progress write, then `resume` — which must finish exactly once.
+files: prepare (isolated version sync) → stamp → changelog file → approved
+version files → release commit → tag, with interruptions injected before
+every effect and between every effect and its progress write, then `resume`
+— which must finish exactly once and never re-runs the sync. The artifacts
+contract itself (prepare, approval, content-verified retry) is pinned in
+tests/test_release_prepare.py.
 
 Every scenario checks reality, not the record: F's bytes (section + history),
 the version file, the whole index, HEAD, the release commit's tree and
@@ -19,7 +22,13 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
-from conftest import approved_plan_digest, git, make_git_repo, run_cli
+from conftest import (
+    approved_plan_digest,
+    approved_proposal_digest,
+    git,
+    make_git_repo,
+    run_cli,
+)
 
 from dct.core.changelog import add_entry, list_entries
 from dct.core.projects import create_project, get_project
@@ -34,6 +43,7 @@ from dct.workflows.release.effects import (
     abandon,
     apply_release,
     attest,
+    prepare_release,
     reconstruct,
     resume_release,
 )
@@ -125,16 +135,25 @@ def record_date(engine, version="1.1.0") -> str:
 
 def apply(engine, repo, **kw):
     """apply_release with the digest of the plan for the same selection (the
-    owner's approval, K-80) unless the test passes its own."""
+    owner's approval, K-80) and of the proposal `prepare` stores for it
+    (K-76) unless the test passes its own."""
     kw.setdefault("confirm", True)
     if "plan_digest" not in kw and not kw.get("strict"):
         kw["plan_digest"] = approved_plan_digest(engine, SLUG, repo, **kw)
+    if "proposal_digest" not in kw and not kw.get("strict"):
+        selection = {k: kw[k] for k in ("version", "bump_type", "entry_ids", "no_entries")
+                     if k in kw}
+        kw["proposal_digest"] = approved_proposal_digest(
+            engine, SLUG, repo, plan_digest=kw["plan_digest"], **selection)
     return apply_release(engine, SLUG, cwd=str(repo), **kw)
 
 
 def cli_digest(engine, repo, version: str, entries: list[int] | None) -> list[str]:
     kw = {"entry_ids": entries} if entries is not None else {"no_entries": True}
-    return ["--plan-digest", approved_plan_digest(engine, SLUG, repo, version=version, **kw)]
+    plan = approved_plan_digest(engine, SLUG, repo, version=version, **kw)
+    proposal = approved_proposal_digest(engine, SLUG, repo, plan_digest=plan, version=version,
+                                        **kw)
+    return ["--plan-digest", plan, *(["--proposal-digest", proposal] if proposal else [])]
 
 
 def resume(engine, repo, **kw):
@@ -194,8 +213,8 @@ def test_apply_performs_and_verifies_every_effect(engine, proj):
     candidate = git(repo, "rev-parse", "HEAD")
     out = apply(engine, repo, version="1.1.0", entry_ids=[a])
     assert out["outcome"] == "completed" and tuple(out) == RESULT_KEYS
-    assert [s["step"] for s in out["steps"]] == ["stamp", "changelog", "sync", "commit", "tag",
-                                                  "complete"]
+    assert [s["step"] for s in out["steps"]] == ["stamp", "changelog", "version_files", "commit",
+                                                  "tag", "complete"]
     record = assert_released(engine, repo, candidate, [a])
     assert record["proof"] == {str(a): {"commits": [candidate], "merge_commit": None,
                                         "pr": None, "source": None, "ambiguous": False,
@@ -280,9 +299,9 @@ def test_interrupted_release_resumes_exactly_once(engine, proj, point):
         out = resume(engine, repo)
         assert out["outcome"] == "completed", out
     assert_released(engine, repo, candidate, [a])
-    # The sync is re-run only by a resume of a record still before
-    # 'files_written' whose sync had already run — never on a newer HEAD.
-    assert sync_runs(log) == (["1.1.0", "1.1.0"] if point == "after_sync" else ["1.1.0"])
+    # K-76: the sync runs ONLY in prepare (isolated) — once per prepare,
+    # never after the stamp, never on a resume (before_stamp: prepared twice).
+    assert sync_runs(log) == (["1.1.0", "1.1.0"] if point == "before_stamp" else ["1.1.0"])
     final = snapshot(repo)
     assert resume(engine, repo)["outcome"] == "noop"
     assert snapshot(repo) == final
@@ -393,72 +412,77 @@ def test_attest_refuses_staged_changes_and_proven_ids(engine, proj):
         attest(engine, SLUG, [b], cwd=str(repo))
 
 
-# ── first release: learning the version-file contract (K-73) ────────────────
+# ── first release: learning the version-file contract (K-73, K-76) ──────────
 
 
-def test_first_release_needs_the_version_file_confirmation(engine, proj):
+def test_first_release_learns_the_approved_proposal_as_the_contract(engine, proj):
     repo, log = proj
     with engine.begin() as conn:
         conn.execute(projects.update().values(version_files=None,
                                               version_files_confirmed_at=None))
     a = proven(engine, repo, "feature a")
     candidate = git(repo, "rev-parse", "HEAD")
-    with pytest.raises(ReleaseRefused, match="first release") as exc:
-        apply(engine, repo, version="1.1.0", entry_ids=[a])
-    assert exc.value.details["proposed_version_files"] == ["pyproject.toml"]
-    rec = get_release(engine, SLUG, "1.1.0")
-    assert rec["status"] == "stamped" and rec["manifest"] == {"untracked_baseline": []}
-    assert get_version_files(engine, SLUG)["version_files"] is None
-    assert git(repo, "rev-parse", "HEAD") == candidate and git(repo, "tag", "--list") == "v1.0.0"
-    resume(engine, repo, confirm_version_files=True)
+    digest = approved_plan_digest(engine, SLUG, repo, version="1.1.0", entry_ids=[a])
+    prepared = prepare_release(engine, SLUG, cwd=str(repo), version="1.1.0", entry_ids=[a],
+                               plan_digest=digest)["details"]
+    assert prepared["contract"] == {"confirmed": None, "proposed": ["pyproject.toml"],
+                                    "change": True}
+    assert get_version_files(engine, SLUG)["version_files"] is None  # nothing learned yet
+    apply(engine, repo, version="1.1.0", entry_ids=[a], plan_digest=digest,
+          proposal_digest=prepared["proposal_sha256"])
     assert get_version_files(engine, SLUG)["version_files"] == ["pyproject.toml"]
     assert_released(engine, repo, candidate, [a])
-    assert sync_runs(log) == ["1.1.0", "1.1.0"]  # the legal retry on the candidate
+    assert sync_runs(log) == ["1.1.0"]  # once, isolated — never after the stamp
 
 
-def test_first_release_resume_ignores_untracked_files_present_before_the_release(
+def test_untracked_files_present_before_the_release_never_become_version_files(
         engine, proj):
-    """The pre-release untracked files (local junk) are recorded with the
-    stamp and never become version files — also on the resume."""
+    """Local junk holding V is invisible to the isolated sync and recorded
+    as the untracked baseline with the stamp."""
     repo, _ = proj
     with engine.begin() as conn:
         conn.execute(projects.update().values(version_files=None))
     (repo / "notes.local").write_text("scratch 1.1.0\n")
     a = proven(engine, repo, "feature a")
     candidate = git(repo, "rev-parse", "HEAD")
-    with pytest.raises(ReleaseRefused) as exc:
-        apply(engine, repo, version="1.1.0", entry_ids=[a])
-    assert exc.value.details["proposed_version_files"] == ["pyproject.toml"]
-    assert get_release(engine, SLUG, "1.1.0")["manifest"] == {
-        "untracked_baseline": ["notes.local"]}
-    resume(engine, repo, confirm_version_files=True)
+    apply(engine, repo, version="1.1.0", entry_ids=[a])
+    assert get_release(engine, SLUG, "1.1.0")["manifest"]["untracked_baseline"] == [
+        "notes.local"]
     assert get_version_files(engine, SLUG)["version_files"] == ["pyproject.toml"]
     assert "notes.local" not in git(repo, "show", "--name-only", "--format=", "HEAD")
     assert git(repo, "rev-parse", "HEAD^") == candidate
     assert (repo / "notes.local").exists()
 
 
-def test_version_files_differing_from_the_contract_are_refused(engine, proj):
+def test_a_contract_change_is_shown_and_approved_by_the_proposal_digest(engine, proj):
     repo, _ = proj
     set_version_files(engine, SLUG, ["VERSION"], confirm=True)
     a = proven(engine, repo, "feature a")
-    candidate = git(repo, "rev-parse", "HEAD")
-    with pytest.raises(ReleaseRefused, match="contract") as exc:
-        apply(engine, repo, version="1.1.0", entry_ids=[a])
-    assert exc.value.details == {"changed": ["pyproject.toml"], "contract": ["VERSION"]}
-    assert get_release(engine, SLUG, "1.1.0")["status"] == "stamped"
-    assert git(repo, "rev-parse", "HEAD") == candidate
+    digest = approved_plan_digest(engine, SLUG, repo, version="1.1.0", entry_ids=[a])
+    prepared = prepare_release(engine, SLUG, cwd=str(repo), version="1.1.0", entry_ids=[a],
+                               plan_digest=digest)["details"]
+    assert prepared["contract"] == {"confirmed": ["VERSION"], "proposed": ["pyproject.toml"],
+                                    "change": True}
+    assert get_version_files(engine, SLUG)["version_files"] == ["VERSION"]
+    apply(engine, repo, version="1.1.0", entry_ids=[a], plan_digest=digest,
+          proposal_digest=prepared["proposal_sha256"])
+    contract = get_version_files(engine, SLUG)
+    assert contract["version_files"] == ["pyproject.toml"]
+    assert contract["history"][-1]["version_files"] == ["VERSION"]  # the replaced contract
 
 
-def test_failing_sync_script_stops_without_advancing(engine, proj):
+def test_failing_sync_script_stops_before_the_stamp(engine, proj):
     repo, _ = proj
     (repo / "scripts" / "dct-version-sync.sh").write_text("#!/bin/bash\nexit 3\n")
     git(repo, "commit", "-qam", "chore: broken sync")
     a = proven(engine, repo, "feature a")
+    digest = approved_plan_digest(engine, SLUG, repo, version="1.1.0", entry_ids=[a])
     with pytest.raises(SyncFailed) as exc:
-        apply(engine, repo, version="1.1.0", entry_ids=[a])
+        prepare_release(engine, SLUG, cwd=str(repo), version="1.1.0", entry_ids=[a],
+                        plan_digest=digest)
     assert exc.value.exit_code == 3
-    assert get_release(engine, SLUG, "1.1.0")["status"] == "stamped"
+    assert get_release(engine, SLUG, "1.1.0") is None
+    assert get_project(engine, SLUG)["current_version"] == "1.0.0"
 
 
 # ── resume negatives: contradictions stop without overwriting ────────────────
@@ -481,7 +505,7 @@ def test_partial_section_in_the_changelog_is_not_overwritten(engine, proj):
         resume(engine, repo)
     assert (repo / "changelog.md").read_text() == partial
     assert get_release(engine, SLUG, "1.1.0")["status"] == "stamped"
-    assert sync_runs(log) == []
+    assert sync_runs(log) == ["1.1.0"]  # prepare only
 
 
 def test_reverted_version_file_after_files_written_is_refused(engine, proj):
@@ -548,7 +572,7 @@ def test_resume_from_another_checkout_is_refused(engine, proj, tmp_path):
     record = get_release(engine, SLUG, "1.1.0")
     assert record["checkout_root"] == str(repo) and record["status"] == "stamped"
     assert git(wt, "status", "--porcelain") == before_wt
-    assert sync_runs(log) == []
+    assert sync_runs(log) == ["1.1.0"]  # prepare only
 
 
 def test_resume_on_a_different_head_is_refused_and_never_syncs(engine, proj):
@@ -558,7 +582,7 @@ def test_resume_on_a_different_head_is_refused_and_never_syncs(engine, proj):
     with pytest.raises(ReleaseRefused, match="not the release candidate"):
         resume(engine, repo)
     assert git(repo, "rev-parse", "HEAD") == newer
-    assert sync_runs(log) == []
+    assert sync_runs(log) == ["1.1.0"]  # prepare only
     assert not (repo / "changelog.md").read_text().count("1.1.0")
 
 
@@ -609,7 +633,7 @@ def test_abandoned_record_has_no_effects_and_keeps_the_version(engine, proj):
         apply(engine, repo, version="1.1.0", entry_ids=[a, b])
     assert get_release(engine, SLUG, "1.1.0")["status"] == "abandoned"
     assert get_project(engine, SLUG)["current_version"] == "1.1.0"
-    assert sync_runs(log) == []
+    assert sync_runs(log) == ["1.1.0"]  # prepare only
 
 
 # ── reconstruct (K-60) ───────────────────────────────────────────────────────
@@ -778,11 +802,13 @@ def test_cli_sync_failure_exits_with_the_scripts_code(engine, cli_proj, monkeypa
     (repo / "scripts" / "dct-version-sync.sh").write_text("#!/bin/bash\nexit 3\n")
     git(repo, "commit", "-qam", "chore: broken sync")
     a = proven(engine, repo, "feature a")
-    assert _exit(monkeypatch, ["release", "apply", "-P", SLUG, "--version", "1.1.0",
-                               "--entries", str(a), "--confirm", "--json",
-                               *cli_digest(engine, repo, "1.1.0", [a])]) == 3
+    digest = approved_plan_digest(engine, SLUG, repo, version="1.1.0", entry_ids=[a])
+    assert _exit(monkeypatch, ["release", "prepare", "-P", SLUG, "--version", "1.1.0",
+                               "--entries", str(a), "--json", "--plan-digest", digest]) == 3
     doc = json.loads(capsys.readouterr().out)
-    assert doc["outcome"] == "failed" and doc["release"]["status"] == "stamped"
+    assert doc["outcome"] == "failed" and doc["release"] is None
+    assert doc["details"]["sync"]["exit_code"] == 3
+    assert get_release(engine, SLUG, "1.1.0") is None
 
 
 def test_result_keys_are_the_documented_schema():
