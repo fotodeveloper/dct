@@ -88,6 +88,13 @@ dct/core/handoff.py      — Session handoffs (cross-session prompt ledger)
 dct/core/decisions.py    — ADR / sprint-amendment / open-question records
 dct/core/tags.py         — Global tag dictionary + item_tags links (similarity
                            guard, merge)
+dct/core/changelog_file.py — Which file is a project's changelog (#876): the ONE
+                           resolver (explicit path — projects.
+                           changelog_path_explicit — / detection among the
+                           candidate's tracked files; every path component
+                           checked in the tree and on disk; filter-aware
+                           work-tree check) for plan, effects and CLI;
+                           problems refuse before the stamp
 dct/core/version.py      — Version contract (parse / normalize / compare / bump,
                            X.Y | X.Y.Z, leading v dropped) + project-file autodetect
 dct/core/gitinfo.py      — Git readers (toplevel / branch / common dir) +

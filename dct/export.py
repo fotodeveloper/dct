@@ -15,6 +15,7 @@ def export_changelog_md(
     project_slug: str,
     include_unreleased: bool = True,
     version: str | None = None,
+    provisional: dict | None = None,
 ) -> str:
     """Generate Keep a Changelog format markdown from DB entries.
 
@@ -44,6 +45,13 @@ def export_changelog_md(
     rendered as it always was, so turning the setting on never rewrites
     released history. The full render and the single-version render share
     this ONE rule (_render_version_block).
+
+    `provisional` (#876 K-9 — the release effects' composition BEFORE the
+    stamp, never a trial stamp): {version, entry_ids, render, proof} of the
+    release about to be stamped — rendered as if those entries already
+    carried `version` (as the newest release) and its record existed with
+    that render / proof map. Read-only like every render; nothing is
+    written, no other entry or record is read differently.
     """
     from dct.core.changelog import stored_spellings
 
@@ -58,8 +66,12 @@ def export_changelog_md(
             sa.select(changelog_entries)
             .where(changelog_entries.c.project_id == pid, changelog_entries.c.deleted_at.is_(None))
         )
+        chosen = set(provisional["entry_ids"]) if provisional else set()
         if version is not None:
-            q = q.where(changelog_entries.c.version.in_(stored_spellings(conn, pid, version)))
+            selected = changelog_entries.c.version.in_(stored_spellings(conn, pid, version))
+            if chosen:
+                selected = sa.or_(selected, changelog_entries.c.id.in_(sorted(chosen)))
+            q = q.where(selected)
         q = q.order_by(changelog_entries.c.released_at.desc().nulls_first(), changelog_entries.c.created_at)
         rows = [row_to_dict(r) for r in conn.execute(q)]
         record_rows = conn.execute(
@@ -69,6 +81,17 @@ def export_changelog_md(
         ).all()
     recorded = [r.version for r in record_rows]
     refs_by_version = {_identity(r.version): _pr_refs(r.render, r.proof) for r in record_rows}
+    newest = None
+    if provisional:
+        # The entries about to be stamped carry the version (unreleased rows
+        # come first in the query's order, as the stamp's newest released_at
+        # will); the record about to be written names its spelling and refs.
+        newest = _identity(provisional["version"])
+        for row in rows:
+            if row["id"] in chosen:
+                row["version"] = provisional["version"]
+        recorded.append(provisional["version"])
+        refs_by_version[newest] = _pr_refs(provisional.get("render"), provisional.get("proof"))
 
     category_order = ["added", "changed", "fixed", "removed"]
 
@@ -99,7 +122,9 @@ def export_changelog_md(
 
     # Released versions (sorted by released_at of each version's first entry, desc)
     released_groups = [entries for key, entries in versions.items() if key is not None]
-    for entries in sorted(released_groups, key=lambda e: e[0].get("released_at") or "", reverse=True):
+    for entries in sorted(released_groups, reverse=True,
+                          key=lambda e: (_identity(e[0]["version"]) == newest,
+                                         e[0].get("released_at") or "")):
         _render_version_block(_spelling(entries, recorded), entries, category_order, lines,
                               refs_by_version.get(_identity(entries[0]["version"])))
 

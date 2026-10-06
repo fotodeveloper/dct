@@ -483,8 +483,8 @@ def test_candidates_on_a_detached_head_confirm_nothing(engine, worktree_setup):
 PINNED_PLAN_KEYS = [
     "schema_version", "project", "kind", "version", "checkout", "executor",
     "unfinished_release", "range", "entries", "foreign_citations", "reverts",
-    "squash_commits", "attestation_groups", "proof", "index", "version_files", "warnings",
-    "resume", "snapshot", "snapshot_digest",
+    "squash_commits", "attestation_groups", "proof", "index", "version_files",
+    "changelog_file", "warnings", "resume", "snapshot", "snapshot_digest",
 ]
 PINNED_CANDIDATE_KEYS = [
     "schema_version", "project", "checkout", "range", "confirmed", "uncertain",
@@ -498,7 +498,7 @@ def test_json_documents_keep_their_top_level_keys(cli_engine, repo, monkeypatch,
     monkeypatch.chdir(repo)
     run_cli(monkeypatch, ["release", "plan", "-P", "proj-r", "--patch", "--json"])
     plan = json.loads(capsys.readouterr().out)
-    assert list(plan) == PINNED_PLAN_KEYS and plan["schema_version"] == 3
+    assert list(plan) == PINNED_PLAN_KEYS and plan["schema_version"] == 4
     assert set(plan["executor"]) == {"project", "record"}
     assert plan["version"] == {"current": "1.0.0", "target": "1.0.1", "bump": "patch"}
     assert set(plan["entries"]) == {"proven", "unproven"}
@@ -512,7 +512,7 @@ def test_json_documents_keep_their_top_level_keys(cli_engine, repo, monkeypatch,
     assert len(plan["snapshot_digest"]) == 64 and plan["resume"] is None
     run_cli(monkeypatch, ["clog", "candidates", "-P", "proj-r", "--json"])
     candidates = json.loads(capsys.readouterr().out)
-    assert list(candidates) == PINNED_CANDIDATE_KEYS and candidates["schema_version"] == 3
+    assert list(candidates) == PINNED_CANDIDATE_KEYS and candidates["schema_version"] == 4
 
 
 def test_release_plan_cli_refuses_outside_a_checkout(cli_engine, repo, monkeypatch, tmp_path, capsys):

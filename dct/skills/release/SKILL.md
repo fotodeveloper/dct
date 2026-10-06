@@ -24,7 +24,10 @@ step for step.
 
 The workflow performs and verifies every release effect and records the
 progress in the release record itself. This skill therefore:
-- never edits the changelog file, never runs a version-sync script;
+- never edits the changelog file FOR THE RELEASE (the workflow writes the
+  section), never runs a version-sync script — rewriting a non-Markdown
+  changelog to Markdown (Step 5, the owner's choice) is work in progress,
+  committed in Step 3 before the plan;
 - never stages, commits or tags FOR THE RELEASE (the attestation commit, the
   release commit and the tag are made by `dct release attest` / `apply` /
   `resume`); the only commit it makes is the owner's work in progress
@@ -59,8 +62,8 @@ Run `dct release plan --json`.
   CLI." Do NOT fall back to the MCP tools: the ledger tools alone cannot
   verify the changelog file, the version files, the commit, the tag or the
   push.
-- `schema_version` lower than 3 (the plan has no `executor` key — an older
-  CLI) → STOP with the same message.
+- `schema_version` lower than 4 (the plan has no `executor` or no
+  `changelog_file` key — an older CLI) → STOP with the same message.
 - Exit 1 (the checkout could not be verified, project not found) → show the
   message and STOP. Never retry from another directory.
 
@@ -208,11 +211,67 @@ Version files: pyproject.toml, proj_a/__init__.py (contract)
   and every `warnings` line: shown as they are.
 - `version_files.version_files` null → "Version files: learned at this first
   release — `dct release prepare` shows them for approval (Step 8)".
+- `changelog_file` — the changelog file the release writes (#876): show
+  `path` and `source` (`detected` = found among the tracked files, e.g.
+  `CHANGELOG.md`; `stored` = the project's explicit setting; `default` =
+  `changelog.md`, existing or new) and the other `candidates`. `managed`
+  false → "No changelog file (dct's changelog file is off)". A `problem`
+  is settled in Step 5 before anything else — prepare and apply refuse it
+  before the stamp.
 
 ### Step 5: The owner's decisions (AskUserQuestion)
 
 Ask in as few calls as the question limit allows, in this order:
 
+0. **The changelog file** (only when `changelog_file.problem` is set) —
+   show `changelog_file.found` and its `ways` (each `what` and `command`):
+   - `ambiguous` (several Markdown changelogs) → one option per offered
+     `changelog-path` way (`"Use CHANGES.md"`; a link among them is offered
+     as the path through its target) — run its `dct project
+     changelog-path <slug> <path>`; a link candidate without an admissible
+     target is not offered as a choice: its `"Replace the link"` way and
+     `"Turn dct's changelog file off"` are (K-27);
+   - `case_variant` (the stored path differs from a tracked file only in
+     case) → `"Use <found>"` (its `changelog-path` command) / `"Stop"`;
+   - `not_markdown` (the only changelog is not Markdown, e.g.
+     `HISTORY.rst`, or the stored path has no Markdown extension) → its
+     ways: `"Convert it to Markdown"` (you rewrite its content in the Keep a
+     Changelog layout AND rename it to a Markdown extension, e.g. `git mv
+     HISTORY.rst HISTORY.md` — git mv alone does not convert the format —,
+     show the diff, it is committed as work in progress — Step 3 —, then
+     `dct project changelog-path <slug> HISTORY.md` chooses it; outside
+     git: renamed with `mv`, nothing to commit),
+     `"Explicit Markdown file"` (`dct project changelog-path <slug>
+     CHANGELOG.md` — any Markdown name, `changelog.md` too; the old file
+     stays as it is), `"Turn dct's changelog file off"` (`dct project
+     changelog <slug> off`);
+   - `symlink` (the changelog file or a directory of its path —
+     `component` — is a symbolic link; dct never writes through one) →
+     `"Use <target>"` (its `changelog-path` command, offered only when the
+     path through the target is admissible) / `"Replace the link"`
+     (committed as work in progress; outside git nothing to commit) /
+     `"Turn dct's changelog file off"`; with `baseline: "work_tree"` the
+     link exists only on disk (ignored / untracked) → the owner moves it
+     away;
+   - `not_a_directory` / `not_a_file` / `outside_project` (a file or
+     submodule where a directory is expected, a directory or submodule
+     where the file is expected, a stored path leaving the project) → its
+     ways: another path (`dct project changelog-path <slug> <path>`),
+     detection (`--detect`, offered only when the detected file also
+     passes the work-tree check) or the changelog file off; `not_a_file`
+     with `baseline: "work_tree"` = a TRACKED directory whose name differs
+     only in case, opened at the path by a case-insensitive file system —
+     never moved away: another path or off (K-28);
+   - `not_baseline` → follow its `ways`, by `baseline`: `absent` / `tracked`
+     (a file at the path that is not the candidate's content — ignored,
+     untracked, uncommitted, or a case-variant on a case-insensitive file
+     system) → the owner moves it away or commits it (Step 3);
+     `unfiltered` (the content IS the candidate's, but not in the form a
+     checkout through its filters writes — eol / filter attributes changed
+     after the checkout) → there is nothing to commit: the file is checked
+     out again through its filters (`git rm --cached -q -- <path>`, then
+     `git checkout HEAD -- <path>`).
+   Then re-plan from Step 0 — a settled problem is a new plan.
 1. **Range** (only when `confirm_required`): `"Use <base_tag> as the base"` /
    `"Stop"`.
 2. **Collective attestation** — one question per `attestation_groups` item
@@ -382,12 +441,15 @@ Refusals (the keys are the workflow's own, `dct/workflows/release/effects.py`):
 | `details.mismatch`, `details.pending`, `details.approved_script`, `details.missing_blobs` | the approved proposal is void: another candidate / version / plan, a newer prepare, a changed script, pruned blobs | Step 8 again — a new approval |
 | `details.changed` | before the stamp: a proposal file changed since prepare (approval void); on resume: a release artifact differs from the recorded manifest, or a post-commit hook changed the work tree after the commit | prepare again (Step 8); on resume the owner restores the files, then resume |
 | `details.checkout_changed`, `details.sync`, `details.environment`, `details.path` | prepare: the script wrote outside its isolated worktree, failed / timed out (`sync`, with its `environment` contract: it ran isolated, with only the candidate's files — never in the checkout), touched the changelog, or broke a version file's contract | STOP; the owner fixes the script (it must provide what it needs itself, committed), then Step 8 |
-| `details.foreign` | a release file differs from both its baseline and the approved content — nothing overwritten | the owner restores or finishes the file, then resume |
+| `details.changelog_file`, `details.approved` | the changelog file is not settled (`changelog_file.problem`: `ambiguous`, `case_variant`, `not_markdown`, `symlink`, `not_a_directory`, `not_a_file`, `outside_project`, `not_baseline`, or `content` — K-9, prepare / apply only: composing the release's section into the candidate's file refuses, e.g. not UTF-8, a different pre-written V section or git filters that rewrite the text (`filtered`, K-20), `changelog_file.detail` — refused BEFORE the stamp, nothing released) — or, on resume, `approved` (the file the approved proposal binds) is not the file resolved in the candidate now (a changelog setting changed since the approval, or a record stamped before #876: neither file is written) | before the stamp: Step 5, item 0 (its `ways`; `content` → the owner fixes the file — re-encodes it / removes the pre-written section, committed as work in progress when the project is in git (outside git there is nothing to commit) — or turns the changelog file off), then re-plan from Step 0; on resume FIRST set a changelog setting consistent with the approved path (which setting the approval was made under is not recorded) — `details.restore`, the `dct project changelog …` / `dct project changelog-path …` commands the refusal names, derived from the stored proposal — on the owner's yes, then `dct release resume`; only when `restore` is empty (a record stamped before #876) or the owner declines, the last resort: `dct release abandon` (the owner's reason) ends the record, its stamps and `current_version` stay |
+| `details.tags` | K-8: a tag of V (any spelling) already exists in this repository — the release tags its own release commit, which does not exist yet; refused BEFORE the stamp, nothing released | show the tags; the owner removes a leftover tag themselves (the refusal names the command; the dialog never runs it) or chooses another version; re-plan from Step 0 |
+| `details.foreign` | a release file differs from both its baseline and the approved content — nothing overwritten | an edited file: the owner restores or finishes it, then resume; a changelog file whose baseline is absent (the message says so — an ignored / untracked file, a case-variant, or an edit of the file the release wrote): the owner moves it away, never "restores" it, then resume |
 | `details.foreign_paths`, `details.foreign_content` | the index holds staged changes that are not the release's — left untouched | the owner unstages them, then resume |
-| `details.git_error`, `details.hook`, `details.head`, `details.expected_parent`, `details.tree`, `details.expected_tree`, `details.changed`, `details.subject`, `details.unpublished_commit`, `details.pinned_ref`, `details.head_ref`, `details.signed` | the release (or attestation) commit was stopped and nothing was published — no ref moved: a hook refused it (`hook`, `git_error`), a hook changed the approved content (`changed`, `tree` ≠ `expected_tree`) or the message outside its contract (`subject`; `unpublished_commit` = an unreferenced object git removes), signing failed (`signed`), or HEAD moved / the branch was switched meanwhile (`head` ≠ `expected_parent`, `pinned_ref` ≠ `head_ref`) | show the hook output; the owner fixes the hook or puts the files back as approved (after a branch switch: switches back), then resume on the same candidate (attest: Step 6 again) — no branch has to be moved back |
+| `details.git_error`, `details.hook`, `details.head`, `details.expected_parent`, `details.tree`, `details.expected_tree`, `details.changed`, `details.subject`, `details.unpublished_commit`, `details.pinned_ref`, `details.head_ref`, `details.signed` | the release (or attestation) commit was stopped and nothing was published — no ref moved: a hook refused it (`hook`, `git_error`), a hook changed the approved content (`changed`, `tree` ≠ `expected_tree`) or the message outside its contract (`subject`; `unpublished_commit` = an unreferenced object git removes), signing failed (`signed`), or HEAD moved / the branch was switched meanwhile (`head` ≠ `expected_parent`, `pinned_ref` ≠ `head_ref`) — or, refused by apply BEFORE the stamp (`git_error` alone, nothing released), git cannot name the commit identity (K-8 audit) | show the hook output; the owner fixes the hook or puts the files back as approved (after a branch switch: switches back), then resume on the same candidate (attest: Step 6 again) — no branch has to be moved back; the identity: the owner sets `user.name` / `user.email`, then apply again |
 | `details.commit`, `details.parents`, `details.tree`, `details.expected_tree`, `details.candidate` | on resume HEAD is neither the candidate nor the release commit — a commit made by hand, or the leftover of an older run (`commit`, its `parents`, its `tree` against the approved `expected_tree`, the `candidate`); reported exactly: dct touched no ref, no staging and no file, and it never resets | show it. The hint of `details.error` is conditional: IF that commit is the owner's to discard and nothing is based on it, the owner moves the branch back to the candidate, then resume. The owner decides — never this dialog |
 | `details.foreign_staged` | after the release commit: the owner's own staged version of a release file was preserved | the owner unstages or commits it, then resume |
-| `details.index_lock` | another git process holds `index.lock` (never removed by dct) | wait for it, then resume |
+| `details.index_lock` | before the stamp (apply, K-25): another git process holds `index.lock` (never removed by dct) — refused, nothing stamped or recorded, so `dct release resume` only warns "nothing to resume" | wait for it, then run the same `dct release apply` again (the same approvals) |
+| `details.index_lock` | after the stamp (the commit step of apply or resume): another git process holds `index.lock` (never removed by dct) — the record stays as it is | wait for it, then `dct release resume` (it continues the recorded release) |
 | `details.push_target`, `details.push_urls` | before the stamp, nothing released: the apply did not name the COMPLETE approved push target (`push_target: null` — a missing `--push-remote` / `--push-branch` / `--push-url`; apply never selects the upstream), the named URL is not a push address of that remote (`push_urls`: the remote changed since the approval), or — prepare / takeover — no upstream, or the remote has several push URLs (`push_urls`) — a release goes to ONE approved address (no mirror mode) | pass the three values the owner approved in Step 8; when the target itself changed or is unsettled the owner chooses again — remote, branch and ONE of the listed addresses (`--push-remote … --push-branch … --push-url <url>`), or `--no-push`; then apply again. On resume `push_urls` without the approved URL = the remote no longer pushes to the approved address (outside the consent): the owner restores the remote, then resume |
 | `details.url`, `details.rewrite_rule`, `details.remote_name` | git would not send the approved address `url` to the repository it names: an `insteadOf` / `pushInsteadOf` rule (`rewrite_rule`) would rewrite it on git's command line, or the string is also the name of a git remote (`remote_name` — any config scope, also global; a slash does not make it a path) and git would use that remote's own addresses — dct pushes only to the exact approved URL | the owner removes that rule (or points the remote at the final address); for a remote name BEFORE the stamp: writes the remote's push URL explicitly (`./name`, an absolute path or a real URL) or renames the colliding remote, then Step 8 again; AFTER the stamp the consent keeps the approved string, so only renaming or removing the colliding remote works, then resume (or abandon) |
 | `details.git_error`, `details.push_target` | a failed push → the record stays `tagged` (the commit and the tag exist locally) | fix the cause, then resume — it retries ONLY the push, to the approved URL |
@@ -594,6 +656,7 @@ each refusal and for finishing:
 - NEVER retry a conflict or a refusal on your own, and never loop on a lock.
 - `dct release abandon` only with the owner's reason and explicit
   confirmation.
-- The skill never edits the changelog file, never runs the version sync
-  itself, never commits, tags or pushes FOR THE RELEASE and never calls
+- The skill never edits the changelog file FOR THE RELEASE (a rewrite to
+  Markdown is the owner's work in progress, Step 3), never runs the
+  version sync itself, never commits, tags or pushes FOR THE RELEASE and never calls
   `advance_release` — the workflow does the effects and records them.

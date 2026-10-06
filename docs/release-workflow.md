@@ -23,7 +23,7 @@ messages), `dct/workflows/release/plan.py` (git + database reads) and
 `dct/workflows/release/effects.py` (the effects layer). The
 rules in prose: [assistant-fallbacks.md](assistant-fallbacks.md#changelog-proof-trailers-and-range-shared-by-commit-and-release).
 
-Both documents carry `schema_version` (currently `3`; ONE constant,
+Both documents carry `schema_version` (currently `4`; ONE constant,
 `plan.SCHEMA_VERSION`, for the plan and the candidates) — it moves when the
 meaning of a key changes:
 
@@ -33,10 +33,15 @@ meaning of a key changes:
 - version 3 added `executor` (the project's executor and, for an unfinished
   record, the record's stored executor, progress owner and consent — K-119),
   `pr_source` on every proof object (K-116 H7), the revert comparison that
-  keeps blob identity (K-105) and the ancestry cap that refuses (K-116 H8).
+  keeps blob identity (K-105) and the ancestry cap that refuses (K-116 H8);
+- version 4 added `changelog_file` — the changelog file a release writes,
+  DETECTED among the candidate's tracked files instead of an assumed
+  `changelog.md`, with the problem prepare and apply refuse before the
+  stamp (#876, [The changelog file](#the-changelog-file-876)).
 
 A client that needs a key checks `schema_version` first (a plan with
-`schema_version` lower than 3 has no `executor`). The effects layer's result
+`schema_version` lower than 3 has no `executor`, lower than 4 no
+`changelog_file`). The effects layer's result
 document has its OWN `effects.SCHEMA_VERSION` ([JSON](#json---json-every-subcommand)).
 The top-level keys and the `schema_version` cell of each table below are
 pinned against the module that emits the document by
@@ -64,7 +69,7 @@ what the owner approves: `dct release prepare` and `apply` require its `snapshot
 
 | key | content |
 | --- | --- |
-| `schema_version` | `3` |
+| `schema_version` | `4` |
 | `project` | slug |
 | `kind` | `"release"`, or `"resume"` when an unfinished release record exists (then `resume` is set and nothing is computed on today's HEAD) |
 | `version` | `{current, target, bump}` — `target` from `--version` (normalized) or the bump; for a resume without a version, the record's version |
@@ -80,7 +85,8 @@ what the owner approves: `dct release prepare` and `apply` require its `snapshot
 | `proof` | the proof map the release record stores: `{"<id>": {commits, merge_commit, pr, pr_source, source, ambiguous, associations}}` (`core.releases.validate_proof`; provenance below). More than `core.releases.ASSOCIATIONS_MAX` (50) associations of one entry REFUSE the plan (exit 1) — the list is never cut (K-116 H8) |
 | `index` | `{clean, staged, unstaged, untracked, conflicted, release_artifacts: [{path, role: "changelog" \| "version_file", staged, unstaged, untracked, conflicted}]}` — `clean` ignores untracked files; `staged` = the index differs from HEAD; `null` without git |
 | `version_files` | the project's version-file contract `{version_files (null = to be learned at the first release), confirmed_at, history}` |
-| `warnings` | human-readable strings (range to confirm, approximate range, revert outside the range or unconfirmed, unfinished release, HEAD not the recorded candidate, selection holding unproven ids, no git) |
+| `changelog_file` | the changelog file the release writes (#876 — `core.changelog_file.resolve_changelog` at the candidate; for a resume the RECORDED candidate): `{managed, configured (the stored `changelog_path`), explicit (`projects.changelog_path_explicit` — the owner chose the path; false = detect), path (base-relative; null when not managed or on a problem), source: "stored" \| "detected" \| "default" \| null, format: "markdown" \| "other" \| null, candidates: [{path, format}], problem: null \| "ambiguous" \| "case_variant" \| "not_markdown" \| "symlink" \| "not_a_directory" \| "not_a_file" \| "outside_project" \| "not_baseline", found: [path], ways: [{way, command, what}]}` — `symlink` / `not_a_directory` / `not_a_file` also carry `component: "file" \| "directory"` (K-19); `not_baseline` (a new release in git) also carries `baseline: "absent" \| "tracked" \| "unfiltered"`, and a directory of the path that is a link or no directory ON DISK carries `baseline: "work_tree"`, as does a TRACKED directory / link whose name differs only in case that a case-insensitive file system opens at the file's path (`not_a_file` / `symlink`, component `file`, K-28). The problem `content` (K-9) appears only in a refusal of prepare / apply, never in the plan (the plan composes no section). A problem adds a warning; `prepare` and `apply` refuse it before the stamp ([The changelog file](#the-changelog-file-876)). `null` for a project without a path. Read-only: nothing is stored |
+| `warnings` | human-readable strings (range to confirm, approximate range, revert outside the range or unconfirmed, unfinished release, HEAD not the recorded candidate, selection holding unproven ids, no git, the changelog file's problem or the other changelog-like files beside it) |
 | `resume` | `null`, or for a resume plan (K-95 C5) the RECORDED release: `{version, status, candidate_sha, checkout_root, release_mode, entry_ids, proof, release_commit_sha, manifest, effects: {stamped, files_written, committed, tagged, pushed, completed} (booleans by status), head (today's HEAD, separately), head_is_candidate, new_unreleased (entries added since — NOT part of the record)}`. A resume plan has `range: null`, empty `entries` and `proof`, `snapshot: null` — an approved release is never recomputed on today's HEAD |
 | `snapshot` | the IMMUTABLE approved context (K-80): `{project, version, current_version, git, repo_root, checkout_root, project_root, candidate_sha (full), range: {base_tag, base_sha, approximate, since, revs}, selected_ids, proof (the map of the selected ids), entries: {"<id>": state digest}}` — `entries` covers EVERY unreleased entry the plan saw (`core.changelog.entry_state_digest` over id, category, entry, component, version), so ANY change of the unreleased set after the plan — also a new entry outside the selection — is another snapshot and needs a new plan (K-116 H3); `null` for a resume plan and for a project without a path |
 | `snapshot_digest` | SHA-256 (hex) of the snapshot's canonical JSON (sorted keys, compact separators, UTF-8) — what `dct release apply --plan-digest` takes |
@@ -248,7 +254,7 @@ Best-effort location (read-only; for `/commit`, K-53).
 
 | key | content |
 | --- | --- |
-| `schema_version` | `3` |
+| `schema_version` | `4` |
 | `project` | slug |
 | `checkout` | `{git: true, toplevel, branch, head, detached}` or `{git: false}` |
 | `range` | the `range` object of the plan for target HEAD, or null |
@@ -496,9 +502,13 @@ An explicit EFFECTS stage before the stamp — not part of the read-only plan:
 
 1. **The same pre-checks as apply** — strict checkout, no unfinished
    record, clean index and work tree, the plan re-derived for the pinned
-   candidate must equal `--plan-digest`, the selection proven. A version
+   candidate must equal `--plan-digest`, the selection proven, and the
+   [changelog file](#the-changelog-file-876) settled (`details.changelog_file`
+   — refused before the script runs). A version
    that already has a record, or is lower than `current_version`, has
-   nothing to prepare (refused).
+   nothing to prepare (refused). For a new release, before the script
+   runs: the changelog composition on the candidate's content (problem
+   `content`, K-9) and no local tag of V (`details.tags`, K-8).
 2. **The script of the CANDIDATE** — `scripts/dct-version-sync.sh` (else
    `scripts/version-sync.sh`) under the project root, as the candidate
    commit holds it (an untracked script is refused: the release runs only
@@ -546,7 +556,8 @@ An explicit EFFECTS stage before the stamp — not part of the read-only plan:
    exact paths, `base_blobs` (the candidate's blob, null = absent),
    `expected_blobs`, the script's identity + sha256, `candidate_sha`,
    `version`, `plan_digest`, `release_mode`, and the changelog BASELINE
-   (`changelog`: path, base blob, base sha256). Refused: a script that
+   (`changelog`: path — the RESOLVED file, its exact tracked spelling —,
+   base blob, base sha256). Refused: a script that
    modified the changelog file (dct writes it — K-77 / D2, checked on the
    real result), deleted / retyped a file or changed only a mode, or a
    version file breaking the **version-file contract** (K-96 D9): a file
@@ -603,6 +614,198 @@ carries `pin`, the ref that keeps the blobs). `contract.change` is true
 for a first release (`confirmed` null) and for a changed set — approving
 `P` approves that contract too; it is recorded with the stamp.
 
+### The changelog file (#876)
+
+ONE resolver — `core.changelog_file.resolve_changelog` — decides which file
+F is, for the plan (`changelog_file`), prepare, apply, resume, reconstruct,
+takeover and the CLI (`dct project changelog-path <slug>` shows it, `dct
+project add` reports it). It reads the TRACKED files of the candidate
+(`git ls-tree`, case-sensitive — never the work tree), or outside git the
+project directory. Whether the stored `projects.changelog_path` is the
+owner's choice is the marker `projects.changelog_path_explicit` (K-14),
+never the value: `dct project changelog-path <slug> <path>` always marks
+the choice explicit — also exactly `changelog.md` —, `dct project
+changelog-path <slug> --detect` clears it (the path goes back to the
+default `changelog.md`, used only when detection finds nothing). The
+bootstrap marks every stored path other than `changelog.md` whose marker
+is unset explicit — convergently, on EVERY bootstrap (K-22: it also heals
+a path an older dct without the marker stores later; guarded by a read, so
+a database in the right state is never written) — and leaves the
+historical default NOT explicit: whether it was ever chosen is unknown, so
+it means "detect", and a `--detect` reset is never re-marked.
+
+1. `manages_changelog` off (`dct project changelog <slug> off`) → no
+   changelog file; nothing below is looked at.
+2. An explicit path CHOOSES the file, it waives no check (K-10): a tracked
+   case-variant of it (any component) → `case_variant`, refused — never
+   rewritten silently; a name without a Markdown extension (`.md` /
+   `.markdown`) → `not_markdown`, whether the file exists or not; a
+   stored path leaving the project root (written past the setter, e.g. by
+   another client) → `outside_project`; otherwise that file, existing or
+   new (`stored`), after the path check below.
+3. Detection among the regular files and symlinks DIRECTLY in the project
+   root (a monorepo subproject: its own directory, never the repository
+   root) whose name, compared case-insensitively (NFC + casefold), is
+   `CHANGELOG`, `CHANGES`, `HISTORY`, `NEWS` or `RELEASES` with `.md` /
+   `.markdown` (Markdown) or no extension / `.rst` / `.txt` / `.adoc`:
+   exactly one Markdown file → F in its exact tracked spelling
+   (`detected`, e.g. `CHANGELOG.md` — dct's own `changelog.md` too), or
+   `symlink` when that file is a link; several Markdown files — names
+   differing only in case included, `changelog.md` NOT privileged (K-13) →
+   `ambiguous`, never guessed (`dct project changelog-path <slug> <path>`
+   chooses); only non-Markdown files → `not_markdown`: dct writes Markdown
+   only, so it never writes into that file and never creates a second
+   changelog beside it — the next steps are: convert the existing
+   changelog (K-15: rewrite its content in the Keep a Changelog layout AND
+   give it a Markdown extension, e.g. `git mv HISTORY.rst HISTORY.md` —
+   `git mv` alone does not convert the format —, commit it as work in
+   progress and choose it with `dct project changelog-path <slug>
+   HISTORY.md`), give an explicit Markdown path for a new file (`dct
+   project changelog-path <slug> CHANGELOG.md`), or turn the changelog file
+   off (`dct project changelog <slug> off`); none at all → `changelog.md`,
+   a new file (`default`). Outside git the conversion names no git step
+   and no commit (rename the file yourself, e.g. `mv HISTORY.rst
+   HISTORY.md`, K-24).
+
+EVERY component of the resolved path is checked (K-19), in the candidate's
+tree (outside git: on disk): a symbolic link anywhere on the path —
+the file itself or one of its directories — → `symlink`; a regular file or
+a submodule where a directory is expected → `not_a_directory`; a directory
+or a submodule where the file is expected → `not_a_file` (each problem
+carries `component`: `file` \| `directory`). In git the DIRECTORIES of the
+path are checked on disk too (`check_work_tree`): an ignored or untracked
+link or file where the candidate holds a directory or nothing →
+`symlink` / `not_a_directory` with `baseline: "work_tree"` (move it away).
+On a case-insensitive file system the file itself is checked the same way
+(K-28): where the candidate holds no F but TRACKS a directory, link or
+submodule whose name differs only in case (a tracked `CHANGELOG.md/` while
+F is `changelog.md`), the disk opens that entry at F's path → `not_a_file`
+(a link: `symlink`) with `component: "file"` and `baseline: "work_tree"` —
+never `not_baseline` "move it away": the tracked entry is no thing to move.
+The ways of `not_a_directory`, `not_a_file` and `outside_project` are
+choosing another path, going back to detection when it settles a file that
+also passes the work-tree check (K-28 — in git `check_work_tree` runs on
+the detected path before `--detect` is offered), or turning the changelog
+file off.
+
+A symlink is never written through (K-11; its target may lie anywhere):
+its next steps are the path through the link's target as the explicit path
+(`dct project changelog-path <slug> <target>`, offered only when that path
+is ADMISSIBLE — Markdown, inside the project root, no link, file or
+submodule on it (K-19) — the link then stays as it is), replacing the link
+by the regular file (a directory link: by a real directory), or turning the
+changelog file off. The choices `ambiguous` offers lead only to admissible
+paths the same way (K-24): a link candidate is offered as the path through
+its target, never as itself; a link candidate without an admissible target
+is dropped from the choices, and then its replace-link way and the off way
+are offered (K-27 — `ambiguous` never comes out without a next step). At WRITE time the release guards the project
+boundary again (K-19): a directory of F that became a link or no directory
+after the pre-checks, or a path that resolves outside the project root
+(also a monorepo subproject's), is refused before anything is written
+through it — the record stays stamped; put the directory back and resume.
+
+In git, a NEW release also compares the work tree's file at F's path with
+the candidate's content AS A CHECKOUT WRITES IT
+(`core.changelog_file.check_work_tree`, `git cat-file --filters`: eol /
+smudge filters applied, K-11): something on disk where the candidate has
+no F (ignored or untracked — or, on a case-insensitive file system, a
+tracked file whose name differs only in case) or other bytes →
+`not_baseline` (`baseline: "unfiltered"` when git still considers the
+bytes the candidate's content but its filter attributes changed after the
+checkout — there is nothing to commit: check it out again through its
+filters). The release composes F from the candidate's BLOB and keeps two
+forms of it apart (K-20): the id of the content git STORES (what its clean
+/ eol filters make of the composition as a checkout writes it — `git
+hash-object --path`, what the release commit's tree holds) and the
+expected WORK-TREE bytes — the checkout form of that STORED content
+(K-26), exactly what a fresh checkout of the release commit writes. A CRLF
+work tree under `eol=crlf` gets CRLF; a CRLF history under `* text=auto`
+is stored LF and, like a fresh clone, checked out LF — the whole file,
+history included, so the next release's work-tree check passes. Those
+work-tree bytes must be a fixed point of the filters (`hash-object --path`
+of them gives the stored id again). "Unchanged" is never a byte
+comparison of CRLF with LF: the stored content must be the composition or
+the composition with its line endings normalised (CRLF → LF); a filter
+path that rewrites the release's text otherwise (a clean filter), or one
+without that fixed point, is refused BEFORE the stamp as problem `content`
+(`content: "filtered"`). dct's own id computations run with
+`core.safecrlf=false` (K-29): git's round-trip guard would die on a CRLF
+changelog under `text=auto` where the owner's `git add` succeeds, and dct
+checks the preservation of the text itself. An LF changelog without
+attributes (dct's own repository) is written exactly as composed: work
+tree, blob and composition are the same bytes.
+Every problem is reported by the
+plan (`changelog_file.problem` and a warning) and refused by prepare and by
+apply's pre-checks BEFORE the stamp, with `details.changelog_file` naming
+the configured path, the file(s) found (`found`) and the true next steps
+(`ways`).
+
+The CONTENT is checked before the stamp too (K-9): prepare and apply's
+pre-checks of a new release run the WHOLE composition of F
+(`effects.expected_changelog` — the function the write calls after the
+stamp) on the candidate's content (outside git: the file on disk) for the
+release about to be stamped — its selected entries rendered as if they
+carried V, the record's spelling, today's date, its PR-reference setting
+and proof map; nothing is stamped on trial. A file that is not UTF-8, one
+that already holds a V section (any equivalent spelling) other than
+exactly the section dct renders, or an insertion that fails its own
+verification, or — in git — git filters that do not keep the composed
+text (K-20) → problem `content` (`content`: `not_utf8` \|
+`section_differs` \| `insertion` \| `filtered`, `detail`), whose ways are fixing the
+file yourself (re-encode it / remove the pre-written section), in git
+committing it as work in progress, and planning again (outside git the ways
+name no git step and no commit — there is nothing to commit), or turning
+the changelog file off. The plan does not compose (no release is about to be stamped there),
+so `content` appears only in a refusal of prepare or apply. Every
+changelog-file condition knowable before the stamp — the resolution with
+every component of its path (in the candidate and on disk), the work-tree
+file, the composition into the candidate's content and its filter path —
+is therefore refused before it; the write after the stamp refuses only
+what changed after those pre-checks (the file edited meanwhile, a
+directory of its path swapped for a link, or — for a file already holding
+the identical section — a stamp that falls on the next UTC day, whose
+section date then differs). The guarantee "refused before the stamp"
+reaches exactly that far (K-25): a foreign `index.lock` that EXISTS when
+apply's pre-checks run is refused before the stamp too, but a condition
+that only APPEARS during the operation — an `index.lock` taken by another
+git process after the pre-checks, a refusing commit hook, a failing commit
+signature — stops the release after the stamp (no trial commit is made and
+no hook runs twice to find out earlier); `dct release resume` finishes it
+once the cause is gone. Read-only commands never store the detected path; the
+approved proposal binds it per release (`proposal.changelog.path`), so a
+later rename is detected again instead of being pinned by a stale stored
+value.
+
+A HISTORICAL release is judged by its own evidence, never by today's path
+or detection mode (K-12, K-21): a takeover uses the changelog file of the
+record's VERIFIED manifest when it holds one; otherwise each candidate
+release commit names its F itself — the ONE regular Markdown file inside
+the project that the commit changed (the confirmed version-file contract
+left out) and that holds a V section at the commit; when it changed none
+(the candidate already held the section), the file the resolver settles at
+its parent — with the stored path or with detection — that holds the
+section. SEVERAL such files refuse, never guessed. Finding the section is
+never enough: the section must still be exactly the database's entries and
+the earlier history untouched (K-109). A changelog renamed or chosen since,
+or a `NEWS.md` added since, never changes the verdict on an earlier
+release; outside git the files on disk are the only evidence, so the
+resolution there is today's.
+
+A resume of a `stamped` record whose approved file is not the one the
+candidate resolves now (K-16) writes neither file. Its refusal first
+offers a setting CONSISTENT WITH THE APPROVED PATH (K-23: the proposal does
+not record whether the path was detected or chosen, so the refusal never
+claims to restore "the" setting of the approval) — derived from the stored
+proposal and verified with the same resolver at the recorded candidate:
+`dct project changelog <slug> on|off` when only the switch changed, else
+the MANUAL choice of the approved file, `dct project changelog-path <slug>
+<path>` (project-relative) — never a silent switch to detection;
+`details.restore` —, then `dct release resume`, and abandon as the last
+resort. When no setting
+resolves the approved file again (a record stamped before #876 — `changelog.md`
+approved as absent while the candidate tracks `CHANGELOG.md`, K-18), no
+setting is offered: abandon is the only way.
+
 ### Order of effects (`apply`)
 
 1. **Pre-checks** — strict checkout (K-52; a project without a registered
@@ -612,7 +815,21 @@ for a first release (`confirmed` null) and for a changed set — approving
    unfinished record (else `resume`); index and work tree clean: any
    staged, unstaged or conflicted path, a release artifact that is
    untracked, or an operation in progress refuses — dct never resets,
-   stashes or cleans (K-50). **The approved plan** (K-80): the plan is
+   stashes or cleans (K-50). **The changelog file** (#876 — [The changelog
+   file](#the-changelog-file-876)): a problem of its resolution (`ambiguous`,
+   `case_variant`, `not_markdown`, `symlink`, `not_a_directory`,
+   `not_a_file`, `outside_project` — every component of the path, in the
+   candidate and on disk, K-19), a work-tree file at its path that is
+   not the candidate's content (`not_baseline`) or — for a new release,
+   after the selection is known — a content the composition of F or its
+   filter path refuses (`content`, K-9 / K-20) refuses with
+   `details.changelog_file`. **A local tag of
+   V** (K-8, a new release in git): any tag of V (any spelling) refuses —
+   the release tags its OWN release commit, which does not exist yet, so
+   the tag step could never adopt it (`details.tags`; delete a leftover tag
+   yourself or choose another version). **The commit identity** (apply,
+   git): `git var GIT_AUTHOR_IDENT` / `GIT_COMMITTER_IDENT` must resolve —
+   else refused before the stamp, not at the commit step. **The approved plan** (K-80): the plan is
    re-derived FOR THE PINNED CANDIDATE (never a HEAD read later) with the
    same version and selection; its `snapshot_digest` must equal
    `--plan-digest` — a different HEAD, range base, entry set or entry
@@ -640,7 +857,11 @@ for a first release (`confirmed` null) and for a changed set — approving
    there in any spelling, or a branch there the candidate does not contain
    (the push could never be a fast-forward), refuses — nothing stamped.
    Right before the stamp HEAD must still be the candidate (else refused,
-   nothing stamped). All of this runs under the [operation lock](#the-effects-layer),
+   nothing stamped), and no foreign `index.lock` may exist in the checkout
+   (K-25, `details.index_lock` — dct never removes it; run the same apply
+   again once it is gone). A lock that appears only after this check, a
+   refusing hook or a failing signature stops the release after the stamp
+   (resume finishes it). All of this runs under the [operation lock](#the-effects-layer),
    taken before the first pre-check.
 2. **Stamp** — `release_entries(V, entry_ids, proof=<snapshot proof map>,
    candidate_sha=<the pinned candidate>, checkout_root=<repo root>,
@@ -668,9 +889,9 @@ for a first release (`confirmed` null) and for a changed set — approving
    reads. From here the record's `version` is the spelling of every
    artifact (K-55); the requested V is only reported. A recorded /
    historical / legacy release returns outcome `noop` with no side effect.
-3. **Changelog file F** (`<project root>/<changelog_path>`, only when the
-   project manages its changelog — `manages_changelog`, the plan's
-   artifact rule, D2). The expected content is deterministic: F's BASELINE
+3. **Changelog file F** (the file [The changelog file](#the-changelog-file-876)
+   resolves in the candidate — the path the approved proposal binds; only
+   when the project manages its changelog — `manages_changelog`, D2). The expected content is deterministic: F's BASELINE
    (the candidate commit's F; outside git the copy persisted at prepare —
    K-78, the current file is never its own proof) + the V section rendered
    from the database export of the record's version and headed `##
@@ -690,7 +911,12 @@ for a first release (`confirmed` null) and for a changed set — approving
    is classified — its current content is the baseline (→ written), the
    approved content (→ kept) or anything else (→ refused: nothing written,
    the index untouched, `foreign` names the paths; never restored
-   automatically — restore or finish the file yourself, or abandon).
+   automatically — restore or finish the file yourself, or abandon; a
+   changelog file whose baseline is ABSENT has nothing to restore: what is
+   on disk — an ignored or untracked file, a tracked case-variant on a
+   case-insensitive file system, or an edit of the file the release wrote —
+   is named, and the refusal asks to move it away (resume then writes it),
+   never to "restore" it).
    **One consistent read** (K-77): afterwards the FULL artifact set is
    read ONCE and every hash, every blob id and the expected tree are
    computed from that one read; F must equal its expected content and
@@ -1010,8 +1236,8 @@ progress. Then, by status:
 
 | status | HEAD must be | what resume does |
 | --- | --- | --- |
-| `stamped` | the candidate | index: nothing staged or conflicted; unstaged only F and the proposal's files. A record without an approved proposal (stamped outside the effects layer, or before K-76) is refused — the sync is never run after the stamp; abandon it. Otherwise steps 3-4: each artifact classified (baseline → written, approved → kept, else refused with nothing written), the approved blobs written, the full set verified from one read, the manifest recorded |
-| `files_written` | the candidate — or the release commit itself (its only parent is the candidate, its tree is `manifest.tree`, its subject `release: v<V>`), which is adopted (then only the real-index update and `committed`) | every manifest file must still hold its recorded hash (a reverted version file → refused, not overwritten); then step 5 (the hook lifecycle, the commit on the pinned candidate, the compare-and-swap). An adopted commit runs no hook again. Any OTHER commit at HEAD → refused with its commit / parents / tree / subject and a conditional hint, nothing reset ([above](#commits-and-hooks-k-96-k-79-k-103)) |
+| `stamped` | the candidate | index: nothing staged or conflicted; unstaged only F and the proposal's files. A record without an approved proposal (stamped outside the effects layer, or before K-76) is refused — the sync is never run after the stamp; abandon it. The changelog file is resolved again at the RECORDED candidate ([The changelog file](#the-changelog-file-876)); when it is not the file the approved proposal binds (a record stamped before #876 — `changelog.md` approved as absent while the candidate tracks `CHANGELOG.md` —, or a changed changelog path) resume refuses with `details.changelog_file`, `approved` and `restore`, writing neither file: it executes only the approved proposal. K-16: it first offers the `dct project …` setting that resolves the approved file again (`restore`, derived from the stored proposal and verified with the resolver — then resume), abandon last; `restore` is empty when no setting does (a record stamped before #876, K-18) — then `dct release abandon` ends the record (its stamps and `current_version` stay, V stays taken). Otherwise steps 3-4: each artifact classified (baseline → written, approved → kept, else refused with nothing written), the approved blobs written, the full set verified from one read, the manifest recorded |
+| `files_written` | (F is the file `manifest.changelog` records, from here on) the candidate — or the release commit itself (its only parent is the candidate, its tree is `manifest.tree`, its subject `release: v<V>`), which is adopted (then only the real-index update and `committed`) | every manifest file must still hold its recorded hash (a reverted version file → refused, not overwritten); then step 5 (the hook lifecycle, the commit on the pinned candidate, the compare-and-swap). An adopted commit runs no hook again. Any OTHER commit at HEAD → refused with its commit / parents / tree / subject and a conditional hint, nothing reset ([above](#commits-and-hooks-k-96-k-79-k-103)) |
 | `committed` | the release commit or a descendant | the release commit is verified (tree = `manifest.tree`, parent = candidate); step 6 |
 | `tagged` | the release commit or a descendant | a tag of V must point at the release commit and the recorded `tag_proof` must still be what the repository shows (a moved / deleted tag → refused); a record older than the field gets the identity verified NOW with its next progress write; step 7 — ONLY the push, to the consented target's URL (already there → verified; the URL must still be a push address of its remote); without a push target `completed` |
 | `pushed` | the release commit or a descendant | the tag as for `tagged`; the consented URL must still show the branch and the tag (`git ls-remote <url>`, nothing pushed again; a record without a `push_proof` gets what was read now); `completed` |
@@ -1299,7 +1525,7 @@ One shape, `effects.RESULT_KEYS` (pinned by
 | `release` | the record (`core.releases.RECORD_FIELDS`) or null |
 | `steps` | `[{step, result, …}]` — step ∈ `sync`, `proposal` (prepare; `pin` = the ref keeping its blobs), `stamp`, `changelog`, `version_files`, `files`, `commit`, `index` (the real index after the commit), `tag`, `push` (`remote`, `url`, `branch`, `tag`; `skipped` with `reason` without a push target), `complete`, `attest`, `takeover` (`pin` = the ref keeping the derived proposal's blobs); result ∈ `done`, `verified`, `skipped`, `adopted`, `conflict` (the last step of a conflict response) |
 | `warnings` | human-readable strings (e.g. a post-commit hook that failed after the commit was published; a pin or stored blob that could not be cleaned) |
-| `details` | prepare: see [Prepare](#prepare-dct-release-prepare-k-76), plus `push_target` (the upstream target the owner is shown — apply takes its `remote`, `branch` and `url` as `--push-remote` / `--push-branch` / `--push-url`, K-123 — or null, read-only); apply: `{requested_version, previous_version, bump, entry_ids, mode, released, current_version, push_target}`; attest: `{previous_head, head, entry_ids}`; abandon: `{updated}`; reconstruct: `{evidence: {version (authoritative), requested_version, spellings, entry_ids, candidate_sha, release_commit_sha, tag, tag_proof ({name, object, commit, annotated} \| null), checkout_root, manifest, verification, contract, status, without_git, candidates}, executor: {assigned, provenance: false}, finish: [{way, command, what}]}` (`status` = `completed` \| `committed` — the own adapter also `tagged`; `candidates` (git, dct's rules) = `[{commit, verified, reason, history}]`; `verification` = the recorded scope, `contract` = `{version_files, state}` — [Reconstruct](#reconstruct-dct-release-reconstruct-k-60-k-86-k-96-d8); `executor` = the ASSIGNED responsibility, never provenance; `finish` = the ways to finish a release that is not `completed`); takeover: `{consent, proposal, stage, record_status, status_after, missing_effects, takeover_digest, evidence: {candidate_sha, release_commit_sha, manifest, tag_proof, candidates}, executor}` (+ `next` once taken over — [Takeover](#takeover-dct-release-takeover-k-119-m3-k-117-j4)); version-files: `{contract: {version_files, state, confirmed_at}}` (+ `proposed`, `change` in the preview; `updated` after `--confirm`); advance: `{updated, previous_status}`; conflict: [Conflicts](#conflicts-k-88); refused / failed: the reason (`error`) plus the refusal's data (e.g. `staged`, `unproven`, `proposal_digest` / `plan_digest` (a new release without an approved proposal — also the alias), `mismatch`, `checkout_changed`, `foreign`, `foreign_paths`, `foreign_content`, `foreign_staged`, `changed`, `path`, `sync`, `exit_code`, `environment` (the sync script's environment contract); the commit: `git_error`, `hook`, `commit`, `head`, `tree`, `parents`, `subject`, `expected_tree`, `expected_parent`, `unpublished_commit`, `pinned_ref`, `head_ref`, `signed`, `candidate`, `approved_ids` / `proven_ids` (attest), `previous_head` (attest), `git_version` / `required_git_version`, `index_lock`; the push: `push_target`, `push_urls`, `url`, `rewrite_rule`, `remote_name`, `remote_tags`, `remote_branch`, `outside_consent`; a reconstruction / takeover: `candidates`, `history` (`[{commit, state, diff, diff_lines, diff_sha256}]` — the candidates that changed older changelog history, K-109), `contract` (an unknown version-file contract, K-110), `executor`, `contradictions`, `approved_digest` / `derived_digest` (the takeover digest), `artifacts`; the operation lock: `lock` (null with `reason`: `no_path` \| `unverifiable_path` when its identity cannot be determined), `holder`, `process_groups` (groups a killed dct left running — or `[]` when that cannot be verified), `process_group` (a sync script's group that could not be stopped); the executor: `executor`, `consent`) |
+| `details` | prepare: see [Prepare](#prepare-dct-release-prepare-k-76), plus `push_target` (the upstream target the owner is shown — apply takes its `remote`, `branch` and `url` as `--push-remote` / `--push-branch` / `--push-url`, K-123 — or null, read-only); apply: `{requested_version, previous_version, bump, entry_ids, mode, released, current_version, push_target}`; attest: `{previous_head, head, entry_ids}`; abandon: `{updated}`; reconstruct: `{evidence: {version (authoritative), requested_version, spellings, entry_ids, candidate_sha, release_commit_sha, tag, tag_proof ({name, object, commit, annotated} \| null), checkout_root, manifest, verification, contract, status, without_git, candidates}, executor: {assigned, provenance: false}, finish: [{way, command, what}]}` (`status` = `completed` \| `committed` — the own adapter also `tagged`; `candidates` (git, dct's rules) = `[{commit, verified, reason, history}]`; `verification` = the recorded scope, `contract` = `{version_files, state}` — [Reconstruct](#reconstruct-dct-release-reconstruct-k-60-k-86-k-96-d8); `executor` = the ASSIGNED responsibility, never provenance; `finish` = the ways to finish a release that is not `completed`); takeover: `{consent, proposal, stage, record_status, status_after, missing_effects, takeover_digest, evidence: {candidate_sha, release_commit_sha, manifest, tag_proof, candidates}, executor}` (+ `next` once taken over — [Takeover](#takeover-dct-release-takeover-k-119-m3-k-117-j4)); version-files: `{contract: {version_files, state, confirmed_at}}` (+ `proposed`, `change` in the preview; `updated` after `--confirm`); advance: `{updated, previous_status}`; conflict: [Conflicts](#conflicts-k-88); refused / failed: the reason (`error`) plus the refusal's data (e.g. `staged`, `unproven`, `proposal_digest` / `plan_digest` (a new release without an approved proposal — also the alias), `mismatch`, `checkout_changed`, `changelog_file` (the changelog file's resolution with its `problem` and `ways` — #876; problem `content` adds `content` and `detail`, K-9; on a resume also `approved`, the path the approved proposal binds, and `restore`, the setting commands that resolve it again — K-16), `tags` (local tags of V refused before the stamp, K-8), `foreign`, `foreign_paths`, `foreign_content`, `foreign_staged`, `changed`, `path`, `sync`, `exit_code`, `environment` (the sync script's environment contract); the commit: `git_error`, `hook`, `commit`, `head`, `tree`, `parents`, `subject`, `expected_tree`, `expected_parent`, `unpublished_commit`, `pinned_ref`, `head_ref`, `signed`, `candidate`, `approved_ids` / `proven_ids` (attest), `previous_head` (attest), `git_version` / `required_git_version`, `index_lock`; the push: `push_target`, `push_urls`, `url`, `rewrite_rule`, `remote_name`, `remote_tags`, `remote_branch`, `outside_consent`; a reconstruction / takeover: `candidates`, `history` (`[{commit, state, diff, diff_lines, diff_sha256}]` — the candidates that changed older changelog history, K-109), `contract` (an unknown version-file contract, K-110), `executor`, `contradictions`, `approved_digest` / `derived_digest` (the takeover digest), `artifacts`; the operation lock: `lock` (null with `reason`: `no_path` \| `unverifiable_path` when its identity cannot be determined), `holder`, `process_groups` (groups a killed dct left running — or `[]` when that cannot be verified), `process_group` (a sync script's group that could not be stopped); the executor: `executor`, `consent`) |
 
 Exit codes: 0 success (also `noop`), 1 refused, the script's own code when
 the version sync fails in prepare (124 on timeout), 75 for a conflict

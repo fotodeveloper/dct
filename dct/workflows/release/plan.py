@@ -25,7 +25,10 @@ full HEAD of a STRICTLY verified checkout, K-52):
     marked `pr_source: "git"`, a heuristic one is never a `pr` (K-116 H7);
   - classification of every unreleased entry: proven | unproven with a
     reason; foreign citations; the index state (K-50, read part); the
-    version-file contract (K-73);
+    version-file contract (K-73); the changelog file (`changelog_file`,
+    #876 — core.changelog_file: detected among the candidate's tracked
+    files, with the problem prepare / apply refuse before the stamp;
+    never stored);
   - the SNAPSHOT (K-80) — the immutable approved context (candidate, base,
     V, selection, proof, entry states) and its digest, which `dct release
     apply --plan-digest` re-derives for the candidate it pins. A resume
@@ -43,7 +46,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 import re
 import sys
 from collections import deque
@@ -54,6 +56,7 @@ import sqlalchemy as sa
 
 from dct.core import gitinfo
 from dct.core.changelog import entry_state_digest, list_entries, normalize_worktree
+from dct.core.changelog_file import check_work_tree, explain, resolve_changelog
 from dct.core.projects import get_project
 from dct.core.releases import get_version_files, release_routing, validate_proof
 from dct.core.version import (
@@ -76,12 +79,12 @@ from dct.workflows.release.proof import (
     suffix_pr,
 )
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 PLAN_KEYS = (
     "schema_version", "project", "kind", "version", "checkout", "executor",
     "unfinished_release", "range", "entries", "foreign_citations", "reverts",
-    "squash_commits", "attestation_groups", "proof", "index", "version_files", "warnings",
-    "resume", "snapshot", "snapshot_digest",
+    "squash_commits", "attestation_groups", "proof", "index", "version_files",
+    "changelog_file", "warnings", "resume", "snapshot", "snapshot_digest",
 )
 # K-116 H8 — the most commits the range resolution reads from the ancestry
 # graph of a candidate (read_ancestry). Past it the plan REFUSES; it never
@@ -582,17 +585,31 @@ def _target_version(current: str | None, version: str | None, bump_type: str | N
     return None
 
 
-def _artifacts(project: dict, checkout: dict, version_files: list[str] | None) -> list[dict]:
-    """Release artifacts as repo-relative paths: the changelog file (when
-    dct manages it) and the version-file contract (repo-relative, K-73)."""
+def _artifacts(changelog: str | None, version_files: list[str] | None) -> list[dict]:
+    """Release artifacts as repo-relative paths: the changelog file
+    (`changelog` — the path core.changelog_file.resolve_changelog resolved;
+    None when dct manages none or the resolution has a problem) and the
+    version-file contract (repo-relative, K-73)."""
     out = []
-    if project.get("manages_changelog", True) and project.get("changelog_path"):
-        full = os.path.join(checkout["project_root"], project["changelog_path"])
-        rel = os.path.relpath(full, checkout["repo_root"]).replace(os.sep, "/")
-        out.append({"path": rel, "role": "changelog"})
+    if changelog:
+        out.append({"path": changelog, "role": "changelog"})
     for path in version_files or []:
         out.append({"path": path, "role": "version_file"})
     return out
+
+
+def _changelog_file(found: dict, warnings: list[str]) -> dict:
+    """The plan's `changelog_file` (the resolution, #876) — a problem (what
+    prepare / apply refuse before the stamp) or other changelog-like files
+    beside the chosen one add a warning."""
+    if found["problem"]:
+        warnings.append(f"changelog file: {explain(found)} — prepare and apply refuse until "
+                        f"it is settled")
+    elif found["managed"] and len(found["candidates"]) > 1:
+        others = [c["path"] for c in found["candidates"] if c["path"] != found["path"]]
+        warnings.append(f"the changelog file is {found['path']} ({found['source']}); the other "
+                        f"changelog-like file(s) {', '.join(others)} are not written")
+    return found
 
 
 # ── the plan ─────────────────────────────────────────────────────────────────
@@ -875,6 +892,9 @@ def build_plan(
                             "project_root": path}
         warnings.append("the project has no registered path — its checkout cannot be verified"
                         if not path else "no git checkout — entries cannot be proven by commits")
+        if path:
+            plan["changelog_file"] = _changelog_file(
+                resolve_changelog(project, project_root=path), warnings)
         if unfinished:
             plan["resume"] = _jsonable(_resume_section(unfinished, None, views))
             return plan
@@ -890,7 +910,16 @@ def build_plan(
         "git": True, "repo_root": root, "project_root": checkout["project_root"],
         "candidate_sha": head, "head": head, "branch": branch, "detached": branch is None,
     }
-    index_artifacts = _artifacts(project, checkout, (plan["version_files"] or {}).get("version_files"))
+    # #876: the changelog file of the CANDIDATE (a resume: the recorded one)
+    # — detected among its tracked files, never assumed; read-only, nothing
+    # stored. A new release also compares the work tree's file with it.
+    found = resolve_changelog(project, project_root=checkout["project_root"], repo_root=root,
+                              commit=(unfinished or {}).get("candidate_sha") or head)
+    index_artifacts = _artifacts(found["path"],
+                                 (plan["version_files"] or {}).get("version_files"))
+    if not unfinished:
+        found = check_work_tree(found, repo_root=root, commit=head, slug=project["slug"])
+    plan["changelog_file"] = _changelog_file(found, warnings)
     if unfinished:
         recorded = unfinished.get("candidate_sha")
         plan["checkout"]["candidate_sha"] = recorded

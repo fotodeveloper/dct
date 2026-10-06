@@ -326,7 +326,7 @@ dct project detect                                            # Print current pr
 dct project rename myproj --slug myproj2 --name "Rebranded"   # Rename in-place, project_id stable
 dct project set-version myproj 1.1                            # Post-factum version fix
 dct project changelog myproj off      # Opt out of changelog enforcement (on by default)
-dct project changelog-path myproj docs/changelog.md           # Changelog outside repo root; default: changelog.md
+dct project changelog-path myproj docs/CHANGELOG.md           # Explicit Markdown changelog path (--detect: detect the tracked one again)
 
 # Plans
 dct plan rescan /path/to/docs/plans/2026-04-17-feature.md     # Idempotent rescan; hook entrypoint

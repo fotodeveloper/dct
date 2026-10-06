@@ -317,10 +317,11 @@ def test_release_documented_keys_exist_in_the_workflow_schemas():
     for outcome in ("completed", "noop", "refused", "failed", "attested", "preview",
                     "prepared", "taken_over", "confirmed", "conflict"):
         assert outcome in OUTCOMES and f"`{outcome}`" in flat, outcome
-    # K-111 / K-119: the routing keys are the plan's real ones (schema 3).
+    # K-111 / K-119: the routing keys are the plan's real ones (schema 3);
+    # #876: schema 4 added changelog_file.
     from dct.workflows.release.plan import SCHEMA_VERSION
 
-    assert SCHEMA_VERSION == 3 and "executor" in PLAN_KEYS
+    assert SCHEMA_VERSION == 4 and "executor" in PLAN_KEYS and "changelog_file" in PLAN_KEYS
     for key in ("executor.project", "executor.record"):
         assert f"`{key}" in flat, key
 
@@ -388,7 +389,7 @@ def test_release_dialog_respects_the_executor_and_the_stored_consent(text):
     flat = " ".join(text().split())
     assert "dct project release-executor" not in flat  # K-111: one read, the plan
     assert "`executor.project" in flat and "`executor.record" in flat and "`own`" in flat
-    assert "`schema_version` lower than 3" in flat  # the capability check (K-114)
+    assert "`schema_version` lower than 4" in flat  # the capability check (K-114, #876)
     assert re.search(r"no new approval", flat, re.IGNORECASE)
     assert "dct release resume --json" in flat
     assert "`conflict`" in flat and "75" in flat and "details.observed_effects" in flat
@@ -693,7 +694,7 @@ REFUSAL_KEYS = {
     "required_git_version", "foreign_staged", "index_lock", "push_target", "push_urls",
     "rewrite_rule", "url", "remote_tags", "remote_branch", "outside_consent", "lock",
     "holder", "reason", "process_groups", "conflict", "observed_effects", "record_state",
-    "recorded",
+    "recorded", "changelog_file", "approved",
 }
 # Keys the table named before round 4 that the workflow no longer reports
 # under that meaning — a row for them would describe a state that cannot occur.

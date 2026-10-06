@@ -372,6 +372,9 @@ def cmd_project_add(args):
 
     print(f"✓ Project '{args.slug}' registered at {path}")
     _warn_unsupported_detection(project)
+    # #876: the changelog file a release would write — reported, never stored
+    # (the release proposal binds the detected path per release).
+    _print_changelog_file(project, stored_note=True)
 
     version = project.get("current_version")
     source = project.get("_detected_source")
@@ -530,44 +533,77 @@ def cmd_project_manages_changelog(args):
     sys.exit(0 if project_manages_changelog(engine, args.slug) else 1)
 
 
-def cmd_project_changelog_path(args):
-    """Get or set a project's changelog file location, relative to its root (#225).
+def _print_changelog_file(project: dict, *, stored_note: bool = False) -> None:
+    """Print the changelog file a release of `project` would write — the ONE
+    resolver (core.changelog_file, #876) at the HEAD of its checkout (else
+    its directory): the path and how it was found, or the problem with its
+    next steps (stderr). Read-only; a failed git read is a warning."""
+    import os
 
-    With a relpath → set it (validated to stay within the project root). Without
-    → print the current relpath and its resolved absolute path.
+    from dct.core import gitinfo
+    from dct.core.changelog_file import explain, resolve_at_head
+
+    try:
+        found, base = resolve_at_head(project)
+    except gitinfo.GitReadError as exc:
+        print(f"  ⚠ changelog file not resolved: {exc}", file=sys.stderr)
+        return
+    if not found["managed"]:
+        print("  changelog file: none (dct's changelog file is off for this project)")
+        return
+    if found["problem"]:
+        print(f"  ⚠ changelog file ({found['problem']}): {explain(found)}", file=sys.stderr)
+        return
+    if base is None:
+        return
+    where = os.path.join(base, *found["path"].split("/"))
+    note = " — nothing stored" if stored_note and found["source"] == "detected" else ""
+    print(f"  changelog file: {found['path']} ({found['source']}){note} → {where}")
+
+
+def cmd_project_changelog_path(args):
+    """Get or choose a project's changelog file, relative to its root (#225).
+
+    With a relpath → the owner's EXPLICIT choice (validated to stay within
+    the project root; #876 K-14: also exactly changelog.md). With --detect →
+    back to detection (core.projects.reset_changelog_path). Without either
+    → print the stored value, whether it is a choice, and the file a release
+    would write (core.changelog_file.resolve_changelog).
     """
-    from dct.core.projects import (
-        get_project,
-        resolve_changelog_path,
-        set_changelog_path,
-    )
+    from dct.core.projects import get_project, reset_changelog_path, set_changelog_path
 
     engine = _get_engine()
 
-    if args.relpath is None:
+    if args.relpath is not None and args.detect:
+        print("✗ give a path OR --detect, not both", file=sys.stderr)
+        sys.exit(2)
+    if args.relpath is None and not args.detect:
         project = get_project(engine, args.slug)
         if not project:
             print(f"✗ Project '{args.slug}' not found", file=sys.stderr)
             sys.exit(1)
-        rel = project.get("changelog_path") or "changelog.md"
-        print(f"{args.slug}: {rel}")
-        resolved = resolve_changelog_path(project)
-        if resolved:
-            print(f"  → {resolved}")
+        print(f"{args.slug}: {_changelog_setting(project)}")
+        _print_changelog_file(project)
         return
 
     try:
-        project = set_changelog_path(engine, args.slug, args.relpath)
+        project = (reset_changelog_path(engine, args.slug) if args.detect
+                   else set_changelog_path(engine, args.slug, args.relpath))
     except ValueError as e:
         print(f"✗ {e}", file=sys.stderr)
         sys.exit(1)
     if not project:
         print(f"✗ Project '{args.slug}' not found", file=sys.stderr)
         sys.exit(1)
-    print(f"✓ {args.slug}: changelog-path → {project['changelog_path']}")
-    resolved = resolve_changelog_path(project)
-    if resolved:
-        print(f"  → {resolved}")
+    print(f"✓ {args.slug}: changelog-path → {_changelog_setting(project)}")
+    _print_changelog_file(project)
+
+
+def _changelog_setting(project: dict) -> str:
+    """The stored changelog path and what it means (#876 K-14)."""
+    if project.get("changelog_path_explicit"):
+        return f"{project['changelog_path']} (explicit choice)"
+    return f"{project['changelog_path']} (not chosen — detect)"
 
 
 # ── Plan rescan (v0.2.0) ─────────────────────────────────────────────────────
@@ -2781,7 +2817,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_proj_rename.add_argument("--path", help="New filesystem path (does not move files on disk)")
 
     p_proj_clog = p_proj_sub.add_parser(
-        "changelog", help="Opt a project in/out of dct changelog-hook enforcement (#222)",
+        "changelog",
+        help="Opt a project in/out of dct changelog-hook enforcement (#222); off also means "
+             "the release writes no changelog file (#876)",
     )
     p_proj_clog.add_argument("slug")
     p_proj_clog.add_argument("state", choices=["on", "off"])
@@ -2811,12 +2849,23 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_proj_clogpath = p_proj_sub.add_parser(
         "changelog-path",
-        help="Get/set a project's changelog file location relative to its root (#225)",
+        help="Get/choose a project's changelog file relative to its root (#225); without a "
+             "choice dct detects it (#876: the ONE tracked CHANGELOG / CHANGES / HISTORY / "
+             "NEWS / RELEASES Markdown file of the project root)",
     )
     p_proj_clogpath.add_argument("slug")
     p_proj_clogpath.add_argument(
         "relpath", nargs="?",
-        help="Relative changelog path (e.g. pkg/changelog.md). Omit to query the current value.",
+        help="Relative Markdown changelog path (e.g. pkg/CHANGELOG.md, or exactly "
+             "changelog.md) — an explicit choice; it chooses the file but waives no check (a "
+             "non-Markdown name, a symlink anywhere on the path, or a file / submodule where a "
+             "directory is expected is refused by the release). Omit to query the "
+             "stored value and the file a release would write (detected / stored / default, "
+             "or the problem with its next steps).",
+    )
+    p_proj_clogpath.add_argument(
+        "--detect", action="store_true",
+        help="Drop the explicit choice: dct detects the changelog file again",
     )
 
     # plan

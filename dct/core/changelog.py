@@ -566,6 +566,41 @@ def _check_plan_binding(
             )
 
 
+def _selection_versions(conn: sa.Connection, pid: int, ids: list[int],
+                        version: str) -> dict[int, str | None]:
+    """{id: stored version} of a selective release's `ids` — STRICT: an
+    unknown / foreign / deleted id, or one already released in ANOTHER
+    version, raises ValueError (nothing released)."""
+    c = changelog_entries.c
+    records.validate_project_rows(
+        conn, changelog_entries, pid, ids, "changelog entry", "nothing released."
+    )
+    stamped = dict(conn.execute(sa.select(c.id, c.version).where(c.id.in_(ids))).all())
+    foreign = {
+        i: stamped[i] for i in ids
+        if stamped[i] is not None and not same_version(stamped[i], version)
+    }
+    if foreign:
+        listing = ", ".join(f"#{i} ({v})" for i, v in sorted(foreign.items()))
+        raise ValueError(
+            f"Changelog entries already released in another version: {listing} "
+            f"— released entries are history; nothing released."
+        )
+    return stamped
+
+
+def check_release_selection(engine: sa.Engine, project_slug: str, version: str,
+                            ids: list[int]) -> None:
+    """Read-only: the selection a release of `version` would stamp passes
+    the stamp's own STRICT validation (_selection_versions) — the release
+    effects check it BEFORE composing the provisional changelog section
+    (#876 K-9), so an unknown id is refused for what it is. ValueError."""
+    if not ids:
+        return
+    with project_transaction(engine, project_slug) as (conn, pid):
+        _selection_versions(conn, pid, sorted(set(ids)), version)
+
+
 def release_entries(
     engine: sa.Engine,
     project_slug: str,
@@ -793,22 +828,7 @@ def release_entries(
             to_stamp, selected, resolved = [], [], []
             nothing_to_do = is_current
         else:
-            records.validate_project_rows(
-                conn, changelog_entries, pid, ids, "changelog entry", "nothing released."
-            )
-            stamped = dict(conn.execute(
-                sa.select(c.id, c.version).where(c.id.in_(ids))
-            ).all())
-            foreign = {
-                i: stamped[i] for i in ids
-                if stamped[i] is not None and not same_version(stamped[i], version)
-            }
-            if foreign:
-                listing = ", ".join(f"#{i} ({v})" for i, v in sorted(foreign.items()))
-                raise ValueError(
-                    f"Changelog entries already released in another version: {listing} "
-                    f"— released entries are history; nothing released."
-                )
+            stamped = _selection_versions(conn, pid, ids, version)
             already = [i for i in ids if stamped[i] is not None]
             to_stamp = [i for i in ids if stamped[i] is None]
             selected = ids
