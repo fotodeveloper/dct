@@ -264,10 +264,10 @@ def _not_markdown_ways(slug: str, *, existing: str | None, new_path: str,
     if existing:
         converted = _markdown_name(existing)
         if in_git:
-            rename = (f"e.g. `git mv {existing} {converted}`, but git mv alone does not convert "
+            rename = (f"e.g. `{_command('git', 'mv', existing, converted)}`, but git mv alone does not convert "
                       f"the format —, commit it as work in progress")
         else:
-            rename = (f"e.g. rename it with `mv {existing} {converted}`, but a rename alone does "
+            rename = (f"e.g. rename it with `{_command('mv', existing, converted)}`, but a rename alone does "
                       f"not convert the format —")
         ways.append({
             "way": "rewrite_markdown", "command": None,
@@ -305,8 +305,8 @@ def _symlink_ways(slug: str, rel: str, target: str | None, *, in_git: bool,
     if directory:
         replace = f"replace the link {rel} by a real directory holding the changelog{done}"
     elif target and in_git:
-        replace = (f"replace the link {rel} by the regular file (e.g. `git rm {rel}` and "
-                   f"`git mv {target} {rel}`){done}")
+        replace = (f"replace the link {rel} by the regular file (e.g. `{_command('git', 'rm', rel)}` and "
+                   f"`{_command('git', 'mv', target, rel)}`){done}")
     elif target:
         replace = f"replace the link {rel} by the regular file (move {target} to {rel}){done}"
     else:
@@ -654,8 +654,9 @@ def check_work_tree(resolution: dict, *, repo_root: str, commit: str, slug: str)
     elif isinstance(disk, bytes) and gitinfo.git_read(
             repo_root, "hash-object", f"--path={rel}", "--", full)[1].strip() == blob:
         baseline = "unfiltered"
-        what = (f"check {rel} out again through its filters (`git rm --cached -q -- {rel}`, "
-                f"then `git checkout HEAD -- {rel}`) and plan again — its content is the "
+        what = (f"check {rel} out again through its filters "
+                f"(`{_command('git', 'rm', '--cached', '-q', '--', rel)}`, "
+                f"then `{_command('git', 'checkout', 'HEAD', '--', rel)}`) and plan again — its content is the "
                 f"candidate's, but not in the form a checkout writes it (eol / filter "
                 f"attributes changed after it was checked out)")
     else:
@@ -686,7 +687,7 @@ def content_problem(resolution: dict, *, slug: str, reason: str, detail: str,
         fix = {"way": "fix_filter", "command": None,
                "what": f"make the git attributes of {rel} keep the text (a line-ending "
                        f"normalisation is fine; a clean filter that rewrites the content is "
-                       f"not — check `git check-attr -a -- {rel}`){done}"}
+                       f"not — check `{_command('git', 'check-attr', '-a', '--', rel)}`){done}"}
     elif reason == "section_differs":
         fix = {"way": "remove_section", "command": None,
                "what": f"remove the {version} section(s) from {rel} yourself (dct writes it from "

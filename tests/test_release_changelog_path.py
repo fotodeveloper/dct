@@ -998,3 +998,36 @@ def test_cli_project_add_reports_the_detection_and_stores_nothing(
     captured = capsys.readouterr()
     assert "CHANGELOG.md" in captured.out + captured.err
     assert get_project(cli, "proj-fresh")["changelog_path"] == "changelog.md"
+
+
+# ── K-31: every suggested command quotes the paths it interpolates ───────────
+
+
+@pytest.mark.parametrize("odd", ["docs/my changes.rst", "it's history.txt", "a;b$(x).adoc"])
+def test_suggested_git_commands_quote_odd_file_names(odd):
+    """A repository may hold a changelog whose name carries spaces or shell
+    metacharacters. The ways dct prints for pasting must quote every
+    interpolated path, so the line does what it says (the same rule hooks
+    follow with `printf %q`); the raw name never appears inside backticks."""
+    from dct.core import changelog_file as cf
+
+    texts = []
+    for way in cf._not_markdown_ways("proj-a", existing=odd, new_path="CHANGELOG.md",
+                                     markdown=[], in_git=True):
+        texts.append(way["what"])
+    for way in cf._not_markdown_ways("proj-a", existing=odd, new_path="CHANGELOG.md",
+                                     markdown=[], in_git=False):
+        texts.append(way["what"])
+    for way in cf._symlink_ways("proj-a", odd, "docs/real target.md", in_git=True):
+        texts.append(way["what"])
+    import re
+    import shlex
+    seen = 0
+    for text in texts:
+        for snippet in re.findall(r"`([^`]*)`", text):
+            for name in (odd, "docs/real target.md"):
+                if name in snippet:
+                    seen += 1
+                    # Split as a shell would: the whole name must survive as ONE argument.
+                    assert name in shlex.split(snippet), f"path not quoted as one argument: {snippet!r}"
+    assert seen >= 1, "the ways under test no longer mention the file"
