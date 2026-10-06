@@ -328,7 +328,8 @@ CHANGELOG_COLS = [
 ]
 CHECKPOINT_COLS = ["id", "status", "sort_order", "text"]
 TAG_COLS = ["id", "name", "item_count", "created_at", "description"]
-PROJECT_COLS = ["id", "slug", "current_version", "name", "path", "changelog_path"]
+PROJECT_COLS = ["id", "slug", "current_version", "name", "path", "changelog_path",
+                "changelog_path_explicit"]
 HANDOFF_COLS = [
     "id", "scope", "created_by", "created_at", "consumed_at", "prompt",
 ]
@@ -364,10 +365,17 @@ def list_projects(format: str = "structured"):
         format: "structured" (default, {cols,rows}) | "markdown" | "dict".
 
     Returns: table of all non-deleted projects with {id, slug, current_version,
-        name, path, changelog_path}, shaped per `format`. changelog_path (#225)
-        is the changelog file location relative to the project root (default
-        'changelog.md'). /release resolves it against the project root of
-        the checkout the release RUNS in — that checkout's toplevel plus the
+        name, path, changelog_path, changelog_path_explicit}, shaped per
+        `format`. changelog_path (#225) is the changelog file location
+        relative to the project root; changelog_path_explicit (bool, #876
+        K-14) says whether it is the owner's choice (`dct project
+        changelog-path <slug> <path>` — also exactly 'changelog.md'). False =
+        "detect": the release finds the ONE tracked CHANGELOG / CHANGES /
+        HISTORY / NEWS / RELEASES Markdown file of the project root and
+        changelog_path holds only the default 'changelog.md' (used when
+        nothing is found); `dct project changelog-path <slug>` shows the
+        file. /release resolves it
+        against the project root of the checkout the release RUNS in — that checkout's toplevel plus the
         project's path relative to its own repository toplevel (a monorepo
         subdirectory maps to the same subdirectory of a linked worktree) —
         not against `path`, which names the main checkout.

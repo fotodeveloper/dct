@@ -359,28 +359,28 @@ class TestChangelogPath:
 
         assert set_changelog_path(engine, "nope", "pkg/changelog.md") is None
 
-    def test_resolve_joins_path_and_changelog_path(self, engine):
-        import os
+    def test_resolve_uses_the_stored_path_below_the_project_root(self, engine, tmp_path):
+        # #876: ONE resolver (core.changelog_file) replaced resolve_changelog_path.
+        from dct.core.changelog_file import resolve_changelog
+        from dct.core.projects import set_changelog_path
 
-        from dct.core.projects import resolve_changelog_path, set_changelog_path
-
-        create_project(engine, slug="a", name="A", path="/Users/x/mono")
+        create_project(engine, slug="a", name="A", path=str(tmp_path))
         set_changelog_path(engine, "a", "pkg/changelog.md")
-        proj = get_project(engine, "a")
-        assert resolve_changelog_path(proj) == os.path.join(proj["path"], "pkg/changelog.md")
+        found = resolve_changelog(get_project(engine, "a"), project_root=str(tmp_path))
+        assert (found["path"], found["source"], found["explicit"]) == (
+            "pkg/changelog.md", "stored", True)
 
-    def test_resolve_default_is_root_changelog(self, engine):
-        import os
+    def test_resolve_default_is_root_changelog(self, engine, tmp_path):
+        from dct.core.changelog_file import resolve_changelog
 
-        from dct.core.projects import resolve_changelog_path
+        create_project(engine, slug="a", name="A", path=str(tmp_path))
+        found = resolve_changelog(get_project(engine, "a"), project_root=str(tmp_path))
+        assert (found["path"], found["source"], found["explicit"]) == (
+            "changelog.md", "default", False)
 
-        create_project(engine, slug="a", name="A", path="/Users/x/proj")
-        proj = get_project(engine, "a")
-        assert resolve_changelog_path(proj) == os.path.join(proj["path"], "changelog.md")
-
-    def test_resolve_none_when_no_path(self, engine):
-        from dct.core.projects import resolve_changelog_path
+    def test_resolve_nothing_when_no_path(self, engine):
+        from dct.core.changelog_file import resolve_changelog
 
         create_project(engine, slug="a", name="A")  # no path registered
         proj = get_project(engine, "a")
-        assert resolve_changelog_path(proj) is None
+        assert resolve_changelog(proj, project_root=proj.get("path"))["path"] is None

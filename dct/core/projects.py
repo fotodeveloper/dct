@@ -223,31 +223,42 @@ def project_manages_changelog(engine: sa.Engine, slug: str) -> bool:
 
 
 def set_changelog_path(engine: sa.Engine, slug: str, relpath: str) -> dict | None:
-    """Set a project's changelog file location, relative to its root (#225).
+    """Choose a project's changelog file, relative to its root (#225).
 
-    Default is 'changelog.md' (repo root). A project whose changelog lives in a
-    subdirectory (e.g. a monorepo package) points it there, and /release writes
-    {project.path}/{changelog_path}. The value is normalized and constrained to
-    the project root — a leading '/' is stripped and any '..' escape is rejected
-    — so /release can only ever write inside the project tree.
+    Every call is the owner's EXPLICIT choice (#876 K-14: it sets
+    changelog_path_explicit — also for exactly 'changelog.md'); the release
+    then writes {project root}/{changelog_path} after the resolver's format
+    checks (core.changelog_file.resolve_changelog: a non-Markdown name, a
+    symlink or a tracked case-variant is refused, never written).
+    reset_changelog_path() goes back to detection. A project whose changelog
+    lives in a subdirectory (e.g. a monorepo package) points it there. The
+    value is normalized and constrained to the project root — a leading '/'
+    is stripped and any '..' escape is rejected — so /release can only ever
+    write inside the project tree.
 
     Returns the updated project row, or None when the slug does not resolve to a
-    live project. Raises ValueError on an empty path or a '..' escape.
+    live project. Raises ValueError on an empty path or a '..' escape
+    (nothing written — the marker stays as it was).
     """
     if relpath is None or not relpath.strip():
         raise ValueError("changelog_path cannot be empty")
     rel = os.path.normpath(relpath.strip().lstrip("/"))
     if rel.startswith("..") or os.path.isabs(rel):
         raise ValueError("changelog_path must stay within the project root (no '..' escape)")
-    with engine.begin() as conn:
-        result = conn.execute(
-            projects.update()
-            .where(projects.c.slug == slug, projects.c.deleted_at.is_(None))
-            .values(changelog_path=rel, updated_at=datetime.now(UTC))
-        )
-        if result.rowcount == 0:
-            return None
-    return get_project(engine, slug)
+    return _set_project_value(engine, slug, changelog_path=rel.replace(os.sep, "/"),
+                              changelog_path_explicit=True)
+
+
+def reset_changelog_path(engine: sa.Engine, slug: str) -> dict | None:
+    """Go back to DETECTING the changelog file (#876 K-14): changelog_path
+    the default 'changelog.md', changelog_path_explicit false — the release
+    then finds the tracked changelog of the project root
+    (core.changelog_file.resolve_changelog). Returns the updated project
+    row, or None when the slug does not resolve to a live project."""
+    from dct.core.changelog_file import DEFAULT_CHANGELOG_PATH
+
+    return _set_project_value(engine, slug, changelog_path=DEFAULT_CHANGELOG_PATH,
+                              changelog_path_explicit=False)
 
 
 def _set_project_value(engine: sa.Engine, slug: str, **values) -> dict | None:
@@ -299,19 +310,6 @@ def set_changelog_pr_refs(engine: sa.Engine, slug: str, enabled: bool) -> dict |
     if not isinstance(enabled, bool):
         raise TypeError(f"changelog_pr_refs must be true or false, got {enabled!r}")
     return _set_project_value(engine, slug, changelog_pr_refs=enabled)
-
-
-def resolve_changelog_path(project: dict) -> str | None:
-    """Absolute path to a project's changelog file: {path}/{changelog_path} (#225).
-
-    Returns None when the project has no registered path (nothing to resolve
-    against). changelog_path falls back to 'changelog.md' if missing/empty so a
-    row predating the column still resolves to the repo-root default.
-    """
-    path = project.get("path")
-    if not path:
-        return None
-    return os.path.join(path, project.get("changelog_path") or "changelog.md")
 
 
 def update_project(

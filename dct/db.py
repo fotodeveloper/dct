@@ -72,6 +72,12 @@ projects = sa.Table(
     # /release resolves {path}/{changelog_path}. Constrained to the project root
     # by set_changelog_path (leading '/' stripped, '..' escape rejected).
     sa.Column("changelog_path", sa.String(500), nullable=False, server_default="changelog.md"),
+    # #876 K-14: the explicit-choice marker of changelog_path. True = the
+    # owner chose the path (set_changelog_path — also exactly 'changelog.md');
+    # False = detect (core.changelog_file.resolve_changelog finds the tracked
+    # changelog). The value of changelog_path alone cannot say which.
+    sa.Column("changelog_path_explicit", sa.Boolean, nullable=False,
+              server_default=sa.false()),
     # K-73: the project's version-file contract — JSON array of repo-relative
     # paths the release's version sync must change (NULL = not learned yet,
     # [] = learned: none). Set only with explicit confirmation
@@ -956,6 +962,28 @@ RELEASE_LEDGER_COLUMNS: dict[str, tuple[tuple[str, str], ...]] = {
 }
 
 
+def _heal_changelog_path_marker(engine: sa.Engine) -> None:
+    """#876 K-22 — CONVERGENT, on every bootstrap: a stored changelog_path
+    other than the default with the explicit marker unset is the owner's
+    choice (the marker → true). It covers the rows the column was added to
+    AND a path an OLDER dct (no marker) stores later on the same user-scoped
+    database — the new code would otherwise silently detect instead. Only
+    NON-default paths: the default with the marker false is detection —
+    never chosen or a `--detect` reset — and is never re-marked; an explicit
+    `changelog.md` already carries the marker. Guarded by a read, so a
+    database in the right state is never written (bootstraps 2-3 no-ops);
+    two concurrent runs set the same rows to the same value."""
+    from dct.core.changelog_file import DEFAULT_CHANGELOG_PATH
+
+    stale = sa.and_(projects.c.changelog_path != DEFAULT_CHANGELOG_PATH,
+                    projects.c.changelog_path_explicit == sa.false())
+    with engine.connect() as conn:
+        if conn.execute(sa.select(projects.c.id).where(stale).limit(1)).first() is None:
+            return
+    with engine.begin() as conn:
+        conn.execute(projects.update().where(stale).values(changelog_path_explicit=True))
+
+
 def _ddl_type(engine: sa.Engine, ddl_type: str) -> str:
     """Fill the dialect placeholders of a RELEASE_LEDGER_COLUMNS DDL type."""
     false = "FALSE" if engine.dialect.name == "postgresql" else "0"
@@ -1052,6 +1080,15 @@ def _apply_schema_updates(engine: sa.Engine) -> None:
                 "ALTER TABLE projects ADD COLUMN changelog_path "
                 "VARCHAR(500) NOT NULL DEFAULT 'changelog.md'"
             ))
+
+    # #876 K-14 / K-22: the explicit-choice marker of changelog_path, added
+    # by the duplicate-safe helper (two processes bootstrapping at once —
+    # a hook and the MCP server — never crash each other). Runs after the
+    # changelog_path block (a database older than #225 gains both in one
+    # bootstrap).
+    _add_column_if_missing(engine, "projects", "changelog_path_explicit",
+                           _ddl_type(engine, "BOOLEAN NOT NULL DEFAULT {false}"))
+    _heal_changelog_path_marker(engine)
 
     # v0.4.0: add item_checkpoints.kind column + partial index for gate lookup.
     # See item #33 (gate checkpoints). Pre-v0.4 checkpoints default to kind='task'

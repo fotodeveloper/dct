@@ -20,7 +20,7 @@ New tools become callable only after the Claude Code session restarts (the MCP s
 
 | Tool | Purpose |
 |---|---|
-| `list_projects` | List all registered projects (no CWD auto-detection — discovery only). `changelog_path` is relative to the project root of the checkout a release runs in (that checkout's toplevel + the project's path relative to its repository toplevel), not to `path` (the main checkout). |
+| `list_projects` | List all registered projects (no CWD auto-detection — discovery only). `changelog_path` with `changelog_path_explicit` (#876 — [release-workflow.md](release-workflow.md#the-changelog-file-876)): true = the owner chose that path (also exactly `changelog.md`), false = dct detects the tracked changelog (the default `changelog.md` is used only when none is found) — the value alone never says which. The path is relative to the project root of the checkout a release runs in (that checkout's toplevel + the project's path relative to its repository toplevel), not to `path` (the main checkout). |
 
 Project registration, rename, version, and changelog-location changes are **CLI-only** (`dct project add|rename|set-version|changelog|changelog-path`) — see the [README usage](../README.md#cli).
 

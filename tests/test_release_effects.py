@@ -637,13 +637,23 @@ def test_head_moved_after_the_commit_still_gets_the_tag(engine, proj):
 
 
 def test_existing_conflicting_tag_is_refused(engine, proj):
+    """K-8 (#876 round 2): a local tag of V elsewhere is known before the
+    stamp — prepare and apply refuse it then, never the tag step after the
+    release commit (which left a 'committed' record)."""
     repo, _ = proj
     a = proven(engine, repo, "feature a")
     git(repo, "tag", "v1.1.0", "v1.0.0")
-    with pytest.raises(ReleaseRefused, match="another commit"):
+    head = git(repo, "rev-parse", "HEAD")
+    plan = approved_plan_digest(engine, SLUG, repo, version="1.1.0", entry_ids=[a])
+    with pytest.raises(ReleaseRefused, match="v1.1.0"):
+        prepare_release(engine, SLUG, cwd=str(repo), version="1.1.0", entry_ids=[a],
+                        plan_digest=plan)
+    with pytest.raises(ReleaseRefused):
         apply(engine, repo, version="1.1.0", entry_ids=[a])
     assert git(repo, "rev-parse", "v1.1.0") == git(repo, "rev-parse", "v1.0.0")
-    assert get_release(engine, SLUG, "1.1.0")["status"] == "committed"
+    assert get_release(engine, SLUG, "1.1.0") is None
+    assert get_project(engine, SLUG)["current_version"] == "1.0.0"
+    assert git(repo, "rev-parse", "HEAD") == head
 
 
 def test_unfinished_record_blocks_a_new_apply(engine, proj):

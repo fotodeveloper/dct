@@ -126,7 +126,15 @@ Stages of one release:
      release — also for the alias, K-117) must be the pending one, bound
      to the same candidate, version and plan digest (K-116 H2), with the
      script and the baseline unchanged, its blobs available and pinned;
-     HEAD unchanged right before the stamp;
+     for a NEW release what a later step would otherwise find first
+     (_new_release_prechecks, prepare too): the WHOLE changelog composition
+     on the candidate's content (#876 K-9 — expected_changelog, the write's
+     own function, `provisional`: never a trial stamp) and its git filter
+     path (K-20 / K-26, _composed_forms), no local tag of V (K-8), and the commit
+     identity git resolves (apply); HEAD unchanged and no foreign
+     index.lock right before the stamp (K-25 — a lock, a refusing hook or
+     a failing signature that only APPEARS later stops the release after
+     the stamp; resume finishes it, no trial commit);
   2. stamp — core release_entries (the record, status 'stamped'), bound to
      the plan inside its transaction (K-81: stampable_ids, expected_entries)
      and consuming the approved proposal in the SAME transaction
@@ -135,7 +143,16 @@ Stages of one release:
      version-file contract, the untracked baseline — K-76, K-96 D3/D4);
      from here the record's `version` is the spelling of every artifact
      (K-55);
-  3. changelog file F — the script is NEVER run again after the stamp; F's
+  3. changelog file F — WHICH file is the ONE resolver's answer
+     (core.changelog_file, #876: detected among the candidate's tracked
+     files; every problem — several Markdown changelogs, a stored
+     case-variant, a non-Markdown changelog, a symlink / file / submodule
+     on its path in the candidate or on disk (K-19), a work-tree file that
+     is not the candidate's, a content the composition or its filters
+     refuse — is refused by the pre-checks BEFORE the stamp,
+     _check_changelog_file / _check_changelog_content; the write guards
+     the project boundary again, _guard_changelog_write; written in the
+     checkout form, committed as what git stores for it, K-20); the script is NEVER run again after the stamp; F's
      expected content is DETERMINISTIC: F's baseline (the candidate's blob;
      outside git the copy persisted at prepare, K-78) + the V section
      rendered from the database and the record (date = the record's
@@ -194,7 +211,10 @@ section, the WHOLE older changelog history against the parent — a changed
 older section, also a typo fix, is a deviation that is shown as a diff and
 never verified —, the version files' fields — never a substring, J8); a
 tag → 'completed', a single verified commit without a tag → 'committed',
-several → all listed, the choice explicit. An UNKNOWN version-file contract
+several → all listed, the choice explicit. Each candidate's changelog file
+is its own (K-12 / K-21, _candidate_changelog: a takeover's recorded
+verified manifest, else the one Markdown file the commit changed that holds
+the V section — several refuse) — never today's path or detection mode. An UNKNOWN version-file contract
 (None) is never read as a confirmed "none" ([]): outside git it refuses
 with the procedure that shows and confirms it (version_files_contract);
 the scope of the verification is recorded (manifest.verification). Nothing
@@ -215,6 +235,7 @@ import difflib
 import hashlib
 import os
 import re
+import shlex
 import shutil
 import stat
 import tempfile
@@ -227,10 +248,19 @@ from dct import paths as dct_paths
 from dct.core import gitinfo, procs
 from dct.core import releases as ledger
 from dct.core.changelog import (
+    check_release_selection,
     list_entries,
     normalize_worktree,
     release_entries,
     version_spelling,
+)
+from dct.core.changelog_file import (
+    EXPLICIT_MARKER,
+    MARKDOWN_EXTS,
+    check_work_tree,
+    content_problem,
+    explain,
+    resolve_changelog,
 )
 from dct.core.ids import new_ulid
 from dct.core.projects import get_project
@@ -1224,18 +1254,25 @@ class _Run:
         # (reached 'tagged' / 'pushed' before the fields existed) — written
         # with the next progress write.
         self.verified: dict[str, dict] = {}
-        self.changelog_rel = self._changelog_rel()
+        self.changelog: dict | None = None
+        self.changelog_rel: str | None = None
+        self.bind_changelog(checkout["head"] if checkout else None)
 
-    def _changelog_rel(self) -> str | None:
+    def bind_changelog(self, commit: str | None) -> None:
+        """#876 — the project's changelog file F from the ONE resolver
+        (core.changelog_file.resolve_changelog): in git among the tracked
+        files of `commit` (the candidate), outside git in the project
+        directory. `changelog_rel` is its base-relative path — None when dct
+        manages no changelog file, or when the resolution has a problem,
+        which every path refuses before any effect (_check_changelog_file
+        before the stamp, _record_proposal after it)."""
         if not self.project_root:
-            return None
-        if self.checkout:
-            found = [a["path"] for a in planning._artifacts(self.project, self.checkout, None)
-                     if a["role"] == "changelog"]
-            return found[0] if found else None
-        if not self.project.get("manages_changelog", True):
-            return None
-        return _rel(os.path.normpath(self.project.get("changelog_path") or "changelog.md"))
+            self.changelog, self.changelog_rel = None, None
+            return
+        self.changelog = resolve_changelog(self.project, project_root=self.project_root,
+                                           repo_root=self.repo,
+                                           commit=commit if self.repo else None)
+        self.changelog_rel = self.changelog["path"]
 
     @property
     def base(self) -> str:
@@ -1301,6 +1338,118 @@ def _clean_tree(run: _Run, artifacts: list[dict]) -> dict:
     return state
 
 
+def _check_changelog_file(run: _Run, *, work_tree: bool = True) -> None:
+    """#876 — every condition of the changelog file's RESOLUTION that can
+    refuse, checked BEFORE the stamp (prepare, apply's pre-checks; a
+    reconstruction outside git before it records anything — in git a
+    historical release is judged at its own commit, _candidate_changelog;
+    the content: _check_changelog_content): no file guessed among several Markdown
+    changelogs, no stored path whose case-variant is tracked, no Markdown
+    written into (or beside) a non-Markdown changelog and — in git, with
+    `work_tree` — the work tree's file at the path is the candidate's
+    content (core.changelog_file.check_work_tree: an ignored / untracked
+    file, or a tracked case-variant on a case-insensitive file system, is
+    never overwritten after a stamp). Refused with details.changelog_file
+    (the resolution) and the true next steps."""
+    found = run.changelog
+    if found is None:
+        return
+    if work_tree and run.repo:
+        found = check_work_tree(found, repo_root=run.repo, commit=run.checkout["head"],
+                                slug=run.slug)
+    if found["problem"]:
+        raise run.refuse(f"changelog file: {explain(found)}; nothing done.",
+                         changelog_file=found)
+
+
+def _stamp_proof(plan: dict, ids: list[int]) -> dict | None:
+    """The proof map the stamp stores for `ids` — the approved snapshot's."""
+    proof = plan["snapshot"]["proof"]
+    return {str(i): proof[str(i)] for i in ids if str(i) in proof} or None
+
+
+def _provisional_record(run: _Run, target: str, ids: list[int], plan: dict) -> dict:
+    """What the stamp of a new release WOULD record and the section render
+    reads (version, created_at — now —, entry_ids, render, proof) — data
+    only, nothing is written (render_section `provisional`)."""
+    try:
+        proof = ledger.validate_proof(_stamp_proof(plan, ids), "git")
+        check_release_selection(run.engine, run.slug, target, ids)
+    except ValueError as exc:  # the stamp would refuse it the same way
+        raise run.refuse(f"{exc}") from None
+    return {"version": normalize_version(target), "created_at": datetime.now(UTC),
+            "entry_ids": list(ids),
+            "render": {"pr_refs": bool(run.project.get("changelog_pr_refs"))},
+            "proof": proof}
+
+
+def _check_changelog_content(run: _Run, target: str, ids: list[int], plan: dict) -> None:
+    """#876 K-9 — BEFORE the stamp of a new release: the WHOLE changelog
+    composition (expected_changelog — the function the write calls after
+    the stamp) runs on F's content before the release (in git the
+    candidate's blob, outside git the file on disk) for the release about
+    to be stamped, and in git its render + filter path (_composed_forms,
+    K-20: what git stores for the composition keeps its text). Every
+    refusal it raises over that content (not UTF-8, a different V section,
+    an insertion that fails its own verification, filters that rewrite the
+    text) refuses here with details.changelog_file (problem `content`) and
+    true next steps — never a trial stamp."""
+    rel = run.changelog_rel
+    if not rel:
+        return
+    if run.repo:
+        base = gitinfo.git_read_blob(run.repo, run.checkout["head"], rel)
+    else:
+        base = _read_regular(run.abspath(rel))
+        if base == _NOT_A_FILE:
+            raise run.refuse(f"{rel} is not a regular file — nothing released.")
+    record = _provisional_record(run, target, ids, plan)
+    try:
+        composed = expected_changelog(run.engine, run.slug, record, base, provisional=True)
+        # K-20: the whole render + filter path — what git stores for the
+        # composition keeps its text (line endings aside).
+        _composed_forms(run, rel, composed)
+    except ReleaseRefused as exc:
+        reason = exc.details.get("content")
+        if reason is None:
+            raise run.refuse(f"{exc} — refused before the stamp.", **exc.details) from None
+        detail = str(exc).removesuffix(" — not touched").removesuffix(" — not overwritten.") \
+            .removesuffix(" — not written")
+        found = content_problem(run.changelog, slug=run.slug, reason=reason, detail=detail,
+                                version=record["version"], in_git=bool(run.repo))
+        raise run.refuse(f"changelog file: {explain(found)}; nothing done.",
+                         changelog_file=found) from None
+
+
+def _check_local_tags(run: _Run, target: str) -> None:
+    """K-8 — BEFORE the stamp of a new release in git: no tag of V (any
+    spelling, _version_tags) may exist locally — the release commit does
+    not exist yet, so no such tag could ever be adopted by the tag step."""
+    tags = _version_tags(run.repo, normalize_version(target))
+    if tags:
+        names = ", ".join(f"{t['name']} → {t['commit']}" for t in tags)
+        deletes = " ".join(f"`git tag -d {t['name']}`" for t in tags)
+        raise run.refuse(
+            f"tag(s) of {target} already exist in this repository ({names}) — the release "
+            f"tags its OWN release commit, which does not exist yet, so the tag step could "
+            f"never adopt them; refused before the stamp. Delete a leftover tag yourself "
+            f"({deletes}) if it is no release, or choose another version, then plan again; "
+            f"nothing released.", tags=tags)
+
+
+def _new_release_prechecks(run: _Run, target: str, ids: list[int], plan: dict) -> None:
+    """The conditions of a NEW release (no record of V, V above the current
+    version) known before the stamp but otherwise checked only by a step
+    after it — prepare and apply both run them, before anything is written:
+    the changelog composition (K-9) and a local tag of V (K-8)."""
+    if ledger.get_release(run.engine, run.slug, target) is not None \
+            or not _newer_than_current(run.project, target):
+        return
+    _check_changelog_content(run, target, ids, plan)
+    if run.repo:
+        _check_local_tags(run, target)
+
+
 def _check_record_location(run: _Run) -> None:
     """K-51: the record belongs to THIS checkout — never re-pinned."""
     record = run.record
@@ -1360,14 +1509,20 @@ def _norm_block(text: str) -> str:
     return text.replace("\r\n", "\n").rstrip("\n")
 
 
-def render_section(engine: sa.Engine, slug: str, record: dict) -> tuple[str, str]:
+def render_section(engine: sa.Engine, slug: str, record: dict, *,
+                   provisional: bool = False) -> tuple[str, str]:
     """(section, date) of the release — deterministic, from the database
     and the record only (K-32/K-49): the export's block of the record's
     version (every equivalent stored spelling, K-55) headed `## [<record
     version>] - <record created_at date>`; a version-only release gets
-    VERSION_ONLY_LINE. Ends with exactly one newline."""
+    VERSION_ONLY_LINE. Ends with exactly one newline. `provisional` (#876
+    K-9): `record` is the release ABOUT TO BE stamped ({version, created_at,
+    entry_ids, render, proof} — _provisional_record) and the export renders
+    its entries as if they carried the version (export_changelog_md
+    `provisional`) — the same composition, before the stamp."""
     version, date = record["version"], _date_of(record["created_at"])
-    block = export_changelog_md(engine, slug, version=version)
+    block = export_changelog_md(engine, slug, version=version,
+                                provisional=record if provisional else None)
     if record["entry_ids"]:
         lines = block.split("\n") if block else []
         match = _MARKER_RE.match(lines[0]) if lines else None
@@ -1414,7 +1569,8 @@ def _insert_section(base: str, section: str, version: str) -> str:
     return new
 
 
-def expected_changelog(engine: sa.Engine, slug: str, record: dict, base: bytes | None) -> bytes:
+def expected_changelog(engine: sa.Engine, slug: str, record: dict, base: bytes | None, *,
+                       provisional: bool = False) -> bytes:
     """The expected content of F after the release (K-32) from its content
     BEFORE the release (`base`; None = F does not exist — bootstrap):
       - bootstrap: the full export (no Unreleased) with the release's block
@@ -1423,28 +1579,38 @@ def expected_changelog(engine: sa.Engine, slug: str, record: dict, base: bytes |
         rest byte-identical, one section more;
       - existing F already holding the IDENTICAL V section once: unchanged;
         any other V section (different text, several) → ReleaseRefused.
-    """
+    A refusal caused by an existing F's CONTENT carries details.content
+    ('not_utf8' | 'section_differs' | 'insertion'). The ONE composition: the write
+    (_step_files, after the stamp) and the pre-check of a new release
+    (_check_changelog_content, BEFORE it — `provisional`, see
+    render_section) both call it (#876 K-9)."""
     version = record["version"]
-    section, _ = render_section(engine, slug, record)
+    section, _ = render_section(engine, slug, record, provisional=provisional)
     if base is None:
-        full = export_changelog_md(engine, slug, include_unreleased=False)
+        full = export_changelog_md(engine, slug, include_unreleased=False,
+                                   provisional=record if provisional else None)
         for _, start, end in reversed(_version_blocks(full, version)):
             full = full[:start] + full[end:]
         return _insert_section(full, section, version).encode("utf-8")
     try:
         text = base.decode("utf-8")
     except UnicodeDecodeError:
-        raise ReleaseRefused("the changelog file is not UTF-8 — not touched") from None
+        raise ReleaseRefused("the changelog file is not UTF-8 — not touched",
+                             details={"content": "not_utf8"}) from None
     existing = _version_blocks(text, version)
     if len(existing) == 1 and _norm_block(text[existing[0][1]:existing[0][2]]) == \
             _norm_block(section):
         return base
     if existing:
+        labels = ", ".join(f"[{label}]" for label, _, _ in existing)
         raise ReleaseRefused(
-            f"the changelog file already holds {len(existing)} {version} section(s) that "
-            f"differ from the expected one — not overwritten.",
-            details={"sections": len(existing)})
-    return _insert_section(text, section, version).encode("utf-8")
+            f"the changelog file already holds {len(existing)} {version} section(s) ({labels}) "
+            f"that differ from the expected one — not overwritten.",
+            details={"sections": len(existing), "content": "section_differs"})
+    try:
+        return _insert_section(text, section, version).encode("utf-8")
+    except ReleaseRefused as exc:  # its own verification of the result
+        raise ReleaseRefused(str(exc), details={"content": "insertion"}) from None
 
 # ── content identities and approved blobs ────────────────────────────────────
 #
@@ -1523,15 +1689,87 @@ def _id_of_bytes(run: _Run, rel: str, data: bytes) -> str:
     """The id of `data` as the content of `rel` — computed from THESE bytes
     (K-77: from the one read), never from a second read of the file. In git
     the blob is written to the object database (the expected tree needs
-    it)."""
+    it). #876 K-29: with `core.safecrlf=false` — git's round-trip guard
+    would die on a CRLF changelog under `text=auto` ("CRLF would be
+    replaced by LF") where the owner's own `git add` succeeds; dct checks
+    the preservation of the changelog's text itself (_composed_forms), and
+    the guard changes no id."""
     if run.repo is None:
         return _sha256(data)
     with tempfile.TemporaryDirectory(prefix="dct-release-blob-") as tmp:
         scratch = os.path.join(tmp, "content")
         with open(scratch, "wb") as fh:
             fh.write(data)
-        _, out = gitinfo.git_write(run.repo, "hash-object", "-w", f"--path={rel}", "--", scratch)
+        _, out = gitinfo.git_write(run.repo, "-c", "core.safecrlf=false", "hash-object", "-w",
+                                   f"--path={rel}", "--", scratch)
     return out.strip().lower()
+
+
+def _raw_blob(run: _Run, data: bytes) -> str:
+    """The blob id of `data` AS IS (`git hash-object -w --no-filters`) —
+    written to the object database (a checkout form is read from it)."""
+    with tempfile.TemporaryDirectory(prefix="dct-release-blob-") as tmp:
+        scratch = os.path.join(tmp, "content")
+        with open(scratch, "wb") as fh:
+            fh.write(data)
+        _, out = gitinfo.git_write(run.repo, "hash-object", "-w", "--no-filters", "--", scratch)
+    return out.strip().lower()
+
+
+def _checkout_form(run: _Run, rel: str, data: bytes | None) -> bytes | None:
+    """The work-tree bytes of `data` as the content of `rel` (K-11): in git
+    `data` is BLOB content and the bytes are what a checkout of it writes
+    (`git cat-file --filters`: eol / smudge filters of the path applied —
+    the form the work tree holds and the release compares and writes);
+    outside git the bytes themselves. None for None."""
+    if data is None or run.repo is None:
+        return data
+    return gitinfo.git_cat_blob(run.repo, _raw_blob(run, data), path=rel)
+
+
+def _eol(data: bytes) -> bytes:
+    return data.replace(b"\r\n", b"\n")
+
+
+def _composed_forms(run: _Run, rel: str, composed: bytes) -> tuple[bytes, str]:
+    """#876 K-20 / K-26 — the two forms of F's COMPOSED content
+    (expected_changelog: blob content), kept apart: (expected WORK-TREE
+    bytes, id of the content git STORES — what the release commit's tree
+    holds). Outside git: (the bytes, their SHA-256).
+
+    The stored id is what git's clean / eol filters make of the
+    composition as a checkout writes it (_checkout_form, then `git
+    hash-object --path`, _id_of_bytes). The work-tree bytes are the
+    checkout form of THAT STORED content (K-26: exactly what a fresh
+    checkout of the release commit writes — under `* text=auto` a CRLF
+    history is stored LF and checked out LF, so the work tree holds LF, as
+    a fresh clone does; the next release's work-tree check then passes),
+    and they must be a FIXED POINT of the filters: `hash-object --path` of
+    them gives the stored id again.
+
+    The filter path must KEEP the composed text: the stored content is the
+    composition itself or the composition with its line endings normalised
+    (CRLF → LF — e.g. a CRLF changelog under `text=auto`); anything else (a
+    clean filter rewriting the text) or a checkout form that is no fixed
+    point refuses with details.content 'filtered' — called BEFORE the stamp
+    too (_check_changelog_content), so such a filter path never stamps."""
+    if run.repo is None:
+        return composed, _sha256(composed)
+    stored = _id_of_bytes(run, rel, _checkout_form(run, rel, composed))
+    if stored not in {_raw_blob(run, composed), _raw_blob(run, _eol(composed))}:
+        raise ReleaseRefused(
+            f"the git filters of {rel} do not keep the release's text: what git stores for "
+            f"the composed changelog ({stored}) is neither that text nor that text with its "
+            f"line endings normalised — not written", details={"content": "filtered"})
+    work = gitinfo.git_cat_blob(run.repo, stored, path=rel)
+    again = _id_of_bytes(run, rel, work)
+    if again != stored:
+        raise ReleaseRefused(
+            f"the git filters of {rel} are not stable: what a checkout of the stored changelog "
+            f"({stored}) writes is stored as {again} again — the release could not leave the "
+            f"work tree a checkout of its own commit; not written",
+            details={"content": "filtered"})
+    return work, stored
 
 
 def _approved_bytes(run: _Run, rel: str, blob: str) -> bytes:
@@ -2151,13 +2389,84 @@ def _record_proposal(run: _Run) -> dict:
         raise run.refuse(f"the approved proposal of {run.version} is for a "
                          f"{proposal['release_mode']} release, this checkout is {run.mode} — "
                          f"nothing done.")
-    if (proposal.get("changelog") or {}).get("path") != run.changelog_rel:
+    approved = (proposal.get("changelog") or {}).get("path")
+    if approved != run.changelog_rel:
+        # #876 / K-16: the approved file is not the one the resolver finds in
+        # the candidate now — a changelog setting changed since the approval
+        # (or a record stamped before dct detected the changelog file, K-18).
+        # Resume executes ONLY the approved proposal (K-97 F4), so it writes
+        # neither file; the way back is a setting that resolves the approved
+        # file again — offered only when it verifiably does.
+        found = run.changelog
+        if found is None or not found["managed"]:
+            now = "none (dct's changelog file is off)"
+        elif found["path"]:
+            now = f"{found['path']} ({found['source']})"
+        else:
+            now = f"not settled — {explain(found)}"
+        restore = _restore_commands(run, approved)
+        ways = []
+        if restore:
+            ways.append(
+                f"(1) set a changelog setting consistent with the approved path "
+                f"{approved or 'none (off)'}: "
+                + ", then ".join(f"`{c}`" for c in restore)
+                + f" — the candidate then resolves {approved or 'no changelog file'} again "
+                f"(which setting the approval was made under is not recorded) — and run "
+                f"`dct release resume`")
+        ways.append(
+            f"({len(ways) + 1}) {'as the last resort, ' if restore else ''}"
+            f"`dct release abandon --version {run.version} --reason … --confirm` ends the "
+            f"record — its stamps and current_version stay, the version stays taken; its "
+            f"section is then not in the changelog unless you add it yourself")
         raise run.refuse(
-            f"the changelog file of the approved proposal "
-            f"({(proposal.get('changelog') or {}).get('path')}) is not the project's "
-            f"({run.changelog_rel}) — the changelog setting changed since the approval; "
-            f"nothing done.")
+            f"the approved proposal of {run.version} binds the changelog file "
+            f"{approved or 'none (off)'}, but the candidate's changelog file is {now}. Resume "
+            f"executes only the approved proposal, so it writes neither file (both are "
+            f"untouched); nothing done. Next step: {'; '.join(ways)}.",
+            changelog_file=found, approved=approved, restore=restore)
     return proposal
+
+
+def _restore_commands(run: _Run, approved: str | None) -> list[str]:
+    """K-16 / K-23 — the `dct project …` commands after which the ONE
+    resolver yields the APPROVED changelog file (`approved`, base-relative;
+    None = dct's changelog file was off) at the record's candidate again,
+    derived from the stored proposal. The proposal does not record WHICH
+    setting produced the path (detection or a manual choice), so this is a
+    setting CONSISTENT with the approved path, never "the setting of the
+    approval": the current setting when it already yields it (only the
+    switch flipped back — `on` / `off`), else the MANUAL choice of the
+    approved file (project-relative) — never a switch to detection, which
+    would silently drop a manual mode. Each command is offered only when
+    the resolution it leads to verifiably gives `approved`. [] when none
+    does — e.g. a record stamped by the pre-fix code whose approved file the
+    resolver can never yield (K-18): then abandon is the only way, never a
+    false promise."""
+    if not run.project_root:
+        return []
+    project = run.project
+    commit = run.record.get("candidate_sha") if run.repo else None
+
+    def yields(**fields) -> bool:
+        found = resolve_changelog({**project, **fields}, project_root=run.project_root,
+                                  repo_root=run.repo, commit=commit)
+        return found["path"] == approved if found["managed"] else approved is None
+
+    slug = shlex.quote(run.slug)
+    if approved is None:
+        return [f"dct project changelog {slug} off"] if yields(manages_changelog=False) else []
+    switch = [] if project.get("manages_changelog", True) else [
+        f"dct project changelog {slug} on"]
+    if yields(manages_changelog=True):
+        return switch
+    prefix = _project_prefix(run) if run.repo else ""
+    if not approved.startswith(prefix):
+        return []
+    rel = approved[len(prefix):]
+    if yields(manages_changelog=True, changelog_path=rel, **{EXPLICIT_MARKER: True}):
+        return switch + [f"dct project changelog-path {slug} {shlex.quote(rel)}"]
+    return []
 
 
 def _changelog_baseline(run: _Run, proposal: dict) -> bytes | None:
@@ -2195,16 +2504,25 @@ def _check_resume_tree(run: _Run) -> None:
                          f"nothing done.", foreign=foreign)
 
 
-def _verified_manifest(run: _Run, proposal: dict, expected_f: bytes | None) -> dict:
+def _verified_manifest(run: _Run, proposal: dict, expected_f: tuple) -> dict:
     """K-77: read the FULL artifact set ONCE and compute every hash and the
     expected tree from that one read; every artifact must be exactly the
-    approved content (F: its baseline + the rendered section) — a mismatch
-    refuses and records nothing."""
+    approved content (F: its baseline + the rendered section — `expected_f`
+    is (expected work-tree bytes, id of the content git stores for them)
+    from _composed_forms, K-11 / K-20: the bytes compared as written, the
+    id the tree holds) — a mismatch refuses and records nothing."""
     rels = ([run.changelog_rel] if run.changelog_rel else []) + list(proposal["paths"])
     data = {rel: _read_regular(run.abspath(rel)) for rel in rels}
     ids, bad = {}, []
-    if run.changelog_rel and data[run.changelog_rel] != expected_f:
-        bad.append(run.changelog_rel)
+    if run.changelog_rel:
+        expected_bytes, expected_id = expected_f
+        if data[run.changelog_rel] != expected_bytes:
+            bad.append(run.changelog_rel)
+        elif run.repo:
+            ids[run.changelog_rel] = _id_of_bytes(run, run.changelog_rel,
+                                                  data[run.changelog_rel])
+            if ids[run.changelog_rel] != expected_id:
+                bad.append(run.changelog_rel)
     for rel in proposal["paths"]:
         if not isinstance(data[rel], bytes):
             bad.append(rel)
@@ -2225,11 +2543,73 @@ def _verified_manifest(run: _Run, proposal: dict, expected_f: bytes | None) -> d
                                  "sha256": _sha256(data[run.changelog_rel]),
                                  "section_date": date}
     if run.repo:
-        if run.changelog_rel:
-            ids[run.changelog_rel] = _id_of_bytes(run, run.changelog_rel,
-                                                  data[run.changelog_rel])
         manifest["tree"] = _tree_of_blobs(run.repo, run.record["candidate_sha"], ids)
     return manifest
+
+
+def _foreign_message(run: _Run, foreign: list[str], changelog_base: bytes | None) -> str:
+    """The refusal of _step_files for files that are neither the baseline
+    nor the approved content. #876: a changelog file the candidate does NOT
+    hold, found on disk, was never touched by dct — the text names what is
+    there and never asks to "restore" it."""
+    parts = []
+    edited = [rel for rel in foreign if rel != run.changelog_rel or changelog_base is not None]
+    if edited:
+        parts.append(
+            f"{', '.join(edited)} differ(s) from both the content before the release and the "
+            f"approved content (a partial or foreign edit?) — not overwritten; restore the "
+            f"file(s) yourself (or finish them exactly as approved)")
+    if run.changelog_rel in foreign and changelog_base is None:
+        rel = run.changelog_rel
+        directory = os.path.dirname(run.abspath(rel))
+        try:
+            here = sorted(n for n in os.listdir(directory)
+                          if n.casefold() == os.path.basename(rel).casefold())
+        except OSError:
+            here = []
+        parts.append(
+            f"{rel} did not exist before the release (the approved baseline: absent), and "
+            f"what is there now ({', '.join(here) or rel}) is not the approved content — an "
+            f"ignored or untracked file, a tracked file whose name differs only in case on a "
+            f"case-insensitive file system, or an edit of the file this release wrote — not "
+            f"overwritten; move it away (resume then writes it)")
+    return (f"{'; '.join(parts)} — nothing written, the index untouched; then resume, or "
+            f"abandon the release.")
+
+
+def _guard_changelog_write(run: _Run) -> None:
+    """#876 K-19 — at WRITE time, again: F's path never leads out of the
+    project. Every directory of F below the base must be a real directory
+    (or not exist yet — the write creates it), F itself a regular file or
+    absent, and F inside the project root (also when the project is a
+    subdirectory of the repository). The pre-checks refused every such path
+    in the candidate and on disk before the stamp; this catches one that
+    changed since (a directory swapped for a link) — refused, nothing
+    written through it; the record stays as it is (resume once restored)."""
+    rel = run.changelog_rel
+    parts = rel.split("/")
+    path, bad = run.base, None
+    for i, name in enumerate(parts):
+        path = os.path.join(path, name)
+        try:
+            mode = os.lstat(path).st_mode
+        except FileNotFoundError:
+            break
+        if stat.S_ISLNK(mode) or (i < len(parts) - 1 and not stat.S_ISDIR(mode)) \
+                or (i == len(parts) - 1 and not stat.S_ISREG(mode)):
+            bad = "/".join(parts[:i + 1])
+            break
+    root = os.path.realpath(run.project_root)
+    full = os.path.realpath(run.abspath(rel))
+    if bad is None and os.path.commonpath([root, full]) == root:
+        return
+    where = f"{bad} is a symbolic link or not a directory / regular file" if bad else \
+        f"{rel} resolves outside the project root ({full})"
+    raise run.refuse(
+        f"the changelog file's path changed since the pre-checks: {where} — dct never writes "
+        f"the changelog through it (it could leave the project); nothing written. Put the "
+        f"directory back as the candidate holds it, then run `dct release resume` (or "
+        f"abandon the release).", path=rel, component=bad)
 
 
 def _step_files(run: _Run) -> None:
@@ -2244,17 +2624,27 @@ def _step_files(run: _Run) -> None:
     proposal = _record_proposal(run)
     actions: list[tuple[str, str]] = []
     foreign: list[str] = []
-    expected_f = None
+    expected_f, base = (None, None), None
     if run.changelog_rel:
         base = _changelog_baseline(run, proposal)
         try:
-            expected_f = expected_changelog(run.engine, run.slug, run.record, base)
+            raw = expected_changelog(run.engine, run.slug, run.record, base)
         except ReleaseRefused as exc:
             raise run.refuse(str(exc), path=run.changelog_rel, **exc.details) from None
+        # K-11 / K-20: compared and written in the form a checkout writes
+        # (eol / smudge filters); committed as what git stores for those
+        # bytes (its clean / eol filters — a line-ending normalisation).
+        try:
+            expected_f = _composed_forms(run, run.changelog_rel, raw)
+        except ReleaseRefused as exc:
+            raise run.refuse(f"{exc}; nothing done.", path=run.changelog_rel,
+                             **exc.details) from None
+        base_form = _checkout_form(run, run.changelog_rel, base)
+        _guard_changelog_write(run)
         current = _read_regular(run.abspath(run.changelog_rel))
-        if current == expected_f:
+        if current == expected_f[0]:
             actions.append((run.changelog_rel, "verified"))
-        elif current == base:
+        elif current == base_form:
             actions.append((run.changelog_rel, "write"))
         else:
             foreign.append(run.changelog_rel)
@@ -2267,16 +2657,13 @@ def _step_files(run: _Run) -> None:
         else:
             foreign.append(rel)
     if foreign:
-        raise run.refuse(
-            f"{', '.join(foreign)} differ(s) from both the content before the release and the "
-            f"approved content (a partial or foreign edit?) — not overwritten: nothing "
-            f"written, the index untouched; restore the file(s) yourself (or finish them "
-            f"exactly as approved) and resume, or abandon the release.", foreign=foreign)
+        raise run.refuse(_foreign_message(run, foreign, base), foreign=foreign)
     todo = dict(actions)
     _point(run.on_point, "before_changelog")
     if run.changelog_rel:
         if todo[run.changelog_rel] == "write":
-            _write_atomic(run.abspath(run.changelog_rel), expected_f)
+            _guard_changelog_write(run)
+            _write_atomic(run.abspath(run.changelog_rel), expected_f[0])
             run.step("changelog", "done", path=run.changelog_rel)
         else:
             run.step("changelog", "verified", path=run.changelog_rel)
@@ -2347,14 +2734,21 @@ def _is_release_commit(run: _Run, commit: str) -> bool:
             and facts["subject"] == RELEASE_SUBJECT.format(version=run.version))
 
 
+def _foreign_index_lock(repo: str) -> str | None:
+    """The path of THIS checkout's `index.lock` when it exists (another git
+    process is using the index — dct never removes it), else None."""
+    lock = _git_path(repo, "index") + ".lock"
+    return lock if os.path.lexists(lock) else None
+
+
 def _check_index_for_commit(run: _Run, candidate: str, expected: str, paths: list[str]) -> None:
     """K-50 / K-79, read-only, before the commit: the user's index may hold
     nothing but release artifacts already staged as their EXPECTED blobs —
     a foreign staged path, foreign content inside a release file or an
     unmerged path refuses with the staging untouched; an existing
     index.lock (another git process) refuses before anything is created."""
-    lock = _git_path(run.repo, "index") + ".lock"
-    if os.path.lexists(lock):
+    lock = _foreign_index_lock(run.repo)
+    if lock:
         raise run.refuse(
             f"{lock} exists — another git process is using the index; dct never removes a "
             f"foreign index.lock; nothing committed — run `dct release resume` once it is gone.",
@@ -3074,8 +3468,9 @@ def _approved_context(engine: sa.Engine, project_slug: str, located: tuple, *, v
     if checkout:
         _check_git_version(checkout["repo_root"])
         state = _clean_tree(run, planning._artifacts(
-            project, checkout, ledger.get_version_files(engine, project_slug)["version_files"]))
+            run.changelog_rel, ledger.get_version_files(engine, project_slug)["version_files"]))
         pre_untracked = set(state["untracked"])
+    _check_changelog_file(run)
     try:
         plan = planning.build_plan(
             engine, project_slug, version=version, bump_type=bump_type, cwd=cwd,
@@ -3197,6 +3592,7 @@ def _prepare(engine, project_slug, located, *, version, bump_type, entry_ids, no
         raise NothingToPrepare(f"{target} is lower than the current version "
                                f"{run.project['current_version']} — releases never rewind; "
                                f"nothing to prepare.")
+    _new_release_prechecks(run, target, ids, plan)
     details = _prepared(run, target, plan)
     try:  # what apply would push to by default — shown for the approval (read-only)
         default_push = push_target(run, target)
@@ -3382,8 +3778,7 @@ def _apply(engine, project_slug, located, *, version, bump_type, entry_ids, no_e
         cwd=cwd, on_point=on_point)
     checkout = run.checkout
     snapshot = plan["snapshot"]
-    proof = {str(i): snapshot["proof"][str(i)] for i in ids if str(i) in snapshot["proof"]} \
-        or None
+    proof = _stamp_proof(plan, ids)
     stampable = [i for i in ids if str(i) in snapshot["proof"]]
     if not checkout:  # K-63: a project CONFIRMED outside git — the owner's selection
         stampable = list(ids)
@@ -3391,6 +3786,15 @@ def _apply(engine, project_slug, located, *, version, bump_type, entry_ids, no_e
     consent = None
     push_to = None
     if before is None:
+        _new_release_prechecks(run, target, ids, plan)
+        if checkout and _newer_than_current(run.project, target):
+            # K-8 audit: the identity the release commit needs — known now,
+            # otherwise first resolved by the commit step after the stamp.
+            _commit_identity(
+                lambda message, **details: run.refuse(
+                    message.replace("nothing committed.",
+                                    "refused before the stamp; nothing released."), **details),
+                checkout["repo_root"])
         if proposal_digest is None and _newer_than_current(run.project, target):
             # K-117 / K-116 H2: a NEW release needs the owner's approval of
             # ONE specific proposal — also through the alias. Equal paths and
@@ -3449,6 +3853,17 @@ def _apply(engine, project_slug, located, *, version, bump_type, entry_ids, no_e
         raise ReleaseRefused(
             f"HEAD moved since the plan was derived for the candidate {checkout['head']} — "
             f"nothing released; plan again.", details={"candidate": checkout["head"]})
+    if checkout and before is None:
+        # K-25: an index.lock that EXISTS now would stop the release commit
+        # after the stamp — refused before it. (One that appears later — like
+        # a refusing hook or a signature failure — stops the release after
+        # the stamp; `dct release resume` finishes it. No trial commit.)
+        lock = _foreign_index_lock(checkout["repo_root"])
+        if lock:
+            raise run.refuse(
+                f"{lock} exists — another git process is using the index; dct never removes "
+                f"a foreign index.lock; refused before the stamp, nothing released — run the "
+                f"same `dct release apply` again once it is gone.", index_lock=lock)
     def stamp() -> dict:
         return release_entries(
             engine, project_slug, target, entry_ids=ids,
@@ -3580,8 +3995,21 @@ def resume_release(
             _check_git_version(run.repo)
             if _operation_in_progress(run.repo):
                 raise run.refuse("a git operation is in progress — finish or abort it first")
+        _bind_record_changelog(run)
         _continue(run, fresh=False)
         return _finish("resume", run, "completed")
+
+
+def _bind_record_changelog(run: _Run) -> None:
+    """#876 — the changelog file of a resumed record: resolved again at the
+    RECORDED candidate (deterministic after HEAD moved; a 'stamped' record's
+    approved file is compared with it by _record_proposal); past 'stamped'
+    the file is the one its verified manifest records."""
+    if run.repo and run.record.get("candidate_sha"):
+        run.bind_changelog(run.record["candidate_sha"])
+    recorded = (run.record.get("manifest") or {}).get("changelog")
+    if run.record["status"] != "stamped" and recorded:
+        run.changelog_rel = recorded["path"]
 
 
 @_conflict_boundary("abandon")
@@ -3821,17 +4249,19 @@ def _legacy_version_file(rel: str, base: bytes | None, data: bytes | None, versi
     return {"path": rel, "check": "lines_with_version", "changed_lines": changed}
 
 
-def _legacy_section(run: _Run, version: str, ids: list[int], data: bytes | None) -> dict:
-    """F holds the V section (any equivalent label) EXACTLY once, its body
-    equal to the database render of the entries → the manifest's changelog
-    {path, sha256, section_date}; ReleaseRefused otherwise."""
+def _legacy_section(run: _Run, rel: str, version: str, ids: list[int],
+                    data: bytes | None) -> dict:
+    """F (`rel`, its content `data`) holds the V section (any equivalent
+    label) EXACTLY once, its body equal to the database render of the
+    entries → the manifest's changelog {path, sha256, section_date};
+    ReleaseRefused otherwise."""
     try:
         text = data.decode("utf-8", "strict") if data is not None else None
     except UnicodeDecodeError:
-        raise ReleaseRefused(f"{run.changelog_rel} is not UTF-8 text") from None
+        raise ReleaseRefused(f"{rel} is not UTF-8 text") from None
     blocks = _version_blocks(text, version) if text is not None else []
     if len(blocks) != 1:
-        raise ReleaseRefused(f"{run.changelog_rel} holds {len(blocks)} {version} sections")
+        raise ReleaseRefused(f"{rel} holds {len(blocks)} {version} sections")
     block = text[blocks[0][1]:blocks[0][2]]
     header = block.split("\n", 1)[0].rstrip("\r")
     date = header.rsplit(" - ", 1)[-1].strip() if " - " in header else None
@@ -3842,9 +4272,9 @@ def _legacy_section(run: _Run, version: str, ids: list[int], data: bytes | None)
     except ReleaseRefused as exc:
         raise ReleaseRefused(f"the section cannot be rendered: {exc}") from None
     if _norm_block(block).split("\n", 1)[-1] != _norm_block(section).split("\n", 1)[-1]:
-        raise ReleaseRefused(f"the {version} section of {run.changelog_rel} differs from the "
+        raise ReleaseRefused(f"the {version} section of {rel} differs from the "
                              f"database's entries")
-    return {"path": run.changelog_rel, "sha256": _sha256(data), "section_date": date}
+    return {"path": rel, "sha256": _sha256(data), "section_date": date}
 
 
 # K-109: the lines of a history diff kept in a result (the digest covers
@@ -3870,7 +4300,7 @@ def _history_diff(old: str, new: str, old_label: str, new_label: str) -> dict:
             "diff_sha256": _sha256("\n".join(lines).encode("utf-8"))}
 
 
-def _changelog_history(run: _Run, repo: str, parent: str, commit: str, version: str) -> dict:
+def _changelog_history(rel: str, repo: str, parent: str, commit: str, version: str) -> dict:
     """K-109 — the WHOLE changelog history against the release commit's
     parent, read-only (neither the commit nor the file is ever touched):
 
@@ -3891,7 +4321,6 @@ def _changelog_history(run: _Run, repo: str, parent: str, commit: str, version: 
 
     The caller has verified that F at the commit holds the V section
     exactly once (_legacy_section)."""
-    rel = run.changelog_rel
     new, old = (gitinfo.git_read_blob(repo, sha, rel) for sha in (commit, parent))
     if old is None:
         return {"state": "bootstrap"}
@@ -3916,8 +4345,76 @@ def _changelog_history(run: _Run, repo: str, parent: str, commit: str, version: 
                          f"{rel} at {commit[:12]} without its {version} section")
 
 
+def _holds_section(repo: str, commit: str, rel: str, version: str) -> bool:
+    """`rel` at `commit` is UTF-8 text holding at least one V section (any
+    equivalent label) — read-only."""
+    data = gitinfo.git_read_blob(repo, commit, rel)
+    try:
+        return data is not None and bool(_version_blocks(data.decode("utf-8", "strict"),
+                                                         version))
+    except UnicodeDecodeError:
+        return False
+
+
+def _candidate_changelog(run: _Run, repo: str, parent: str, commit: str, version: str,
+                         contract: list[str] | None, recorded: dict | None) -> str | None:
+    """#876 K-12 / K-21 — the changelog file of a HISTORICAL release, from its
+    own evidence, never from today's path or detection mode:
+
+      1. the record's VERIFIED manifest (`recorded`, it holds a `tree` — the
+         takeover): its changelog path (none when it records none);
+      2. dct's changelog file off → None (nothing judged);
+      3. else the release COMMIT's evidence: among the files it changed
+         inside the project (the confirmed version-file contract's left
+         out), the regular Markdown files that hold a V section at the
+         commit — exactly ONE is the release's changelog; SEVERAL refuse
+         (never guessed);
+      4. none changed holds one (the candidate already held the section):
+         the files the resolver settles at the parent — with the stored
+         path and with detection, whichever the release was made with —
+         that hold a V section at the commit; again exactly one, several
+         refuse.
+    The caller still verifies the section against the database's entries
+    and the untouched earlier history (_legacy_section, _changelog_history)
+    — finding a section is never enough. ReleaseRefused when no file is
+    found."""
+    if recorded and recorded.get("tree"):
+        return (recorded.get("changelog") or {}).get("path")
+    if not run.project.get("manages_changelog", True) or not run.project_root:
+        return None
+    prefix = _project_prefix(run)
+    changed = sorted(p for p in _diff_names(repo, parent, commit)
+                     if p.startswith(prefix) and p not in (contract or ())
+                     and os.path.splitext(p)[1].casefold() in MARKDOWN_EXTS)
+    entries = _tree_entries(repo, commit, changed)
+    holding = [p for p in changed if entries.get(p, ("",))[0] in ("100644", "100755")
+               and _holds_section(repo, commit, p, version)]
+    source = "changed by the release commit"
+    if not holding:
+        settled = set()
+        for marker in (bool(run.project.get(EXPLICIT_MARKER)), False):
+            found = resolve_changelog({**run.project, EXPLICIT_MARKER: marker},
+                                      project_root=run.project_root, repo_root=repo,
+                                      commit=parent)
+            if found["path"]:
+                settled.add(found["path"])
+        holding = sorted(p for p in settled if _holds_section(repo, commit, p, version))
+        source = "unchanged by the release commit"
+    if len(holding) > 1:
+        raise ReleaseRefused(
+            f"{len(holding)} changelog files {source} hold a {version} section "
+            f"({', '.join(holding)}) — which one is the release's changelog is not decided by "
+            f"its evidence; refused, never guessed")
+    if not holding:
+        raise ReleaseRefused(
+            f"no Markdown file of the project holds a {version} section at {commit[:12]} — "
+            f"dct manages the changelog file, so its release commit must hold the section")
+    return holding[0]
+
+
 def _verify_release_candidate(run: _Run, repo: str, commit: str, version: str,
-                              ids: list[int], contract: list[str] | None) -> dict:
+                              ids: list[int], contract: list[str] | None, *,
+                              recorded_manifest: dict | None = None) -> dict:
     """D8 — ONE candidate release commit, verified on its own evidence:
     subject `release: v<V>` (any equivalent spelling), exactly one parent
     (the candidate), the paths it changed besides F = the version-file
@@ -3927,9 +4424,10 @@ def _verify_release_candidate(run: _Run, repo: str, commit: str, version: str,
     section once (the database's entries), the REST of F preserved from
     the parent (K-109, _changelog_history — a changed history refuses with
     details.history, its diff), each changed version file passing the D9
-    contract against the parent. → {candidate_sha, manifest, history
-    (None without a managed changelog)}; ReleaseRefused (the reason)
-    otherwise."""
+    contract against the parent. F is the file of THIS release
+    (_candidate_changelog: the `recorded_manifest`'s, else the one the
+    commit's own evidence names — K-12 / K-21). → {candidate_sha, manifest, history (None without a
+    managed changelog)}; ReleaseRefused (the reason) otherwise."""
     match = _RELEASE_SUBJECT_RE.match(_subject(repo, commit))
     if not match or not _same_label(match.group(1), version):
         raise ReleaseRefused(f"its subject is not `release: v{version}`")
@@ -3937,20 +4435,21 @@ def _verify_release_candidate(run: _Run, repo: str, commit: str, version: str,
     if len(parents) != 1:
         raise ReleaseRefused(f"it has {len(parents)} parents — the candidate is ambiguous")
     parent = parents[0]
-    changed = sorted(_diff_names(repo, parent, commit) - {run.changelog_rel})
+    rel = _candidate_changelog(run, repo, parent, commit, version, contract, recorded_manifest)
+    changed = sorted(_diff_names(repo, parent, commit) - {rel})
     if contract is not None and changed != contract:
         raise ReleaseRefused(f"it changed {changed} but the version-file contract is "
                              f"{contract}")
     manifest: dict = {"tree": _tree(repo, commit)}
     history = None
-    if run.changelog_rel:
+    if rel:
         manifest["changelog"] = _legacy_section(
-            run, version, ids, gitinfo.git_read_blob(repo, commit, run.changelog_rel))
-        history = _changelog_history(run, repo, parent, commit, version)
+            run, rel, version, ids, gitinfo.git_read_blob(repo, commit, rel))
+        history = _changelog_history(rel, repo, parent, commit, version)
         if history["state"] == "changed":
             raise ReleaseRefused(
-                f"it changes earlier changelog history: {run.changelog_rel} at its parent is "
-                f"not what remains of {run.changelog_rel} at the commit once the {version} "
+                f"it changes earlier changelog history: {rel} at its parent is "
+                f"not what remains of {rel} at the commit once the {version} "
                 f"section is taken out ({history['diff_lines']} diff line(s)) — a deviation "
                 f"(also a typo fix): dct does not attest that the history was preserved",
                 details={"history": history})
@@ -4035,7 +4534,7 @@ def _legacy_identity(engine: sa.Engine, project_slug: str, project: dict,
 
 
 def _git_evidence(run: _Run, version: str, ids: list[int], contract: list[str] | None, *,
-                  choose: str | None = None) -> dict:
+                  choose: str | None = None, recorded_manifest: dict | None = None) -> dict:
     """The git evidence of a release of `version` (D8, K-109, K-119 M3) —
     used by the reconstruction and by the takeover of an existing record.
 
@@ -4047,8 +4546,11 @@ def _git_evidence(run: _Run, version: str, ids: list[int], contract: list[str] |
     at the commit; SEVERAL → every verified alternative is listed and the
     choice is explicit (`choose`, a commit id: it must be one of the
     verified candidates, and the tagged one when there is a tag); none →
-    refused. → {candidate_sha, release_commit_sha, status, manifest (tree,
-    changelog, version_files), history, tag, tag_proof, candidates
+    refused. Each candidate's changelog file is its own (K-12,
+    _candidate_changelog; `recorded_manifest` — the takeover's recorded
+    manifest). → {candidate_sha, release_commit_sha, status,
+    manifest (tree, changelog, version_files), history, tag, tag_proof,
+    candidates
     ([{commit, verified, reason, history}])}; ReleaseRefused with
     details.candidates (and details.history: the candidates whose history
     changed) otherwise."""
@@ -4065,7 +4567,8 @@ def _git_evidence(run: _Run, version: str, ids: list[int], contract: list[str] |
     candidates, verified = [], {}
     for sha in pool:
         try:
-            verified[sha] = _verify_release_candidate(run, repo, sha, version, ids, contract)
+            verified[sha] = _verify_release_candidate(
+                run, repo, sha, version, ids, contract, recorded_manifest=recorded_manifest)
             candidates.append({"commit": sha, "verified": True, "reason": None,
                                "history": verified[sha]["history"]})
         except ReleaseRefused as exc:
@@ -4117,6 +4620,8 @@ def _git_evidence(run: _Run, version: str, ids: list[int], contract: list[str] |
             f"dct never picks one — choose it explicitly: `--release-commit <sha>`"
             f"{'; not verified: ' + reasons if reasons else ''}.", details=details)
     found = verified[commit]
+    # K-12: from here on the changelog file is the verified release's own.
+    run.changelog_rel = (found["manifest"].get("changelog") or {}).get("path")
     # K-115 G4: the tag identity as verified now — what 'completed' records
     # (None without a tag: the evidence then ends at 'committed').
     tag_proof = _tag_proof(tags, version, commit) if tagged is not None else None
@@ -4147,7 +4652,8 @@ def gather_evidence(engine: sa.Engine, project_slug: str, version: str, *,
        a list = confirmed ([] = confirmed "no version files") — `contract`
        ({version_files, state}).
     3. Git (_git_evidence): the candidates, each verified — subject, one
-       parent, the changed paths vs the confirmed contract (an unknown one:
+       parent, F named by that commit's own evidence (K-12 / K-21, never
+       today's path or detection mode), the changed paths vs the confirmed contract (an unknown one:
        the changed paths, each checked), the section once with the
        database's entries, the WHOLE older history preserved from the
        parent (K-109), each version file's FIELD / changed lines (J8). A
@@ -4195,6 +4701,8 @@ def gather_evidence(engine: sa.Engine, project_slug: str, version: str, *,
                                  "choose; drop --release-commit.")
         if not project_root:
             raise ReleaseRefused("the project has no path — no artifact can be verified")
+        # Outside git the files on disk are the only evidence there is.
+        _check_changelog_file(run, work_tree=False)
         if contract is None:
             # K-110: unknown is not "none" — nothing is checked against a
             # contract nobody confirmed.
@@ -4207,7 +4715,7 @@ def gather_evidence(engine: sa.Engine, project_slug: str, version: str, *,
         manifest: dict = {}
         if run.changelog_rel:
             manifest["changelog"] = _legacy_section(
-                run, version, ids, _read_bytes(run.abspath(run.changelog_rel)))
+                run, run.changelog_rel, version, ids, _read_bytes(run.abspath(run.changelog_rel)))
         files, bad = [], []
         for rel in contract:
             data = _read_bytes(run.abspath(rel))
@@ -4736,8 +5244,11 @@ def _takeover(engine, project_slug: str, located: tuple, version: str, push: dic
     final = record["version"]
     contract = ledger.get_version_files(engine, project_slug)["version_files"]
     try:
+        # K-12: judged at the release's own commit — the recorded manifest's
+        # changelog file when the record holds one, never today's HEAD.
         found = _git_evidence(run, final, record["entry_ids"], contract,
-                              choose=record["release_commit_sha"])
+                              choose=record["release_commit_sha"],
+                              recorded_manifest=record["manifest"])
     except ReleaseRefused as exc:
         raise run.refuse(
             f"release {final} cannot be taken over — no verified release commit: {exc} "
