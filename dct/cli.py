@@ -830,6 +830,8 @@ def cmd_update(args):
         # `is not None` on purpose: `--tags ""` is a legal CLEAR (empty list),
         # while omitting the flag leaves the item's tags untouched.
         kwargs["tags"] = [t.strip() for t in args.tags.split(",") if t.strip()]
+    if args.reason is not None:
+        kwargs["reason"] = args.reason
 
     try:
         item = update_item(engine, args.id, **kwargs)
@@ -3136,6 +3138,9 @@ def build_parser() -> argparse.ArgumentParser:
                           help="Comma-separated tags — FULL REPLACE of the item's "
                                "tags. Omit to leave them unchanged; --tags \"\" "
                                "clears them all.")
+    p_update.add_argument("--reason", default=None,
+                          help="Why the item changes — added as a note in the same "
+                               "transaction as the update (a refused update adds none).")
 
     # resolve
     p_resolve = sub.add_parser("resolve", help="Resolve/close an item")

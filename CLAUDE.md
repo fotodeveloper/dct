@@ -227,8 +227,9 @@ Red flag: calling one function to fix what another should have done correctly
 ## Gate checkpoints
 
 `item_checkpoints.kind` defaults to `'task'` (non-blocking). Any other kind
-except `'cc-task'` is a **gate**: `resolve_item` refuses to close the item
-while a gate is `pending` — complete it (done) or reject it (consciously
+except `'cc-task'` is a **gate**: `resolve_item` — and `update_item` with a
+terminal status, through the same check in the same transaction — refuses to
+close the item while a gate is `pending` — complete it (done) or reject it (consciously
 skipped, ledger-preserved). Known kinds: `dogfood` (user validates a
 user-facing feature in a fresh session), `security`, `approval`, `review`;
 unknown kinds are conservatively treated as gates.

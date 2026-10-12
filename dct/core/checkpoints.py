@@ -83,25 +83,33 @@ def add_checkpoint(
         return row_to_dict(row)
 
 
-def list_pending_gates(engine: sa.Engine, item_id: int) -> list[dict]:
-    """Return pending gate checkpoints (kind != 'task', status = 'pending') for item.
-    Used by resolve_item to block resolution until gates close. cc-task is
-    treated as non-gating even though kind != 'task' — it's a mirror class, not
-    a gate. The filter is NON_GATE_KINDS-driven (exclusion, not a whitelist),
-    so a future gate kind is captured by default.
+def pending_gates_conn(conn: sa.Connection, item_id: int) -> list[dict]:
+    """Pending gate checkpoints (kind outside NON_GATE_KINDS, status =
+    'pending') of the item, read on the CALLER's connection — so the gate
+    guard of a terminal transition (items._refuse_pending_gates_conn) runs in
+    the same transaction as the status write. cc-task is treated as
+    non-gating even though kind != 'task' — it's a mirror class, not a gate.
+    The filter is NON_GATE_KINDS-driven (exclusion, not a whitelist), so a
+    future gate kind is captured by default.
     """
+    rows = conn.execute(
+        sa.select(item_checkpoints)
+        .where(
+            item_checkpoints.c.item_id == item_id,
+            item_checkpoints.c.kind.notin_(NON_GATE_KINDS),
+            item_checkpoints.c.status == "pending",
+            item_checkpoints.c.deleted_at.is_(None),
+        )
+        .order_by(item_checkpoints.c.sort_order)
+    ).fetchall()
+    return [row_to_dict(r) for r in rows]
+
+
+def list_pending_gates(engine: sa.Engine, item_id: int) -> list[dict]:
+    """Return pending gate checkpoints for item — the engine-level reader over
+    pending_gates_conn (same filter, own transaction)."""
     with engine.begin() as conn:
-        rows = conn.execute(
-            sa.select(item_checkpoints)
-            .where(
-                item_checkpoints.c.item_id == item_id,
-                item_checkpoints.c.kind.notin_(NON_GATE_KINDS),
-                item_checkpoints.c.status == "pending",
-                item_checkpoints.c.deleted_at.is_(None),
-            )
-            .order_by(item_checkpoints.c.sort_order)
-        ).fetchall()
-        return [row_to_dict(r) for r in rows]
+        return pending_gates_conn(conn, item_id)
 
 
 def _sprint_checkpoints_base(project_id: int, *columns: sa.ColumnElement) -> sa.Select:
