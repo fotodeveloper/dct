@@ -73,11 +73,13 @@ out of scope") resolves without a confirmation question: call
 
 ### Step 5: Acknowledge in one line
 ```
-✓ #42 → resolved (Fixed in commit abc1234)
+✓ #42 → resolved (Fixed in commit abc1234) · to reopen: /track-update #42 reopen
 ```
-One line per item; add `· 2 task checkpoints left open` when there are. A
-wrong resolve is corrected by reopening the item: `/track-update #42 reopen`
-(`update_item(42, status="open")`, which also clears `resolved_at`).
+One line per item, ENDING with how to reopen it, in words the user can type
+back — never left out, the write had no question; add `· 2 task checkpoints
+left open` when there are. A wrong resolve is corrected by reopening the
+item: `/track-update #42 reopen` (`update_item(42, status="open")`, which
+also clears `resolved_at`).
 
 ## Rules
 

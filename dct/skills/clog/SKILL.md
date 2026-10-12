@@ -45,11 +45,13 @@ server-detected entry without that correction.
 
 ### Step 3: Acknowledge in one line
 ```
-✓ Changelog #15 [added] — New Python parser support (feat/x)
+✓ Changelog #15 [added] — New Python parser support (feat/x) · to change it: "#15: <new text>" · to remove it: "delete #15"
 ```
-One line per entry: id, category, text, branch. To correct it,
-`mcp__dct__update_changelog(15, ...)` changes a field; an entry that should
-not exist is withdrawn with `mcp__dct__delete_changelog(15)`.
+One line per entry: id, category, text, branch — and it ENDS with how to
+correct it, in words the user can type back; never left out, the write had
+no question. "#15: <new text>" → `mcp__dct__update_changelog(15, entry=…)`
+(any other field likewise); "delete #15" withdraws an entry that should not
+exist with `mcp__dct__delete_changelog(15)`.
 
 ## Category mapping
 | Change type | category |
@@ -77,6 +79,7 @@ a helper:
 ✓ Changelog #20 [changed] — Extracted shared auth validation (core/auth)
 ✓ Changelog #21 [fixed]   — Token refresh race condition on concurrent login (core/auth)
 ✓ Changelog #22 [added]   — is_expired() helper on Session model (core/auth)
+  to change one: "#21: <new text>" · to remove one: "delete #21"
 ```
 
 Each entry is a separate `add_changelog` call. Don't concatenate changes

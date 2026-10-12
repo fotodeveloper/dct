@@ -129,15 +129,16 @@ fixed minimum taken from its type.
 ## Step 5: Acknowledge in one line
 
 ```
-✓ #42 priority P2 → P1 · status open → in_progress
+✓ #42 priority P2 → P1 · status open → in_progress · to undo: /track-update #42 priority P2, open
 ```
 
-One line per update: what changed, old → new. To correct a wrong change, run
-`/track-update` again with the previous value (`update_item`). A batch is one
-line too:
+One line per update: what changed, old → new — and it ENDS with how to undo
+it, in words the user can type back; never left out, the write had no
+question. To correct a wrong change, run `/track-update` again with the
+previous value (`update_item`). A batch is one line too:
 
 ```
-✓ #7, #12, #19 status open → in_progress
+✓ #7, #12, #19 status open → in_progress · to undo: /track-update #7 #12 #19 open
 ```
 
 ## Rules

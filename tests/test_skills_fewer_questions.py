@@ -244,6 +244,22 @@ def test_acknowledgement_is_one_line_with_a_correction_hint(name, text):
         assert len(lines) == 1, f"the single-write acknowledgement is {len(lines)} lines: {lines}"
 
 
+EXAMPLE_HINT = re.compile(r"·\s*to (change it|undo|reopen|drop it|remove it)\b")
+
+
+@pytest.mark.parametrize(("name", "text"), ACKS)
+def test_the_acknowledgement_example_itself_says_how_to_correct(name, text):
+    """K-77 (dogfood of #877, two models): a hint written BELOW the example
+    line reads as an instruction to the assistant, and the user never saw
+    it. The example line the assistant copies ends with the hint itself."""
+    ack = _ack_part(text())
+    fenced = re.findall(r"```[a-z]*\n(.*?)```", ack, re.DOTALL)
+    inline = re.findall(r"`(✓[^`]+)`", ack)
+    example = (fenced[0].strip().splitlines()[0] if fenced else inline[0] if inline else "")
+    assert example.startswith("✓"), f"no acknowledgement example: {ack[:200]}"
+    assert EXAMPLE_HINT.search(example), f"the example line carries no correction hint: {example}"
+
+
 @pytest.mark.parametrize("text", [
     pytest.param(lambda: _skill("track-resolve"), id="skill"),
     pytest.param(lambda: _fallback("track-resolve"), id="fallback"),

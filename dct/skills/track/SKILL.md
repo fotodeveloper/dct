@@ -91,13 +91,14 @@ asks for that breakdown.
 ### Step 3: Acknowledge in one line
 
 ```
-✓ #42 issue/P1 [Parser empty-file crash] — Parser crashes on empty files
+✓ #42 issue/P1 [Parser empty-file crash] — Parser crashes on empty files · to change it: /track-update #42 · to drop it: "#42 won't fix"
 ```
 
 One line: what was created (id, type, priority, label, title; tags as
-STORED — trimmed and lowercased — when any were set). To correct a
-field, `/track-update #42` (`update_item`); an item that should not exist is
-closed with `/track-resolve` as `wont_fix`.
+STORED — trimmed and lowercased — when any were set) — and it ENDS with how
+to correct it, in words the user can type back; never left out, the write
+had no question. To correct a field, `/track-update #42` (`update_item`); an
+item that should not exist is closed with `/track-resolve` as `wont_fix`.
 
 ## Priority mapping
 

@@ -1054,7 +1054,7 @@ committed.
 2. Gather: item_type (from the user's phrasing; no type cue → `todo` without a question; ask about the type only when the phrase is genuinely ambiguous — it carries cues for two different types — and the choice changes the scope), title, `short_title` (the label: a 2-4 word English noun phrase naming what the item is about, ≤ 50 chars, no item number, no project name — e.g. "Windows hook paths"), priority, description, component, tags (optional).
 3. An unambiguous instruction creates the item without a confirmation question: `mcp__dct__create_item(item_type, title, project, short_title, ...)` at once — **REMEMBER the returned `id`**. The ack must echo `short_title` (null when none was stored); a MISSING key means the MCP server predates the field — report an unsupported (outdated) server contract and tell the user to restart/upgrade it. Do NOT retry the create (the item already exists) and do not claim the label was saved.
 4. No checkpoints at creation: the plan comes when work on the item starts (`/track-update`, status → `in_progress`), which proposes at least 3 checkpoints via `mcp__dct__add_checkpoint(item_id, text)` when the work is a non-trivial feature or improvement, or when the user asks to break the work down. A small bug or a one-line fix gets none; a complex issue or todo may get some, with no fixed minimum. Add them now only when the user asks for that breakdown.
-5. Acknowledge in one line: `✓ #<id> <type>/<priority> [<short_title>] — <title>`. To correct a field, `/track-update #<id>` (`update_item`); an item that should not exist is closed as `wont_fix`.
+5. Acknowledge in one line, ending with how to correct it in words the user can type back: `✓ #<id> <type>/<priority> [<short_title>] — <title> · to change it: /track-update #<id> · to drop it: "#<id> won't fix"`. To correct a field, `/track-update #<id>` (`update_item`); an item that should not exist is closed as `wont_fix`.
 
 ## `/clog` (changelog entry) fallback
 
@@ -1063,7 +1063,7 @@ committed.
 3. In the agent's CURRENT working directory read `git branch --show-current` (empty = detached → omit `branch`) and `git rev-parse --show-toplevel` → `branch` / `worktree`. Pass them explicitly: the MCP server's directory is the session start directory, which may be another checkout.
 4. An unambiguous instruction writes the entry without a confirmation question: `mcp__dct__add_changelog(category, entry, project, component, source_file, source_lines, related_item_id, branch, worktree)` at once.
 5. If the ack carries `branch_source='server'` (or a `warning`), the entry is NOT confirmed: correct it with `update_changelog(id, branch=<current>, worktree=<toplevel>)`.
-6. Acknowledge in one line per entry: `✓ clog #<id> [<category>] — <entry> (<branch>)`. To correct it, `update_changelog(id, ...)`; an entry that should not exist is withdrawn with `delete_changelog(id)`.
+6. Acknowledge in one line per entry, ending with how to correct it in words the user can type back: `✓ clog #<id> [<category>] — <entry> (<branch>) · to change it: "#<id>: <new text>" · to remove it: "delete #<id>"`. To correct it, `update_changelog(id, ...)`; an entry that should not exist is withdrawn with `delete_changelog(id)`.
 
 ## `/track-resolve` (resolve/close item) fallback
 
@@ -1079,7 +1079,7 @@ committed.
 4. Determine resolution status: `resolved` (fixed/implemented) or `wont_fix` (scope decision).
 5. Build resolution note: "Fixed in commit <hash>" if recent commit, or "Decision: <reason>" from context; ask only when the status or the reason is genuinely unclear.
 6. An unambiguous instruction resolves without a confirmation question: `mcp__dct__resolve_item(id, status, resolution)` at once.
-7. Acknowledge in one line per item: `✓ #<id> → <status>` (plus how many `task` checkpoints stay open, if any). A wrong resolve is corrected by reopening the item: `/track-update #<id> reopen` (`update_item(id, status="open")`).
+7. Acknowledge in one line per item, ending with how to reopen it: `✓ #<id> → <status> · to reopen: /track-update #<id> reopen` (plus how many `task` checkpoints stay open, if any). A wrong resolve is corrected by reopening the item: `/track-update #<id> reopen` (`update_item(id, status="open")`).
 
 These prose descriptions are the authoritative behavior. Skill files in
 `dct/skills/` are shortcuts. If they diverge — fix the skill, not this doc.
