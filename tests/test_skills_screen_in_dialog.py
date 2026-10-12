@@ -46,6 +46,7 @@ SCREEN_OPTIONS = {
     "pickup": r"each with that handoff's screen as its preview",
     "release": r'"Release" \(in each of its forms\) carries the screen of the shown variant',
     "dct-import": r'the preview of "Import all as listed"',
+    "dct-init": r'"Register" \(recommended\) — its preview',
 }
 
 # Phrases of the retired print-then-ask pattern.

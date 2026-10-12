@@ -1079,11 +1079,13 @@ def test_dct_init_asks_the_commit_lines_once_and_stores_them():
 
 def test_dct_init_never_promises_null_for_a_detected_version():
     """`dct project add` stores the detected version when --version is left
-    out, so no option may promise an unset one where a version is detected."""
-    version = _init_section("d) Version", "For any")
-    detected = version[:version.index("Else:")]
-    assert not re.search(r"\bNULL\b|\bunset\b|\bleave (it )?empty\b", detected, re.IGNORECASE), \
-        detected
+    out, so nothing may promise an unset one where a version is detected:
+    the registration passes the version the "Register" preview showed, and
+    leaves --version out only when none was detected or given."""
+    registration = _init_section("Always pass the version", "Run via Bash")
+    assert not re.search(r"\bNULL\b|\bunset\b|\bleave (it )?empty\b", registration,
+                         re.IGNORECASE), registration
+    assert re.search(r"no version detected or given, leave `--version` out", registration)
     assert not re.search(r"Leave NULL", _init())
 
 
