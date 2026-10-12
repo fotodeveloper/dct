@@ -175,7 +175,7 @@ def test_a_sync_group_that_cannot_be_stopped_keeps_its_worktree_and_the_protecti
         effects.prepare_release(engine, SLUG, **kw)
     assert second.value.details["process_groups"] == [pgid]
     assert second.value.details["holder"]["action"] == "prepare"
-    os.killpg(pgid, signal.SIGKILL)
+    family.stop()  # never a signal to a number read from a .pid file
     deadline = time.monotonic() + 10
     while procs.group_alive(pgid):
         assert time.monotonic() < deadline

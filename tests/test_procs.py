@@ -19,6 +19,13 @@ operation lock and supervises the family) that the tests signal or kill.
 
 Barriers are FIFOs (the family reports "ready" through one). Liveness is
 asserted the moment the supervised call returned — never polled for.
+
+Cleanup never signals a number read from a .pid file: once a member is
+gone its number may name any process on the machine, and a check before
+the signal would still race with its reuse. A family is ended by asking
+its members to leave (they all honour a stop file and cap their own
+lifetime); a test signals only what it started itself and still holds
+(an unreaped Popen and the group it leads).
 """
 
 from __future__ import annotations
@@ -50,19 +57,34 @@ MIB = 1024 * 1024
 # receives "ready" once all three pid files exist; MODE is a comma list:
 # "ignore" makes the child and the grandchild ignore TERM / HUP / INT, "cwd"
 # makes every member also append to ./ticks of the directory it runs in.
+# Every member holds DIR/presence (a FIFO the test reads) open for writing
+# for as long as it lives, and leaves BY ITSELF once DIR/stop exists, once
+# nobody reads DIR/presence any more, or after LIFETIME seconds — so the
+# test ends a family without ever signalling a number from a .pid file.
 FAMILY = r'''
 import os, signal, sys, time
 d, fifo, mode = sys.argv[1], sys.argv[2], sys.argv[3].split(",")
 targets = [os.path.join(d, "ticks")] + (["ticks"] if "cwd" in mode else [])
+deadline = time.monotonic() + 600  # LIFETIME: a family outlives no test run
+
+def running():
+    return not os.path.exists(os.path.join(d, "stop")) and time.monotonic() < deadline
+
+def register(name):
+    try:  # never written to; the kernel closes it when this process ends
+        os.open(os.path.join(d, "presence"), os.O_WRONLY | os.O_NONBLOCK)
+    except OSError:  # no reader: the test that started the family is gone
+        os._exit(0)
+    with open(os.path.join(d, name + ".pid.tmp"), "w") as fh:
+        fh.write(str(os.getpid()))
+    os.replace(os.path.join(d, name + ".pid.tmp"), os.path.join(d, name + ".pid"))
 
 def loop(name):
     if "ignore" in mode:
         for s in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
             signal.signal(s, signal.SIG_IGN)
-    with open(os.path.join(d, name + ".pid.tmp"), "w") as fh:
-        fh.write(str(os.getpid()))
-    os.replace(os.path.join(d, name + ".pid.tmp"), os.path.join(d, name + ".pid"))
-    while True:
+    register(name)
+    while running():
         for target in targets:
             try:
                 with open(target, "a") as fh:
@@ -70,6 +92,7 @@ def loop(name):
             except OSError:
                 pass
         time.sleep(0.01)
+    os._exit(0)
 
 if os.fork() == 0:
     if os.fork() == 0:
@@ -77,21 +100,33 @@ if os.fork() == 0:
     loop("child")
 with open(os.path.join(d, "cwd"), "w") as fh:
     fh.write(os.getcwd())
-with open(os.path.join(d, "leader.pid"), "w") as fh:
-    fh.write(str(os.getpid()))
-while not all(os.path.exists(os.path.join(d, n + ".pid")) for n in ("child", "grandchild")):
+register("leader")
+while running() and not all(os.path.exists(os.path.join(d, n + ".pid"))
+                            for n in ("child", "grandchild")):
     time.sleep(0.005)
 if fifo:
-    with open(fifo, "w") as fh:
-        fh.write("ready\n")
-time.sleep(600)
+    try:  # non-blocking: a reader that is gone must not hang the leader
+        ready = os.open(fifo, os.O_WRONLY | os.O_NONBLOCK)
+    except OSError:
+        pass
+    else:
+        os.write(ready, b"ready\n")
+        os.close(ready)
+while running():
+    time.sleep(0.01)
 '''
 
 NAMES = ("leader", "child", "grandchild")
 
 
 class Family:
-    """The family's scratch directory: pid files, ticks, the ready FIFO."""
+    """The family's scratch directory: pid files, ticks, the ready FIFO.
+
+    The .pid files serve observations only (`alive`, `pids`): they outlive
+    the family, and a number in them may by then name anybody's process.
+    Ending the family therefore never signals such a number — `stop` asks
+    the members to leave and watches the presence FIFO they hold open.
+    """
 
     def __init__(self, root: Path):
         self.dir = root / "family"
@@ -103,6 +138,8 @@ class Family:
         # Opened for reading FIRST (non-blocking), so the family's open for
         # writing never blocks and a dead helper cannot hang the test.
         self._ready = os.open(self.fifo, os.O_RDONLY | os.O_NONBLOCK)
+        os.mkfifo(self.dir / "presence")
+        self._presence = os.open(self.dir / "presence", os.O_RDONLY | os.O_NONBLOCK)
 
     def argv(self, mode: str = "plain", *, barrier: bool = True) -> list[str]:
         return [sys.executable, str(self.script), str(self.dir),
@@ -162,14 +199,32 @@ class Family:
         time.sleep(0.15)
         assert self.ticks() == size
 
-    def kill(self) -> None:
-        for pid in self.pids().values():
-            with contextlib.suppress(ProcessLookupError, PermissionError):
-                os.kill(pid, signal.SIGKILL)
+    def present(self) -> bool:
+        """Whether any member still holds the presence FIFO open. Members
+        never write to it, so an empty read means nobody holds it (the
+        kernel closed it when each one ended, reaped or not)."""
+        try:
+            return os.read(self._presence, 1) != b""
+        except BlockingIOError:  # a writer holds it, nothing to read
+            return True
+
+    def stop(self, timeout: float = 10) -> None:
+        """End every member WITHOUT a signal: each one leaves by itself once
+        DIR/stop exists. Returns when none of them is present any more; a
+        member that never registered (not started yet) finds the stop file
+        or the closed FIFO and leaves at once."""
+        (self.dir / "stop").touch()
+        deadline = time.monotonic() + timeout
+        while self.present():
+            assert time.monotonic() < deadline, "a family member did not stop"
+            time.sleep(0.01)
 
     def close(self) -> None:
-        self.kill()
-        os.close(self._ready)
+        try:
+            self.stop()
+        finally:
+            os.close(self._ready)
+            os.close(self._presence)
 
 
 @pytest.fixture
@@ -185,6 +240,62 @@ def family(tmp_path):
 def _short_grace(monkeypatch):
     """A family member that ignores SIGTERM costs the whole grace."""
     monkeypatch.setattr(procs, "TERM_GRACE_SECONDS", 0.3)
+
+
+@pytest.fixture
+def foreign(tmp_path):
+    """A process the family has nothing to do with — started by the test, so
+    its number stays reserved (unreaped) until this fixture waits for it."""
+    proc = subprocess.Popen(["sleep", "300"], start_new_session=True)
+    try:
+        yield proc
+    finally:
+        proc.kill()
+        proc.wait()
+
+
+def assert_untouched(proc: subprocess.Popen) -> None:
+    """`proc` is still running half a second later (no signal ended it)."""
+    with pytest.raises(subprocess.TimeoutExpired):
+        proc.wait(timeout=0.5)
+
+
+def forge_pid_files(family: Family, pid: int) -> None:
+    """Every .pid file now names `pid` — what a reused number looks like."""
+    for name in NAMES:
+        (family.dir / f"{name}.pid").write_text(str(pid))
+
+
+def test_the_cleanup_never_signals_a_number_a_pid_file_holds(tmp_path, foreign):
+    """The .pid files outlive the family: once it is gone the numbers in them
+    can name anybody's process. The cleanup must not signal them."""
+    family = Family(tmp_path)
+    forge_pid_files(family, foreign.pid)
+    family.close()
+    assert_untouched(foreign)
+
+
+def test_the_cleanup_stops_a_live_family_without_signalling_its_pid_files(tmp_path, foreign):
+    """A family that runs (two members refuse SIGTERM) while its .pid files
+    name a foreign process: the family ends by itself, the foreign process
+    lives on."""
+    family = Family(tmp_path)
+    leader = subprocess.Popen(family.argv("ignore"), start_new_session=True,
+                              stdin=subprocess.DEVNULL)
+    try:
+        family.wait_ready(leader)
+        forge_pid_files(family, foreign.pid)
+        family.close()
+        assert_untouched(foreign)
+        assert leader.wait(timeout=10) == 0  # it left by itself, not by a signal
+        size = family.ticks()  # … and so did the child and the grandchild
+        time.sleep(0.15)
+        assert family.ticks() == size
+    finally:
+        if leader.returncode is None:
+            # Never reaped, so its number still names the group we started.
+            os.killpg(leader.pid, signal.SIGKILL)
+            leader.wait()
 
 
 def wait_until_gone(pgid: int, timeout: float = 10) -> None:
@@ -374,7 +485,7 @@ def test_a_killed_supervisor_leaves_a_record_that_refuses_the_next_operation(tmp
     # The refusal keeps the dead holder's record: every later attempt refuses too.
     with pytest.raises(oplock.LeftoverProcesses), oplock.operation_lock(str(lock), "third"):
         pytest.fail("the record was lost by the refused attempt")
-    os.killpg(pgid, signal.SIGKILL)
+    family.stop()
     wait_until_gone(pgid)
     with oplock.operation_lock(str(lock), "after") as held:
         assert oplock.read_holder(str(lock))["action"] == "after"
@@ -402,7 +513,7 @@ def test_a_supervisor_killed_inside_the_spawn_window_is_refused_as_unverifiable(
             oplock.operation_lock(str(lock), "second"):
         pytest.fail("ran although a started process could not be accounted for")
     assert exc.value.groups == []
-    family.kill()
+    family.stop()
     # The documented recovery: the owner checks, then empties the lock file.
     with open(lock, "w"):
         pass
@@ -426,7 +537,7 @@ def test_a_group_that_cannot_be_confirmed_dead_keeps_the_protection(
     assert oplock.read_holder(str(lock))["groups"] == [pgid]
     with pytest.raises(oplock.LeftoverProcesses), oplock.operation_lock(str(lock), "two"):
         pytest.fail("ran next to a group that was never confirmed dead")
-    os.killpg(pgid, signal.SIGKILL)
+    family.stop()
     wait_until_gone(pgid)
     with oplock.operation_lock(str(lock), "three"):
         pass
