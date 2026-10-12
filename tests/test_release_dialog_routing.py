@@ -16,9 +16,10 @@ and RUNS what the code does:
   the text drops or invents breaks the run, not only a string comparison.
 - continuation: an unchanged resume needs no further approval and finishes
   the commit, the tag and the push; a takeover is a new consent (preview →
-  that digest → resume); work in progress is committed inside the workflow
-  (the `/commit` procedure), the plan recomputed, the release finished and
-  pushed to the approved target.
+  that digest → resume); work in progress is committed by dct inside the
+  ONE dialog (the documented `prepare --preview` with the drafted message,
+  then `apply --consent` with the shown variant's digest), released and
+  pushed to the target the screen bound.
 
 Table / numbering equality of the two documents is the auxiliary doc test
 (tests/test_skill_prose_changelog.py)."""
@@ -50,7 +51,6 @@ from test_release_executor import world
 from test_release_round4_reconstruct import legacy
 from test_skill_prose_changelog import (
     _commands,
-    _refusal_rows,
     _release_fallback,
     _resume_path,
     _skill,
@@ -70,7 +70,8 @@ DIALOGS = [
     pytest.param(lambda: _skill("release"), id="skill"),
     pytest.param(_release_fallback, id="fallback"),
 ]
-BARE_FLAGS = {"--json", "--confirm", "--no-push", "--no-entries", "--none"}
+BARE_FLAGS = {"--json", "--confirm", "--no-push", "--no-entries", "--none", "--preview",
+              "--discard-preview", "--no-variants"}
 
 
 @pytest.fixture(autouse=True)
@@ -191,7 +192,7 @@ def test_a_dct_release_is_resumed_although_the_project_is_own_now(text, engine, 
     rows, stamps, before = release_rows(engine), stamped_versions(engine), world(engine, repo)
 
     plan = first_plan(body, run)
-    assert plan["schema_version"] == 4 and plan["kind"] == "resume"
+    assert plan["schema_version"] == 5 and plan["kind"] == "resume"
     assert plan["executor"] == {"project": "own", "record": {
         "version": "1.1.0", "status": "stamped", "executor": "dct", "progress_owner": "dct",
         "consent": True}}
@@ -339,74 +340,67 @@ def test_the_documented_takeover_records_the_shown_consent_then_resume_finishes(
     assert remote["refs/tags/v1.1.0"] == head and remote["refs/heads/main"] == head
 
 
-# ── K-120: WIP commit → re-plan → release → the approved push, one workflow ──
+# ── K-120 / section H: WIP committed by dct inside the ONE dialog, pushed ───
 
 
 @pytest.mark.parametrize("text", DIALOGS)
-def test_work_in_progress_is_committed_then_the_documented_run_releases_and_pushes(
-        text, engine, cli):
-    """The run the guard and the dialog protect: with uncommitted work the
-    workflow refuses (the refusal row points at Step 3 — the commit inside
-    the workflow); the agent commits it by the /commit procedure (trailer
-    from `dct clog candidates`), plans again, binds the selection, prepares,
-    applies — the documented commands, with the documented flags, the push
-    choice being the complete target the prepare showed (K-123) — and the
-    release commit and its tag are on the approved push target."""
+def test_work_in_progress_is_committed_by_the_documented_one_dialog_run_and_pushed(
+        text, engine, cli, tmp_path):
+    """The run the guard and the dialog protect, as section H runs it: with
+    uncommitted work the dialog reads the candidates, drafts the message
+    into a file, runs the DOCUMENTED preview (`--message-file`, an untracked
+    file the owner includes with `--include-untracked`) and, on "Release",
+    the DOCUMENTED `apply --consent` with the shown variant's digest — dct
+    commits the work (parent H0, the approved message, through the hooks),
+    releases it and pushes the release commit and the tag to the bound
+    target. One screen; the owner is never sent away to commit."""
     body = text()
     repo, run = cli
     commit(repo, "chore: base")                       # f.txt, tracked and clean
     eid = add_entry(engine, SLUG, "added", "wip feature")["id"]
     Path(repo, "f.txt").write_text("work in progress\n")
+    Path(repo, "notes.txt").write_text("the owner includes this\n")
+    h0 = git(repo, "rev-parse", "HEAD")
 
-    # Step 0 / 3: the plan shows the dirty index; prepare refuses it untouched
     plan = first_plan(body, run)
     assert plan["kind"] == "release" and plan["index"]["clean"] is False
-    assert plan["index"]["unstaged"] == ["f.txt"]
-    bind = documented(body, "plan", having=("--version", "--no-entries"))
-    _, bound = run(argv("plan", bind, {"--version": "1.1.0"}))
-    code, doc = run(argv("prepare", documented(body, "prepare", having=("--no-entries",)),
-                         {"--version": "1.1.0", "--plan-digest": bound["snapshot_digest"]}))
-    assert code == 1 and doc["outcome"] == "refused" and doc["details"]["unstaged"] == ["f.txt"]
-    assert "Step 3" in _refusal_rows(body)["unstaged"]
+    assert plan["pending_consent"] is None
 
-    # Step 3: the /commit procedure, performed by the agent in this workflow
     code, candidates = run(["clog", "candidates", "--json"])
     assert code == 0
-    offered = {e["id"] for key in ("confirmed", "uncertain") for e in candidates[key]}
-    assert eid in offered
-    head = commit(repo, f"feat: wip feature\n\nChangelog: {eid}\n")
+    assert eid in {e["id"] for key in ("confirmed", "uncertain") for e in candidates[key]}
+    message = tmp_path / "wip-message.txt"
+    message.write_text(f"feat: wip feature (v1.0.0)\n\nChangelog: {eid}\n")
 
-    # … then the plan AGAIN: the new HEAD is the candidate, the entry proven
-    plan = first_plan(body, run)
-    assert plan["index"]["clean"] is True and plan["checkout"]["candidate_sha"] == head
-    assert [e["id"] for e in plan["entries"]["proven"]] == [eid]
+    flags = documented(body, "prepare", having=("--preview", "--message-file"))
+    def published() -> tuple:
+        # what a preview must not change (its own slot in the projects row
+        # and its pin ref are storage, not publication)
+        return (git(repo, "rev-parse", "HEAD"), git(repo, "status", "--porcelain=v1",
+                                                    "--untracked-files=all"),
+                git(repo, "tag", "--list"), git(repo, "ls-remote", "origin"),
+                stamped_versions(engine), release_rows(engine))
 
-    # Steps 7–9 with the documented flags
-    values = {"--version": "1.1.0", "--entries": str(eid)}
-    _, bound = run(argv("plan", documented(body, "plan", having=("--version", "--entries")),
-                        values))
-    values["--plan-digest"] = bound["snapshot_digest"]
-    code, prepared = run(argv("prepare", documented(body, "prepare", having=("--entries",)),
-                              values))
-    assert code == 0 and prepared["outcome"] == "prepared"
+    before = published()
+    code, preview = run(argv("prepare", flags, {"--message-file": str(message),
+                                                "--include-untracked": "notes.txt"}))
+    assert code == 0 and preview["outcome"] == "preview", preview["details"]
+    assert published() == before                        # the preview publishes nothing
+    [shown] = [v for v in preview["details"]["variants"] if v["name"] == "shown"]
+    assert shown["consent"]["work"]["proves"] == [eid]
+    assert shown["consent"]["version"]["target"] == "1.1.0"   # added → minor, pre-selected
     url = git(repo, "remote", "get-url", "--push", "origin")
-    shown = prepared["details"]["push_target"]                # what the owner approves
-    assert shown == {"remote": "origin", "branch": "main", "url": url, "tag": "v1.1.0"}
-    values["--proposal-digest"] = prepared["details"]["proposal_sha256"]
-    # K-123: no documented apply pushes without the complete approved target —
-    # the dialog passes details.push_target.{remote,branch,url} of the prepare.
-    pushing = [flags for group, sub, flags in _commands(body)
-               if (group, sub) == ("release", "apply") and len(flags) > 1
-               and "--no-push" not in flags]
-    assert pushing and all(
-        {"--push-remote", "--push-branch", "--push-url"} <= set(flags) for flags in pushing)
-    values.update({"--push-remote": shown["remote"], "--push-branch": shown["branch"],
-                   "--push-url": shown["url"]})
-    code, doc = run(argv("apply", documented(body, "apply", having=("--entries",),
-                                             lacking=("--no-push",)), values))
-    assert code == 0 and doc["outcome"] == "completed"
+    assert shown["consent"]["push"] == {"mode": "push", "remote": "origin", "branch": "main",
+                                        "url": url, "tag": "v1.1.0"}
+
+    code, doc = run(argv("apply", documented(body, "apply", having=("--consent",)),
+                         {"--consent": shown["consent_digest"]}))
+    assert code == 0 and doc["outcome"] == "completed", doc["details"]
+    work = doc["details"]["made"]["work_commit"]
+    assert git(repo, "rev-parse", f"{work}^") == h0
+    assert git(repo, "log", "-1", "--format=%s", work) == "feat: wip feature (v1.0.0)"
+    assert git(repo, "show", "--name-only", "--format=", work).split() == ["f.txt", "notes.txt"]
     steps = {step["step"]: step for step in doc["steps"]}
     assert steps["push"]["result"] == "done" and steps["push"]["url"] == url
-    assert doc["details"]["push_target"]["url"] == url
-    assert_released(engine, repo, head, [eid],
+    assert_released(engine, repo, work, [eid],
                     section=released_section(record_date(engine), lines="- wip feature\n"))

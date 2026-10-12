@@ -9,38 +9,59 @@ description: >-
 # /pickup — Session Resume
 
 Open a new session by loading the previous session's handoff prompt + sprint
-state in ONE composed READ, then let the user decide what to do with the
-handoff before anything is written.
+state in ONE composed call, print the handoff for the user to read, then
+start on its next step — or ask what to do first when that step is not clear.
 
-No ToolSearch preload needed: `pickup_work` (and `get_item`) are alwaysLoad
-residents.
-
-The flow is TWO-PHASE by design: **read first, consume only after the user
-says so.** Consuming a handoff is a write on a ledger the user may want to
-keep for audit — /pickup never makes that call on its own.
+No ToolSearch preload needed for the main path: `pickup_work` (and
+`get_item`) are alwaysLoad residents. `get_handoff` and `list_handoffs` are
+deferred — load them lazily, only in the several-handoffs branch below.
 
 ## Workflow
 
-### Step 1: One composed read (CWD auto-detect)
+### Step 1: One composed call (CWD auto-detect)
+
+What the user said decides whether a handoff is consumed:
+
+- **An instruction to continue** — on an unambiguous "continue" / "pickup" /
+  "resume" (or `/pickup` itself) the call consumes the single matching
+  handoff (AUTO mode). Treating "resume" like "continue" is a proposed
+  refinement of the owner's decision, which named only "continue" — say so if
+  the user asks why it was consumed.
+- **A status question** — "where were we", "what's next", "what's the state"
+  → `pickup_work(project="", consume="false")`, a PURE READ, no `consumed_by`
+  needed: report the state and say that a handoff is waiting and that
+  "continue" picks it up. A request to only look ("show the handoff but keep
+  it", an audit) is the same read.
+- A word the user merely quotes or mentions ("what does "continue" do?") is
+  not a command; only a request addressed to you counts.
 
 ```
-mcp__dct__pickup_work(project="", consume="false")
+mcp__dct__pickup_work(project="", consume="",
+                      consumed_by="claude-<model_id> @ <project_slug> <iso_utc>Z")
 ```
 
-`consume="false"` makes this a PURE READ — nothing is written, so no
-`consumed_by` identity is needed (and passing `handoff_id` here is an error).
-One call returns everything Step 2 needs — never follow up with
-`review_sprint` / `list_handoffs` / `get_handoff`:
+`consume=""` is the server's AUTO mode. With exactly ONE matching unconsumed
+handoff it consumes that handoff in the same transaction, without a question —
+an unambiguous "continue" / "pickup" already says to pick it up — and returns
+it as `picked_up` with its FULL prompt (`consumed: true`). With several
+matching handoffs it consumes nothing and returns them in the `handoff`
+section (Step 2 asks which); with none, nothing is written. When the user
+names a workstream, pass `scope=<tag>` so only its handoffs match.
 
-- **`handoff.latest`** — the newest unconsumed handoff with its FULL prompt
-  (this is the text you show the user); `handoff.others` carries 200-char
-  previews of the rest; `handoff.pending_count` says how many are waiting.
-- **`picked_up: null` + `consumed: false`** — always, in this phase.
-- **`pending_count: 0`** — no handoff; go straight to the first-action question.
+One call returns everything Step 2 needs:
+
+- **`picked_up`** — the consumed handoff row with its FULL prompt (and
+  `context_summary`), or `null` when nothing was consumed.
+- **`handoff.latest`** — the newest matching handoff still unconsumed after
+  the call, with its FULL prompt; `handoff.others` carries 200-char previews
+  of every OTHER unconsumed handoff — of any scope, capped (`truncated:
+  true` when rows were left out).
+- **How many match** — with a scope, `handoff.scope_matched` (only this
+  workstream's unconsumed handoffs); without a scope, the global
+  `pending_count` of the `handoff` section (all of them). Never branch on `pending_count` when a scope was given.
 - **`sprint`** — ALL active sprints (`active_sprints`, `primary_sprint_id`),
   member items with `cp`, their `checkpoints` (the next pending checkpoint is
-  readable directly — no `get_item` needed for the plan preview),
-  `stale_in_progress`.
+  readable directly), `stale_in_progress`.
 - **`gates`** — pending gate checkpoints of in-sprint items; **`decisions`** —
   live ADRs/open questions with previews; **`summary`** — sprint_size,
   sprint_completion, handoffs_pending, gates_pending.
@@ -48,95 +69,133 @@ One call returns everything Step 2 needs — never follow up with
 **Fallback only when project is unresolved** (CWD not registered →
 `pickup_work` errors): call `mcp__dct__list_projects()` and ask via
 `AskUserQuestion` ("Which project are we working on?" → slugs + "Cancel"),
-then re-call `pickup_work(<slug>, consume="false")`.
+then re-call `pickup_work(<slug>, ...)` the same way.
 
-### Step 2: Merged decision — handoff + first action (TWO TURNS)
+### Step 2: Print the handoff, then start or decide
 
-When there is a handoff to show, the decision is TWO TURNS and this is
-NON-NEGOTIABLE. **Why: the `AskUserQuestion` dialog truncates and hides long
-text**, so a handoff prompt carried inside the question (or an option label,
-description or `preview`) is a prompt the user CANNOT read — they would be
-deciding on text they have never seen.
+A handoff to show is ALWAYS printed in full as plain message text, never
+inside a dialog — this is NON-NEGOTIABLE. **Why: the `AskUserQuestion`
+dialog truncates and hides long text**, so a handoff prompt carried inside
+the question (or an option label, description or `preview`) is a prompt the
+user CANNOT read.
 
-**Turn 1 — print the handoff prompt(s) as plain message text, nothing else.**
-No tool call in this turn. Emit the FULL `handoff.latest.prompt` verbatim (and
-its `context_summary` if present), clearly delimited, with the header line
-`Handoff #N [scope: X] from <created_at> by <created_by>`:
+Whether the printing is a turn of its own depends on whether the user must
+decide something after reading it:
+
+- **The auto-start path — no question follows** (one handoff consumed on an
+  unambiguous "continue", Step 4 below): print the handoff and continue in
+  the same turn — check its next step (`get_item`, the pending `gates`) and
+  start on it. A turn that only prints would make the user answer when there
+  is nothing to decide. When that check finds the step stale,
+  contradictory or unclear, end the turn after the printed handoff and ask
+  the first action in the next turn — the dialog never shares a turn with
+  the text it refers to.
+- **The user must decide** (several matching handoffs, Step 3): the printed
+  text is its own turn, before the question.
+
+**Turn 1 — print the handoff prompt(s) as plain message text, nothing else**
+— when a question follows: no tool call in this turn, the dialog comes in
+the next one. Emit the FULL prompt verbatim — `picked_up.prompt`
+when one was consumed, otherwise `handoff.latest.prompt` — (and its
+`context_summary` if present), clearly delimited, with the header line
+`Handoff #N [scope: X] from <created_at> by <created_by>` (add `— consumed`
+when it was):
 
 ```
-Handoff #N [scope: X] from <created_at> by <created_by>
+Handoff #N [scope: X] from <created_at> by <created_by> — consumed
 --- BEGIN HANDOFF PROMPT ---
 <the full prompt text, verbatim>
 --- END HANDOFF PROMPT ---
 ```
 
-With `pending_count >= 2`, print the newest in full the same way and list the
-others as their `handoff.others` previews (`#N [scope] — <preview>`), one per
-line.
+**Several matching handoffs** (nothing consumed; the count from Step 1 ≥ 2):
+offer only the matching ones — with a scope, only handoffs of that scope,
+never another workstream's. Print the newest in full the same way and list
+the others as `#N [scope] — <preview>`, one per line. When `handoff.others`
+is truncated, or holds fewer matching rows than the count says, the list is
+not complete: fetch it first with `mcp__dct__list_handoffs(project="")`
+(unconsumed, previews; keep only the matching scope) and list from that.
 
-**Turn 2 — ONE `AskUserQuestion` that REFERENCES what was printed and contains
-NONE of its content.** Handle the handoff decision AND the first-action
-decision in that SINGLE call; keep every question, option label and description
-short and self-contained.
+### Step 3: Several handoffs — pick the id, read it in full, then continue
 
-**Question 1 — handoff** (branch on Step 1's `pending_count`):
-- If exactly ONE handoff (`pending_count == 1`) — the user decides whether it
-  is followed AND whether it gets consumed:
-  - question: "Pick up handoff #N shown above?"
-  - options:
-    - "Consume and follow" (recommended) — mark it consumed, work its plan
-    - "Follow but keep unconsumed (audit)" — work its plan, leave the row
-      pending so another session/reviewer still sees it
-    - "Start fresh" — ignore its plan; nothing is consumed
-- If several handoffs (`pending_count >= 2`):
-  - question: "N handoffs listed above. Which to pick up?"
-  - options: one per handoff — `#N [scope]` (id only; the previews were
-    printed in Turn 1) — plus "None — start fresh"
-- If `pending_count: 0` — skip Question 1 entirely AND skip Turn 1: with
-  nothing to read, ask the first-action question directly.
+**Turn 2 — ONE `AskUserQuestion`, only "which handoff"** (never together with
+the first action — that is decided only after the chosen handoff was read):
+- question: "N handoffs listed above. Which one?"
+- options: "Continue #N (shown in full above)" for the newest; "Show #M in
+  full" for each other one (id only — the previews were printed in Turn 1);
+  "None — start fresh".
 
-**Question 2 — first action** (always present):
-- question: "First action for this session?"
-- options:
-  - "Open #<first-sprint-item> and start on its checkpoints"
-  - "Review all sprint items first"
-  - "Look at stale in_progress first (#X)"
-  - "Something else — tell me what"
+A choice made from a 200-char preview is no consent to run a plan nobody has
+read:
 
-**Empty-sprint variants** — replace Question 2's options when the sprint is empty:
-- Sprint empty BUT open items exist: "Pick sprint items now — run /handoff" / "Browse open items — /track-list" / "Just start working — I'll tell you what".
-- Sprint empty AND no open items: "Create the first item — run /track" / "Import existing tracking data — run /dct-import" / "Exit — not the right project".
-
-### Step 3: Act on the answers (ONE parallel message)
-
-- User chose "Consume and follow" (single handoff) or picked #N among several →
+- **"Show #M in full"** (or "show the older one") → `mcp__dct__get_handoff(M)`
+  — a read, without consuming it — and print its full prompt (and
+  `context_summary`) the Turn 1 way. Then ask ONE question: "Continue #M
+  shown above?" → "Continue #M" / "Back to the list" / "None — start fresh".
+  Showing it stays a read: nothing is consumed by it.
+- **"Continue #N"** — an unambiguous instruction to continue a handoff the
+  user has read in full → only now consume it:
   ```
   mcp__dct__pickup_work(project="", consume="true", handoff_id=N,
                         include="none",
                         consumed_by="claude-<model_id> @ <project_slug> <iso_utc>Z")
   ```
-  `include="none"` makes the consume call cheap (no snapshot re-read) —
-  Step 1 already delivered the state.
-- User chose "Open #X" → `mcp__dct__get_item(X)` — BATCH it in the SAME
-  parallel message as the consume call above.
-- "Follow but keep unconsumed (audit)" → write nothing; work the plan you
-  already read in Step 1.
-- "Start fresh" / "None — start fresh" → consume nothing; optionally
-  `delete_handoff(id)` (deferred tool — load only if the user explicitly
-  wants a discard).
+  `include="none"` keeps the consume cheap (Step 1 already delivered the
+  state). Then Step 4.
+- **"None — start fresh"** → consume nothing; optionally `delete_handoff(id)`
+  (deferred tool — load only if the user explicitly wants a discard).
 
-Then show the sprint items as a compact table (from `sprint.items`) plus
-summary: sprint_size, sprint_completion, handoffs_pending, and the opened
-item's pending checkpoints (from `sprint.checkpoints`) as the next-step plan.
+### Step 4: The first step — start it, or ask
 
-### Step 4: Report
+After a handoff was consumed on an instruction to continue, read the next step
+it names: an item id or a pending checkpoint. Check it against the CURRENT
+state before acting — `mcp__dct__get_item(X)` (its status, its checkpoints)
+and the pending `gates` of the snapshot.
+
+- **The step is concrete and still current** (the item is open or
+  in_progress, the checkpoint pending, no gate in its way, and nothing the
+  user said in this session points elsewhere) → start on it at once, without
+  a question, and say so: `Starting with #22 — "<next pending checkpoint>";
+  tell me if you want something else.`
+- **The step is stale, contradictory or unclear** (the item is resolved, the
+  checkpoint done, a gate blocks it, two handoffs disagree, the user asked for
+  something else, or no step is named) → ask the first action — ONE
+  `AskUserQuestion` that only references what was printed:
+  - question: "First action for this session?"
+  - options: "Open #<first-sprint-item> and start on its checkpoints" /
+    "Review all sprint items first" / "Look at stale in_progress first (#X)" /
+    "Something else — tell me what".
+
+An old handoff is no new consent: a commit, a push, publishing a release or
+any destructive step written in its text still waits for the user's own
+instruction in this session (and for the consent the skill that performs it
+asks for). The handoff names the work, not a permission — and it never
+overrides what the user asks for now.
+
+With no handoff at all (or "None — start fresh"), ask the first action the
+same way. **Empty-sprint variants** — replace its options when the sprint is
+empty:
+- Sprint empty BUT open items exist: "Pick sprint items now — run /handoff" / "Browse open items — /track-list" / "Just start working — I'll tell you what".
+- Sprint empty AND no open items: "Create the first item — run /track" / "Import existing tracking data — run /dct-import" / "Exit — not the right project".
+
+Show the sprint items as a compact table (from `sprint.items`) plus summary:
+sprint_size, sprint_completion, handoffs_pending, and the opened item's
+pending checkpoints (from `sprint.checkpoints`) as the next-step plan.
+
+### Step 5: Report
 
 ```
-✓ Picked up handoff #N (consumed | left unconsumed for audit)
+✓ Picked up handoff #N (consumed)
   Sprint: 3 items, 1/3 done
-  Starting: #22 — "Optimize MCP response format"
+  Starting with #22 — "Optimize MCP response format"
   Plan: 4 pending checkpoints in this item
 ```
+
+The first line names the consumed handoff by its id (`#N`): the consume
+happened without a question, so this is where the user sees it. Consuming only
+marks the handoff read — the row and its prompt stay in the ledger. Nothing
+consumed → `✓ No handoff consumed` (or `left unconsumed` after a read-only
+look).
 
 If the project has plans with pending checkpoints, mention that
 **`/plan-status` shows overall plan progress** — a good next call when planned
@@ -146,29 +205,29 @@ work is in flight.
 
 - **Every decision is an `AskUserQuestion`.** No plain-text Y/N prompts.
 - **Long text NEVER goes inside an `AskUserQuestion`.** The dialog truncates
-  and hides it. A handoff prompt, context_summary or snapshot the user must
-  read is printed as plain message text in its own turn FIRST; the dialog that
-  follows only references it ("shown above") with short, self-contained
-  options.
-- **Consumption happens ONLY after the dialog.** Step 1 is always
-  `consume="false"`; NEVER pass `consume="true"` without a user-chosen
-  `handoff_id` or an explicit user instruction.
-- `consume=""` (auto) and the CLI's `--consume always` are for AUTONOMOUS
-  flows (Codex, CI, unattended agents) where no human can be asked — never
-  this skill.
-- Race note: a parallel session may consume the same handoff between Step 1
-  and Step 3. A server-selected consume then degrades to `consumed: false`
-  (no error) — just proceed with the fresh snapshot. An explicit `handoff_id`
-  (this skill's path) instead errors "not found or already consumed": report
-  it verbatim, keep the plan you already read in Step 1, and do NOT retry in
-  a loop.
+  and hides it. Before a dialog, a handoff prompt, context_summary or snapshot
+  the user must read is printed as plain message text in its own turn FIRST;
+  the dialog that follows only references it ("shown above") with short,
+  self-contained options. With no dialog to follow (the auto-start path of
+  Step 4) the handoff is printed and the work starts in the same turn.
+- **Two consumes, nothing else.** The Step 1 AUTO consume of the single
+  matching handoff on an instruction to continue, and `consume="true",
+  handoff_id=N` for the handoff the user chose to continue after reading it in
+  full. A status question or a request to only look is `consume="false"`.
+  Never auto-pick among several handoffs, and never consume one that was only
+  previewed.
+- Race note: a parallel session may consume the same handoff first. The AUTO
+  consume then degrades to `consumed: false` (no error) — proceed with the
+  fresh snapshot. An explicit `handoff_id` instead errors "not found or
+  already consumed": report it verbatim, keep the plan you already read, and
+  do NOT retry in a loop.
 - On empty sprint + no handoffs, don't force-create a sprint — ask user what to do.
 - Show resolved items (they surface via `summary.sprint_completion` and
   `recent_changes`) only as context, not as work candidates.
 - `consumed_by` MUST mirror /handoff's `created_by` format:
-  `claude-<model_id> @ <project_slug> <iso_utc>Z` — required on the Step 3
-  consume, meaningless (and unnecessary) on the Step 1 read.
-- Round-trip budget: 2 dct calls — the Step 1 read plus the Step 3 consume,
-  with `get_item` batched into the same parallel message. No handoff to
-  consume (or "keep unconsumed") = 1 call. If you find yourself calling
-  `review_sprint` or `get_handoff` here, you are off the rails.
+  `claude-<model_id> @ <project_slug> <iso_utc>Z` — required on every call
+  that may consume, unnecessary on a `consume="false"` read.
+- Round-trip budget: 1 dct call — the Step 1 call, with `get_item` batched
+  after it. The several-handoffs branch adds what it needs: `list_handoffs`
+  only for an incomplete list, `get_handoff` for each handoff shown in full,
+  and the Step 3 consume. `review_sprint` is never needed here.

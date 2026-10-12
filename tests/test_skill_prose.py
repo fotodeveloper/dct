@@ -5,6 +5,8 @@ turn, then a dialog whose options only REFERENCE it. The owner's
 AskUserQuestion dialog truncates long text, so a draft embedded in the
 question is a draft nobody can read before approving it."""
 
+import re
+
 from dct.assets import skills_dir
 
 
@@ -16,7 +18,10 @@ def test_handoff_prints_the_draft_before_asking():
     text = _skill("handoff")
     assert "Turn 1 — print the draft as plain message text" in text
     assert "NEVER embed draft content in the question" in text
-    assert "Save the draft shown above as-is" in text
+    # #877: the one question is Save / Change / Cancel; its Save option
+    # refers to the draft printed above instead of carrying it.
+    assert re.search(r'"Save\b[^"\n]*"', text), "no Save option"
+    assert "shown above" in text
 
 
 def test_pickup_prints_the_handoff_before_asking():

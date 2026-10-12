@@ -10,9 +10,11 @@ description: >-
 
 ## Type triggers — natural language → item_type
 
-Map the phrase the user actually used to the closest type. Do NOT ask
-about type unless the phrase is genuinely ambiguous. When in doubt, prefer
-`todo` (the most neutral bucket).
+Map the phrase the user actually used to the closest type. No type cue in
+the phrase → `todo` (the most neutral bucket), without a question. Ask about
+the type only when the phrase is genuinely ambiguous — it carries cues for two
+different types ("a bug, or maybe a new feature?") — and the choice changes
+the scope of the work; otherwise pick the closer type and write.
 
 | User says (EN / PL) | item_type | When to pick |
 |---|---|---|
@@ -34,12 +36,16 @@ about type unless the phrase is genuinely ambiguous. When in doubt, prefer
 
 ## Workflow
 
-### Step 1: Infer type, then gather rest
+### Step 1: Infer the fields
 
 From the conversation context, determine:
 
-- **project**: Detect from CWD using `mcp__dct__list_projects()` (longest path prefix), or ask if ambiguous
-- **item_type**: Infer from the user's phrasing per the table above
+- **project**: Detect from CWD using `mcp__dct__list_projects()` (longest path
+  prefix); ask only when the project is ambiguous (CWD not registered, or
+  several projects fit)
+- **item_type**: Infer from the user's phrasing per the table above; no type
+  cue → `todo` without a question; ask about the type only when the phrase
+  carries cues for two different types and the choice changes the scope
 - **title**: Concise summary (max ~80 chars)
 - **short_title**: Label — a 2-4 word English noun phrase naming what the item
   is about (≤ 50 chars; no item number, no project name), e.g. "Windows hook
@@ -59,59 +65,39 @@ From the conversation context, determine:
   `mcp__dct__add_tag(name=..., force=true)` first, then retry the create. The
   refusal rolls the whole create back, so no orphan item is left behind.
 
-### Step 2: Confirm with user
+### Step 2: Create — no confirmation question
 
-Present the proposed item (short form — no wall of JSON):
+An unambiguous instruction ("track this bug", "dodaj ficzer: dark mode")
+creates the item without a confirmation question: call
+`mcp__dct__create_item(project, item_type, title, short_title, ...)` at once
+with all fields. A wrong field is cheap to fix afterwards, so the
+acknowledgement (Step 3) is the check, not a question before the write.
 
-```
-Track this?
-  Type:     issue
-  Priority: P1
-  Label:    Parser empty-file crash
-  Title:    Parser crashes on empty files
-  File:     cmd/parse.go:42-58
-  Tags:     parser, crash
-```
-
-Show the tags as they will be STORED (normalized — trimmed and lowercased), so
-the user confirms what actually lands in the dictionary.
-
-Wait for confirmation or corrections. If user said "just add it" or similar,
-skip confirmation.
-
-### Step 3: Create
-
-Call `mcp__dct__create_item(project, item_type, title, short_title, ...)` with
-all fields.
 Verify the ack echoes `short_title` (the stored label; null when none). A
 MISSING `short_title` key means the MCP server's contract is older than this
 skill: report an unsupported (outdated) server contract and ask the user to
 restart the MCP server (or upgrade dct). Do NOT retry `create_item` — the item
 was created; a retry would duplicate it — and do not claim the label was
 saved.
-**REMEMBER the returned `id`** — needed for any follow-up (add_checkpoint,
-update_item, resolve_item).
+**REMEMBER the returned `id`** — needed for any follow-up (update_item,
+resolve_item, add_checkpoint).
 
-### Step 4: Sketch checkpoints (feature / improvement only)
+No checkpoints at creation: the plan comes when work on the item starts —
+`/track-update` "start working on #N" (status → `in_progress`) proposes at
+least 3 checkpoints when the work is a non-trivial feature or improvement, or
+when the user asks to break the work down. Add them now only when the user
+asks for that breakdown.
 
-If `item_type` ∈ {feature, improvement}, IMMEDIATELY after create_item,
-call `add_checkpoint` 3-7 times to break the work into concrete steps.
-Do this BEFORE starting any code. Remember each checkpoint id.
-
-Skip for `issue`, `todo`, `idea` unless the user explicitly asks for a
-checkpoint breakdown.
-
-### Step 5: Report
+### Step 3: Acknowledge in one line
 
 ```
 ✓ #42 issue/P1 [Parser empty-file crash] — Parser crashes on empty files
 ```
 
-For feature/improvement with checkpoints:
-```
-✓ #43 feature/P2 [Dark mode] — Dark mode
-  Checkpoints: 5 (ready to track)
-```
+One line: what was created (id, type, priority, label, title; tags as
+STORED — trimmed and lowercased — when any were set). To correct a
+field, `/track-update #42` (`update_item`); an item that should not exist is
+closed with `/track-resolve` as `wont_fix`.
 
 ## Priority mapping
 
@@ -130,10 +116,11 @@ would bury a P1 in the backlog.
 
 ## Rules
 
-- **Never ask about type** if the phrase maps cleanly per the table. Claude's
-  job is to read the language, not interrogate the user.
-- **Never silently create** — always show the draft and wait for confirmation
-  (exception: user explicitly waived with "just add it", "szybko", "don't ask").
+- **Never ask about type** if the phrase maps cleanly per the table, or
+  carries no type cue at all (→ `todo`). Claude's job is to read the
+  language, not interrogate the user.
+- **No confirmation question on an unambiguous instruction** — create, then
+  acknowledge in one line with how to correct it. A question stays only for
+  what the skill genuinely cannot tell: a type between two cued types that
+  changes the scope, or the project.
 - **REMEMBER the returned id** — it's the handle for every future operation.
-- **Checkpoints are mandatory for feature/improvement** — the visible
-  plan is the contract. No "I'll add them later" — add before coding.

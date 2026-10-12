@@ -366,7 +366,41 @@ def get_item(engine: sa.Engine, item_id: int) -> dict | None:
     return d
 
 
+def _refuse_pending_gates_conn(conn: sa.Connection, item_id: int) -> None:
+    """The ONE gate guard of every terminal transition — resolve_item and
+    update_item(status='resolved'|'wont_fix') alike, so no client (MCP, CLI,
+    core) can close an item past a pending gate. Raises ValueError while any
+    gate checkpoint of the item is pending; never rejects a gate itself.
+
+    It runs on the caller's connection, inside the transaction that writes
+    the status: the refusal rolls back everything the call would write
+    (fields, tags, reason note) and no separate transaction opens a gap
+    between the check and the write."""
+    from dct.core.checkpoints import pending_gates_conn
+
+    pending_gates = pending_gates_conn(conn, item_id)
+    if pending_gates:
+        gate_summary = ", ".join(f"#{g['id']} [{g['kind']}]" for g in pending_gates[:3])
+        more = f" (+{len(pending_gates) - 3} more)" if len(pending_gates) > 3 else ""
+        raise ValueError(
+            f"Cannot resolve item #{item_id}: {len(pending_gates)} gate checkpoint(s) "
+            f"pending — {gate_summary}{more}. Complete them (done) or reject them "
+            f"(not applicable) before resolving. See CLAUDE.md 'Gate checkpoints'."
+        )
+
+
 def update_item(engine: sa.Engine, item_id: int, **kwargs) -> dict | None:
+    """Update the given fields of item `item_id` → the full item dict, or None
+    for an unknown / soft-deleted id. `reason` (optional, non-blank) is the
+    WHY of the change: appended as an item note in the SAME transaction as
+    the update, so a refused update (invalid field, refused tag, unknown
+    item) leaves no orphan note and a reason alone is no update (ValueError,
+    like any call without a field to change).
+
+    A terminal `status` (resolved / wont_fix) runs the same gate guard as
+    resolve_item (_refuse_pending_gates_conn) in the update's transaction:
+    with a gate checkpoint pending the whole call is refused (ValueError) —
+    no field, tag or note is written."""
     # v0.2+ guard: direct writes to `in_current_sprint` are forbidden.
     # The boolean is now derived from item_sprints; callers must use
     # assign_item_to_sprint / remove_item_from_sprint instead. Internal
@@ -384,6 +418,9 @@ def update_item(engine: sa.Engine, item_id: int, **kwargs) -> dict | None:
     # only an explicit list (including []) replaces them.
     tags = kwargs.pop("tags", None)
     force_tags = kwargs.pop("force_tags", False)
+    reason = kwargs.pop("reason", None)
+    if reason is not None and not reason.strip():
+        raise ValueError("reason cannot be empty")
 
     allowed = {"title", "short_title", "description", "priority", "status", "component", "source_file", "source_lines", "resolution", "item_type"}
     values = {}
@@ -434,6 +471,10 @@ def update_item(engine: sa.Engine, item_id: int, **kwargs) -> dict | None:
         ).first()
         if exists is None:
             return None
+        # Gate guard BEFORE any write, in this transaction: a refusal raises
+        # out of the `begin()` block, so nothing of this call is committed.
+        if values.get("status") in TERMINAL_STATUSES:
+            _refuse_pending_gates_conn(conn, item_id)
         # K-37: the UPDATE repeats the soft-delete guard. The SELECT above is a
         # separate statement, so without it a concurrent delete_item between the
         # two would let this write resurrect a soft-deleted row.
@@ -446,6 +487,8 @@ def update_item(engine: sa.Engine, item_id: int, **kwargs) -> dict | None:
             return None
         if tags is not None:
             set_item_tags_conn(conn, item_id, tags, force=force_tags, now=now)
+        if reason is not None:
+            conn.execute(item_notes.insert().values(item_id=item_id, note=reason))
 
     return get_item(engine, item_id)
 
@@ -461,6 +504,8 @@ def resolve_item(
     Gate check: if any pending gate checkpoint exists for this item
     (kind not in {'task','cc-task'}, status='pending'), raises ValueError.
     Gates must be explicitly completed (done) or rejected (not applicable).
+    The check (_refuse_pending_gates_conn — shared with update_item's
+    terminal transitions) runs in the transaction that writes the status.
 
     Dogfood gate rationale: user-facing features (new skills, CLI commands,
     MCP tools) carry a `kind='dogfood'` checkpoint as their last one — this
@@ -468,19 +513,7 @@ def resolve_item(
     not just self-reviewed by the implementer. See CLAUDE.md "Gate
     checkpoints" section.
     """
-    from dct.core.checkpoints import list_pending_gates
-
     _validate_enum(status, TERMINAL_STATUSES, "resolve status")
-
-    pending_gates = list_pending_gates(engine, item_id)
-    if pending_gates:
-        gate_summary = ", ".join(f"#{g['id']} [{g['kind']}]" for g in pending_gates[:3])
-        more = f" (+{len(pending_gates) - 3} more)" if len(pending_gates) > 3 else ""
-        raise ValueError(
-            f"Cannot resolve item #{item_id}: {len(pending_gates)} gate checkpoint(s) "
-            f"pending — {gate_summary}{more}. Complete them (done) or reject them "
-            f"(not applicable) before resolving. See CLAUDE.md 'Gate checkpoints'."
-        )
 
     now = datetime.now(UTC)
     values: dict = {
@@ -492,6 +525,7 @@ def resolve_item(
         values["resolution"] = resolution
 
     with engine.begin() as conn:
+        _refuse_pending_gates_conn(conn, item_id)
         result = conn.execute(items.update().where(items.c.id == item_id, items.c.deleted_at.is_(None)).values(**values))
         if result.rowcount == 0:
             return None

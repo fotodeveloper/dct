@@ -112,7 +112,11 @@ its readers and writers. So does the PENDING version-file proposal (K-76:
 set_pending_proposal, read by get_pending_proposal) — consumed by the stamp
 that names its digest (changelog.release_entries consume_proposal), which
 records it as the record's `proposal` and its paths as the contract
-(store_version_files) in the stamp transaction.
+(store_version_files) in the stamp transaction. Beside it the PREVIEW slot
+(`projects.release_preview`, set_preview / get_preview / discard_preview /
+record_preview_progress): the consent views of the one-dialog release
+(`dct release prepare --preview`), each keyed by its digest C
+(consent_view_digest); a preview and a prepare replace each other's slot.
 """
 
 import json
@@ -786,7 +790,7 @@ def proposal_digest(proposal: Mapping) -> str:
 
 CONSENT_KEYS = frozenset({
     "candidate_sha", "entry_ids", "version", "proposal_sha256", "render", "push_target",
-    "executor", "takeover",
+    "executor", "takeover", "content_sha256", "changelog_sha256",
 })
 PUSH_TARGET_KEYS = frozenset({"remote", "url", "branch", "tag"})
 # K-119 M3: what a TAKEOVER consent names as verified besides the consent's
@@ -905,7 +909,10 @@ def check_record_consistency(state: Mapping) -> None:
       consent that names none, is a contradiction; `takeover` (K-119 M3,
       when the consent carries one) names the record's release commit, the
       manifest's tree and artifacts_digest of the recorded manifest
-      (`state["manifest"]`);
+      (`state["manifest"]`); `content_sha256` (the approved consent view)
+      only beside a `proposal_sha256` — the view binds a proposal;
+      `changelog_sha256` (the approved composition) only beside a recorded
+      proposal that approves a changelog file (its `changelog` baseline);
     - proposal ↔ record: its `version`, `candidate_sha` and `release_mode`
       (each when bound) are the record's;
     - tag_proof: only on a record with git; its `commit` is the record's
@@ -928,6 +935,13 @@ def check_record_consistency(state: Mapping) -> None:
     candidate, commit = state.get("candidate_sha"), state.get("release_commit_sha")
     mode = state.get("release_mode")
     if consent is not None:
+        if consent.get("content_sha256") is not None and consent.get("proposal_sha256") is None:
+            raise refuse("consent.content_sha256 names an approved consent view but the "
+                         "consent names no proposal (proposal_sha256 is null)")
+        if consent.get("changelog_sha256") is not None and (proposal is None or
+                                                            proposal.get("changelog") is None):
+            raise refuse("consent.changelog_sha256 binds a changelog composition but the "
+                         "recorded proposal approves no changelog file")
         if not same_version(consent["version"], version):
             raise refuse(f"consent.version {consent['version']} is not the record's version")
         if sorted(consent["entry_ids"]) != sorted(state["entry_ids"]):
@@ -1071,8 +1085,18 @@ def validate_consent(consent: Mapping | None) -> dict | None:
     the consent of take_over_release: what was VERIFIED when the owner
     handed an existing release to dct, {"release_commit_sha": the verified
     release commit, "tree": its tree, "artifacts_sha256": artifacts_digest
-    of the verified manifest} — all three required, FULL ids).
-    ≤ CONSENT_MAX_BYTES of canonical JSON. ValueError / TypeError
+    of the verified manifest} — all three required, FULL ids) and the
+    OPTIONAL "content_sha256" (kept only when given — the digest C of the
+    consent VIEW the owner approved on the one-dialog screen, `dct release
+    prepare --preview`; hex SHA-256, lowercased; a consent that names it
+    must also name its proposal_sha256, check_record_consistency) and the
+    OPTIONAL "changelog_sha256" (kept only when given — the sha256 of the
+    composed changelog file in its work-tree form the owner approved on that
+    screen, consent view `changelog.composed_sha256`; the file write after
+    the stamp and every resume refuse another composition — so released
+    history imported between the stamp and the write never lands unseen;
+    consents recorded before it, and those that approved no changelog file,
+    carry none and are not checked). ≤ CONSENT_MAX_BYTES of canonical JSON. ValueError / TypeError
     otherwise."""
     if consent is None:
         return None
@@ -1094,6 +1118,11 @@ def validate_consent(consent: Mapping | None) -> dict | None:
         out["executor"] = validate_executor(consent["executor"])
     if consent.get("takeover") is not None:
         out["takeover"] = _takeover(consent["takeover"])
+    for key in ("content_sha256", "changelog_sha256"):
+        value = consent.get(key)
+        if value is not None:
+            out[key] = _digest(value.lower() if isinstance(value, str) else value,
+                               f"consent.{key}")
     ensure_json_fits(out, "consent", CONSENT_MAX_BYTES)
     return out
 
@@ -1148,6 +1177,20 @@ def live_records(conn: sa.Connection, project_id: int) -> list:
     ).all())
 
 
+def record_versions(engine: sa.Engine, project_slug: str) -> list[str]:
+    """The version of EVERY live release record of the project, whatever its
+    status — `abandoned` included (an abandoned version stays taken) —
+    oldest id first, as stored. Read-only; the release plan's version
+    suggestion skips these versions."""
+    with engine.begin() as conn:
+        pid = resolve_project_id(conn, project_slug)
+        return list(conn.execute(
+            sa.select(releases.c.version).where(
+                releases.c.project_id == pid, releases.c.deleted_at.is_(None)
+            ).order_by(releases.c.id)
+        ).scalars())
+
+
 def find_records(conn: sa.Connection, project_id: int, version: str) -> list:
     """EVERY live record of `version` under the version contract (1.1 ==
     1.1.0 == v1.1), oldest id first. More than one is an AMBIGUOUS ledger
@@ -1191,14 +1234,21 @@ def unique_record(conn: sa.Connection, project_id: int, project_slug: str, versi
 
 def project_release_settings(conn: sa.Connection, project_id: int) -> dict:
     """The project's release settings read on the caller's connection:
-    {executor ('dct' | 'own', K-85), render ({"pr_refs": bool}, K-90)}."""
+    {executor ('dct' | 'own', K-85), render ({"pr_refs": bool}, K-90),
+    changelog (the settings that choose the changelog file —
+    core.changelog_file.choice_settings: {managed, explicit, path})}."""
+    from dct.core.changelog_file import choice_settings
+
     row = conn.execute(
-        sa.select(projects.c.release_executor, projects.c.changelog_pr_refs)
+        sa.select(projects.c.release_executor, projects.c.changelog_pr_refs,
+                  projects.c.manages_changelog, projects.c.changelog_path,
+                  projects.c.changelog_path_explicit)
         .where(projects.c.id == project_id)
     ).first()
     return {
         "executor": row.release_executor or DEFAULT_EXECUTOR,
         "render": {"pr_refs": bool(row.changelog_pr_refs)},
+        "changelog": choice_settings(row._mapping),
     }
 
 
@@ -2275,15 +2325,23 @@ def set_pending_proposal(engine: sa.Engine, project_slug: str, proposal: Mapping
     REPLACES an earlier pending proposal (only the latest one can be
     approved; its digest differs whenever its content does). Being pending
     is not an approval: only the stamp that names its digest consumes it
-    (changelog.release_entries consume_proposal). Returns {"proposal",
-    "proposal_sha256"}."""
+    (changelog.release_entries consume_proposal). The SAME transaction
+    clears the project's preview slot (`dct release prepare --preview`,
+    set_preview): a prepare and a preview replace each other. Returns
+    {"proposal", "proposal_sha256"} plus "replaced_preview" (the cleared
+    slot, for the caller to release its resources) when there was one."""
     canonical = validate_proposal(proposal)
     if canonical is None:
         raise TypeError("proposal must be a JSON object")
     with project_transaction(engine, project_slug, write=True) as (conn, pid):
+        replaced = read_preview(conn, pid)
         conn.execute(projects.update().where(projects.c.id == pid).values(
-            release_proposal=_canonical(canonical), updated_at=datetime.now(UTC)))
-    return {"proposal": canonical, "proposal_sha256": proposal_digest(canonical)}
+            release_proposal=_canonical(canonical), release_preview=None,
+            updated_at=datetime.now(UTC)))
+    out = {"proposal": canonical, "proposal_sha256": proposal_digest(canonical)}
+    if replaced is not None:
+        out["replaced_preview"] = replaced
+    return out
 
 
 def get_pending_proposal(engine: sa.Engine, project_slug: str) -> dict | None:
@@ -2304,18 +2362,26 @@ def read_pending_proposal(conn: sa.Connection, pid: int) -> dict | None:
 def live_proposals(engine: sa.Engine) -> list[dict]:
     """Every proposal that is still NEEDED, across ALL projects (K-117 —
     dct's release blob store is shared by them): each live project's
-    PENDING proposal and the proposal of every live release record that is
-    not terminal (completed / abandoned). → [{"project" (slug), "version"
-    (None for a pending proposal), "proposal"}]. Read-only. What a cleanup
-    of a finished proposal's resources must keep: anything one of these
-    still names."""
+    PENDING proposal, the proposal content of every variant of its preview
+    slot (set_preview — no id, no candidate) and the proposal of every live
+    release record that is not terminal (completed / abandoned). →
+    [{"project" (slug), "version" (None for a pending proposal or a
+    preview), "proposal"}]. Read-only. What a cleanup of a finished
+    proposal's resources must keep: anything one of these still names."""
     out: list[dict] = []
     with engine.begin() as conn:
-        for slug, text in conn.execute(
-                sa.select(projects.c.slug, projects.c.release_proposal).where(
+        for slug, pending, preview in conn.execute(
+                sa.select(projects.c.slug, projects.c.release_proposal,
+                          projects.c.release_preview).where(
                     projects.c.deleted_at.is_(None),
-                    projects.c.release_proposal.isnot(None))):
-            out.append({"project": slug, "version": None, "proposal": json.loads(text)})
+                    sa.or_(projects.c.release_proposal.isnot(None),
+                           projects.c.release_preview.isnot(None)))):
+            if pending is not None:
+                out.append({"project": slug, "version": None, "proposal": json.loads(pending)})
+            if preview is not None:
+                out.extend({"project": slug, "version": None,
+                            "proposal": variant["proposal_content"]}
+                           for variant in json.loads(preview)["variants"].values())
         for slug, version, text in conn.execute(
                 sa.select(projects.c.slug, releases.c.version, releases.c.proposal)
                 .select_from(releases.join(projects, releases.c.project_id == projects.c.id))
@@ -2330,3 +2396,410 @@ def clear_pending_proposal(conn: sa.Connection, pid: int) -> None:
     consumed it)."""
     conn.execute(projects.update().where(projects.c.id == pid).values(release_proposal=None))
 
+
+
+# ── the project's PREVIEW slot (`dct release prepare --preview`) ─────────────
+#
+# The one-dialog release: `prepare --preview` computes, for each variant it
+# offers ("shown", and "all" — the shown one plus every waiting entry
+# attested), the CONSENT VIEW — exactly the release content the owner
+# approves on one screen — and stores the variants here
+# (projects.release_preview), keyed by the view's digest C
+# (consent_view_digest). Being stored is not an approval: `apply --consent
+# C` re-derives the view and stamps only when it is still C. A preview and
+# a prepare replace each other's slot (set_preview clears the pending
+# proposal; set_pending_proposal clears the slot).
+
+PREVIEW_MAX_BYTES = 262144
+PREVIEW_KEYS = frozenset({"id", "created_at", "base", "work", "variants", "pin", "progress"})
+PREVIEW_BASE_KEYS = frozenset({"head", "ref", "checkout_root"})
+PREVIEW_WORK_KEYS = frozenset({"index_before", "paths_state", "untracked_included", "message"})
+PREVIEW_VARIANT_KEYS = frozenset({"name", "consent", "proposal_content"})
+PREVIEW_VARIANTS = ("shown", "all")
+PREVIEW_PROGRESS_KEYS = frozenset({"work_commit", "attest_commit", "consent"})
+# validate_proposal's shape minus what binds a proposal to one candidate
+# (the preview's candidate is synthetic) and its identity.
+PROPOSAL_CONTENT_KEYS = PROPOSAL_KEYS - {"id", "candidate_sha", "plan_digest"}
+CONSENT_VIEW_FORMAT = 1
+CONSENT_VIEW_KEYS = frozenset({
+    "format", "project", "executor", "release_mode", "checkout_root", "project_root",
+    "version", "base", "work", "attest", "candidate_tree", "range", "entries", "changelog",
+    "version_files", "push",
+})
+VIEW_WORK_KEYS = frozenset({"tree", "subject", "message_sha256", "proves", "paths"})
+VIEW_RANGE_KEYS = frozenset({"base_tag", "base_sha", "approximate", "since", "notice_code"})
+VIEW_ENTRIES_KEYS = frozenset({"selected", "state", "waiting", "proof"})
+VIEW_CHANGELOG_KEYS = frozenset({"path", "managed", "base_blob", "composed_sha256",
+                                 "section_sha256", "date", "pr_refs"})
+VIEW_VERSION_FILES_KEYS = frozenset({"paths", "base_blobs", "expected_blobs", "script",
+                                     "contract"})
+VIEW_PUSH_KEYS = frozenset({"mode", "remote", "branch", "url", "tag"})
+LOCAL_PUSH_REASONS = ("requested", "no_upstream", "upstream_invalid", "detached", "several_urls",
+                      "url_not_literal")
+TREE_MODES = ("100644", "100755", "120000")
+_DATE_RE = re.compile(r"\d{4}-\d{2}-\d{2}", re.ASCII)
+_ID_KEY_RE = re.compile(r"[1-9][0-9]*", re.ASCII)
+
+
+def _exact_sha(value, field: str, *, optional: bool = False) -> str | None:
+    """A lowercase hex object id (7-64), checked — never rewritten (the
+    view's validator returns what it was given)."""
+    if value is None and optional:
+        return None
+    if not isinstance(value, str) or validate_sha(value, field) != value:
+        raise ValueError(f"{field} must be a lowercase hex object id, got {value!r}")
+    return value
+
+
+def _required_digest(value, field: str) -> str:
+    if value is None:
+        raise ValueError(f"{field} must be a lowercase hex SHA-256 (64 chars), got None")
+    return _digest(value, field)
+
+
+def _string(value, field: str, *, optional: bool = False) -> str | None:
+    if value is None and optional:
+        return None
+    if not isinstance(value, str):
+        raise TypeError(f"{field} must be a string, got {value!r}")
+    return value
+
+
+def _bool(value, field: str) -> bool:
+    if not isinstance(value, bool):
+        raise TypeError(f"{field} must be true or false, got {value!r}")
+    return value
+
+
+def _ids(value, field: str) -> list[int]:
+    if not isinstance(value, list) or any(isinstance(i, bool) or not isinstance(i, int)
+                                          or i < 1 for i in value) \
+            or value != sorted(set(value)):
+        raise ValueError(f"{field} must be an ascending list of distinct entry ids")
+    return value
+
+
+def _id_map(value, field: str) -> Mapping:
+    if not isinstance(value, Mapping) or any(
+            not isinstance(k, str) or not _ID_KEY_RE.fullmatch(k) for k in value):
+        raise ValueError(f"{field} must be an object keyed by entry ids")
+    return value
+
+
+def _copy(value):
+    return json.loads(_canonical(value))
+
+
+def validate_consent_view(view: Mapping) -> dict:
+    """The CONSENT VIEW of one preview variant — the exact release content
+    the owner approves (docs/release-workflow.md, "The consent view") —
+    CHECKED against its closed key sets and returned unchanged (a copy):
+    {format (1), project, executor ('dct'), release_mode, checkout_root,
+    project_root, version {current, target}, base {head, ref}, work (null |
+    {tree, subject, message_sha256, proves, paths {path: null | {mode,
+    blob}}}), attest (null | {ids}), candidate_tree, range (null | {base_tag,
+    base_sha, approximate, since, notice_code}), entries {selected, state
+    {id: digest}, waiting {id: reason}, proof {id: object}}, changelog
+    {managed, path, base_blob, composed_sha256, section_sha256, date,
+    pr_refs} (ALWAYS an object: the section, its UTC date and the render
+    are bound also when dct writes no changelog file — managed false, then
+    path, base_blob and composed_sha256 are null), version_files {paths, base_blobs, expected_blobs, script,
+    contract {confirmed, change}}, push (null | {mode 'push', remote,
+    branch, url, tag} | {mode 'local', reason})}. Every key is required;
+    an unknown key, a bad digest or object id, a wrong type → ValueError
+    (TypeError for a non-object)."""
+    _object(view, "consent view", set(CONSENT_VIEW_KEYS), set(CONSENT_VIEW_KEYS))
+    if view["format"] != CONSENT_VIEW_FORMAT or isinstance(view["format"], bool):
+        raise ValueError(f"consent view format must be {CONSENT_VIEW_FORMAT}, got "
+                         f"{view['format']!r}")
+    _text(view["project"], "consent view.project", 200)
+    if view["executor"] != DEFAULT_EXECUTOR:
+        raise ValueError(f"consent view.executor must be 'dct', got {view['executor']!r}")
+    if view["release_mode"] not in GIT_MODES:
+        raise ValueError(f"consent view.release_mode must be one of {GIT_MODES}")
+    _string(view["checkout_root"], "consent view.checkout_root", optional=True)
+    _string(view["project_root"], "consent view.project_root")
+    version = _object(view["version"], "consent view.version", {"current", "target"},
+                      {"current", "target"})
+    _string(version["current"], "consent view.version.current", optional=True)
+    _text(version["target"], "consent view.version.target", 50)
+    base = _object(view["base"], "consent view.base", {"head", "ref"}, {"head", "ref"})
+    _exact_sha(base["head"], "consent view.base.head", optional=True)
+    _string(base["ref"], "consent view.base.ref", optional=True)
+    work = view["work"]
+    if work is not None:
+        _object(work, "consent view.work", set(VIEW_WORK_KEYS), set(VIEW_WORK_KEYS))
+        _exact_sha(work["tree"], "consent view.work.tree")
+        _string(work["subject"], "consent view.work.subject")
+        _required_digest(work["message_sha256"], "consent view.work.message_sha256")
+        _ids(work["proves"], "consent view.work.proves")
+        if not isinstance(work["paths"], Mapping) or not work["paths"]:
+            raise ValueError("consent view.work.paths must be a non-empty object")
+        for path, entry in work["paths"].items():
+            if entry is None:
+                continue
+            _object(entry, f"consent view.work.paths[{path!r}]", {"mode", "blob"},
+                    {"mode", "blob"})
+            if entry["mode"] not in TREE_MODES:
+                raise ValueError(f"consent view.work.paths[{path!r}].mode must be one of "
+                                 f"{TREE_MODES}")
+            _exact_sha(entry["blob"], f"consent view.work.paths[{path!r}].blob")
+    attest = view["attest"]
+    if attest is not None:
+        _object(attest, "consent view.attest", {"ids"}, {"ids"})
+        if not _ids(attest["ids"], "consent view.attest.ids"):
+            raise ValueError("consent view.attest.ids must not be empty")
+    _exact_sha(view["candidate_tree"], "consent view.candidate_tree", optional=True)
+    rng = view["range"]
+    if rng is not None:
+        _object(rng, "consent view.range", set(VIEW_RANGE_KEYS), set(VIEW_RANGE_KEYS))
+        _string(rng["base_tag"], "consent view.range.base_tag", optional=True)
+        _exact_sha(rng["base_sha"], "consent view.range.base_sha", optional=True)
+        _bool(rng["approximate"], "consent view.range.approximate")
+        _string(rng["since"], "consent view.range.since", optional=True)
+        _string(rng["notice_code"], "consent view.range.notice_code", optional=True)
+    entries = _object(view["entries"], "consent view.entries", set(VIEW_ENTRIES_KEYS),
+                      set(VIEW_ENTRIES_KEYS))
+    _ids(entries["selected"], "consent view.entries.selected")
+    for key, digest in _id_map(entries["state"], "consent view.entries.state").items():
+        _required_digest(digest, f"consent view.entries.state[{key}]")
+    for key, reason in _id_map(entries["waiting"], "consent view.entries.waiting").items():
+        _text(reason, f"consent view.entries.waiting[{key}]", 50)
+    for key, proof in _id_map(entries["proof"], "consent view.entries.proof").items():
+        _object(proof, f"consent view.entries.proof[{key}]", set(_PROOF_KEYS))
+    # The release's section, its date and its PR-reference render are bound
+    # whether or not dct writes a changelog file (`managed`): the screen
+    # shows the dated section either way, and the record and the export
+    # carry them.
+    changelog = _object(view["changelog"], "consent view.changelog", set(VIEW_CHANGELOG_KEYS),
+                        set(VIEW_CHANGELOG_KEYS))
+    if _bool(changelog["managed"], "consent view.changelog.managed"):
+        _string(changelog["path"], "consent view.changelog.path")
+        _exact_sha(changelog["base_blob"], "consent view.changelog.base_blob", optional=True)
+        _required_digest(changelog["composed_sha256"], "consent view.changelog.composed_sha256")
+    elif any(changelog[key] is not None for key in ("path", "base_blob", "composed_sha256")):
+        raise ValueError("consent view.changelog: path, base_blob and composed_sha256 must be "
+                         "null when dct writes no changelog file (managed false)")
+    _required_digest(changelog["section_sha256"], "consent view.changelog.section_sha256")
+    if not isinstance(changelog["date"], str) or not _DATE_RE.fullmatch(changelog["date"]):
+        raise ValueError("consent view.changelog.date must be YYYY-MM-DD")
+    _bool(changelog["pr_refs"], "consent view.changelog.pr_refs")
+    files = _object(view["version_files"], "consent view.version_files",
+                    set(VIEW_VERSION_FILES_KEYS), set(VIEW_VERSION_FILES_KEYS))
+    paths = files["paths"]
+    if not isinstance(paths, list) or normalize_version_files(paths) != paths:
+        raise ValueError("consent view.version_files.paths must be normalized version-file "
+                         "paths")
+    for key, nullable in (("base_blobs", True), ("expected_blobs", False)):
+        blobs = files[key]
+        if not isinstance(blobs, Mapping) or set(blobs) != set(paths):
+            raise ValueError(f"consent view.version_files.{key} must name exactly its paths")
+        for path, blob in blobs.items():
+            _exact_sha(blob, f"consent view.version_files.{key}[{path!r}]", optional=nullable)
+    script = files["script"]
+    if script is not None:
+        _object(script, "consent view.version_files.script", {"identity", "sha256"},
+                {"identity", "sha256"})
+        _string(script["identity"], "consent view.version_files.script.identity")
+        _digest(script["sha256"], "consent view.version_files.script.sha256")
+    contract = _object(files["contract"], "consent view.version_files.contract",
+                       {"confirmed", "change"}, {"confirmed", "change"})
+    if contract["confirmed"] is not None and not isinstance(contract["confirmed"], list):
+        raise ValueError("consent view.version_files.contract.confirmed must be a list or null")
+    _bool(contract["change"], "consent view.version_files.contract.change")
+    push = view["push"]
+    if push is not None:
+        if not isinstance(push, Mapping):
+            raise TypeError("consent view.push must be a JSON object")
+        if push.get("mode") == "push":
+            _object(push, "consent view.push", set(VIEW_PUSH_KEYS), set(VIEW_PUSH_KEYS))
+            for key in ("remote", "branch", "url", "tag"):
+                _text(push[key], f"consent view.push.{key}", 2000)
+        elif push.get("mode") == "local":
+            _object(push, "consent view.push", {"mode", "reason"}, {"mode", "reason"})
+            if push["reason"] not in LOCAL_PUSH_REASONS:
+                raise ValueError(f"consent view.push.reason must be one of {LOCAL_PUSH_REASONS}")
+        else:
+            raise ValueError("consent view.push.mode must be 'push' or 'local'")
+    return _copy(view)
+
+
+def consent_view_digest(view: Mapping) -> str:
+    """C — SHA-256 of the canonical JSON of a valid consent view (sorted
+    keys, compact separators, UTF-8): what the preview returns per variant
+    and `apply --consent` names."""
+    import hashlib
+
+    return hashlib.sha256(_canonical(validate_consent_view(view)).encode("utf-8")).hexdigest()
+
+
+def proposal_content(proposal: Mapping) -> dict:
+    """A proposal's CONTENT (validate_proposal minus id, candidate_sha and
+    plan_digest) — what a preview variant stores: the version files, their
+    blobs, the script, the version, the mode and the changelog baseline."""
+    canonical = validate_proposal(proposal)
+    if canonical is None:
+        raise TypeError("proposal content must be a JSON object")
+    return {key: canonical[key] for key in sorted(PROPOSAL_CONTENT_KEYS)}
+
+
+def validate_preview(preview: Mapping) -> dict:
+    """The PREVIEW slot (projects.release_preview) CHECKED against its
+    closed key sets and returned unchanged (a copy):
+
+    {"id": the preview's ULID, "created_at": ISO time, "base": {"head",
+    "ref", "checkout_root"} (null outside git), "work": null | {"index_before"
+    {path: null | {mode, blob, stage}} (the user's index entries before),
+    "paths_state" {path: sha256 of the work-tree bytes | null (deleted)},
+    "untracked_included": [path], "message": the cleaned message},
+    "variants": {C: {"name" ('shown' | 'all'), "consent" (validate_consent_view,
+    C = consent_view_digest of it), "proposal_content" (proposal_content)}},
+    "pin": the ref pinning its blobs | null, "progress": {"work_commit",
+    "attest_commit" (null until apply made them), "consent" (the C of the
+    variant whose commits they are — one of `variants`, written with the
+    first commit; null before)}}.
+    Every key is required; ≤ PREVIEW_MAX_BYTES of canonical JSON (refused
+    with "too long", never truncated). ValueError / TypeError otherwise."""
+    _object(preview, "preview", set(PREVIEW_KEYS), set(PREVIEW_KEYS))
+    if not isinstance(preview["id"], str) or not PROPOSAL_ID_RE.fullmatch(preview["id"]):
+        raise ValueError(f"preview.id must be 1-64 letters / digits, got {preview['id']!r}")
+    _text(preview["created_at"], "preview.created_at", 64)
+    base = _object(preview["base"], "preview.base", set(PREVIEW_BASE_KEYS),
+                   set(PREVIEW_BASE_KEYS))
+    _exact_sha(base["head"], "preview.base.head", optional=True)
+    _string(base["ref"], "preview.base.ref", optional=True)
+    _string(base["checkout_root"], "preview.base.checkout_root", optional=True)
+    work = preview["work"]
+    if work is not None:
+        _object(work, "preview.work", set(PREVIEW_WORK_KEYS), set(PREVIEW_WORK_KEYS))
+        if not isinstance(work["index_before"], Mapping):
+            raise TypeError("preview.work.index_before must be a JSON object")
+        for path, entry in work["index_before"].items():
+            if entry is None:
+                continue
+            _object(entry, f"preview.work.index_before[{path!r}]", {"mode", "blob", "stage"},
+                    {"mode", "blob", "stage"})
+            _string(entry["mode"], f"preview.work.index_before[{path!r}].mode")
+            _exact_sha(entry["blob"], f"preview.work.index_before[{path!r}].blob")
+            _string(entry["stage"], f"preview.work.index_before[{path!r}].stage")
+        if not isinstance(work["paths_state"], Mapping):
+            raise TypeError("preview.work.paths_state must be a JSON object")
+        for path, digest in work["paths_state"].items():
+            _digest(digest, f"preview.work.paths_state[{path!r}]")
+        included = work["untracked_included"]
+        if not isinstance(included, list) or any(not isinstance(p, str) for p in included):
+            raise ValueError("preview.work.untracked_included must be a list of paths")
+        _string(work["message"], "preview.work.message")
+    variants = preview["variants"]
+    if not isinstance(variants, Mapping) or not variants:
+        raise ValueError("preview.variants must be a non-empty object keyed by consent digest")
+    names = []
+    for digest, item in variants.items():
+        _required_digest(digest, "preview.variants key")
+        _object(item, "preview.variants[…]", set(PREVIEW_VARIANT_KEYS),
+                set(PREVIEW_VARIANT_KEYS))
+        if item["name"] not in PREVIEW_VARIANTS:
+            raise ValueError(f"preview variant name must be one of {PREVIEW_VARIANTS}")
+        names.append(item["name"])
+        if consent_view_digest(item["consent"]) != digest:
+            raise ValueError(f"preview variant {digest} is not the digest of its consent view")
+        content = item["proposal_content"]
+        _object(content, "preview.variants[…].proposal_content", set(PROPOSAL_CONTENT_KEYS),
+                set(PROPOSAL_CONTENT_KEYS))
+        if _canonical(proposal_content(content)) != _canonical(content):
+            raise ValueError("preview.variants[…].proposal_content is not in canonical form")
+    if len(set(names)) != len(names):
+        raise ValueError("preview.variants: each variant name at most once")
+    _string(preview["pin"], "preview.pin", optional=True)
+    progress = _object(preview["progress"], "preview.progress", set(PREVIEW_PROGRESS_KEYS),
+                       set(PREVIEW_PROGRESS_KEYS))
+    for key in ("work_commit", "attest_commit"):
+        _exact_sha(progress[key], f"preview.progress.{key}", optional=True)
+    if _digest(progress["consent"], "preview.progress.consent") is not None \
+            and progress["consent"] not in variants:
+        raise ValueError("preview.progress.consent must be the digest of one of its variants")
+    ensure_json_fits(preview, "preview", PREVIEW_MAX_BYTES)
+    return _copy(preview)
+
+
+def read_preview(conn: sa.Connection, pid: int) -> dict | None:
+    """The project's preview slot on the caller's connection, or None."""
+    text = conn.execute(
+        sa.select(projects.c.release_preview).where(projects.c.id == pid)).scalar()
+    return None if text is None else json.loads(text)
+
+
+def get_preview(engine: sa.Engine, project_slug: str) -> dict | None:
+    """The project's preview slot (validate_preview shape) or None. Read-only."""
+    with engine.begin() as conn:
+        return read_preview(conn, resolve_project_id(conn, project_slug))
+
+
+def clear_preview(conn: sa.Connection, pid: int) -> None:
+    """Drop the preview slot on the caller's connection."""
+    conn.execute(projects.update().where(projects.c.id == pid).values(release_preview=None))
+
+
+def set_preview(engine: sa.Engine, project_slug: str, preview: Mapping) -> dict:
+    """Store `preview` (validate_preview — ValueError / TypeError, nothing
+    written) as the project's preview slot, in ONE transaction that also
+    clears the pending proposal (a preview and a prepare replace each
+    other). → {"preview", "replaced_preview", "replaced_proposal"} — the
+    replaced slot / pending proposal (or None), whose resources the caller
+    releases after this commit."""
+    canonical = validate_preview(preview)
+    with project_transaction(engine, project_slug, write=True) as (conn, pid):
+        replaced = read_preview(conn, pid)
+        pending = read_pending_proposal(conn, pid)
+        conn.execute(projects.update().where(projects.c.id == pid).values(
+            release_preview=_canonical(canonical), release_proposal=None,
+            updated_at=datetime.now(UTC)))
+    return {"preview": canonical, "replaced_preview": replaced,
+            "replaced_proposal": None if pending is None else pending["proposal"]}
+
+
+def discard_preview(engine: sa.Engine, project_slug: str) -> dict | None:
+    """Clear the project's preview slot (`prepare --discard-preview`: a
+    screen the owner declined can no longer be applied) → the discarded
+    slot, or None when it was empty (nothing written)."""
+    with project_transaction(engine, project_slug, write=True) as (conn, pid):
+        found = read_preview(conn, pid)
+        if found is not None:
+            clear_preview(conn, pid)
+    return found
+
+
+def record_preview_progress(engine: sa.Engine, project_slug: str, preview_id: str, *,
+                            work_commit: str | None = None,
+                            attest_commit: str | None = None,
+                            consent: str | None = None) -> dict:
+    """Record what `apply --consent` made for the preview `preview_id`
+    BEFORE it goes on (the work-in-progress commit, the attestation
+    commit) and under which consent (`consent`: the C applied — one of the
+    slot's variants; apply writes it with its first commit, so a progress
+    two variants share still names the screen the owner approved), so a
+    re-run adopts them. Each field is WRITE-ONCE (the same value again is a
+    confirmation; another one → ValueError, nothing written); a slot that
+    is empty or holds another preview → ValueError. Returns the updated
+    slot."""
+    given = {"work_commit": work_commit, "attest_commit": attest_commit, "consent": consent}
+    with project_transaction(engine, project_slug, write=True) as (conn, pid):
+        slot = read_preview(conn, pid)
+        if slot is None or slot["id"] != preview_id:
+            raise ValueError(
+                f"the preview slot of '{project_slug}' holds "
+                f"{'nothing' if slot is None else 'preview ' + slot['id']}, not {preview_id} — "
+                f"it was replaced or discarded; nothing written.")
+        progress = {"consent": None, **slot["progress"]}  # a slot of an older dct: no consent
+        for field, value in given.items():
+            if value is None:
+                continue
+            value = _digest(value, f"progress.{field}") if field == "consent" \
+                else _full_sha(value, f"progress.{field}")
+            if not check_unchanged(f"preview progress.{field}", progress[field], value):
+                progress[field] = value
+        if progress != slot["progress"]:
+            slot = validate_preview({**slot, "progress": progress})
+            conn.execute(projects.update().where(projects.c.id == pid).values(
+                release_preview=_canonical(slot), updated_at=datetime.now(UTC)))
+    return slot

@@ -5,7 +5,7 @@ from datetime import UTC, datetime
 
 import sqlalchemy as sa
 
-from dct.db import projects, row_to_dict
+from dct.db import COMMIT_TRAILER_COLUMNS, projects, row_to_dict
 
 
 def create_project(
@@ -193,18 +193,12 @@ def set_version(engine: sa.Engine, slug: str, version: str) -> dict | None:
 def set_manages_changelog(engine: sa.Engine, slug: str, value: bool) -> dict | None:
     """Opt a project in/out of dct changelog-hook enforcement (#222).
 
+    One of the settings that choose the release's changelog file: written
+    under the stamp's project lock (_set_release_setting, K-44).
     Returns the updated project row, or None when the slug does not resolve to
     a live project.
     """
-    with engine.begin() as conn:
-        result = conn.execute(
-            projects.update()
-            .where(projects.c.slug == slug, projects.c.deleted_at.is_(None))
-            .values(manages_changelog=value, updated_at=datetime.now(UTC))
-        )
-        if result.rowcount == 0:
-            return None
-    return get_project(engine, slug)
+    return _set_release_setting(engine, slug, manages_changelog=value)
 
 
 def project_manages_changelog(engine: sa.Engine, slug: str) -> bool:
@@ -236,6 +230,7 @@ def set_changelog_path(engine: sa.Engine, slug: str, relpath: str) -> dict | Non
     is stripped and any '..' escape is rejected — so /release can only ever
     write inside the project tree.
 
+    Written under the stamp's project lock (_set_release_setting, K-44).
     Returns the updated project row, or None when the slug does not resolve to a
     live project. Raises ValueError on an empty path or a '..' escape
     (nothing written — the marker stays as it was).
@@ -245,20 +240,21 @@ def set_changelog_path(engine: sa.Engine, slug: str, relpath: str) -> dict | Non
     rel = os.path.normpath(relpath.strip().lstrip("/"))
     if rel.startswith("..") or os.path.isabs(rel):
         raise ValueError("changelog_path must stay within the project root (no '..' escape)")
-    return _set_project_value(engine, slug, changelog_path=rel.replace(os.sep, "/"),
-                              changelog_path_explicit=True)
+    return _set_release_setting(engine, slug, changelog_path=rel.replace(os.sep, "/"),
+                                changelog_path_explicit=True)
 
 
 def reset_changelog_path(engine: sa.Engine, slug: str) -> dict | None:
     """Go back to DETECTING the changelog file (#876 K-14): changelog_path
     the default 'changelog.md', changelog_path_explicit false — the release
     then finds the tracked changelog of the project root
-    (core.changelog_file.resolve_changelog). Returns the updated project
+    (core.changelog_file.resolve_changelog). Written under the stamp's
+    project lock (_set_release_setting, K-44). Returns the updated project
     row, or None when the slug does not resolve to a live project."""
     from dct.core.changelog_file import DEFAULT_CHANGELOG_PATH
 
-    return _set_project_value(engine, slug, changelog_path=DEFAULT_CHANGELOG_PATH,
-                              changelog_path_explicit=False)
+    return _set_release_setting(engine, slug, changelog_path=DEFAULT_CHANGELOG_PATH,
+                                changelog_path_explicit=False)
 
 
 def _set_project_value(engine: sa.Engine, slug: str, **values) -> dict | None:
@@ -270,6 +266,27 @@ def _set_project_value(engine: sa.Engine, slug: str, **values) -> dict | None:
         )
         if result.rowcount == 0:
             return None
+    return get_project(engine, slug)
+
+
+def _set_release_setting(engine: sa.Engine, slug: str, **values) -> dict | None:
+    """Write project settings the release stamp checks in its own
+    transaction (the executor, the changelog-file choice, the PR render)
+    inside project_transaction(write=True) — the SAME project lock as the
+    stamp (K-106, K-44): a change either precedes the stamp's comparison
+    (the stamp refuses consent_mismatch) or waits until the stamp committed
+    (the record keeps what the stamp saw). None when the slug does not
+    resolve to a live project."""
+    from dct.db import project_transaction
+
+    if get_project(engine, slug) is None:
+        return None
+    try:
+        with project_transaction(engine, slug, write=True) as (conn, pid):
+            conn.execute(projects.update().where(projects.c.id == pid).values(
+                **values, updated_at=datetime.now(UTC)))
+    except ValueError:  # the project was deleted between the two reads
+        return None
     return get_project(engine, slug)
 
 
@@ -287,29 +304,68 @@ def set_release_executor(engine: sa.Engine, slug: str, executor: str) -> dict | 
     or None when the slug does not resolve to a live project. ValueError
     for any other value."""
     from dct.core.releases import validate_executor
-    from dct.db import project_transaction
 
-    value = validate_executor(executor)
-    if get_project(engine, slug) is None:
-        return None
-    try:
-        with project_transaction(engine, slug, write=True) as (conn, pid):
-            conn.execute(projects.update().where(projects.c.id == pid).values(
-                release_executor=value, updated_at=datetime.now(UTC)))
-    except ValueError:  # the project was deleted between the two reads
-        return None
-    return get_project(engine, slug)
+    return _set_release_setting(engine, slug, release_executor=validate_executor(executor))
 
 
 def set_changelog_pr_refs(engine: sa.Engine, slug: str, enabled: bool) -> dict | None:
     """Opt the project's changelog render into `(#N)` PR references (K-90;
     default off). Persisted per release at stamp time (releases.render), so
-    a change never alters a release already stamped. Returns the updated
+    a change never alters a release already stamped; written under the
+    stamp's project lock (_set_release_setting, K-44), so a change waits for
+    a running stamp or makes it refuse consent_mismatch. Returns the updated
     project row, or None when the slug does not resolve to a live project.
     TypeError unless `enabled` is a bool."""
     if not isinstance(enabled, bool):
         raise TypeError(f"changelog_pr_refs must be true or false, got {enabled!r}")
-    return _set_project_value(engine, slug, changelog_pr_refs=enabled)
+    return _set_release_setting(engine, slug, changelog_pr_refs=enabled)
+
+
+def get_commit_trailers(engine: sa.Engine, slug: str) -> dict | None:
+    """The project's stored commit-trailer preferences:
+    {co_authored_by, session_link}, each None (not answered yet — the
+    question was never asked), False (a stored "no") or True (a stored
+    "yes"). None when the slug does not resolve to a live project.
+
+    The answer is asked ONCE, at the project's first configuration; /commit
+    applies it without another question. A project's own instructions that
+    forbid a trailer (dct's own repository bans a session link) still win
+    over a stored "yes"."""
+    project = get_project(engine, slug)
+    if project is None:
+        return None
+    return {key: project[column] for key, column in COMMIT_TRAILER_COLUMNS.items()}
+
+
+def set_commit_trailers(
+    engine: sa.Engine,
+    slug: str,
+    *,
+    co_authored_by: bool | None = None,
+    session_link: bool | None = None,
+) -> dict | None:
+    """Store the owner's answer about commit trailers: whether /commit adds a
+    `Co-Authored-By` trailer (`co_authored_by`) and a session / artifact link
+    (`session_link`). Each keyword is the answer True / False; None (the
+    default) leaves that preference as stored — an unanswered one stays
+    unanswered. There is no way back to "not answered" here: an answer is
+    changed, never withdrawn.
+
+    Returns the updated project row, or None when the slug does not resolve
+    to a live project. ValueError when neither preference is given; TypeError
+    when a given value is not a bool (a string such as "off" or 0 / 1 is
+    never taken as an answer). Validation runs before any write, so a
+    refused call writes nothing."""
+    answers = {"co_authored_by": co_authored_by, "session_link": session_link}
+    given = {key: value for key, value in answers.items() if value is not None}
+    if not given:
+        raise ValueError("set_commit_trailers: give co_authored_by and/or session_link")
+    for key, value in given.items():
+        if not isinstance(value, bool):
+            raise TypeError(f"{key} must be true or false, got {value!r}")
+    return _set_project_value(
+        engine, slug, **{COMMIT_TRAILER_COLUMNS[key]: value for key, value in given.items()}
+    )
 
 
 def update_project(

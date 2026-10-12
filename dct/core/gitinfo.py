@@ -23,6 +23,10 @@ STRICT (raises instead of guessing — the mutating release path only, K-52):
   - git_read_lines(cwd, *args) — the same read STREAMED line by line, for
     output that grows with the history (K-116 H8); a failure or a timeout
     raises GitReadError, an early close stops git.
+  - all_version_tags(cwd) / version_tags(cwd, version) — the local tags
+    that follow the version contract / that name ONE version in any
+    spelling; shared by the release plan (version suggestion) and the
+    effects layer.
 WRITER (the release effects layer only, dct.workflows.release.effects):
   - git_write(cwd, *args, index_file=None, network=False) — keeps the
     caller's identity / config-location variables (WRITE_ENV_PASSTHROUGH;
@@ -70,6 +74,7 @@ from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 
 from dct.core import procs
+from dct.core.version import normalize_version, same_version
 
 GIT_TIMEOUT_SECONDS = 2
 # stdout that is DATA is read whole up to this size — past it the command is
@@ -565,6 +570,53 @@ def git_is_ancestor(cwd: str | os.PathLike[str], ancestor: str, descendant: str)
     return code == 0
 
 
+def head_ref(cwd: str | os.PathLike[str]) -> str | None:
+    """The full name of the ref HEAD NAMES (`refs/heads/<b>`), or None for a
+    detached HEAD — the symbolic HEAD, not its commit (`git symbolic-ref -q
+    HEAD`, read-only; another failure raises GitReadError)."""
+    code, out = git_read(cwd, "symbolic-ref", "-q", "HEAD", ok_codes=(0, 1))
+    return (out.strip() or None) if code == 0 else None
+
+
+def all_version_tags(cwd: str | os.PathLike[str], merged: str | None = None) -> list[dict]:
+    """EVERY local tag whose name follows the version contract (`v1.5.0`,
+    `1.5`, `V1.5.0` — core.version.normalize_version; `v0.2.0-rc1`,
+    `release-0.2.0` are not versions and are left out), wherever it points:
+    [{name, version (normalized), commit (peeled), object (what the ref
+    resolves to — the tag object of an annotated tag), annotated}], sorted
+    by name. ONE `for-each-ref` (read-only, git_read: a failure raises
+    GitReadError) — for a caller that asks about many versions at once (the
+    plan's version suggestion). `merged` (a commit) keeps only the tags
+    reachable from it (`--merged=<commit>` — the plan's range base)."""
+    scope = [f"--merged={merged}"] if merged else []
+    _, out = git_read(
+        cwd, "for-each-ref", *scope,
+        "--format=%(refname:strip=2)%1f%(objectname)%1f%(*objectname)", "refs/tags")
+    tags = []
+    for line in out.splitlines():
+        parts = line.split("\x1f")
+        if len(parts) != 3:
+            continue
+        name, obj, peeled = parts
+        try:
+            version = normalize_version(name)
+        except ValueError:
+            continue
+        tags.append({"name": name, "version": version, "commit": (peeled or obj).lower(),
+                     "object": obj.lower(), "annotated": bool(peeled)})
+    return sorted(tags, key=lambda t: t["name"])
+
+
+def version_tags(cwd: str | os.PathLike[str], version: str) -> list[dict]:
+    """The local tags that are the SAME version as `version` in any spelling
+    (core.version.same_version: `0.2.0`, `v0.2`, `V0.2.0`; lightweight and
+    annotated alike): [{name, commit (peeled), object, annotated}], sorted
+    by name — the ONE reader of a version's tags for the release plan and
+    the effects layer (all_version_tags filtered)."""
+    return [{k: t[k] for k in ("name", "commit", "object", "annotated")}
+            for t in all_version_tags(cwd) if same_version(t["version"], version)]
+
+
 def git_read_blob(cwd: str | os.PathLike[str], commit: str, path: str) -> bytes | None:
     """The EXACT bytes of `path` (repo-root-relative, forward slashes) in
     `commit`, or None when the commit's tree has no such file. Read-only
@@ -638,7 +690,9 @@ def git_write(
 ) -> tuple[int, str]:
     """(exit code, stdout) of a git command that MAY write (`git -C <cwd>
     <args>`, no shell, C locale, stdin closed, no terminal) — the release
-    effects layer only (dct.workflows.release.effects). GIT_* variables are
+    effects layer (dct.workflows.release.effects) and the future tree of a
+    work-in-progress commit (dct.workflows.release.plan.future_tree — a
+    temporary index, shared by the preview and the plan). GIT_* variables are
     dropped except WRITE_ENV_PASSTHROUGH (+ NETWORK_ENV_PASSTHROUGH and
     GIT_TERMINAL_PROMPT=0 with `network`); `index_file` sets GIT_INDEX_FILE
     (a TEMPORARY index — the user's index is never touched through it; `git

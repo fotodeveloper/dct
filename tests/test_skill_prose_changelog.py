@@ -187,13 +187,18 @@ def test_every_named_workflow_command_and_flag_exists_in_the_cli(text):
 
 def test_release_skill_and_fallback_drive_the_same_workflow_commands():
     """K-72: the skill and the authoritative fallback describe ONE dialog over
-    the same commands — every effects / proof subcommand of the CLI."""
+    the same commands — every effects / proof subcommand of the CLI. Phase 2
+    (section H): the attestation is made by `apply --consent` (the "with all
+    N" variant, `prepare --preview --attest`), so a standalone `dct release
+    attest` is no longer a step the dialog must name."""
     effects = {"plan", "attest", "prepare", "apply", "resume", "abandon", "reconstruct", "status",
                "takeover", "version-files"}
+    required = effects - {"attest"}
     assert effects <= set(_cli()["release"])
-    for text in (_skill("release"), _release_fallback()):
-        named = {sub for group, sub, _ in _commands(text) if group == "release"}
-        assert named == effects, sorted(named ^ effects)
+    named = [{sub for group, sub, _ in _commands(text) if group == "release"}
+             for text in (_skill("release"), _release_fallback())]
+    assert named[0] == named[1], sorted(named[0] ^ named[1])
+    assert required <= named[0] <= effects, sorted(named[0] ^ required)
 
 
 @pytest.mark.parametrize("text", [
@@ -201,32 +206,36 @@ def test_release_skill_and_fallback_drive_the_same_workflow_commands():
     pytest.param(_release_fallback, id="fallback"),
 ])
 def test_release_dialog_passes_the_owners_decisions_as_flags(text):
-    """Explicit version, explicit selection, explicit confirmation — the flags
-    the effects layer requires (it refuses otherwise)."""
+    """The owner's decisions reach the effects layer as flags it requires.
+    Phase 2 (section H): the screen's content is bound by the preview, so
+    every apply of the dialog is `apply --consent C --confirm --json` (a
+    binding flag beside it is refused, consent_flag_conflict) and every
+    prepare is the preview (`--preview`, or `--discard-preview` on Stop) —
+    never the D/P prepare with `--plan-digest`."""
     calls = [(sub, flags) for group, sub, flags in _commands(text()) if group == "release"]
     applies = [flags for sub, flags in calls if sub == "apply" and len(flags) > 1]
     assert applies, "no complete `dct release apply …` invocation"
     for flags in applies:
-        assert "--version" in flags and "--confirm" in flags
-        assert "--plan-digest" in flags  # K-80: the approved snapshot
-        assert "--proposal-digest" in flags  # K-76: the approved version-file proposal
-        assert ("--entries" in flags) != ("--no-entries" in flags)
-        assert not {"--patch", "--minor", "--major"} & set(flags)  # V computed once
+        assert set(flags) == {"--consent", "--confirm", "--json"}, flags
     prepares = [flags for sub, flags in calls if sub == "prepare" and len(flags) > 1]
-    assert prepares, "no complete `dct release prepare …` invocation (K-76)"
+    assert prepares, "no complete `dct release prepare …` invocation"
     for flags in prepares:
-        assert "--version" in flags and "--plan-digest" in flags
-        assert ("--entries" in flags) != ("--no-entries" in flags)
+        assert ("--preview" in flags) != ("--discard-preview" in flags), flags
+        assert "--plan-digest" not in flags
+        assert not ({"--entries", "--no-entries"} <= set(flags))
     abandons = [flags for sub, flags in calls if sub == "abandon" and flags]
     assert abandons and all({"--version", "--reason", "--confirm"} <= set(f) for f in abandons)
     attests = [flags for sub, flags in calls if sub == "attest" and flags]
-    assert attests and all({"--entries", "--confirm"} <= set(f) for f in attests)
+    assert all({"--entries", "--confirm"} <= set(f) for f in attests)
     flat = " ".join(text().split())
     assert "--confirm-version-files" not in flat  # removed (K-76): it refuses now
     # The flags the dialog relies on are really required / present.
     cli = _cli()["release"]
     required = {a.option_strings[0] for a in cli["abandon"]._actions if a.required}
     assert {"--version", "--reason"} <= required
+    assert "--consent" in _option_strings(cli["apply"])
+    assert {"--preview", "--discard-preview", "--message-file", "--include-untracked",
+            "--attest"} <= _option_strings(cli["prepare"])
 
 
 @pytest.mark.parametrize("text", [
@@ -243,9 +252,17 @@ def test_release_dialog_never_performs_the_effects_itself(text):
     body = text()
     for forbidden in ("advance_release(", "release_changelog(", "release-advance",
                       "git tag", "git commit", "git add", "git push origin v",
-                      "version-sync.sh", "export_changelog", "--allow-empty"):
+                      "export_changelog", "--allow-empty"):
         assert forbidden not in body, forbidden
+    # The version script is NAMED by its path (the owner fixes or adds it),
+    # but never RUN by the dialog: no execution form anywhere, and the
+    # prohibition itself is stated.
+    assert not re.search(r"(\bbash|\bsh|\bsource|\./|\bexec)\s+\S*version-sync\.sh", body), \
+        "the dialog runs the version script itself"
+    assert re.search(r"never runs? the version script itself", " ".join(body.split())), \
+        "the dialog does not say it never runs the version script itself"
     for block in re.findall(r"```(?:bash)?\n(.*?)```", body, re.DOTALL):
+        assert "version-sync.sh" not in block, block
         for line in block.splitlines():
             assert not line.lstrip().startswith("git "), line
 
@@ -259,22 +276,32 @@ _BAN_RE = re.compile(r"\bnever\b[^.;:()]{0,70}\b(?:commits?|push(?:es)?)\b[^.;:(
     pytest.param(_release_fallback, id="fallback"),
 ])
 def test_release_dialog_guard_keeps_the_wip_commit_and_the_push(text):
-    """K-120 (accepted state + the owner's note): the pointer to /commit is
-    an instruction FOR THE AGENT — after the owner's consent the agent
-    commits the work in progress itself, recomputes the plan, finishes the
-    release and the workflow performs the approved push. No sentence bans a
-    commit or a push wholesale: every "never … commit / push" clause is
-    scoped to the release's own effects."""
+    """K-120, deliberately rewritten for phase 2 (section H, K-a (a)): the
+    work in progress is still committed INSIDE the release — no longer by
+    the agent's own `git commit` and a re-plan, but by `apply --consent`
+    (through the repository's hooks, under the release's lock) from the
+    message the agent drafted (`--message-file`); the owner is never sent
+    away to commit, and the workflow performs the push the screen bound. No
+    sentence bans a commit or a push wholesale: every "never … commit /
+    push" clause is scoped to the release's own effects."""
     flat = " ".join(text().split())
-    assert "`/commit` procedure" in flat  # ONE source, named — not copied
-    assert re.search(r"instruction for (you|the assistant)\b", flat, re.IGNORECASE)
-    assert re.search(r"not a request (to|that|for) the owner", flat, re.IGNORECASE)
-    assert re.search(r"(you|the assistant) commits? the work in progress", flat, re.IGNORECASE)
-    # … then: re-plan → finish the release → the approved push, same workflow.
-    _in_order(flat, "dct clog candidates --json", "dct release prepare --version",
-              "dct release apply --version")
-    assert re.search(r"then .{0,40}`dct release plan --json` again", flat, re.IGNORECASE)
-    assert re.search(r"push(es)? .{0,120}approved", flat)
+    # (worded without "never … commit": the scoped-ban check below stays)
+    assert re.search(r"not a request (to|that|for) the owner|"
+                     r"do not tell the owner to commit", flat, re.IGNORECASE), \
+        "the dialog may send the owner away to commit"
+    # candidates → the drafted message on the preview → apply --consent commits it
+    # (the Finish route of a resumed consent may name apply --consent earlier)
+    for marker in ("dct clog candidates --json", "--message-file", "dct release apply --consent"):
+        assert marker in flat, marker
+    _in_order(flat, "dct clog candidates --json", "--message-file")
+    assert flat.find("dct release apply --consent", flat.index("--message-file")) != -1, \
+        "no apply --consent after the drafted message"
+    assert re.search(r"apply --consent`?[^.]{0,200}\bcommits?\b[^.]{0,120}"
+                     r"(work in progress|uncommitted|your changes)|"
+                     r"(work in progress|uncommitted changes)[^.]{0,200}committed by "
+                     r"`?(dct|apply)", flat, re.IGNORECASE), \
+        "the dialog does not say apply --consent commits the work in progress"
+    assert re.search(r"push(es)? .{0,120}(approved|bound|the screen)", flat)
     bans =[m.group(0) for m in _BAN_RE.finditer(flat)]
     unscoped = [b for b in bans if not re.search(
         r"FOR THE RELEASE|of its own|on your own|by itself|--no-verify|--amend|without", b)]
@@ -284,15 +311,18 @@ def test_release_dialog_guard_keeps_the_wip_commit_and_the_push(text):
 def test_release_skill_plans_first_and_reports_versions_separately():
     body = _skill("release")
     _in_order(body, "dct release plan --json", "## Resume path")
-    _in_order(body, "### Step 0:", "### Step 1:", "### Step 4:", "### Step 6:")
+    # Phase 2 (section H) replaces the old Steps 2-9 by the one screen: only
+    # the probe and the routing keep their numbers; the steps stay sequential.
+    _in_order(body, "### Step 0:", "### Step 1:")
     headings = [int(n) for n in re.findall(r"^### Step (\d+)", body, re.MULTILINE)]
     assert headings == list(range(len(headings)))
     flat = " ".join(body.split())
     # K-55 / K-31: requested V, the record's version and current_version.
     for key in ("details.requested_version", "details.current_version"):
         assert key in flat
-    assert "range.confirm_required" in flat and "range.approximate" in flat
-    assert "attestation_groups" in flat
+    # The range is shown from the preview's display (its text, approximate
+    # and notice), no longer from the plan's range.* keys.
+    assert "display.range" in flat
     assert 'There is NO "include without proof" option' in body
     assert "version-only" in flat.lower() and "consent" in flat
 
@@ -309,19 +339,25 @@ def test_release_documented_keys_exist_in_the_workflow_schemas():
     from dct.workflows.release.plan import PLAN_KEYS
 
     flat = " ".join((_skill("release") + _release_fallback()).split())
-    for key in ("kind", "unfinished_release", "range", "entries", "attestation_groups",
-                "index", "version_files", "warnings"):
-        assert key in PLAN_KEYS and re.search(rf"`(range\.)?{key}[`. ]", flat), key
+    # Phase 2 (section H): the dialog reads the plan for routing only (the
+    # screen comes from the preview), so the old Step 4 keys (range,
+    # entries, attestation_groups, index, version_files) are not required.
+    for key in ("kind", "unfinished_release", "executor", "changelog_file", "pending_consent",
+                "warnings"):
+        assert key in PLAN_KEYS and re.search(rf"`{key}[`. ]", flat), key
     for key in ("details", "steps", "version", "release"):
         assert key in RESULT_KEYS
-    for outcome in ("completed", "noop", "refused", "failed", "attested", "preview",
-                    "prepared", "taken_over", "confirmed", "conflict"):
+    # (`attested` / `prepared` were the outcomes of the old Steps 6 / 8.)
+    for outcome in ("completed", "noop", "refused", "failed", "preview",
+                    "taken_over", "confirmed", "conflict"):
         assert outcome in OUTCOMES and f"`{outcome}`" in flat, outcome
     # K-111 / K-119: the routing keys are the plan's real ones (schema 3);
-    # #876: schema 4 added changelog_file.
+    # #876: schema 4 added changelog_file; schema 5 version.suggested and
+    # pending_consent.
     from dct.workflows.release.plan import SCHEMA_VERSION
 
-    assert SCHEMA_VERSION == 4 and "executor" in PLAN_KEYS and "changelog_file" in PLAN_KEYS
+    assert SCHEMA_VERSION == 5 and "executor" in PLAN_KEYS and "changelog_file" in PLAN_KEYS
+    assert "pending_consent" in PLAN_KEYS
     for key in ("executor.project", "executor.record"):
         assert f"`{key}" in flat, key
 
@@ -337,29 +373,24 @@ RELEASE_DIALOGS = [
 
 @pytest.mark.parametrize("text", RELEASE_DIALOGS)
 def test_release_dialog_runs_plan_prepare_apply_with_the_push_choice(text):
-    """K-76 / K-97 F2 / F3: plan → prepare (the file list approved before the
-    stamp) → apply with BOTH digests and the owner's push choice; the
-    workflow pushes, so no "never pushes" survives; H4: the owner's selection
-    is re-planned and THAT snapshot_digest is passed."""
+    """K-76 / K-97 F2 / F3, phase 2 (section H): plan → `prepare --preview`
+    (the version sync, the files, the checks, the contract and the push
+    target computed BEFORE the one question) → `apply --consent`. The push
+    choice is part of the previewed content: "Change something" previews
+    again with the owner's push target (all three of remote, branch, URL)
+    or `--no-push`; the workflow pushes, so no "never pushes" survives."""
     body = text()
     flat = " ".join(body.split())
     calls = [(sub, flags) for group, sub, flags in _commands(body) if group == "release"]
-    for flag in ("--plan-digest", "--proposal-digest"):
-        assert any(flag in flags for sub, flags in calls if sub == "apply"), flag
-    assert any("--plan-digest" in flags for sub, flags in calls if sub == "prepare")
-    applies = [set(flags) for sub, flags in calls if sub == "apply" and len(flags) > 1]
-    assert any("--no-push" in f for f in applies), "no apply with --no-push"
-    assert any({"--push-remote", "--push-branch"} <= f for f in applies), \
-        "no apply with --push-remote / --push-branch"
-    assert "details.push_target" in flat
-    # H4: the owner's selection is bound by a NEW plan with --entries / --no-entries.
-    assert re.search(r"dct release plan --version \S+ --entries \S+ --json", body)
-    assert re.search(r"dct release plan --version \S+ --no-entries --json", body)
+    previews = [set(flags) for sub, flags in calls if sub == "prepare" and "--preview" in flags]
+    assert any("--no-push" in f for f in previews), "no preview with --no-push"
+    assert any({"--push-remote", "--push-branch", "--push-url"} <= f for f in previews), \
+        "no preview with the complete push target"
+    assert any("--consent" in flags for sub, flags in calls if sub == "apply")
     lowered = flat.lower()
     for stale in ("never pushes", "never pushed", "--confirm-version-files"):
         assert stale not in lowered, stale
-    for key in ("details.proposal.paths", "details.checks", "details.contract",
-                "details.sync", "output_dropped_bytes"):
+    for key in ("display.checks", "display.contract", "display.sync", "output_dropped_bytes"):
         assert key in flat, key
 
 
@@ -372,7 +403,8 @@ def test_release_dialog_commits_work_in_progress_inline(text):
     flat = " ".join(text().split())
     assert re.search(r"work in progress", flat, re.IGNORECASE)
     assert "dct clog candidates --json" in flat  # the trailer selection of that commit
-    assert "Changelog: <ids>" in flat
+    # phase 2 (H1.3): `Changelog: <confirmed ids matching the diff>` — any placeholder
+    assert re.search(r"Changelog: <[^>]+>", flat)
     assert "--no-verify" in flat  # named as forbidden
     assert re.search(r"in this (same )?workflow", flat, re.IGNORECASE)
     assert not re.search(r"(run|with|use|invoke) (the )?`?/commit`?( dialog| flow)? "
@@ -389,7 +421,7 @@ def test_release_dialog_respects_the_executor_and_the_stored_consent(text):
     flat = " ".join(text().split())
     assert "dct project release-executor" not in flat  # K-111: one read, the plan
     assert "`executor.project" in flat and "`executor.record" in flat and "`own`" in flat
-    assert "`schema_version` lower than 4" in flat  # the capability check (K-114, #876)
+    assert "`schema_version` lower than 5" in flat  # the capability check (K-114, #876, schema 5)
     assert re.search(r"no new approval", flat, re.IGNORECASE)
     assert "dct release resume --json" in flat
     assert "`conflict`" in flat and "75" in flat and "details.observed_effects" in flat
@@ -481,13 +513,35 @@ def test_release_dialog_routes_an_unfinished_release_before_the_project_setting(
     assert re.search(r"ONE (plan )?result", flat)
 
 
-def test_snippet_routes_the_release_from_the_plan():
-    """K-111: the CLAUDE.md snippet names the same single read."""
-    flat = " ".join(_section(_snippet(), "**Releasing**", "**Session end**").split())
-    assert "dct project release-executor" not in flat
-    assert "`executor.record`" in flat and "`executor.project`" in flat
-    assert "dct release takeover" in flat
-    _in_order(flat, "`executor.record`", "`executor.project`")
+def _snippet_releasing() -> str:
+    return _section(_snippet(), "**Releasing**", "**Session end**")
+
+
+def test_snippet_release_paragraph_only_points_to_the_skill_and_the_fallback():
+    """#877 K-53 (replaces the K-111 pin, which made the snippet a third copy
+    of the release sequence): the always-loaded snippet sends the assistant
+    to `/release` and to the authoritative `/release` fallback; the CLI
+    sequence, the routing keys and the flags live ONLY in those two. The ban
+    is limited to the Releasing paragraph — the same flags may be described
+    elsewhere."""
+    body = _snippet_releasing()
+    flat = " ".join(body.split())
+    assert "/release" in flat and "assistant-fallbacks.md" in flat
+    assert not _commands(body), f"the snippet still carries release commands: {_commands(body)}"
+    for copy in ("--plan-digest", "--proposal-digest", "--consent", "--push-", "--confirm",
+                 "executor.", "attest", "takeover", "prepare", "apply"):
+        assert copy not in flat, f"a piece of the CLI sequence is still copied here: {copy}"
+
+
+def test_snippet_promises_one_screen_only_for_the_typical_case():
+    """"The typical case has one screen" — never one question in every
+    exception (a changelog file to settle, an unreadable version, Change
+    something add rounds)."""
+    for sentence in re.split(r"(?<=[.!?])\s+", " ".join(_snippet_releasing().split())):
+        if re.search(r"\b(one|ONE|a single|single) (question|dialog|screen)\b", sentence):
+            assert re.search(r"\btypical", sentence), f"an unconditional promise: {sentence}"
+    assert re.search(r"\btypical[^.]{0,60}\bone screen\b",
+                     " ".join(_snippet_releasing().split()))
 
 
 # ── resume without a second question (K-112) ────────────────────────────────
@@ -532,6 +586,107 @@ def test_release_resume_path_resumes_without_a_second_question(text):
 
 
 @pytest.mark.parametrize("text", RELEASE_DIALOGS)
+def test_release_resume_path_reads_the_block_and_never_offers_finish_as_doable(text):
+    """K-34 (#877): the plan reports `resume.blocked` (the predicate resume
+    itself refuses with: the approved changelog file, the `restore`
+    commands, the abandon way) — the dialog shows them and does not offer
+    finishing the release while the block is known."""
+    section = " ".join(_resume_path(text()).split())
+    assert "resume.blocked" in section, "the Resume path does not read resume.blocked"
+    at = section.index("resume.blocked")
+    passage = section[max(0, at - 300):at + 900]
+    assert "restore" in passage and "abandon" in passage, passage
+    assert re.search(r"(never|not|no)\b[^.]{0,80}\b(finish|resume)", passage, re.IGNORECASE), \
+        f"the dialog does not say that a blocked record is not finished by resume: {passage}"
+
+
+def _dct_executes(text: str) -> str:
+    """The Resume path's subsection of a release dct executes."""
+    section = _resume_path(text)
+    if "### A release dct executes" in section:
+        return _section(section, "### A release dct executes", "### A record nobody")
+    return _section(section, "*A release dct executes*", "*A record nobody")
+
+
+def _runs_resume(sentence: str) -> bool:
+    """A sentence that tells the dialog to run the resume (not one that
+    forbids it)."""
+    return bool(re.search(r"\b(run|runs|running|then)\b[^.]{0,40}\bresume\b|"
+                          r"\bresume when\b|dct release resume", sentence, re.IGNORECASE)) \
+        and not re.search(r"\b(do not|never|don't)\b[^.]{0,20}\b(run|resume)", sentence,
+                          re.IGNORECASE)
+
+
+@pytest.mark.parametrize("text", RELEASE_DIALOGS)
+def test_release_resume_path_every_branch_checks_the_block_first(text):
+    """Delta review F6 (K-34): `resume.blocked` is a precondition of EVERY
+    branch of the Resume path that runs resume — the "something else"
+    branch (finish this release first, run resume on "finish it") included.
+    Either the subsection states the check once for every branch BEFORE the
+    branches, or each branch that runs resume names it itself."""
+    section = " ".join(_dct_executes(text()).split())
+    first_branch = section.index("asked to continue")
+    precondition = any(
+        "resume.blocked" in s and re.search(
+            r"\b(every|each|any|all)\b[^.]{0,60}\b(branch|branches|case|cases|request|way)",
+            s, re.IGNORECASE)
+        for s in re.split(r"(?<=[.;])\s+", section[:first_branch]))
+    if precondition:
+        return
+    branches = re.split(r"(?<=\.)\s+(?=[A-Z*-])|\s-\s\*\*", section)
+    unguarded = [b for b in branches if _runs_resume(b) and "resume.blocked" not in b]
+    assert unguarded == [], \
+        f"Resume-path branches run resume without checking resume.blocked: {unguarded}"
+
+
+@pytest.mark.parametrize("text", RELEASE_DIALOGS)
+def test_release_something_else_branch_is_gated_by_the_block(text):
+    """Delta review F6: the concrete gap — the "something else" branch says
+    the release is finished first and resumes on "finish it"; while
+    `resume.blocked` is not null that resume is not doable."""
+    section = " ".join(_dct_executes(text()).split())
+    start = section.index("something else")
+    end = min(i for i in (section.find(m, start) for m in
+                          ("An earlier explicit", "**An earlier explicit")) if i != -1)
+    branch = section[start:end]
+    first_branch = section.index("asked to continue")
+    global_gate = re.search(
+        r"resume\.blocked[^.]{0,200}\b(every|each|any|all)\b[^.]{0,60}\b(branch|case|request)|"
+        r"\b(every|each|any|all)\b[^.]{0,60}\b(branch|case|request)[^.]{0,200}resume\.blocked",
+        section[:first_branch], re.IGNORECASE)
+    assert "resume.blocked" in branch or global_gate, \
+        f"the 'something else' branch resumes without the resume.blocked check: {branch}"
+
+
+@pytest.mark.parametrize("text", [
+    pytest.param(lambda: _skill("commit"), id="skill"),
+    pytest.param(_commit_fallback, id="fallback"),
+])
+def test_commit_has_no_unreleased_count_release_threshold(text):
+    """#877: a count of unreleased entries is no reason to suggest /release;
+    only a STAGED version bump redirects there."""
+    flat = " ".join(text().split())
+    assert not re.search(r"(≥|>=)\s*10\b", flat), "the >= 10 entries threshold is still there"
+    assert "release-ready" not in flat
+
+
+def test_commit_keeps_the_staged_version_bump_redirect():
+    flat = " ".join(_skill("commit").split())
+    assert "/release" in flat
+    assert "## [X.Y.Z]" in flat and "pyproject.toml" in flat
+
+
+def test_track_update_records_the_reason_with_the_update():
+    """#877: the reason of a transition is part of the update (one
+    operation, one transaction — update_item(reason=…)), never a separate
+    add_note that survives a refused update."""
+    flat = " ".join(_skill("track-update").split())
+    assert "BEFORE the `update_item` call" not in flat, \
+        "the reason is still a separate add_note before the update"
+    assert re.search(r"update_item\([^)]*reason", flat), "update_item(reason=…) is not used"
+
+
+@pytest.mark.parametrize("text", RELEASE_DIALOGS)
 def test_release_resume_path_offers_the_takeover_as_a_new_consent(text):
     """R8d / K-119 M3: a `dct` record without a consent → the takeover
     preview, the owner approves THAT digest, then resume; an `own` record →
@@ -563,10 +718,13 @@ def test_release_dialog_shows_what_round_four_reports(text):
     assert "pr_source" in flat and re.search(r"client[^.]{0,80}(declar|attest)", flat)
     # an entry never takes a version from the dialog (K-102)
     assert re.search(r"never takes a version", flat)
-    # Step 8 / 9 / 10: ONE push URL, the owner's choice among several, warnings
-    assert "details.push_target.url" in flat and "--push-url" in flat
-    applies = [set(f) for g, s, f in _commands(body) if (g, s) == ("release", "apply")]
-    assert any("--push-url" in f for f in applies)
+    # ONE push URL, the owner's choice among several, warnings. Phase 2: the
+    # target is bound by the preview (`push.url` of the consent view), so the
+    # owner's choice is passed to `prepare --preview`, not to apply.
+    assert re.search(r"(details\.push_target|push)\.url`", flat) and "--push-url" in flat
+    previews = [set(f) for g, s, f in _commands(body)
+                if (g, s) == ("release", "prepare") and "--preview" in f]
+    assert any("--push-url" in f for f in previews)
     assert re.search(r"`warnings`[^.]{0,200}(post-commit|cleanup|cleaned)", flat)
     # legacy path (R8d)
     for key in ("evidence.verification", "limited", "evidence.contract", "details.history",
@@ -606,7 +764,8 @@ _PUSH_SET = {"--push-remote", "--push-branch", "--push-url"}
 
 @pytest.mark.parametrize("text", [
     *RELEASE_DIALOGS,
-    pytest.param(_snippet, id="claude-md-snippet"),
+    # (the CLAUDE.md snippet shows no release command at all since K-53 —
+    # test_snippet_release_paragraph_only_points_to_the_skill_and_the_fallback)
     pytest.param(lambda: (ROOT / "README.md").read_text(encoding="utf-8"), id="readme"),
     pytest.param(lambda: _workflow_doc(), id="release-workflow"),
 ])
@@ -616,17 +775,26 @@ def test_every_executable_release_names_the_complete_push_target(text):
     show (one that carries `--confirm`) names the complete approved target
     (`--push-remote`, `--push-branch`, `--push-url`) or `--no-push`. The
     no-flag form, which pushed to whatever the upstream was at apply time,
-    is gone from all of them."""
+    is gone from all of them. `apply --consent C` is the exception by
+    construction: the approved consent view binds the push target, and a
+    push flag beside it is refused (consent_flag_conflict)."""
     body = text()
-    usages = [set(flags) for group, sub, flags in _commands(body)
-              if (group, sub) in {("release", "apply"), ("clog", "release")}
-              and "--confirm" in flags]
-    assert usages, "no executable apply / alias usage"
+    executable = [set(flags) for group, sub, flags in _commands(body)
+                  if (group, sub) in {("release", "apply"), ("clog", "release")}
+                  and "--confirm" in flags]
+    usages = [flags for flags in executable if "--consent" not in flags]
+    assert executable, "no executable apply / alias usage"
     for flags in usages:
         # (the workflow doc's command table shows both alternatives in one line)
         assert _PUSH_SET <= flags or (
             "--no-push" in flags and not _PUSH_SET & flags), sorted(flags)
-    assert any(_PUSH_SET <= flags for flags in usages), "no pushing usage shown"
+    for flags in executable:
+        if "--consent" in flags:
+            assert not (_PUSH_SET | {"--no-push"}) & flags, sorted(flags)
+    # Phase 2: the release dialogs apply only `--consent` (the push target is
+    # in the previewed content); the other documents still show the D/P path.
+    if usages or "--consent" not in set().union(*executable):
+        assert any(_PUSH_SET <= flags for flags in usages), "no pushing usage shown"
 
 
 def test_cli_help_states_the_complete_push_target():
@@ -749,8 +917,9 @@ def test_release_refusal_rows_tell_the_round_four_actions(text):
     assert re.search(r"\bIF\b", leftover) and re.search(r"owner decides", leftover)
     assert re.search(r"never resets", leftover)
     # (3) the alias row is gone; a new release without an approved proposal
+    # — phase 2: the way back is a new preview (the old Step 8 is gone)
     assert rows["proposal_digest"] == rows["plan_digest"]
-    assert "Step 8" in rows["proposal_digest"]
+    assert re.search(r"prepare --preview|preview again", rows["proposal_digest"])
     # (4) push: several URLs → the owner picks ONE; a rewrite rule
     assert "--push-url" in rows["push_urls"] and re.search(r"owner (picks|chooses)",
                                                            rows["push_urls"])
@@ -769,20 +938,26 @@ def test_release_refusal_rows_tell_the_round_four_actions(text):
 
 def test_release_skill_and_fallback_keep_the_same_step_order():
     """F6 / F7: the skill and the fallback walk the SAME steps in the same
-    order — probe, routing from the plan (K-111), the legacy check, inline
-    WIP commit, attest, the bound plan, prepare, apply, resume. An AUXILIARY
-    documentation test (K-120): routing and continuation are pinned on the
-    real workflow in tests/test_release_dialog_routing.py."""
+    order — probe, routing from the plan (K-111), the report-only status
+    read, the drafted work-in-progress message, then (phase 2, section H)
+    the preview, the one screen's apply --consent, Stop's discard, resume.
+    An AUXILIARY documentation test (K-120): routing and continuation are
+    pinned on the real workflow in tests/test_release_dialog_routing.py and
+    tests/test_release_skill_one_dialog.py."""
     markers = ("dct release plan --json", ROUTING_HEADER, "dct release status --version",
-               "dct clog candidates --json", "dct release attest --entries",
-               "dct release prepare --version", "dct release apply --version",
+               "dct clog candidates --json", "dct release prepare --preview",
+               "dct release prepare --discard-preview",
                "dct release resume --json", "dct release abandon --version",
                "dct release takeover --version", "dct release reconstruct --version",
                "dct release version-files")
     for body in (_skill("release"), _release_fallback()):
-        assert not [m for m in markers if m not in body], [m for m in markers if m not in body]
+        needed = (*markers, "dct release apply --consent")
+        assert not [m for m in needed if m not in body], [m for m in needed if m not in body]
         _in_order(body, *markers)
-        assert re.search(r"dct release plan --version \S+ --entries", body)
+        # the screen's apply (the Finish route may name it before the preview)
+        preview = body.index("dct release prepare --preview")
+        assert body.find("dct release apply --consent", preview) != -1
+        assert not re.search(r"dct release plan --version \S+ --entries", body)
 
 
 # ── /commit: candidates from the workflow, K-30 order, K-53 / K-66 / K-68 ──

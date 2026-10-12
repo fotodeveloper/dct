@@ -62,7 +62,10 @@ _INSTRUCTIONS = (
         "WORKFLOW:\n"
         "1. list_items / get_item to find/inspect; an item's checkpoints are your TODO\n"
         "   list (sort_order). REMEMBER ids from create_item/add_checkpoint/create_handoff.\n"
-        "2. For feature/improvement items sketch 3-7 checkpoints BEFORE coding.\n"
+        "2. When work starts on a non-trivial feature/improvement — or the user asks\n"
+        "   to break the work down — sketch AT LEAST 3 checkpoints BEFORE coding (a\n"
+        "   minimum, never a cap). None at creation; a small fix needs none; another\n"
+        "   item may get some, with no fixed minimum taken from its type.\n"
         "3. complete_checkpoint(id) as each step finishes (real-time, NOT batched);\n"
         "   reject_checkpoint irrelevant ones. Then resolve_item (no auto-transition).\n\n"
         "SPRINT & HANDOFFS:\n"
@@ -329,7 +332,7 @@ CHANGELOG_COLS = [
 CHECKPOINT_COLS = ["id", "status", "sort_order", "text"]
 TAG_COLS = ["id", "name", "item_count", "created_at", "description"]
 PROJECT_COLS = ["id", "slug", "current_version", "name", "path", "changelog_path",
-                "changelog_path_explicit"]
+                "changelog_path_explicit", "commit_co_authored_by", "commit_session_link"]
 HANDOFF_COLS = [
     "id", "scope", "created_by", "created_at", "consumed_at", "prompt",
 ]
@@ -379,6 +382,13 @@ def list_projects(format: str = "structured"):
         project's path relative to its own repository toplevel (a monorepo
         subdirectory maps to the same subdirectory of a linked worktree) —
         not against `path`, which names the main checkout.
+        commit_co_authored_by / commit_session_link are the project's stored
+        commit-trailer preferences (add a `Co-Authored-By` trailer / a
+        session or artifact link), each null = NOT ANSWERED YET (ask once,
+        then store the answer with `dct project trailers <slug>
+        --co-authored-by on|off --session-link on|off`), false = a stored
+        "no", true = a stored "yes". /commit applies a stored answer without
+        asking; the project's own rules forbidding a trailer still win.
     """
     from dct.core.projects import list_projects as _list
     rows = _list(_get_engine())
@@ -404,8 +414,10 @@ def create_item(
     """Create a tracked item (issue / todo / feature / idea / improvement).
 
     REMEMBER the returned `id` — needed for add_checkpoint / update_item /
-    resolve_item / add_note. For feature/improvement items, sketch 3-7
-    checkpoints with add_checkpoint before starting work.
+    resolve_item / add_note. No checkpoints are required at creation; when
+    work starts on a non-trivial feature/improvement — or the user asks to
+    break the work down — sketch AT LEAST 3 with add_checkpoint (a minimum,
+    never a cap). A small fix needs none.
 
     TYPE SELECTION (pick from the user's phrasing; when in doubt use `todo`):
       - issue: defect in existing code — bug, crash, error, broken, regression
@@ -578,14 +590,19 @@ def update_item(
     resolution: str = "",
     description: str = "",
     tags: list[str] | None = None,
+    reason: str = "",
 ) -> dict:
     """Update one or more mutable fields on an existing item. Only non-empty
     args are applied; an empty/omitted field is left unchanged.
 
     Terminal status (resolved/wont_fix) sets resolved_at AND clears the DERIVED
     in_current_sprint flag — the sprint MEMBERSHIP is retained as the sprint's
-    completion history; reopening (open/in_progress) clears resolved_at. This path does
-    NOT run the gate-checkpoint guard — prefer resolve_item for terminal moves.
+    completion history; reopening (open/in_progress) clears resolved_at.
+    GATE GUARD: a terminal status runs the SAME guard as resolve_item — with a
+    gate checkpoint pending (kind not in {'task','cc-task'}) the WHOLE call is
+    refused: {"error": "Cannot resolve item #N: ... gate checkpoint(s)
+    pending ..."}, no field, tag or reason note written; pending gates are never
+    rejected for you. Complete (done) or reject (not applicable) them first.
     Sprint membership is not set here (`in_current_sprint` is read-only) — use
     set_sprint / assign_item_to_sprint / remove_item_from_sprint.
 
@@ -612,6 +629,11 @@ def update_item(
             A refused tag name rolls back the ENTIRE update — no field is
             applied, not even the non-tag ones; re-issue the WHOLE call once
             the tag is resolved.
+        reason: Optional WHY of this change (e.g. what prompted a status or
+            priority move) — appended as an item note in the SAME transaction
+            as the update: a refused update writes no note. Use it instead of
+            a separate add_note for a transition's rationale. "" (default) =
+            no note; a reason alone, with no field to change, is an error.
 
     Clearing a field — pass literal '__clear__' to null a NULLABLE field
     (short_title, component, resolution, description). NOT for title/status/priority: all
@@ -626,13 +648,13 @@ def update_item(
         the field and ignored it);
         progress is {done, pending, active}. NOT the full item dict (no
         notes/checkpoints/tags/description echo) — call get_item to read the
-        resulting tag list back. {"error": "..."} on unknown id, a refused tag
-        name, a blank title, an over-long field (refused, never truncated), or
-        markup.
+        resulting tag list / the reason note back. {"error": "..."} on unknown id, a refused tag
+        name, a blank title, an over-long field (refused, never truncated),
+        markup, or a terminal status with a gate checkpoint pending.
     """
     if (err := _reject_toolcall_markup(
         title=title, short_title=short_title, description=description,
-        resolution=resolution, tags=tags,
+        resolution=resolution, tags=tags, reason=reason,
     )):
         return err
     from dct.core.items import update_item as _update
@@ -654,6 +676,8 @@ def update_item(
     # the tags alone", so it must NOT be passed through as a kwarg.
     if tags is not None:
         kwargs["tags"] = tags
+    if reason:
+        kwargs["reason"] = reason
 
     try:
         result = _update(_get_engine(), item_id, **kwargs)
@@ -683,9 +707,9 @@ def resolve_item(item_id: int, status: str = "resolved", resolution: str = "") -
     {"error": "Cannot resolve item #N: ... gate checkpoint(s) pending ..."}.
     Complete (done) or reject (not applicable) those gates first.
 
-    PREFER THIS OVER update_item FOR TERMINAL TRANSITIONS — explicit intent, and
-    it runs the gate guard above. update_item(status="resolved") also stamps
-    resolved_at and clears the sprint, but SKIPS the gate check.
+    PREFER THIS OVER update_item FOR TERMINAL TRANSITIONS — explicit intent.
+    update_item(status="resolved"|"wont_fix") runs the SAME gate guard (one
+    shared check, same message) and is refused the same way.
 
     Args:
         item_id: Item ID.
@@ -720,7 +744,8 @@ def add_note(item_id: int, note: str) -> dict:
     their own rationale field (use update_item resolution=).
 
     /track-update treats status/priority transitions as mandatory note points —
-    the audit trail is what lets /pickup explain "why #42 moved to P1".
+    the audit trail is what lets /pickup explain "why #42 moved to P1"; it
+    records them with update_item(reason=...), in the update's transaction.
 
     Returns: slim ack {id, item_id, item_title} — `id` is the new note's id,
         `item_title` the parent item's title. NOT the note body echo.
@@ -843,7 +868,10 @@ def add_checkpoint(item_id: int, text: str, kind: str = "task") -> dict:
     """Add an acceptance criterion (checkpoint) to an item.
 
     USE LIBERALLY — one checkpoint per concrete, actionable step.
-    For features/improvements, sketch 3-7 checkpoints BEFORE starting work.
+    When work starts on a non-trivial feature/improvement — or the user asks
+    to break the work down — sketch AT LEAST 3 checkpoints (a minimum, never
+    a cap). A small fix needs none; another item may get some, with no fixed
+    minimum taken from its type.
 
     REMEMBER the returned `id` — needed for complete_checkpoint / reject_checkpoint.
 

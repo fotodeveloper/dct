@@ -5,8 +5,10 @@ description: |
   [dct] Initialize dct for the current project — dual-mode: runs global bootstrap if
   missing, then registers the current directory as a dct project. Interactive
   via AskUserQuestion for path / slug / name / version (with smart defaults from
-  detect_version). Also offers to inject `mcp__dct__*` into the Claude Code
-  permissions allowlist so daily MCP calls stop prompting.
+  detect_version) and, once, the commit-line preferences (Co-Authored-By, a
+  session link). Also offers to inject `mcp__dct__*` into the Claude Code
+  permissions allowlist so daily MCP calls stop prompting. A registered
+  project gets its configuration status, never a reconfiguration.
   Use when: "dct-init", "/dct-init", "zainicjalizuj dct", "setup dct here",
   "add this project to dct", "register this project", "dodaj projekt do dct",
   "skonfiguruj dct", "dct setup", "initialize dct", "bootstrap dct".
@@ -39,9 +41,50 @@ If NOT complete:
   On "yes": Bash `dct init`, capture output, show summary. Re-probe after.
   On "abort": print instructions and exit.
 
-If complete: skip to Step 2.
+If complete: continue to Step 2.
 
-### Step 2: Probe + offer MCP allowlist injection
+### Step 2: Probe current project registration (before any setup question)
+
+Call `mcp__dct__list_projects`. Let `cwd = os.getcwd()`.
+
+Match: for each project row, check if `cwd == row.path` or
+`cwd.startswith(row.path + "/")`. Longest-prefix wins (use
+`get_project_by_path` semantics).
+
+If matched — the project is already set up: read its configuration and
+SHOW it; nothing is reconfigured (no allowlist edit, no script generated or
+changed, no registration). Read-only, in parallel:
+
+- the allowlist — Step 3's probe of `permissions.allow` in
+  `~/.claude/settings.json`: present / missing;
+- the version sync — Step 5's probe: `scripts/dct-version-sync.sh` (with or
+  without the dct sentinel), else `scripts/version-sync.sh` (the release
+  runs it as the version sync), else none;
+- the commit-line preferences — the row's `commit_co_authored_by` and
+  `commit_session_link`: on / off / not answered (null).
+
+```
+✓ Already registered as `<slug>` — current_version=<v>, path=<path>
+  Allowlist:     mcp__dct__* in ~/.claude/settings.json
+  Version sync:  scripts/dct-version-sync.sh (dct template)
+  Commit lines:  Co-Authored-By on · session link off
+  Change the version: `dct project set-version <slug> <v>` · items: /track-list
+```
+
+The other states, one line each: "Allowlist: missing — add mcp__dct__* to
+permissions.allow in ~/.claude/settings.json"; "Version sync:
+scripts/dct-version-sync.sh without the dct sentinel", "Version sync:
+scripts/version-sync.sh — run by every release as the version sync, before
+you approve" or "Version sync: none — template: dct's
+scripts/dct-version-sync.sh"; "Commit lines: not answered".
+
+Then stop. The one exception: a commit-line preference that is not
+answered (the project was registered before dct stored them) — ask the
+question of Step 8 once and store the answer; nothing else is asked.
+
+If no match: continue to Step 3.
+
+### Step 3: Probe + offer MCP allowlist injection
 
 Read `~/.claude/settings.json`. Check if `permissions.allow` contains
 any entry matching `mcp__dct__*` (wildcard) or any individual
@@ -64,10 +107,10 @@ If none present:
 
 If already present: note "✓ allowlist already has dct entries" and continue.
 
-### Step 2.5: Probe project-local CC artefacts for conflicts
+### Step 4: Probe project-local CC artefacts for conflicts
 
 Scan CWD for project-local CC artefacts that could conflict with or shadow
-the global dct install. Read-only until Step 2.5b.
+the global dct install. Read-only until the owner decides each conflict.
 
 Check in parallel:
 
@@ -88,61 +131,74 @@ For each conflict, ask via `AskUserQuestion`:
     - "Keep local, use it (ignore global)" — CC precedence already favors local, no action
     - "Remove local (backup to <path>.bak) and use global dct" — rename file, keep backup
     - "Integrate — wire local into dct workflow" — for hooks: add `exec <global-hook>` at end of local script; for CLAUDE.md: add a "[uses dct]" note and suggest /dct-import
-    - "Skip — decide later" — leave the conflict, proceed to Step 3
+    - "Skip — decide later" — leave the conflict, proceed to Step 5
 
-Each decision is recorded; at the end of Step 2.5, print a short summary:
+Each decision is recorded; at the end of Step 4, print a short summary:
   "✓ Handled N conflicts: <list>" or "✓ No conflicts" if clean.
 
-### Step 2.6: Probe version-sync script integration
+### Step 5: Probe version-sync script integration
 
 dct's release workflow (`dct release prepare`, behind `/release`) runs the
-committed `./scripts/dct-version-sync.sh <version>` (else
-`./scripts/version-sync.sh`) if present — once, in an isolated temporary
-worktree — and the owner approves the files it changes as the project's
-version-file contract at the first release (`docs/release-workflow.md`). We want every
-registered project to have a version-sync script so `/release` can bump
-project files automatically.
+committed `./scripts/dct-version-sync.sh <version>` if present — it takes
+precedence — else a script named exactly `./scripts/version-sync.sh`,
+automatically, with no setting to switch it on — once, in an isolated
+temporary worktree — and the owner approves the files it changes as the
+project's version-file contract at the first release
+(`docs/release-workflow.md`).
+
+**The script changes ONLY the version files** (the version fields of
+`pyproject.toml`, `package.json`, `Cargo.toml`, …) and nothing else.
+`prepare` runs it BEFORE the owner sees the release's consent screen, and
+the isolated worktree is not a sandbox: the script can still reach the
+network, the user's home directory or any absolute path. Never wrap a
+release, publish or deploy command (an existing `release.sh`, a `release`
+make / just / task target, `npm publish`, `cargo publish`, `twine upload`,
+a tag or a push) as the version sync — it could publish before anyone
+approved the release. A script that writes into the checkout itself is
+refused by prepare, with the changed files named.
 
 Probe in order (first-match wins for the existence check):
 
-1. `./scripts/dct-version-sync.sh` — if line 1 begins with `# dct-version-sync template v`, report "✓ version-sync already integrated" and continue. Otherwise treat as existing-but-unmarked → ask user whether to add sentinel.
-2. `./scripts/*version*.sh` or `./scripts/*bump*.sh` or `./scripts/release.sh` — existing non-dct bump script.
-3. `./Makefile` or `./justfile` or `./Taskfile.yml` with a `version:` / `bump:` / `release:` target.
-4. None of the above — greenfield, no script.
+1. `./scripts/dct-version-sync.sh` — if line 1 begins with `# dct-version-sync template v`, it is integrated: report "✓ version-sync already integrated" and continue. Without the sentinel → treat as existing-but-unmarked: ask whether to add the sentinel.
+2. `./scripts/*version*.sh` or `./scripts/*bump*.sh` — an existing non-dct bump script.
+3. None of the above — greenfield, no script.
 
 Based on probe result, use `AskUserQuestion`:
 
-**Case 1 — existing dct template (sentinel present)**: skip, already good.
+**Case 1 — existing dct template (sentinel present)**:
+skip, already good.
 
-**Case 2 — existing non-dct script**:
-  question: f"Found existing {script_path}. Integrate with dct?"
-  header: "Version sync"
-  options:
-    - "Wrap — generate scripts/dct-version-sync.sh that delegates to <script> $1 (recommended)"
-    - "Replace — overwrite with dct template (backup original to .bak)"
-    - "Keep standalone — the release workflow bumps no files; the project releases those files with its own tool"
-    - "Skip for now"
+**Case 2 — existing non-dct script**: read it first, to see which version
+files it edits. It is never wrapped: the dct script carries its own
+version-file edits, so it is safe to run before the consent screen whatever
+the other script does. Branch on the path found:
 
-  On "wrap": write minimal shim:
-    ```bash
-    #!/usr/bin/env bash
-    # dct-version-sync template v1 (wraps <original-script>)
-    set -euo pipefail
-    exec "$(dirname "$0")/<original-script-name>" "$@"
-    ```
+- exactly `scripts/version-sync.sh` — dct's release already runs it
+  automatically as the version sync (when there is no
+  `scripts/dct-version-sync.sh`, which takes precedence), BEFORE the owner's
+  consent screen, so it must change only the version files. Say so plainly:
+    question: "scripts/version-sync.sh is run by every dct release as the version sync, before you approve the release. Keep it that way?"
+    header: "Version sync"
+    options:
+      - "Generate scripts/dct-version-sync.sh from the dct template — it takes precedence, so the release no longer runs scripts/version-sync.sh (recommended)"
+      - "Keep it — the release runs scripts/version-sync.sh as it is (it must change only the version files)"
+      - "Skip — configure nothing now; the release still runs scripts/version-sync.sh"
+- Any other name (`scripts/bump-version.sh`, …) — the release never runs
+  it:
+    question: f"Found existing {script_path}. Integrate with dct?"
+    header: "Version sync"
+    options:
+      - "Generate scripts/dct-version-sync.sh from the dct template — it edits only the version files {script_path} edits (recommended)"
+      - "Keep standalone — the release workflow bumps no files; the project releases those files with its own tool"
+      - "Skip for now"
 
-  On "replace": copy dct's `scripts/dct-version-sync.sh` template, uncomment
-  the block matching detected project kind (result of `detect_version` in
-  Step 4d: VERSION / pyproject.toml / package.json / Cargo.toml / tauri.conf.json).
+  On "generate": copy dct's `scripts/dct-version-sync.sh` template, uncomment
+  the blocks for the version files the existing script edits (or, when that
+  is unclear, the block matching the detected project kind — `detect_version`
+  in Step 6d: VERSION / pyproject.toml / package.json / Cargo.toml /
+  tauri.conf.json). The original script stays untouched.
 
-**Case 3 — Makefile/justfile/Taskfile target**:
-  question: f"Found {tool} target {target_name}. Integrate with dct?"
-  header: "Version sync"
-  options:
-    - "Wrap — generate scripts/dct-version-sync.sh that calls `{tool} {target} $1` (recommended)"
-    - "Skip — the release workflow bumps no files; the project releases those files with its own tool"
-
-**Case 4 — no script detected**:
+**Case 3 — no script detected**:
   question: "No version-sync script found. Generate template?"
   header: "Version sync"
   options:
@@ -152,30 +208,11 @@ Based on probe result, use `AskUserQuestion`:
 
 All generated scripts include the sentinel `# dct-version-sync template v1`
 as line 1 (after shebang) so future `/dct-init` runs short-circuit via
-Case 1 and do not regenerate.
+Case 1 and do not regenerate. Generating never overwrites an existing
+`scripts/dct-version-sync.sh`: Case 1 finds it first, and only the owner's
+answer to its sentinel question changes it.
 
-### Step 3: Probe current project registration
-
-Call `mcp__dct__list_projects`. Let `cwd = os.getcwd()`.
-
-Match: for each project row, check if `cwd == row.path` or
-`cwd.startswith(row.path + "/")`. Longest-prefix wins (use
-`get_project_by_path` semantics).
-
-If matched:
-  Print "✓ Already registered as `<slug>` — current_version=<v>, path=<path>".
-  Offer via AskUserQuestion:
-    question: "Project is already registered. What now?"
-    header: "Registered"
-    options:
-      - "Nothing — just confirm status"
-      - "Update version — call `dct project set-version`"
-      - "Show current items — /track-list"
-  Run matching action. Exit.
-
-If no match: continue to Step 4.
-
-### Step 4: Collect registration inputs
+### Step 6: Collect registration inputs
 
 Derive defaults first (pure functions, no side effects):
   - `default_path` = CWD
@@ -213,7 +250,6 @@ d) Version:
      options:
        - f"{detected_version} (detected, recommended)"
        - "Type custom"
-       - "Leave NULL (set later via `dct project set-version`)"
    Else:
      question: "Starting version? (none detected)"
      header: "Version"
@@ -225,62 +261,68 @@ d) Version:
 
 For any "Other — type custom" / "Type custom", use the answer's free-text value.
 
-### Step 5: Execute registration
+### Step 7: Execute registration
 
 Build command:
 ```
-dct project add <slug> <path> --name "<name>" [--version <vX.Y.Z>]
+dct project add <slug> <path> --name "<name>" --version <vX.Y.Z>
 ```
 
-Skip `--version` when user picked "Leave NULL".
+Always pass the chosen `--version`: without it `dct project add` stores the
+version it detects itself, so there is no "no version" choice when one is
+detected (change it later with `dct project set-version`).
 
 Run via Bash. Verify with `mcp__dct__list_projects` — the new slug must appear.
 
-### Step 6: Final report
+### Step 8: Commit-line preferences — one question, asked once
 
-```
-✓ Bootstrap:   mcpServers.dct OK, N skills installed, M hooks installed
-✓ Allowlist:   "mcp__dct__*" in ~/.claude/settings.json
-✓ Project:     <slug> registered at <path>, version <v>
-```
+Which lines /commit adds to every commit of this project. Asked once, at
+the project's first configuration (and for a registered project whose
+preferences are not answered yet — Step 2). Once stored, never asked
+again: /commit applies the stored answer without asking.
 
-### Step 7: Propose a concrete next action
-
-Registration alone does nothing visible — the project's DB row is empty.
-Offer the natural follow-up via `AskUserQuestion`:
-
-  question: "Project is registered. What next?"
-  header:   "Next step"
+  question: "Which lines should commits in <slug> carry? I ask once — /commit applies your answer to every commit."
+  header: "Commit lines"
   options:
-    - "Import existing MD tracking — run /dct-import now"
-      → delegate to the `/dct-import` skill (pass the freshly-registered
-         slug implicitly via CWD auto-detect — the skill takes over from
-         there with its own AskUserQuestion flow for file selection).
-    - "Create first item manually — run /track"
-      → delegate to the `/track` skill.
-    - "Exit — I'll come back later"
-      → print a one-liner hint listing both commands and stop.
+    - "Co-Authored-By, no session link (recommended)"
+    - "Neither"
+    - "Both — Co-Authored-By and a link to the assistant session"
+    - "Session link only"
 
-**Why this matters**: without the follow-up prompt, users correctly
-register their project and then bounce off a blank slate — the DB has a
-projects row but nothing else, so `/pickup` returns empty, `/track-list`
-returns empty, and it looks like dct "doesn't do anything". For projects
-with pre-existing MD tracking (ROADMAP, TODOS, sprint docs, changelog),
-`/dct-import` is almost always the right next move and should be
-offered proactively, not discovered by hunting.
+The project's own rules win over a stored yes: when its CLAUDE.md forbids
+one of these lines (a public repository that bans session links), say so
+in the question and leave out the options that add it.
 
-**Probe before offering**: if the project path contains plausible
-tracking files (any of `ROADMAP.md`, `TODOS.md`, `BACKLOG.md`,
+Store the answer (on = the line is added, off = never added):
+```
+dct project trailers <slug> --co-authored-by on|off --session-link on|off
+```
+
+### Step 9: Final report
+
+```
+✓ Bootstrap:    mcpServers.dct OK, N skills installed, M hooks installed
+✓ Allowlist:    "mcp__dct__*" in ~/.claude/settings.json
+✓ Project:      <slug> registered at <path>, version <v>
+✓ Commit lines: Co-Authored-By on · session link off
+  Next: /dct-import (tracking files found) · /track to add the first item
+```
+
+The report ends the skill — no closing question. The `Next:` line is a
+hint, not a menu: name `/dct-import` first when the project path holds
+plausible tracking files (any of `ROADMAP.md`, `TODOS.md`, `BACKLOG.md`,
 `SPRINT*.md`, `PLAN*.md`, `CHANGELOG.md`, `changelog.md`,
-`docs/plans/*.md`, `docs/specs/*.md`), make the `/dct-import` option the
-**recommended** choice. If none exist, demote it — the recommended
-default becomes `/track` for a greenfield project.
+`docs/plans/*.md`, `docs/specs/*.md`), else `/track` alone. Registration
+alone leaves an empty project (`/pickup` and `/track-list` return
+nothing), so the hint says where to go — the owner runs it when they want.
 
 ## Rules
 
 - **Every decision is AskUserQuestion.** Never plain Y/N via read.
-- **Idempotent probes first.** Safe to re-run at any time — re-running
-  with everything in place reports ✓ for each check and exits.
+- **Idempotent probes first.** Safe to re-run at any time — an already
+  registered project gets its configuration status (Step 2) and no setup
+  question; only a commit-line preference that is not answered yet is
+  asked, once.
 - **Smart defaults, no free-text when avoidable.** The "Other — type
   custom" escape hatch covers unusual cases but default path is one click.
 - **Single source of truth for bootstrap.** Skill calls `dct init`

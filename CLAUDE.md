@@ -126,7 +126,10 @@ dct/integrations/claude.py — Claude Code adapter: MCP registration, skill/hook
 dct/integrations/codex.py — Codex MCP, workflow skills and managed AGENTS.md
 dct/integrations/codex_hooks.py — Native event bridge over shared hook policies
 dct/workflows/task_mirror.py — Append-only client plan/task observations
-dct/workflows/release/   — Release workflow (K-72): proof layer, read-only —
+dct/workflows/release/   — Release workflow (K-72): proof layer, read-only for
+                           index, refs, work tree and database (the plan may
+                           write unreferenced git objects to build the future
+                           tree of uncommitted work, as the preview does) —
                            proof.py (trailer / revert / squash rules),
                            plan.py (`dct release plan`, `dct clog candidates`);
                            effects layer — effects.py (`dct release attest /
@@ -224,8 +227,9 @@ Red flag: calling one function to fix what another should have done correctly
 ## Gate checkpoints
 
 `item_checkpoints.kind` defaults to `'task'` (non-blocking). Any other kind
-except `'cc-task'` is a **gate**: `resolve_item` refuses to close the item
-while a gate is `pending` — complete it (done) or reject it (consciously
+except `'cc-task'` is a **gate**: `resolve_item` — and `update_item` with a
+terminal status, through the same check in the same transaction — refuses to
+close the item while a gate is `pending` — complete it (done) or reject it (consciously
 skipped, ledger-preserved). Known kinds: `dogfood` (user validates a
 user-facing feature in a fresh session), `security`, `approval`, `review`;
 unknown kinds are conservatively treated as gates.

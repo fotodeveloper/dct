@@ -69,3 +69,63 @@ def test_three_bootstraps_create_the_table_once_then_converge(engine, capsys):
 def test_partial_unique_index_exists_after_bootstrap(engine):
     names = {ix["name"] for ix in sa.inspect(engine).get_indexes("releases")}
     assert "ix_releases_project_version_live" in names
+
+
+# ── projects.release_preview (the preview slot of `prepare --preview`) ────────
+
+_PREVIEW = re.compile(r"\brelease_preview\b", re.IGNORECASE)
+_PROJECTS = re.compile(r"\bprojects\b", re.IGNORECASE)
+
+
+def _project_columns(engine) -> set[str]:
+    return {c["name"] for c in sa.inspect(engine).get_columns("projects")}
+
+
+def _slot_and_proposal(engine) -> tuple:
+    from dct.db import projects
+
+    with engine.begin() as conn:
+        return conn.execute(sa.select(projects.c.release_preview, projects.c.release_proposal)
+                            .where(projects.c.slug == "proj-a")).one()
+
+
+def test_release_preview_column_is_added_once_then_bootstraps_converge(engine, capsys):
+    """Additive, nullable, no backfill: the first bootstrap of a database
+    without the column adds it (existing rows read NULL, nothing else
+    written); the second and third issue no DDL, write nothing to
+    `projects`, print nothing and keep a slot stored in between. Valid on
+    SQLite and on the PG lane."""
+    from dct.db import projects
+
+    assert "release_preview" in _project_columns(engine), "projects has no release_preview"
+    create_project(engine, slug="proj-a", name="Project A", path="/tmp/proj-a",
+                   current_version="1.0.0")
+    with engine.begin() as conn:
+        conn.execute(projects.update().where(projects.c.slug == "proj-a")
+                     .values(release_proposal='{"paths": []}'))
+        conn.execute(sa.text("ALTER TABLE projects DROP COLUMN release_preview"))
+    assert "release_preview" not in _project_columns(engine)
+
+    seen = _record(engine)
+    create_tables(engine)  # bootstrap 1 — heals
+    assert "release_preview" in _project_columns(engine)
+    ddl = _ddl(seen)
+    assert any(_PREVIEW.search(s) for s in ddl), ddl
+    preview_dml = [s for s in seen if _DML.match(s) and _PREVIEW.search(s)]
+    assert preview_dml == [], f"bootstrap 1 back-filled the slot: {preview_dml}"
+    assert _slot_and_proposal(engine) == (None, '{"paths": []}')
+    capsys.readouterr()
+
+    with engine.begin() as conn:  # a slot stored by the new code
+        conn.execute(projects.update().where(projects.c.slug == "proj-a")
+                     .values(release_preview='{"id": "01SLOT"}'))
+    for n in (2, 3):
+        seen.clear()
+        create_tables(engine)
+        assert _ddl(seen) == [], f"bootstrap {n} issued DDL: {_ddl(seen)}"
+        writes = [s for s in seen if _DML.match(s) and (_PROJECTS.search(s)
+                                                        or _PREVIEW.search(s))]
+        assert writes == [], f"bootstrap {n} wrote projects: {writes}"
+        out = capsys.readouterr()
+        assert out.out == "" and out.err == "", f"bootstrap {n} printed output"
+        assert _slot_and_proposal(engine) == ('{"id": "01SLOT"}', '{"paths": []}')

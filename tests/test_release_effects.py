@@ -39,6 +39,7 @@ from dct.core.releases import get_release, get_version_files, set_version_files
 from dct.db import changelog_entries, projects, releases
 from dct.workflows.release import effects
 from dct.workflows.release.effects import (
+    CONSENT_INTERRUPTION_POINTS,
     INTERRUPTION_POINTS,
     RESULT_KEYS,
     ReleaseRefused,
@@ -319,7 +320,10 @@ def test_bootstrap_writes_the_full_export_with_the_section_once(engine, proj):
 # ── interruption + resume (K-57) ─────────────────────────────────────────────
 
 
-@pytest.mark.parametrize("point", INTERRUPTION_POINTS)
+# The points of `apply --consent` (its work / attestation commits before the
+# stamp) are never reached on this path — tests/test_release_apply_consent.py.
+@pytest.mark.parametrize("point", [p for p in INTERRUPTION_POINTS
+                                   if p not in CONSENT_INTERRUPTION_POINTS])
 def test_interrupted_release_resumes_exactly_once(engine, proj, point):
     repo, log = proj
     a = proven(engine, repo, "feature a")

@@ -19,10 +19,11 @@ Regex: `^(#|ITEM-|item-|ITEM_|item_)?0*(\d+)$` — capture group 2 is the numeri
 
 **Batch form** — user may give multiple ids for the SAME change, e.g.
 "set #42 #45 to P1" or "w toku: 7, 12, 19". Parse each id separately
-(whitespace or comma separated) and apply the same update to all. Ask
-confirmation ONCE for the batch, not per-item.
+(whitespace or comma separated) and apply the same update to all.
 
-Invalid inputs (non-digit body, empty, negative) — reject with clear message.
+Ask which item only when it is ambiguous (no id given and several items fit
+the description). Invalid inputs (non-digit body, empty, negative) — reject
+with clear message.
 
 For each id, call `mcp__dct__get_item(item_id)` to fetch current state.
 
@@ -47,6 +48,12 @@ Status transitions:
 - "start" / "zacznij" / "rozpocznij" / "w toku" / "wip" / "in progress" → `status="in_progress"`
 - "pause" / "wstrzymaj" / "block" / "zablokuj" → keep status, add note explaining pause
 - "open" / "reopen" / "wznów" → `status="open"` (also clears `resolved_at` automatically — see CLAUDE.md terminal invariant)
+- "resolved" / "done" / "close" / "zamknij" / "wont fix" → closing is a
+  terminal transition: follow the /track-resolve procedure (its pending-gate
+  check, then `mcp__dct__resolve_item(item_id, status, resolution)`), never
+  `update_item` with a terminal status. A pending gate stops the close the
+  same way /track-resolve does — the server refuses it anyway — and no gate
+  is ever rejected to get the item closed: that is the user's own "skip it".
 
 Sprint membership (NOT via update_item):
 - "add to sprint" / "flag for sprint" / "na sprint" / "dodaj do sprintu" →
@@ -56,33 +63,32 @@ Sprint membership (NOT via update_item):
   `mcp__dct__remove_item_from_current_sprint(item_id, project)`.
 - To replace the WHOLE current sprint at once: `mcp__dct__set_sprint(project, item_ids)`.
 
-## Step 3: Confirm
+## Step 3: Execute — no confirmation question
 
-Show before/after (batch shows list):
-```
-#42 — Parser crashes on empty files
-  Priority: P2 → P1
-  Status:   open → in_progress
-  + Note:   "Reproducible on 0-byte input, blocking v0.3"
-```
+An unambiguous instruction ("#42 to P1", "start working on #42", "w toku: 7,
+12, 19") is applied without a confirmation question: call
+`mcp__dct__update_item(item_id, ..., reason="…")` at once (a batch: once per id
+with the same fields). Ask only when the change itself is unclear (which
+field, which value). The one-line acknowledgement shows old → new, so a wrong
+change is visible and reversible at once.
 
-Wait for confirmation.
+### The reason travels with the update
 
-## Step 4: Execute
+When the transition is one of these, pass its reason IN the update call —
+`mcp__dct__update_item(item_id, status=…, priority=…, reason="…")`:
+- **status** change (to `in_progress`, or back to `open`) — the reason / link
+  to commit; a close carries its reason as the `resolution` of `resolve_item`
+- **priority** change — what prompted the bump or demotion
+- **resolution** set — the commit hash or decision rationale
 
-### When add_note is MANDATORY
+`reason` becomes an item note written in the SAME transaction as the
+update: one operation, and a refused update (a refused tag, an invalid
+status) leaves no orphan note behind. This is the audit trail — future
+/pickup reads these notes via `get_item`.
 
-Call `mcp__dct__add_note(item_id, note)` BEFORE the `update_item` call when the
-transition is one of:
-- **status** change (especially to `in_progress` or any terminal) — note the reason / link to commit
-- **priority** change — note what prompted the bump or demotion
-- **resolution** set — note the commit hash or decision rationale
-
-This is the audit trail — future /pickup will read these notes via `get_item`.
-
-### When add_note is OPTIONAL
-
-Title, short_title, component, description, tags edits — notes welcome but not required.
+Title, short_title, component, description, tags edits — a reason is
+welcome but not required. A note WITHOUT a field change (e.g. "pause" that
+keeps the status) stays `mcp__dct__add_note(item_id, note)`.
 
 ### Editing tags
 
@@ -96,30 +102,49 @@ existing tag is refused with a suggestion in the error (e.g. `test` vs `tests`).
 Reuse the suggested tag, or — when the near-duplicate is genuinely wanted — call
 `mcp__dct__add_tag(name=..., force=true)` first and retry the update.
 
-Then call `mcp__dct__update_item(item_id, ...)` with changed fields.
-For batch updates, loop per-id with the same kwargs.
-
 For sprint membership changes, call `add_item_to_current_sprint` /
 `remove_item_from_current_sprint` (or `set_sprint` for a full replace) — NOT
 `update_item`.
 
-## Step 5: Report
+## Step 4: Starting work — propose the plan when the work needs one
 
-Single:
+When the update starts work on an item (status → `in_progress`: "start
+working on #N", "wip"), look at its checkpoints and its description in the
+`get_item` result. An item that already has checkpoints keeps its plan: name
+the next pending one and add nothing.
+
+When work starts on a non-trivial feature or improvement — or when the user
+asks to break the work down — propose a plan of at least 3 checkpoints:
+concrete, actionable steps, as many as the work needs (3 is a minimum, never
+a cap), written at once with `mcp__dct__add_checkpoint(item_id, text)`
+(remember each id) and listed under the acknowledgement. The user adjusts it
+in plain words: `mcp__dct__reject_checkpoint(id)` drops a step the user
+removes (ledger-kept), `add_checkpoint` adds one.
+
+A small bug or a one-line fix starts with no checkpoints: name the next step
+in the acknowledgement instead of writing an artificial plan. A complex issue
+or todo may get checkpoints when its work has several real steps, with no
+fixed minimum taken from its type.
+
+## Step 5: Acknowledge in one line
+
 ```
-✓ #42 updated — priority P1, status in_progress
+✓ #42 priority P2 → P1 · status open → in_progress
 ```
 
-Batch:
+One line per update: what changed, old → new. To correct a wrong change, run
+`/track-update` again with the previous value (`update_item`). A batch is one
+line too:
+
 ```
-✓ 3 items updated — priority P1, status in_progress
-  #7, #12, #19
+✓ #7, #12, #19 status open → in_progress
 ```
 
 ## Rules
 
-- **Every status/priority change gets a note** — no "I'll explain later" allowed.
-- **Batch confirmations are one-shot** — do NOT ask per-item if user clearly grouped them.
+- **Every status/priority change carries a reason** (`update_item(…, reason="…")`) — no "I'll explain later" allowed.
+- **No confirmation question on an unambiguous instruction** — update, then
+  acknowledge in one line (old → new). A batch is one update, not one question per item.
 - **ID normalization is uniform** — use the same regex as /track-resolve and /track-list.
 - **Terminal transitions clear the DERIVED flag, not the membership** — a
   resolved / wont_fix item drops out of `in_current_sprint`, but its

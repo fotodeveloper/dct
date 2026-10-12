@@ -91,6 +91,7 @@ import posixpath
 import shlex
 import stat
 import unicodedata
+from collections.abc import Mapping
 
 from dct.core import gitinfo
 
@@ -104,8 +105,33 @@ PROBLEMS = ("ambiguous", "case_variant", "not_markdown", "symlink", "not_a_direc
 # changelog beside the existing one.
 PROPOSED_MARKDOWN_PATH = "CHANGELOG.md"
 EXPLICIT_MARKER = "changelog_path_explicit"
+# The settings that choose the file (choice_settings): the shape a release
+# consent binds and the stamp transaction compares.
+CHOICE_KEYS = frozenset({"managed", "explicit", "path"})
 
 _FILE_KINDS = ("file", "link")
+
+
+def _configured(project: Mapping) -> str:
+    """The stored changelog path, normalized as the resolver reads it."""
+    configured = os.path.normpath(project.get("changelog_path") or DEFAULT_CHANGELOG_PATH)
+    return configured.replace(os.sep, "/")
+
+
+def choice_settings(project: Mapping) -> dict:
+    """The project settings that CHOOSE its changelog file, and only those
+    (resolve_changelog rules 1-2): {"managed": manages_changelog, "explicit":
+    the marker — only when managed, "path": the stored path — only when
+    managed AND explicit (a path that is not the owner's choice never
+    chooses: detection does)}. Equal settings resolve the same file at the
+    same commit; the release binds them from its last derivation and the
+    stamp compares them with the project row inside its transaction
+    (core.changelog.release_entries expected_changelog_settings). Accepts a
+    project dict or a row mapping."""
+    managed = bool(project.get("manages_changelog", True))
+    explicit = managed and bool(project.get(EXPLICIT_MARKER))
+    return {"managed": managed, "explicit": explicit,
+            "path": _configured(project) if explicit else None}
 
 
 def _fold(name: str) -> str:
@@ -347,8 +373,7 @@ def resolve_changelog(project: dict, *, project_root: str | None,
     → not explicit). Read-only; raises gitinfo.GitReadError when a tree
     read fails."""
     slug = project.get("slug") or "<slug>"
-    configured = os.path.normpath(project.get("changelog_path") or DEFAULT_CHANGELOG_PATH)
-    configured = configured.replace(os.sep, "/")
+    configured = _configured(project)
     explicit = bool(project.get(EXPLICIT_MARKER))
     out = {"managed": bool(project.get("manages_changelog", True)), "configured": configured,
            "explicit": explicit, "path": None, "source": None, "format": None,

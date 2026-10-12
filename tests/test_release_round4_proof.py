@@ -620,7 +620,7 @@ def test_h6_an_edited_plain_revert_gives_no_automatic_proof(engine, repo):
 
 def test_plan_names_the_project_executor(engine, repo):
     plan = plan_of(engine, repo)
-    assert plan["schema_version"] == 4
+    assert plan["schema_version"] == 5
     assert plan["executor"] == {"project": "dct", "record": None}
     set_release_executor(engine, "proj-r", "own")
     assert plan_of(engine, repo)["executor"] == {"project": "own", "record": None}
@@ -672,7 +672,7 @@ def test_plan_json_carries_the_executor_through_the_cli(cli_engine, monkeypatch,
     monkeypatch.chdir(path)
     run_cli(monkeypatch, ["release", "plan", "-P", "proj-c", "--json"])
     plan = json.loads(capsys.readouterr().out)
-    assert plan["schema_version"] == 4 and plan["executor"] == {"project": "dct", "record": None}
+    assert plan["schema_version"] == 5 and plan["executor"] == {"project": "dct", "record": None}
     run_cli(monkeypatch, ["release", "plan", "-P", "proj-c"])
     assert "executor: dct" in capsys.readouterr().out
 
@@ -721,7 +721,7 @@ def test_documented_schema_table_matches_its_module(heading, keys, module):
 def test_schema_versions_of_the_two_layers_are_independent():
     from dct.workflows.release import effects
 
-    assert plan_module.SCHEMA_VERSION == 4 and effects.SCHEMA_VERSION == 1
+    assert plan_module.SCHEMA_VERSION == 5 and effects.SCHEMA_VERSION == 1
 
 
 def test_prose_names_the_current_plan_schema_version():

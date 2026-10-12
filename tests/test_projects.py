@@ -384,3 +384,64 @@ class TestChangelogPath:
         create_project(engine, slug="a", name="A")  # no path registered
         proj = get_project(engine, "a")
         assert resolve_changelog(proj, project_root=proj.get("path"))["path"] is None
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# K-44: the changelog-choice settings are written under the stamp's lock
+# ═════════════════════════════════════════════════════════════════════════════
+
+
+def _changelog_setting_mutators():
+    from dct.core import projects as p
+
+    return [
+        ("manages_changelog", lambda e: p.set_manages_changelog(e, "a", False), False),
+        ("changelog_path", lambda e: p.set_changelog_path(e, "a", "docs/CHANGES.md"),
+         "docs/CHANGES.md"),
+        ("changelog_path_explicit", lambda e: p.reset_changelog_path(e, "a"), False),
+        ("changelog_pr_refs", lambda e: p.set_changelog_pr_refs(e, "a", True), True),
+    ]
+
+
+@pytest.mark.parametrize("column,mutate,expected", _changelog_setting_mutators(),
+                         ids=["managed", "path", "reset", "pr_refs"])
+def test_a_changelog_setting_is_written_inside_the_project_write_transaction(
+        engine, monkeypatch, column, mutate, expected):
+    """The stamp checks these settings inside project_transaction(write=True)
+    (core.changelog.release_entries): a mutator that takes the SAME lock
+    either precedes that check (the stamp refuses consent_mismatch) or waits
+    until the stamp committed — a plain engine.begin() write does neither on
+    PostgreSQL. The spy proves the write happens INSIDE the locked
+    transaction (the row already holds the new value before it ends)."""
+    from contextlib import contextmanager
+
+    import sqlalchemy as sa
+
+    from dct import db
+    from dct.core.projects import set_changelog_path
+    from dct.db import projects
+
+    create_project(engine, slug="a", name="A", path="/tmp/proj-a")
+    if column == "changelog_path_explicit":
+        set_changelog_path(engine, "a", "docs/CHANGES.md")  # reset has work to do
+    real = db.project_transaction
+    seen = []
+
+    @contextmanager
+    def spy(engine_, slug, *, write=False):
+        with real(engine_, slug, write=write) as (conn, pid):
+            yield conn, pid
+            inside = conn.execute(sa.select(projects.c[column])
+                                  .where(projects.c.id == pid)).scalar_one()
+            seen.append((slug, write, inside))
+
+    monkeypatch.setattr(db, "project_transaction", spy)
+    assert mutate(engine) is not None
+    assert seen == [("a", True, expected)], seen
+    assert get_project(engine, "a")[column] == expected
+
+
+@pytest.mark.parametrize("column,mutate,expected", _changelog_setting_mutators(),
+                         ids=["managed", "path", "reset", "pr_refs"])
+def test_a_changelog_setting_of_an_unknown_project_is_none(engine, column, mutate, expected):
+    assert mutate(engine) is None
