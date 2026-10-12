@@ -311,7 +311,9 @@ def test_bootstrap_writes_the_full_export_with_the_section_once(engine, proj):
     a = proven(engine, repo, "feature a")
     apply(engine, repo, version="1.1.0", entry_ids=[a])
     text = (repo / "changelog.md").read_text()
-    assert text.startswith("# Changelog\n")
+    # K-81: exactly one blank line under the heading, no run of blank lines.
+    assert text.startswith("# Changelog\n\n## [")
+    assert "\n\n\n" not in text, repr(text[:120])
     assert text.count("## [1.1.0]") == 1 and "- feature a" in text
     assert f"## [1.1.0] - {record_date(engine)}" in text
     assert git(repo, "status", "--porcelain") == ""

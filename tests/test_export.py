@@ -155,3 +155,24 @@ def test_export_single_version_does_not_break_full_render(engine, project):
     assert "# Changelog" in md
     assert "## [1.0]" in md
     assert "## [2.0]" in md
+
+
+@pytest.mark.parametrize("released", [False, True])
+@pytest.mark.parametrize("unreleased", [False, True])
+def test_the_heading_is_followed_by_exactly_one_blank_line(engine, project, released, unreleased):
+    """K-81 (dogfood of #877): the file header used to carry its own newline
+    AND a blank line, so every new changelog (`dct clog export`, and the
+    first release of a project without a changelog file) started with two
+    blank lines under `# Changelog` (markdownlint MD012). No run of blank
+    lines anywhere, whatever the file holds."""
+    if released:
+        add_entry(engine, "proj-a", "added", "V1 feature")
+        release_entries(engine, "proj-a", "1.0")
+    if unreleased:
+        add_entry(engine, "proj-a", "fixed", "Pending fix")
+    md = export_changelog_md(engine, "proj-a")
+    if released or unreleased:
+        assert md.startswith("# Changelog\n\n## ["), repr(md[:60])
+    else:
+        assert md == "# Changelog\n", repr(md)
+    assert "\n\n\n" not in md, repr(md[:120])

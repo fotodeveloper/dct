@@ -112,7 +112,7 @@ def export_changelog_md(
                               refs_by_version.get(_identity(entries[0]["version"])))
         return "\n".join(block)
 
-    lines = ["# Changelog\n", ""]
+    lines = ["# Changelog", ""]
 
     # Unreleased first
     if include_unreleased and None in versions:
