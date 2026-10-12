@@ -75,6 +75,7 @@ dct = [
     "skills/**/*.md",
     "hooks/*.sh",
     "assets/*.md",
+    "assets/*.sh",
     "web/templates/*",
     "web/templates/**/*",
     "web/static/*",

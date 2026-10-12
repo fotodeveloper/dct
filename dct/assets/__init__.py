@@ -22,3 +22,9 @@ def hooks_dir() -> Path:
 def claude_snippet_path() -> Path:
     """The packaged CLAUDE.md snippet `dct init` offers to attach (#443)."""
     return Path(__file__).resolve().parent / "claude-md-snippet.md"
+
+
+def version_sync_template_path() -> Path:
+    """The packaged generic version-sync template (K-76): every block
+    commented; `dct project version-sync-script` writes it into a project."""
+    return Path(__file__).resolve().parent / "dct-version-sync.sh"

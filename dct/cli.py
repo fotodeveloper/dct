@@ -17,6 +17,7 @@ from dct.config import Config, load_config, save_config
 from dct.core.engine import bootstrap_engine
 from dct.core.items import TERMINAL_STATUSES
 from dct.core.releases import RELEASE_FLOW
+from dct.core.version import VERSION_FILES
 from dct.db import create_tables, get_engine
 
 # Windows-policy seam (tests flip it): dispatches the daemonization,
@@ -556,6 +557,38 @@ def cmd_project_trailers(args):
     shown = (f"Co-Authored-By{arrow}{_trailer_answer(stored['co_authored_by'])} · "
              f"session link{arrow}{_trailer_answer(stored['session_link'])}")
     print(f"✓ {args.slug}: {shown}" if given else f"{args.slug}: {shown}")
+
+
+def cmd_project_version_sync_script(args):
+    """`dct project version-sync-script <slug> [--kind FILE]` — write the
+    project's scripts/dct-version-sync.sh from dct's packaged template with
+    the block of its version file switched on (default: the file
+    detect_version finds), so every release sets the version there (K-76).
+    Never overwrites an existing script."""
+    from dct.core.projects import get_project
+    from dct.core.version import detect_version
+    from dct.core.version_sync import SCRIPT_PATH, write_script
+
+    project = get_project(_get_engine(), args.slug)
+    if project is None:
+        print(f"✗ Project '{args.slug}' not found", file=sys.stderr)
+        sys.exit(1)
+    root = project["path"]
+    kind = args.kind or detect_version(root)[1]
+    if kind is None:
+        print(f"✗ No version file found in {root} (VERSION, pyproject.toml, package.json, "
+              "Cargo.toml, src-tauri/tauri.conf.json) — name one with --kind", file=sys.stderr)
+        sys.exit(1)
+    try:
+        write_script(root, kind)
+    except FileExistsError:
+        print(f"✗ {SCRIPT_PATH} already exists in {root} — nothing was written", file=sys.stderr)
+        sys.exit(1)
+    except (OSError, ValueError) as exc:
+        print(f"✗ {exc}", file=sys.stderr)
+        sys.exit(1)
+    print(f"✓ Wrote {SCRIPT_PATH}: every release sets the new version in {kind}, "
+          "and changes nothing else. It runs once it is committed.")
 
 
 def cmd_project_manages_changelog(args):
@@ -3067,6 +3100,17 @@ def build_parser() -> argparse.ArgumentParser:
              "a project whose own rules forbid it keeps it out regardless)",
     )
 
+    p_proj_vss = p_proj_sub.add_parser(
+        "version-sync-script",
+        help="Write scripts/dct-version-sync.sh from dct's template: every release then sets "
+             "the new version in the project's version file (never overwrites a script)",
+    )
+    p_proj_vss.add_argument("slug")
+    p_proj_vss.add_argument(
+        "--kind", choices=list(VERSION_FILES),
+        help="The version file the script edits (default: the one dct detects)",
+    )
+
     p_proj_mc = p_proj_sub.add_parser(
         "manages-changelog",
         help="Exit 0 if the project opts into dct changelog enforcement, else 1 (hook query)",
@@ -3859,6 +3903,7 @@ PROJECT_COMMAND_MAP = {
     "release-executor": cmd_project_release_executor,
     "changelog-pr-refs": cmd_project_changelog_pr_refs,
     "trailers": cmd_project_trailers,
+    "version-sync-script": cmd_project_version_sync_script,
 }
 
 PLAN_COMMAND_MAP = {

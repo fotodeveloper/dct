@@ -74,9 +74,10 @@ def test_every_skill_directory_has_a_skill_md():
 def _asset_files() -> list[Path]:
     """Every non-Python file the package must ship, relative to dct/."""
     wanted = []
-    for sub in ("skills", "hooks", "web/templates", "web/static"):
+    for sub in ("skills", "hooks", "assets", "web/templates", "web/static"):
         for p in (PKG_ROOT / sub).rglob("*"):
-            if p.is_file() and "__pycache__" not in p.parts and p.name != ".DS_Store":
+            if p.is_file() and "__pycache__" not in p.parts and p.name != ".DS_Store" \
+                    and p.suffix != ".py":  # modules ship as code, not package data
                 wanted.append(p)
     assert wanted, "asset scan came up empty — did the directories move?"
     return wanted
@@ -96,5 +97,5 @@ def test_manifest_grafts_every_asset_dir():
     must graft each asset directory, or the sdist — and any wheel built from
     it — ships without them even when package-data is correct."""
     manifest = (REPO_ROOT / "MANIFEST.in").read_text()
-    for sub in ("dct/skills", "dct/hooks", "dct/web/templates", "dct/web/static"):
+    for sub in ("dct/skills", "dct/hooks", "dct/assets", "dct/web/templates", "dct/web/static"):
         assert f"graft {sub}" in manifest, f"MANIFEST.in missing: graft {sub}"

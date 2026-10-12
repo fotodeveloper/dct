@@ -257,7 +257,7 @@ from datetime import UTC, datetime
 import sqlalchemy as sa
 
 from dct import paths as dct_paths
-from dct.core import gitinfo, procs
+from dct.core import gitinfo, procs, version_sync
 from dct.core import releases as ledger
 from dct.core.changelog import (
     check_release_selection,
@@ -358,7 +358,7 @@ INTERRUPTION_POINTS = (
 CONSENT_INTERRUPTION_POINTS = ("before_work_commit", "after_work_commit", "after_work_index",
                                "after_attest_commit")
 
-VERSION_SYNC_SCRIPTS = ("scripts/dct-version-sync.sh", "scripts/version-sync.sh")
+VERSION_SYNC_SCRIPTS = (version_sync.SCRIPT_PATH, "scripts/version-sync.sh")
 VERSION_ONLY_LINE = "- Version-only release — no changelog entries."
 RELEASE_SUBJECT = "release: v{version}"
 

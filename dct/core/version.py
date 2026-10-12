@@ -195,6 +195,12 @@ def read_version_field(path: str, data: bytes) -> str | None:
     return value if isinstance(value, str) and value else None
 
 
+# The project files detect_version reads, in its order (first hit wins); the
+# version-sync template has one block per entry (core.version_sync).
+VERSION_FILES = ("VERSION", "pyproject.toml", "package.json", "Cargo.toml",
+                 "src-tauri/tauri.conf.json")
+
+
 def detect_version(path: str | Path) -> tuple[str | None, str | None]:
     """Best-effort version detection from common project files.
 
@@ -213,8 +219,7 @@ def detect_version(path: str | Path) -> tuple[str | None, str | None]:
     base = Path(path)
     if not base.is_dir():
         return None, None
-    for rel in ("VERSION", "pyproject.toml", "package.json", "Cargo.toml",
-                "src-tauri/tauri.conf.json"):
+    for rel in VERSION_FILES:
         candidate = base / rel
         if not candidate.is_file():
             continue

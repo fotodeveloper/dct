@@ -97,6 +97,10 @@ dct/core/changelog_file.py — Which file is a project's changelog (#876): the O
                            problems refuse before the stamp
 dct/core/version.py      — Version contract (parse / normalize / compare / bump,
                            X.Y | X.Y.Z, leading v dropped) + project-file autodetect
+                           (VERSION_FILES)
+dct/core/version_sync.py — The project's scripts/dct-version-sync.sh, written
+                           from the packaged generic template (K-76); never
+                           overwrites
 dct/core/gitinfo.py      — Git readers (toplevel / branch / common dir) +
                            resolve_checkout: same-repo checkout of a project
                            (repo root vs project root), best-effort; the

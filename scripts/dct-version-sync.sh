@@ -1,9 +1,9 @@
 #!/bin/bash
 # dct-version-sync template v1
-# dct-version-sync.sh — Update all version-bearing files in this project.
-#
-# Copy this template to your project's scripts/ directory and customize
-# the SYNC TARGETS section for your project's file layout.
+# dct-version-sync.sh — dct's OWN version sync (pyproject.toml and
+# dct/__init__.py). Not a template: other projects get the generic one,
+# dct/assets/dct-version-sync.sh, through `dct project version-sync-script`
+# (/dct-init offers it).
 #
 # Run by `dct release prepare` (once, in an isolated checkout of the release
 # candidate — it must be committed there) when found at:

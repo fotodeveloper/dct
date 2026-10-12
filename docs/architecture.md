@@ -189,6 +189,11 @@ Two layers, one entry point:
   configuration and stored with the project; /commit applies them without
   another question. Without a flag it prints the stored answers; a flag left
   out keeps that answer. Each is on, off or "not answered" (NULL).
+- **`dct project version-sync-script <slug> [--kind FILE]`** — writes the
+  project's `scripts/dct-version-sync.sh` from the generic template shipped
+  in the package (`dct/assets/dct-version-sync.sh`, every block commented)
+  with the block of its version file switched on (default: the detected
+  one). Never overwrites an existing script (`dct/core/version_sync.py`).
 
 The `/dct-init` skill orchestrates both layers interactively (probes bootstrap
 state, permissions allowlist, project-local conflicts, version-sync scripts,
