@@ -12,8 +12,10 @@ description: >-
 
 ### Step 1: Gather from context
 From the current work, determine:
-- **project**: Auto-detect from CWD, or ask
-- **category**: added, changed, fixed, removed (see mapping below)
+- **project**: Auto-detect from CWD; ask only when the project is ambiguous
+  (CWD not registered)
+- **category**: added, changed, fixed, removed (see mapping below); ask only
+  when the category is genuinely ambiguous
 - **entry**: Concise description of the change (English, ~1 sentence)
 - **component**: Module/subsystem (optional)
 - **source_file**: Main file changed (optional)
@@ -25,17 +27,13 @@ From the current work, determine:
   runs in the session start directory, which may be another checkout or
   worktree, so its own guess can name the wrong branch.
 
-### Step 2: Confirm
-```
-Changelog entry:
-  [added] New Python parser support (parser)
-  File: cmd/parse.go
-  Branch: feat/x (/tmp/proj-a)
-```
-Wait for confirmation.
+### Step 2: Write — no confirmation question
+An unambiguous instruction ("clog this", "log the parser fix", right after a
+finished change) writes the entry without a confirmation question: call
+`mcp__dct__add_changelog(project, category, entry, branch, worktree, ...)` at
+once. An entry is cheap to correct, so the acknowledgement (Step 3) is the
+check.
 
-### Step 3: Create
-Call `mcp__dct__add_changelog(project, category, entry, branch, worktree, ...)`.
 The ack echoes `branch` and `branch_source`; if `branch` is missing from the
 ack, the MCP server is older than this skill — tell the user to restart it.
 If the ack says `branch_source: "server"` (it then carries a `warning`), the
@@ -43,12 +41,15 @@ server filled in ITS OWN checkout, not yours — the entry is NOT confirmed.
 Correct it right away against your actual checkout:
 `mcp__dct__update_changelog(id, branch=<yours>, worktree=<yours>)` (both
 fields; on a detached HEAD pass only `worktree`). `/commit` never attaches a
-server-detected entry without that confirmation.
+server-detected entry without that correction.
 
-### Step 4: Report
+### Step 3: Acknowledge in one line
 ```
-✓ Changelog #15 [added] — New Python parser support
+✓ Changelog #15 [added] — New Python parser support (feat/x)
 ```
+One line per entry: id, category, text, branch. To correct it,
+`mcp__dct__update_changelog(15, ...)` changes a field; an entry that should
+not exist is withdrawn with `mcp__dct__delete_changelog(15)`.
 
 ## Category mapping
 | Change type | category |

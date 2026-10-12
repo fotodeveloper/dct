@@ -513,13 +513,35 @@ def test_release_dialog_routes_an_unfinished_release_before_the_project_setting(
     assert re.search(r"ONE (plan )?result", flat)
 
 
-def test_snippet_routes_the_release_from_the_plan():
-    """K-111: the CLAUDE.md snippet names the same single read."""
-    flat = " ".join(_section(_snippet(), "**Releasing**", "**Session end**").split())
-    assert "dct project release-executor" not in flat
-    assert "`executor.record`" in flat and "`executor.project`" in flat
-    assert "dct release takeover" in flat
-    _in_order(flat, "`executor.record`", "`executor.project`")
+def _snippet_releasing() -> str:
+    return _section(_snippet(), "**Releasing**", "**Session end**")
+
+
+def test_snippet_release_paragraph_only_points_to_the_skill_and_the_fallback():
+    """#877 K-53 (replaces the K-111 pin, which made the snippet a third copy
+    of the release sequence): the always-loaded snippet sends the assistant
+    to `/release` and to the authoritative `/release` fallback; the CLI
+    sequence, the routing keys and the flags live ONLY in those two. The ban
+    is limited to the Releasing paragraph — the same flags may be described
+    elsewhere."""
+    body = _snippet_releasing()
+    flat = " ".join(body.split())
+    assert "/release" in flat and "assistant-fallbacks.md" in flat
+    assert not _commands(body), f"the snippet still carries release commands: {_commands(body)}"
+    for copy in ("--plan-digest", "--proposal-digest", "--consent", "--push-", "--confirm",
+                 "executor.", "attest", "takeover", "prepare", "apply"):
+        assert copy not in flat, f"a piece of the CLI sequence is still copied here: {copy}"
+
+
+def test_snippet_promises_one_screen_only_for_the_typical_case():
+    """"The typical case has one screen" — never one question in every
+    exception (a changelog file to settle, an unreadable version, Change
+    something add rounds)."""
+    for sentence in re.split(r"(?<=[.!?])\s+", " ".join(_snippet_releasing().split())):
+        if re.search(r"\b(one|ONE|a single|single) (question|dialog|screen)\b", sentence):
+            assert re.search(r"\btypical", sentence), f"an unconditional promise: {sentence}"
+    assert re.search(r"\btypical[^.]{0,60}\bone screen\b",
+                     " ".join(_snippet_releasing().split()))
 
 
 # ── resume without a second question (K-112) ────────────────────────────────
@@ -636,6 +658,34 @@ def test_release_something_else_branch_is_gated_by_the_block(text):
         f"the 'something else' branch resumes without the resume.blocked check: {branch}"
 
 
+@pytest.mark.parametrize("text", [
+    pytest.param(lambda: _skill("commit"), id="skill"),
+    pytest.param(_commit_fallback, id="fallback"),
+])
+def test_commit_has_no_unreleased_count_release_threshold(text):
+    """#877: a count of unreleased entries is no reason to suggest /release;
+    only a STAGED version bump redirects there."""
+    flat = " ".join(text().split())
+    assert not re.search(r"(≥|>=)\s*10\b", flat), "the >= 10 entries threshold is still there"
+    assert "release-ready" not in flat
+
+
+def test_commit_keeps_the_staged_version_bump_redirect():
+    flat = " ".join(_skill("commit").split())
+    assert "/release" in flat
+    assert "## [X.Y.Z]" in flat and "pyproject.toml" in flat
+
+
+def test_track_update_records_the_reason_with_the_update():
+    """#877: the reason of a transition is part of the update (one
+    operation, one transaction — update_item(reason=…)), never a separate
+    add_note that survives a refused update."""
+    flat = " ".join(_skill("track-update").split())
+    assert "BEFORE the `update_item` call" not in flat, \
+        "the reason is still a separate add_note before the update"
+    assert re.search(r"update_item\([^)]*reason", flat), "update_item(reason=…) is not used"
+
+
 @pytest.mark.parametrize("text", RELEASE_DIALOGS)
 def test_release_resume_path_offers_the_takeover_as_a_new_consent(text):
     """R8d / K-119 M3: a `dct` record without a consent → the takeover
@@ -714,7 +764,8 @@ _PUSH_SET = {"--push-remote", "--push-branch", "--push-url"}
 
 @pytest.mark.parametrize("text", [
     *RELEASE_DIALOGS,
-    pytest.param(_snippet, id="claude-md-snippet"),
+    # (the CLAUDE.md snippet shows no release command at all since K-53 —
+    # test_snippet_release_paragraph_only_points_to_the_skill_and_the_fallback)
     pytest.param(lambda: (ROOT / "README.md").read_text(encoding="utf-8"), id="readme"),
     pytest.param(lambda: _workflow_doc(), id="release-workflow"),
 ])

@@ -26,9 +26,9 @@ prefix and trigger in any language:
 - `/track-resolve` — close (resolved / wont_fix)
 - `/clog` — add changelog entry
 - `/commit` — conventional commit with `(vX.Y.Z)` suffix; `Changelog:` trailer from `dct clog candidates --json`
-- `/release` — one workflow over `dct release plan / attest / prepare / apply / resume` (the workflow stamps, writes, commits, tags and pushes, verified)
-- `/pickup` — start-of-session: read handoff, show sprint, propose first action
-- `/handoff` — end-of-session: flag sprint + write prompt for next session
+- `/release` — release a version: the typical case is one screen; the local `dct release` workflow stamps, writes the changelog and version files, commits, tags and pushes, each verified
+- `/pickup` — start-of-session: pick up the handoff, show sprint, propose first action
+- `/handoff` — end-of-session: one draft (prompt, sprint, scope) saved on one answer
 - `/plan-status` — cross-plan progress dashboard
 - `/dct-import` — migrate markdown-based tracking into dct (user-invoked only)
 - `/dct-init` — bootstrap dct + register current project (user-invoked only)
@@ -37,7 +37,9 @@ prefix and trigger in any language:
 ### Item type triggers (`/track` and `create_item`)
 
 Natural-language phrases map to `item_type`. Use the type the user's language
-implies; do not ask unless the phrase is genuinely ambiguous.
+implies; no type cue in the phrase → `todo`, without a question. Ask about the
+type only when the phrase is genuinely ambiguous — it carries cues for two
+different types — and the choice changes the scope of the work.
 
 | User says | item_type |
 |---|---|
@@ -73,15 +75,33 @@ it and restart the server, but never retry the create (the item exists). On
 
 ### When to auto-invoke
 
-**Session start** — user says "where were we" / "pickup" / "resume" / "continue from last time"
-→ call `/pickup` (reads last handoff, shows current sprint, proposes first action).
+**Session start** — user says "continue" / "pickup" / "resume" / "where were we"
+→ call `/pickup`. An instruction to continue ("continue", "pickup", "resume")
+consumes the single matching handoff without a question and names it in the
+report; a status question ("where were we") only reads. Several matching
+handoffs → it asks which, shows the chosen one in full and consumes it only
+when the user says to continue it. A handoff's next step that is still
+current is started at once ("Starting with …"); an old handoff is never a
+consent for commits, pushes or other risky steps.
 
-**During work, bug or feature surfaces** — user describes it without "track this"
-→ suggest `/track` (don't auto-create without confirmation).
+**Tracking writes** — on an unambiguous instruction ("track this bug", "clog
+it", "#42 to P1", "close #42") `/track`, `/clog`, `/track-update` and
+`/track-resolve` write at once and acknowledge in one line, with how to
+correct it. They ask only what they cannot tell: the project, which item, or
+a type when the phrase cues two different types that change the scope (no
+type cue → `todo`). Closing an item ("close #42", "#42 resolved") goes through
+`/track-resolve`: a pending gate checkpoint stops it in plain words, and no
+gate is rejected without the user's own "skip it". A bug or feature merely
+mentioned during work (no "track this") is not an instruction → suggest
+`/track`, don't create it.
 
-**Non-trivial feature or improvement accepted**
-→ IMMEDIATELY after `create_item`, add 3-7 checkpoints via `add_checkpoint`.
-Sketch the work breakdown BEFORE starting code.
+**Work on an item starts** — "start working on #N" (`/track-update`, status →
+`in_progress`) → when the work is a non-trivial feature or improvement, or the
+user asks to break the work down, propose a plan of at least 3 checkpoints via
+`add_checkpoint` (3 is a minimum, never a cap — as many as the work needs); an
+item that already has checkpoints keeps its plan. A small bug or a one-line
+fix starts with no checkpoints; a complex issue or todo may get some, with no
+fixed minimum taken from its type. Creating an item adds none.
 
 **Each concrete step completes**
 → `complete_checkpoint(id)` in real-time — do NOT batch completions at end.
@@ -90,7 +110,15 @@ Sketch the work breakdown BEFORE starting code.
 → `reject_checkpoint(id)` (ledger-preserving); never delete.
 
 **Committing** — "commit" / "save this" / "commit this"
-→ `/commit` (parallel pre-flight probe, per-branch changelog guard, HEREDOC message with `(vX.Y.Z)`).
+→ `/commit` (parallel pre-flight probe, per-branch changelog guard, HEREDOC message with `(vX.Y.Z)`;
+ONE screen — files, message, entries — answered Commit / Change / Stop).
+Trailers follow the project's stored preferences (`list_projects`:
+`commit_co_authored_by`, `commit_session_link`), applied without a question;
+a preference not answered yet is asked once and stored with
+`dct project trailers`; the project's own rules forbidding a trailer win
+(dct's own repository never takes a session link). A path that looks like a
+secret (`dct clog candidates --json`: `secret_like`) is never staged; a staged
+one stops the commit with the command that unstages it.
 Order: stage the chosen paths first (a deliberate partial staging stays as it
 is), THEN pick the trailer from the complete `git diff --cached`, THEN
 `git commit` without another `git add`; any later index change means picking
@@ -104,10 +132,18 @@ entries proven that way. Reverts keep git's standard `Revert "…"` message.
 If pre-commit hook rejects: fix underlying issue, re-stage, **NEW commit** (never `--amend`, never `--no-verify`).
 
 **Releasing** — "release" / "bump version" / "ship it"
-→ `/release` — ONE workflow over the local CLI: `dct release plan --json` (range, proof per entry, unproven entries, collective attestation proposals — and who releases, routed from that ONE result: an unfinished release by its record, `executor.record` — dct's own continues with `dct release resume` on the stored consent, without asking again; an `own` record stays with its own tool; a record without consent → `dct release takeover --version V …` (a new consent the owner approves) or the ledger path — and only a NEW release by the project's setting, `executor.project`: `own` → its own tool releases) → work in progress committed inside the workflow on the owner's consent (the `/commit` procedure, then re-plan) → the owner decides attest / correct / withdraw / keep and the version → `dct release attest` / `dct release plan --version V --entries … --json` (the snapshot the owner approves) → `dct release prepare --version V --entries … --plan-digest <snapshot_digest>` (the version sync runs isolated; the owner approves the file list and the push target) → `dct release apply --version V --entries … --plan-digest <snapshot_digest> --proposal-digest <proposal_sha256> --push-remote <remote> --push-branch <branch> --push-url <url> --confirm` (the three push values of the target the owner approved at prepare — apply never selects one itself — or `--no-push` for an explicit local release: stamp, changelog section, version files, `release: vX.Y.Z` commit through the hooks, tag, push — each verified and recorded by the workflow; an interrupted release → `dct release resume`, which executes the stored consent with no new approval; `dct release abandon --version V --reason "…" --confirm` only on the owner's explicit decision).
+→ `/release`. The skill drives the local `dct release` workflow, which
+computes the whole release, shows it, and stamps, writes, commits, tags and
+pushes only on the owner's answer, each effect verified. The typical case is
+one screen; an unfinished release, a changelog file to settle or a change of
+plan can add a step. Without the skill, follow the `/release` fallback in
+dct's `docs/assistant-fallbacks.md` — the authoritative step-by-step. The
+command sequence and its flags live only in those two; never release by
+hand from memory.
 
 **Session end** — "handoff" / "end session" / "wrap up" / "next session"
-→ `/handoff` (flag sprint items, optionally write handoff prompt).
+→ `/handoff` (one printed draft — the prompt, `Sprint: unchanged`, `Scope: none` —
+and one question: Save / Change / Cancel).
 
 ### ID memorization pattern
 
@@ -159,9 +195,9 @@ whitespace-separated batch ids.
 
 If a skill name renames or disappears in a future CC version, Claude can
 still drive dct via raw MCP calls. `docs/assistant-fallbacks.md` in dct's own
-repo has the authoritative step-by-step prose for `/release`, `/commit`,
-`/track`, `/clog`, `/track-resolve` — and the shared `Changelog:` trailer /
-release-range rules.
+repo has the authoritative step-by-step prose for `/pickup`, `/handoff`,
+`/release`, `/commit`, `/track`, `/clog`, `/track-resolve` — and the shared
+`Changelog:` trailer / release-range rules.
 
 ### Auto-detect project from CWD
 

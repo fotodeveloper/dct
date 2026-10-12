@@ -16,57 +16,116 @@ context_summary). `list_handoffs` returns 200-char prompt previews — use
 
 ## `/pickup` fallback
 
-The skill is TWO-PHASE — a read, a dialog, then (only if the user says so)
-the consume. Without the skill:
+On an unambiguous "continue" / "pickup" / "resume" the skill consumes the
+single matching handoff without a question and names it in the report
+("resume" counting as "continue" is a proposed refinement of the owner's
+decision, which named only "continue"); it asks which one only when several
+match. A status question ("where were we", "what's next") only reads:
+`consume="false"`. A word the user merely quotes or mentions is not a
+command. Without the skill:
 
-1. `pickup_work(project="", consume="false")` — a PURE READ, no `consumed_by`
-   needed and nothing written. `handoff.latest` carries the newest unconsumed
-   handoff with its FULL prompt; `handoff.others` are 200-char previews;
-   `handoff.pending_count` says how many wait.
-2. Show the prompt and let the USER decide: consume and follow / follow but
-   keep it unconsumed (audit) / start fresh — and, with several handoffs,
-   which one.
-3. On "consume":
+1. `pickup_work(project="", consume="", consumed_by="<agent> @ <slug> <iso_utc>Z")`
+   — AUTO mode: exactly one matching unconsumed handoff is consumed in the
+   same transaction and returned as `picked_up` with its FULL prompt
+   (`consumed: true`); with several, nothing is consumed and `handoff.latest`
+   (full prompt) + `handoff.others` (200-char previews) list them; with none,
+   nothing is written. `scope=<tag>` narrows the match to one workstream. To
+   only look (an audit, "keep it", "where were we"), call `consume="false"`
+   instead — a PURE READ, no `consumed_by` needed.
+2. Count what matches: with a scope, `handoff.scope_matched`; without a scope,
+   the global `pending_count`. With a scope, offer only the handoffs of that
+   scope — never another workstream's (`handoff.others` lists every scope).
+   When `others` is truncated, or holds fewer matching rows than the count,
+   fetch the complete list first: `list_handoffs(project="")`, keeping only
+   the matching scope.
+3. Print the handoff prompt as plain message text, never inside a dialog (the
+   dialog truncates long text). With no question to follow — one handoff
+   consumed on an unambiguous "continue" and a concrete next step (step 5) —
+   print it and continue in the same turn: check that step and start on it.
+   Only where the user must decide after reading (several handoffs, a stale,
+   contradictory or unclear step) is the printed text a turn of its own, the
+   question in the next one. With several matching handoffs, ask ONLY which
+   one ("Continue #N" for the newest, printed in full; "Show #M in full" for
+   the others; "None — start fresh") — not the first action yet. Showing an
+   older one is a read: `get_handoff(M)`, without consuming it, then print its
+   full prompt and ask whether to continue it; nothing is consumed by showing
+   it. Only an unambiguous instruction to continue a handoff the user has read
+   in full consumes it:
    `pickup_work(project="", consume="true", handoff_id=N, include="none", consumed_by="<agent> @ <slug> <iso_utc>Z")`
    — `include="none"` skips the snapshot re-read (step 1 already has it).
-4. Read the next step from `sprint.checkpoints` (first `pending` row of the
-   chosen item); honor `gates` and `decisions` before acting.
-5. CLI equivalent: `dct pickup [--json]` (its `--consume` default is `never`),
-   `dct pickup --consume always --handoff-id N` for the write.
+4. Report which handoff was consumed: `Picked up handoff #<id> (consumed)` —
+   without a question, this line is where the user learns of it. The consumed
+   row stays in the ledger.
+5. The next step: when the consumed handoff names a concrete step (an item id
+   or a pending checkpoint), check its CURRENT state first — `get_item(X)`,
+   its checkpoints, the pending `gates` and `decisions` — and when it is still
+   current, start on it with no question: `Starting with #22 — "<next pending
+   checkpoint>"`. A stale, contradictory or unclear step (resolved item, done
+   checkpoint, a blocking gate, the user asking for something else, none
+   named) → ask the first action instead. An old handoff is no new consent: a
+   commit, a push, publishing or any destructive step written in it still
+   waits for the user's own instruction now.
+6. CLI equivalent: `dct pickup --consume auto [--json]` (the default
+   `--consume never` is a pure read), `dct pickup --consume always --handoff-id N`
+   for the chosen one, after reading it in full (`get_handoff(N)`; the CLI
+   prints only the newest in full).
 
-Never auto-pick among several handoffs; never call `consume_handoff` here —
-`pickup_work` owns the consume. `consume=""` (auto) and `--consume always`
-belong to AUTONOMOUS flows (CI, unattended agents) where nobody can be asked.
-If a parallel session wins the race, a server-selected consume comes back
-`consumed: false` (proceed with the fresh snapshot); an explicit `handoff_id`
-errors "not found or already consumed" — report it, don't retry in a loop.
+Never auto-pick among several handoffs, and never consume one that was only
+previewed; never call `consume_handoff` here — `pickup_work` owns the
+consume. If a parallel session wins the race, the AUTO
+consume comes back `consumed: false` (proceed with the fresh snapshot); an
+explicit `handoff_id` errors "not found or already consumed" — report it,
+don't retry in a loop.
 
 ## `/handoff` fallback
 
-The skill is preflight + dialogs + one atomic call. Without the skill:
+The skill is a preflight, one printed draft and ONE question — Save / Change /
+Cancel — then one atomic call. Without the skill:
 
 1. `get_context_snapshot(project="")` — sprint/gates/decisions feed the draft.
-2. Confirm the membership change + prompt text with the user. Sprints are
-   MULTI-SESSION (ADR #57): the default is "sprint untouched", the normal edge
-   is ADDITIVE (add discovered items / cut scope), and a full replace is
-   conscious replanning.
-3. `handoff_work(prompt=..., created_by="<agent> @ <slug> <iso_utc>Z", project="",
+2. Print the draft as plain message text (never inside a dialog), with the sprint and scope decisions as lines of the draft — `Sprint: unchanged` and `Scope: none` by default — never as questions of their own.
+   Sprints are MULTI-SESSION (ADR #57): the default is an unchanged sprint, the
+   normal edge is ADDITIVE (add discovered items / cut scope), and a full
+   replace is conscious replanning.
+3. Ask ONE question: "Save" / "Change" / "Cancel". "Change" → apply what the
+   user says (prompt text, sprint, scope), print the revised draft again and
+   ask again; with several active sprints a sprint change also asks which
+   sprint. "Cancel" → nothing is written.
+4. On "Save": `handoff_work(prompt=..., created_by="<agent> @ <slug> <iso_utc>Z", project="",
    item_ids="__keep__" (default) | "22,21,6" (replace), add_item_ids="22,6",
-   remove_item_ids="7", sprint=<id-or-code when several active>, scope=...)` —
-   one transaction; a failed sprint write leaves no handoff. Replace and the
+   remove_item_ids="7", sprint=<id-or-code when several active>, scope=...,
+   context_summary=<the approved summary, verbatim, or "">)` —
+   one transaction; a failed sprint write leaves no handoff. Every line of the
+   saved draft maps to an argument (prompt, context summary, sprint, target
+   sprint, scope); the context summary is exactly the text the user saved —
+   never shortened or regenerated after "Save". Replace and the
    additive pair are mutually exclusive. **Never `item_ids=""`** — an empty
    replace errors; emptying a sprint is `clear_sprint`'s job. Unknown item ids
    abort everything (strict), removing a TERMINAL member errors (resolved work
    is the sprint's history), and an ambiguous / membership-less `sprint`
    selector errors too.
-4. "No prompt" case: `handoff_work` requires a prompt — with ≤ 1 active sprint
-   fall back to `set_sprint(project, item_ids=...)`; with ≥ 2 active sprints
-   `set_sprint` errors (current-sprint writes refuse to guess), so target the
-   chosen sprint via `assign_item_to_sprint(item_id, sprint_id)` /
-   `remove_item_from_sprint(item_id, sprint_id)`.
-5. CLI equivalent: `dct handoff create --prompt-file - --add-items 22,6 --scope g1`
+5. **"Sprint only, no prompt"** (a Change that drops the prompt): `handoff_work`
+   requires a prompt, so the `Sprint:` line maps to the existing additive
+   tools, one item at a time — an add adds, a cut cuts, nothing else is
+   touched. No active sprint: add → `add_item_to_current_sprint(item_id,
+   project)` (creates the sprint); a cut has nothing to cut — stop and say so.
+   One active sprint: add → `add_item_to_current_sprint(item_id, project)`, cut
+   → `remove_item_from_current_sprint(item_id, project)` for an OPEN member
+   only (a terminal member is history: stop and say so). Several active
+   sprints: the target sprint the user chose — add →
+   `assign_item_to_sprint(item_id, sprint_id)`, cut →
+   `remove_item_from_sprint(item_id, sprint_id)`; a missing or ambiguous target
+   stops readably, never a guess. `set_sprint(project, item_ids=...)` only for
+   a replace the user accepted on the draft, with no or one active sprint;
+   with several active sprints stop — that replace needs a prompt
+   (`handoff_work` with `sprint=`). Never compute a full list for `set_sprint`
+   from a read plus the change: an item another session added meanwhile would
+   be dropped.
+6. CLI equivalent: `dct handoff create --prompt-file - --add-items 22,6 --scope g1 --context-summary-file summary.md`
    (`--remove-items` cuts scope, `--items` replaces; omit all three to keep the
-   sprint).
+   sprint; `--context-summary "…"` passes a short summary inline — the file
+   form keeps a long, multi-line one exactly; only one of the two `-file`
+   flags can read stdin).
 
 ## Changelog proof: trailers and range (shared by `/commit` and `/release`)
 
@@ -934,47 +993,57 @@ question inside it (the count is in answers, the decisions):
 
 The order is fixed: **stage → select → commit**. The `Changelog:` trailer
 attests what the commit CONTAINS, so it is chosen only after the index holds
-exactly what will be committed, and nothing is staged after the choice.
+exactly what will be committed, and nothing is staged after the choice. The
+owner answers ONE screen — files, message, entries — before anything is
+committed.
 
-1. Pre-flight: run in parallel — `git status`, `git diff --cached --stat`, `git diff --stat`, `git log --oneline -5`, `git branch --show-current`, `git rev-parse --show-toplevel`.
-2. Detect project via CWD.
+1. Pre-flight: run in parallel — `git status`, `git diff --cached --stat`, `git diff --stat`, `git log --oneline -5`, `git branch --show-current`, `git rev-parse --show-toplevel`, and in a dct project `dct clog candidates --json` (its `secret_like` list: `{path, staged, unstage}` for every changed file — staged, unstaged and untracked — whose path looks like a secret). New (untracked) files are changes like any other: the same staging rules apply to them, with no question of their own.
+2. Detect project via CWD (`list_projects`: the row also carries the stored trailer preferences `commit_co_authored_by` / `commit_session_link`).
 3. `mcp__dct__count_unreleased_changelog(project, branch=<current>, include_unbranched=true)` (detached HEAD → project-wide count, no `branch` — a gate only, never a candidate list) — if 0 and non-exempt files staged, prompt user to run `/clog` or add entry inline via `mcp__dct__add_changelog`. Exempt paths decide only whether an entry is REQUIRED; attaching an existing matching entry is always allowed. The count is only this gate — never proof that an entry belongs to the commit.
 4. Determine commit type + scope + description. Read `current_version` from project.
 5. **Stage first.** Stage the chosen files explicitly, path by path:
-   `git add -- <path> <path>`. Never `git add -A` / `git add .`. Never stage `.env`, credentials, binaries. A path that is ALREADY partially staged (it shows in both `git diff --cached` and `git diff`) is a deliberate choice — leave it as it is; never re-add the whole file unless the owner asks for its unstaged hunks too.
+   `git add -- <path> <path>`. Never `git add -A` / `git add .`. Never stage binaries or generated artifacts. A path that is ALREADY partially staged (it shows in both `git diff --cached` and `git diff`) is a deliberate choice — leave it as it is; never re-add the whole file unless the owner asks for its unstaged hunks too. Ask about the staging only when there is a real choice — changed files that do not all belong to the entries; a blacklisted path is never an option of that question; otherwise stage without a question.
+   **Secret-like paths** — ONE predicate, shared with `/release`: `secret_like` of `dct clog candidates --json`, judged by the file name only, never a content scanner (`.env`, `.env.*`, `*.pem`, `*.key`, `id_rsa*`, `*.p12`, `credentials*.json`; the templates `*.example` / `*.sample`, e.g. `.env.example`, are ordinary files). Without the CLI apply exactly these name patterns by hand. A secret-like path that is unstaged or untracked is never offered for staging and never staged; the screen lists it as not included.
+
+   A secret-like path that is already staged STOPS the commit before the screen: say so in one plain sentence and show its `unstage` command exactly as the candidates give it (quoted, with the `--` separator: `git restore --staged -- .env`; before the first commit `git rm --cached -q -- .env`). Never run that command yourself and never change the user's index; if the file really belongs in the repository, the user commits it with git directly.
 6. **Then select the trailer** against the complete staged diff (`git diff --cached`) — the index is now final. `dct clog candidates --json`: keep the `confirmed` candidates whose entry text / `source_file` describe what is staged (ask when unsure). `uncertain` candidates are matched too but attached only after the owner confirms them and `update_changelog(entry_id, branch=<current>, worktree=<toplevel>)` fixes both fields against the actual checkout — never automatically. Detached HEAD → no confirmed list, every entry of this checkout is uncertain: ask (confirm with `worktree` only). No match, but `other_branch` entries describe the change → offer `update_changelog(entry_id, branch=<current>)`. Ids in `already_proven` are never cited again. Without the CLI: `list_changelog(project, unreleased_only=true)` and the same classification by hand (client provenance of this branch + toplevel = confirmed; `branch_source` not `client` = uncertain).
-7. **Then commit — WITHOUT another `git add`.** HEREDOC: `git commit -m "<type>(<scope>): <description> (v<version>) …"`; the final trailer block is `Changelog: <ids>` (when any were selected) followed by `Co-Authored-By:`. A trailer-format example inside the body is quoted (`> Changelog: 12`). A revert keeps git's standard message: `git revert --no-commit <sha>` stages it, the subject is `Revert "<original subject>"` and the body has `This reverts commit <full sha>.`.
-8. Verify: `git log --oneline -3`, report the commit hash and the attached changelog ids.
-9. On hook rejection: fix the reported issue. ANY change to the index afterwards (re-staging, a new file from the fix) means the selection is stale: re-run step 6 against the new `git diff --cached`, then create a NEW commit (never `--amend`, never `--no-verify`).
+7. **One screen.** Print as plain message text the staged files, the full message and the entries the `Changelog:` trailer marks as done, then ask ONE question: "Commit" / "Change" / "Stop". Never commit without the owner's "Commit" on that screen. "Change" → apply it; a change that touches the files (a path added or dropped, a re-stage) changes the index, so the selection is stale: stage by step 5, select again by step 6, then show the screen again. "Stop" → nothing is committed. Trailers follow the project's stored preferences, applied without a question: `commit_co_authored_by` true → `Co-Authored-By:`; `commit_session_link` true → the session link the client gives for this session — a session link is written only on a stored true (yes); false → none. null = not answered yet (never a "no"): ask ONCE, before the screen, then store the answers with `dct project trailers <slug> --co-authored-by on|off --session-link on|off` and apply them. The project's own rules win: when its `CLAUDE.md` / `AGENTS.md` forbids a trailer, it is never written whatever is stored (dct's own repository forbids a session link). Not a dct project → `Co-Authored-By` by default, never a session link. "Change" can drop or add a trailer for this one commit.
+8. **Then commit — WITHOUT another `git add`.** HEREDOC: `git commit -m "<type>(<scope>): <description> (v<version>) …"`; the final trailer block is `Changelog: <ids>` (when any were selected) followed by `Co-Authored-By:`. A trailer-format example inside the body is quoted (`> Changelog: 12`). A revert keeps git's standard message: `git revert --no-commit <sha>` stages it, the subject is `Revert "<original subject>"` and the body has `This reverts commit <full sha>.`.
+9. Verify: `git log --oneline -3`, report the commit hash and the attached changelog ids.
+10. On hook rejection: fix the reported issue. ANY change to the index afterwards (re-staging, a new file from the fix) means the selection is stale: re-run step 6 against the new `git diff --cached`, show the screen again, then create a NEW commit (never `--amend`, never `--no-verify`).
 
 ## `/track` (create item) fallback
 
-1. Determine project (CWD detect or ask).
-2. Gather: item_type, title, `short_title` (the label: a 2-4 word English noun phrase naming what the item is about, ≤ 50 chars, no item number, no project name — e.g. "Windows hook paths"), priority, description, component, tags (optional).
-3. Present draft to user (the label shown as "Label"), confirm.
-4. `mcp__dct__create_item(item_type, title, project, short_title, ...)` — **REMEMBER the returned `id`**. The ack must echo `short_title` (null when none was stored); a MISSING key means the MCP server predates the field — report an unsupported (outdated) server contract and tell the user to restart/upgrade it. Do NOT retry the create (the item already exists) and do not claim the label was saved.
-5. For feature/improvement items: break work into 3-7 checkpoints via `mcp__dct__add_checkpoint(item_id, text)` — each one concrete and actionable. **REMEMBER each returned `id`**.
-6. Report to user: `#<id> <type>/<priority> [<short_title>] — <title>` plus checkpoint count.
+1. Determine project (CWD detect); ask only when the project is ambiguous (CWD not registered, or several projects fit).
+2. Gather: item_type (from the user's phrasing; no type cue → `todo` without a question; ask about the type only when the phrase is genuinely ambiguous — it carries cues for two different types — and the choice changes the scope), title, `short_title` (the label: a 2-4 word English noun phrase naming what the item is about, ≤ 50 chars, no item number, no project name — e.g. "Windows hook paths"), priority, description, component, tags (optional).
+3. An unambiguous instruction creates the item without a confirmation question: `mcp__dct__create_item(item_type, title, project, short_title, ...)` at once — **REMEMBER the returned `id`**. The ack must echo `short_title` (null when none was stored); a MISSING key means the MCP server predates the field — report an unsupported (outdated) server contract and tell the user to restart/upgrade it. Do NOT retry the create (the item already exists) and do not claim the label was saved.
+4. No checkpoints at creation: the plan comes when work on the item starts (`/track-update`, status → `in_progress`), which proposes at least 3 checkpoints via `mcp__dct__add_checkpoint(item_id, text)` when the work is a non-trivial feature or improvement, or when the user asks to break the work down. A small bug or a one-line fix gets none; a complex issue or todo may get some, with no fixed minimum. Add them now only when the user asks for that breakdown.
+5. Acknowledge in one line: `✓ #<id> <type>/<priority> [<short_title>] — <title>`. To correct a field, `/track-update #<id>` (`update_item`); an item that should not exist is closed as `wont_fix`.
 
 ## `/clog` (changelog entry) fallback
 
-1. Determine project (CWD detect or ask).
-2. Gather: category (added/changed/fixed/removed), entry text, component, source_file, source_lines, related_item_id (the last four optional).
+1. Determine project (CWD detect); ask only when the project is ambiguous (CWD not registered).
+2. Gather: category (added/changed/fixed/removed — ask only when the category is genuinely ambiguous), entry text, component, source_file, source_lines, related_item_id (the last four optional).
 3. In the agent's CURRENT working directory read `git branch --show-current` (empty = detached → omit `branch`) and `git rev-parse --show-toplevel` → `branch` / `worktree`. Pass them explicitly: the MCP server's directory is the session start directory, which may be another checkout.
-4. Present draft, confirm.
-5. `mcp__dct__add_changelog(category, entry, project, component, source_file, source_lines, related_item_id, branch, worktree)`.
-6. If the ack carries `branch_source='server'` (or a `warning`), the entry is NOT confirmed: correct it with `update_changelog(id, branch=<current>, worktree=<toplevel>)`.
-7. Report: `✓ clog #<id> [<category>] — <entry>`.
+4. An unambiguous instruction writes the entry without a confirmation question: `mcp__dct__add_changelog(category, entry, project, component, source_file, source_lines, related_item_id, branch, worktree)` at once.
+5. If the ack carries `branch_source='server'` (or a `warning`), the entry is NOT confirmed: correct it with `update_changelog(id, branch=<current>, worktree=<toplevel>)`.
+6. Acknowledge in one line per entry: `✓ clog #<id> [<category>] — <entry> (<branch>)`. To correct it, `update_changelog(id, ...)`; an entry that should not exist is withdrawn with `delete_changelog(id)`.
 
 ## `/track-resolve` (resolve/close item) fallback
 
-1. Parse ID(s) from user input. Accept: `#42`, `42`, `ITEM-42`, `0042` — normalize via regex `^(#|ITEM-|item-)?0*(\d+)$`.
-2. For each id: `mcp__dct__get_item(id)` — show current state, any unfinished checkpoints.
-3. Determine resolution status: `resolved` (fixed/implemented) or `wont_fix` (scope decision).
-4. Build resolution note: "Fixed in commit <hash>" if recent commit, or "Decision: <reason>" from context, else ask user.
-5. If item has pending checkpoints, ask whether to `reject` them (preserved in ledger) or proceed anyway.
-6. `mcp__dct__resolve_item(id, status, resolution)` — set terminal status.
-7. Report: `✓ #<id> → <status>`.
+1. Parse ID(s) from user input. Accept: `#42`, `42`, `ITEM-42`, `0042` — normalize via regex `^(#|ITEM-|item-)?0*(\d+)$`. Ask which item only when it is ambiguous (no id given and several open items fit the description).
+2. For each id: `mcp__dct__get_item(id)` — its state and checkpoints.
+3. A pending gate checkpoint (`kind` other than `task` / `cc-task`) → STOP: `resolve_item` refuses the item (so does `update_item` with a terminal status), there is no resolving around it, and no gate is ever rejected on the assistant's own initiative. Tell the user in plain words — no tool names, no `kind` identifiers — what is still to be checked, one line per gate:
+
+   ```
+   #42 can't be closed yet — it waits on a check: "try the new command in a fresh session" (#17). Once that check is really done, say "done"; to drop it on purpose, say "skip it". Then I close #42.
+   ```
+
+   That answer is the instruction: "done" → `mcp__dct__complete_checkpoint(id)`, "skip it" → the user's own decision to skip, `mcp__dct__reject_checkpoint(id)`; then `resolve_item(id, status, resolution)` in the same turn, with no further question, once no gate is left pending. A "done" or "skip it" covers only the gates named in the stop — with several gates and an answer that does not say which, ask which. "done" is never a substitute for the evidence a gate requires: when the gate's text names a sign-off, a review or a fresh-session test that has not happened, the gate stays pending. Pending `task` checkpoints do not block.
+4. Determine resolution status: `resolved` (fixed/implemented) or `wont_fix` (scope decision).
+5. Build resolution note: "Fixed in commit <hash>" if recent commit, or "Decision: <reason>" from context; ask only when the status or the reason is genuinely unclear.
+6. An unambiguous instruction resolves without a confirmation question: `mcp__dct__resolve_item(id, status, resolution)` at once.
+7. Acknowledge in one line per item: `✓ #<id> → <status>` (plus how many `task` checkpoints stay open, if any). A wrong resolve is corrected by reopening the item: `/track-update #<id> reopen` (`update_item(id, status="open")`).
 
 These prose descriptions are the authoritative behavior. Skill files in
 `dct/skills/` are shortcuts. If they diverge — fix the skill, not this doc.

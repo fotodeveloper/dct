@@ -62,7 +62,10 @@ _INSTRUCTIONS = (
         "WORKFLOW:\n"
         "1. list_items / get_item to find/inspect; an item's checkpoints are your TODO\n"
         "   list (sort_order). REMEMBER ids from create_item/add_checkpoint/create_handoff.\n"
-        "2. For feature/improvement items sketch 3-7 checkpoints BEFORE coding.\n"
+        "2. When work starts on a non-trivial feature/improvement — or the user asks\n"
+        "   to break the work down — sketch AT LEAST 3 checkpoints BEFORE coding (a\n"
+        "   minimum, never a cap). None at creation; a small fix needs none; another\n"
+        "   item may get some, with no fixed minimum taken from its type.\n"
         "3. complete_checkpoint(id) as each step finishes (real-time, NOT batched);\n"
         "   reject_checkpoint irrelevant ones. Then resolve_item (no auto-transition).\n\n"
         "SPRINT & HANDOFFS:\n"
@@ -411,8 +414,10 @@ def create_item(
     """Create a tracked item (issue / todo / feature / idea / improvement).
 
     REMEMBER the returned `id` — needed for add_checkpoint / update_item /
-    resolve_item / add_note. For feature/improvement items, sketch 3-7
-    checkpoints with add_checkpoint before starting work.
+    resolve_item / add_note. No checkpoints are required at creation; when
+    work starts on a non-trivial feature/improvement — or the user asks to
+    break the work down — sketch AT LEAST 3 with add_checkpoint (a minimum,
+    never a cap). A small fix needs none.
 
     TYPE SELECTION (pick from the user's phrasing; when in doubt use `todo`):
       - issue: defect in existing code — bug, crash, error, broken, regression
@@ -863,7 +868,10 @@ def add_checkpoint(item_id: int, text: str, kind: str = "task") -> dict:
     """Add an acceptance criterion (checkpoint) to an item.
 
     USE LIBERALLY — one checkpoint per concrete, actionable step.
-    For features/improvements, sketch 3-7 checkpoints BEFORE starting work.
+    When work starts on a non-trivial feature/improvement — or the user asks
+    to break the work down — sketch AT LEAST 3 checkpoints (a minimum, never
+    a cap). A small fix needs none; another item may get some, with no fixed
+    minimum taken from its type.
 
     REMEMBER the returned `id` — needed for complete_checkpoint / reject_checkpoint.
 

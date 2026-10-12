@@ -124,6 +124,13 @@ def _read_text_arg(text: str | None, path: str | None) -> str | None:
     return text
 
 
+def _refuse_two_stdin_reads(*paths: str | None) -> None:
+    """stdin can be read ONCE: a second `--…-file -` would silently get an
+    empty text. Raises ValueError before anything is read or written."""
+    if sum(p == "-" for p in paths) > 1:
+        raise ValueError("only one --…-file flag can read stdin ('-'); pass the other as a file")
+
+
 def _json_default(obj):
     """json.dumps fallback for core payloads — datetime → ISO 8601, rest → str.
 
@@ -913,7 +920,11 @@ def cmd_handoff_create(args):
     engine = _get_engine()
     try:
         project = args.project or _detect_project(engine)
+        _refuse_two_stdin_reads(args.prompt_file, args.context_summary_file)
         prompt = _read_text_arg(args.prompt, args.prompt_file)
+        # The summary the owner approved on the printed draft, stored as is
+        # (#877 K-58) — a file / stdin keeps every line of a long one.
+        context_summary = _read_text_arg(args.context_summary, args.context_summary_file)
         identity = args.created_by or _default_identity()
 
         result = handoff_work(
@@ -925,7 +936,7 @@ def cmd_handoff_create(args):
             remove_item_ids=_ids(args.remove_items, "--remove-items"),
             sprint=args.sprint,
             scope=args.scope,
-            context_summary=args.context_summary,
+            context_summary=context_summary,
         )
     except Exception as e:
         print(f"✗ Error: {e}", file=sys.stderr)
@@ -950,12 +961,13 @@ def cmd_handoff_update(args):
     engine = _get_engine()
 
     try:
+        _refuse_two_stdin_reads(args.prompt_file, args.context_summary_file)
         prompt = _read_text_arg(args.prompt, args.prompt_file)
         result = update_handoff(
             engine, args.id,
             prompt=prompt or None,
             scope=args.scope,
-            context_summary=args.context_summary,
+            context_summary=_read_text_arg(args.context_summary, args.context_summary_file),
         )
         if result is None:
             print(f"✗ Handoff #{args.id} not found, consumed, or deleted", file=sys.stderr)
@@ -1005,6 +1017,10 @@ def _render_pickup(snap: dict, identity: str | None) -> None:
         print()
         for line in _strip_controls(picked.get("prompt")).splitlines():
             print(f"  {line}")
+        if picked.get("context_summary"):
+            print("\nContext summary:")
+            for line in _strip_controls(picked["context_summary"]).splitlines():
+                print(f"  {line}")
     else:
         print(f"— no handoff consumed ({summary.get('handoffs_pending', 0)} pending)")
 
@@ -3749,7 +3765,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_ho_create.add_argument("--sprint", default=None,
                              help="Target sprint id or code (required when several are active)")
     p_ho_create.add_argument("--scope", default=None, help="Scope tag")
-    p_ho_create.add_argument("--context-summary", default=None, help="Context summary snapshot")
+    p_ho_create.add_argument("--context-summary", default=None,
+                             help="Context summary snapshot, stored verbatim")
+    p_ho_create.add_argument("--context-summary-file", default=None,
+                             help="Read the context summary from a file ('-' = stdin); "
+                                  "wins over --context-summary")
     p_ho_create.add_argument("--project", help="Project slug (default: auto-detect from CWD)")
     p_ho_create.add_argument("--json", action="store_true", help="Print the raw result as JSON")
 
@@ -3759,6 +3779,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_ho_update.add_argument("--prompt-file", default=None, help="Read new prompt from file ('-' = stdin)")
     p_ho_update.add_argument("--scope", default=None, help="New scope tag")
     p_ho_update.add_argument("--context-summary", default=None, help="New context summary snapshot")
+    p_ho_update.add_argument("--context-summary-file", default=None,
+                             help="Read the new context summary from a file ('-' = stdin); "
+                                  "wins over --context-summary")
 
     # web (read-only browser dashboard daemon — v0.4.1)
     p_web = sub.add_parser("web", help="Read-only browser dashboard daemon")
