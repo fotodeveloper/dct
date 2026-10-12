@@ -101,6 +101,12 @@ projects = sa.Table(
     # by the stamp that approves it (release_entries consume_proposal) — it
     # then lives on as releases.proposal. NULL = nothing prepared.
     sa.Column("release_proposal", sa.Text),
+    # The PREVIEW slot of `dct release prepare --preview` — canonical JSON of
+    # core.releases.validate_preview: the consent views of the variants the
+    # one-dialog release offered, their proposal contents and the work /
+    # progress state (set_preview; a preview and a prepare replace each
+    # other's slot; --discard-preview clears it). NULL = no preview.
+    sa.Column("release_preview", sa.Text),
     sa.Column("created_at", sa.DateTime, nullable=False, server_default=sa.text("CURRENT_TIMESTAMP")),
     sa.Column("updated_at", sa.DateTime, nullable=False, server_default=sa.text("CURRENT_TIMESTAMP")),
     sa.Column("deleted_at", sa.DateTime),
@@ -958,6 +964,7 @@ RELEASE_LEDGER_COLUMNS: dict[str, tuple[tuple[str, str], ...]] = {
         ("release_executor", "VARCHAR(8) NOT NULL DEFAULT 'dct'"),
         ("changelog_pr_refs", "BOOLEAN NOT NULL DEFAULT {false}"),
         ("release_proposal", "TEXT"),
+        ("release_preview", "TEXT"),
     ),
 }
 

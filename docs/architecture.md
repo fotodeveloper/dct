@@ -60,6 +60,7 @@ Full DDL lives in:
 - `migrations/009_release_ledger_fields.sql`
 - `migrations/010_release_pending_proposal.sql`
 - `migrations/011_release_tag_push_proof.sql`
+- `migrations/012_release_preview.sql`
 
 At runtime, the engine creates every MISSING table with all its indexes (`_create_missing_tables` — race-safe against a concurrent bootstrap: a duplicate table / index / relation error rolls the attempt back, the whole schema of those tables is re-checked and finished, at most `SCHEMA_CREATE_ATTEMPTS` tries, any other error propagates; tables that already exist are left to the explicit blocks below — except the release-ledger tables (`INDEX_HEALED_TABLES`, K-93 A2), whose missing required indexes every bootstrap completes, warning once instead of failing when existing rows violate a unique index) plus an idempotent `_apply_schema_updates()` that:
 - adds later columns in place (e.g. `item_checkpoints.kind` for gate checkpoints; new columns go through the duplicate-safe `_add_column_if_missing` — `ADD COLUMN IF NOT EXISTS` under a 5 s `lock_timeout` on PostgreSQL, a re-checked "duplicate column" error on SQLite),

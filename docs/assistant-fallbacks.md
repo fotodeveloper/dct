@@ -149,8 +149,9 @@ then ask. The steps are the `/release` skill's, one for one (MCP where a
 tool suffices — the corrections; the CLI where the effects need it):
 
 0. **Probe and plan** — `dct release plan --json`. A missing / older CLI
-   (unknown subcommand or flag, or a plan whose `schema_version` lower than 4
-   shows it has no `executor` or no `changelog_file` key) → STOP and say the CLI must be installed
+   (unknown subcommand or flag, or a plan whose `schema_version` lower than 5
+   shows it has no `executor`, `changelog_file`, `version.suggested` or
+   `pending_consent` key) → STOP and say the CLI must be installed
    or upgraded (and the MCP server restarted). Exit 1 → show the reason, STOP.
 1. **Route — from this ONE plan result** (K-111, K-119). The plan carries
    `kind`, `unfinished_release` and `executor`: `executor.project` (the

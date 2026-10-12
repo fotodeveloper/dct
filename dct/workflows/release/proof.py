@@ -61,6 +61,17 @@ _MAINLINE_RE = re.compile(r"\s+changes made to ([0-9a-fA-F]{7,64})\.", re.ASCII)
 _MERGE_PR_RE = re.compile(r"^Merge pull request #([0-9]+) ", re.ASCII)
 _SUFFIX_PR_RE = re.compile(r"\(#([0-9]+)\)\s*$", re.ASCII)
 LOCAL_SQUASH_MARKER = "Squashed commit of the following:"
+# The subject of an attestation commit (`dct release attest`, and the one
+# `apply --consent` makes for a "release with all N" variant).
+ATTEST_SUBJECT = "chore: attest changelog entries"
+
+
+def attest_message(ids: Iterable[int]) -> str:
+    """The message of an attestation commit for `ids` — ATTEST_SUBJECT and
+    the final trailer paragraph `Changelog: <ids ascending>` (attest, the
+    preview's synthetic attestation commit, and the message a hand-made
+    attestation commit must carry to be adopted by `apply --consent`)."""
+    return f"{ATTEST_SUBJECT}\n\nChangelog: {', '.join(str(i) for i in sorted(ids))}\n"
 
 
 @dataclass(frozen=True)
@@ -105,6 +116,24 @@ def ids_from_body(message: str) -> set[int]:
 def proven_ids(commit: Commit) -> frozenset[int]:
     """The ids `commit` proves: trailer parser ∪ strict body scan."""
     return frozenset(ids_from_trailer_value(commit.trailer_value) | ids_from_body(commit.message))
+
+
+def message_subject(message: str) -> str:
+    """The subject git shows for `message` (`git log --format=%s`): its
+    first paragraph — blank lines before it skipped, its lines stripped of
+    trailing whitespace and joined with single spaces. The one definition
+    the release preview binds and `apply --consent` checks and adopts by
+    (Commit.subject, the first line, stays the proof rules' own)."""
+    lines = (message or "").split("\n")
+    start = 0
+    while start < len(lines) and not lines[start].strip():
+        start += 1
+    paragraph = []
+    for line in lines[start:]:
+        if not line.strip():
+            break
+        paragraph.append(line.rstrip())
+    return " ".join(paragraph)
 
 
 def lost_trailer_ids(message: str) -> set[int]:

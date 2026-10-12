@@ -511,6 +511,124 @@ def entry_state_digest(entry: Mapping) -> str:
 _DIGEST_RE = re.compile(r"[0-9a-f]{64}", re.ASCII)
 
 
+class StampRefused(ValueError):
+    """A refusal of the stamp transaction whose CAUSE a caller routes
+    (release_entries consume_preview / expected_release_date): `details`
+    = {key: data} — `preview_replaced`, `date_changed` or
+    `consent_mismatch` (the effects layer's refusal keys). Nothing was
+    written."""
+
+    def __init__(self, message: str, details: dict):
+        super().__init__(message)
+        self.details = details
+
+
+_RELEASE_DATE_RE = re.compile(r"\d{4}-\d{2}-\d{2}", re.ASCII)
+
+
+def _validate_consume_preview(consume: Mapping, consent: dict | None,
+                              proposal: dict | None) -> dict:
+    """The shape of release_entries' `consume_preview` — {"preview_id",
+    "consent_sha256" (C), "proposal" (the rebound proposal)} — and its
+    agreement with the consent (content_sha256 == C, proposal_sha256 ==
+    the proposal's digest) and a given `proposal`. ValueError before any
+    read."""
+    from dct.core import releases as release_records
+
+    if not isinstance(consume, Mapping) or set(consume) != {"preview_id", "consent_sha256",
+                                                            "proposal"}:
+        raise ValueError("consume_preview must be {preview_id, consent_sha256, proposal}; "
+                         "nothing released.")
+    if not isinstance(consume["preview_id"], str) or not consume["preview_id"]:
+        raise ValueError("consume_preview.preview_id must be the preview's id; nothing released.")
+    rebound = release_records.validate_proposal(consume["proposal"])
+    if rebound is None or rebound.get("id") != consume["preview_id"]:
+        raise ValueError("consume_preview.proposal must be the preview's proposal (its id = "
+                         "the preview id); nothing released.")
+    if proposal is not None and proposal != rebound:
+        raise ValueError("The given proposal differs from the preview's proposal; nothing "
+                         "released.")
+    if consent is None or consent.get("content_sha256") != consume["consent_sha256"] \
+            or consent.get("proposal_sha256") != release_records.proposal_digest(rebound):
+        raise ValueError("consume_preview needs a consent naming its consent view "
+                         "(content_sha256) and its proposal (proposal_sha256); nothing "
+                         "released.")
+    return {"preview_id": consume["preview_id"], "consent_sha256": consume["consent_sha256"],
+            "proposal": rebound}
+
+
+def _consume_preview(conn: sa.Connection, pid: int, consume: dict, render: dict | None) -> None:
+    """Inside the stamp transaction (R11 and the render binding of `apply
+    --consent`): the project's preview slot must STILL be the approved
+    preview and hold the approved view, its stored proposal content must be
+    the rebound proposal's, and the render settings must be the approved
+    ones — StampRefused otherwise, nothing written."""
+    from dct.core import releases as release_records
+
+    slot = release_records.read_preview(conn, pid)
+    approved = consume["consent_sha256"]
+    if slot is None or slot["id"] != consume["preview_id"] or approved not in slot["variants"]:
+        raise StampRefused(
+            f"the preview {consume['preview_id']} the owner approved was replaced or "
+            f"discarded (a newer preview or prepare) before the stamp — nothing released; "
+            f"preview again.",
+            {"preview_replaced": {"preview_id": consume["preview_id"],
+                                  "now": None if slot is None else slot["id"]}})
+    stored = slot["variants"][approved]["proposal_content"]
+    if stored != release_records.proposal_content(consume["proposal"]):
+        raise ValueError("the rebound proposal is not the approved preview's content; nothing "
+                         "released.")
+    now = release_records.project_release_settings(conn, pid)["render"]
+    if render is not None and render != now:
+        raise StampRefused(
+            "the changelog render settings changed since the owner approved the preview — "
+            "nothing released; preview again.",
+            {"consent_mismatch": {"changed": ["changelog"],
+                                  "diff": {"changelog": {"approved": dict(render),
+                                                         "now": dict(now)}}}})
+
+
+def _validate_changelog_settings(settings: Mapping | None) -> dict | None:
+    """release_entries' `expected_changelog_settings` — the shape of
+    core.changelog_file.choice_settings ({managed, explicit, path}, an
+    explicit path only when managed, a path exactly when explicit);
+    TypeError / ValueError before any read."""
+    from dct.core.changelog_file import CHOICE_KEYS
+
+    if settings is None:
+        return None
+    if not isinstance(settings, Mapping):
+        raise TypeError("expected_changelog_settings must be an object {managed, explicit, "
+                        "path}; nothing released.")
+    if set(settings) != CHOICE_KEYS:
+        raise ValueError("expected_changelog_settings must hold exactly managed, explicit and "
+                         "path; nothing released.")
+    managed, explicit, path = settings["managed"], settings["explicit"], settings["path"]
+    if not isinstance(managed, bool) or not isinstance(explicit, bool) \
+            or (path is not None and (not isinstance(path, str) or not path)) \
+            or (explicit and not managed) or (path is not None) != explicit:
+        raise ValueError(f"expected_changelog_settings is not a settings choice "
+                         f"({dict(settings)!r}); nothing released.")
+    return {"managed": managed, "explicit": explicit, "path": path}
+
+
+def _check_changelog_settings(conn: sa.Connection, pid: int, approved: dict) -> None:
+    """Inside the stamp transaction: the settings that choose the changelog
+    file are still the ones the caller's derivation used — StampRefused
+    `consent_mismatch` {changed: ["changelog"]} otherwise, nothing written."""
+    from dct.core import releases as release_records
+
+    now = release_records.project_release_settings(conn, pid)["changelog"]
+    if now != approved:
+        raise StampRefused(
+            "the changelog file settings (whether dct writes the changelog file, and which "
+            "one) changed since the owner approved the preview — nothing released; preview "
+            "again.",
+            {"consent_mismatch": {"changed": ["changelog"],
+                                  "diff": {"changelog": {"approved": {"settings": approved},
+                                                         "now": {"settings": now}}}}})
+
+
 def _validate_expected_entries(expected: Mapping | None) -> dict[int, str] | None:
     if expected is None:
         return None
@@ -527,16 +645,27 @@ def _validate_expected_entries(expected: Mapping | None) -> dict[int, str] | Non
     return out
 
 
+# At most this many entry ids in a stamp's consent_mismatch diff (the
+# effects layer's limit for a diff's leaves).
+_DIFF_MAX_IDS = 20
+
+
 def _check_plan_binding(
     conn: sa.Connection, pid: int, to_stamp: list[int],
-    stampable: list[int] | None, expected: dict[int, str] | None,
+    stampable: list[int] | None, expected: dict[int, str] | None, *,
+    consent: bool = False,
 ) -> None:
     """K-80/K-81, inside the stamp transaction and before any write: the
     live unreleased entries must still be EXACTLY the ones the approved plan
     saw, in the same state (`expected`), and only `stampable` ids (approved
     AND proven by that plan) may receive a new stamp. An entry already
     carrying the version is not stamped again (the legacy set — checked by
-    the caller as a whole)."""
+    the caller as a whole). `consent` (the one-dialog stamp, consume_preview):
+    a change of the entries is StampRefused `consent_mismatch` {changed:
+    ["entries"], diff: {entries: {approved: {state}, now: {state}}}} — the
+    entry states the screen bound against the live ones, narrowed to the
+    differing ids — so the caller routes it like any other change since the
+    screen; the plan path keeps its plain ValueError."""
     if expected is not None:
         c = changelog_entries.c
         live = {
@@ -552,6 +681,17 @@ def _check_plan_binding(
             parts = [f"{label}: {', '.join(f'#{i}' for i in ids)}"
                      for label, ids in (("added", added), ("changed", changed),
                                         ("removed or released", removed)) if ids]
+            if consent:
+                differing = sorted(added + changed + removed)[:_DIFF_MAX_IDS]
+                raise StampRefused(
+                    f"the unreleased changelog entries changed since the owner approved the "
+                    f"screen ({'; '.join(parts)}) — nothing released; preview again and show "
+                    f"the new screen.",
+                    {"consent_mismatch": {"changed": ["entries"], "diff": {"entries": {
+                        "approved": {"state": {str(i): expected[i] for i in differing
+                                               if i in expected}},
+                        "now": {"state": {str(i): live[i] for i in differing
+                                          if i in live}}}}}})
             raise ValueError(
                 f"the unreleased changelog entries changed since the approved plan "
                 f"({'; '.join(parts)}) — run the plan again and approve it; nothing released."
@@ -619,7 +759,10 @@ def release_entries(
     expected_entries: Mapping | None = None,
     manifest: Mapping | None = None,
     consume_proposal: bool = False,
+    consume_preview: Mapping | None = None,
+    expected_release_date: str | None = None,
     expected_executor: str | None = None,
+    expected_changelog_settings: Mapping | None = None,
     pr_source: str = "client",
 ) -> dict:
     """Stamp changelog entries with a version, set the project's current_version
@@ -702,6 +845,33 @@ def release_entries(
     consent digest raises ValueError and NOTHING is written (the earlier
     contract and the pending proposal stay). A no-op (an existing record, a
     historical retry) never needs it.
+    `consume_preview` (the one-dialog release, `apply --consent`; mutually
+    exclusive with `consume_proposal` — ValueError before any read):
+    {"preview_id", "consent_sha256" (the approved consent view's digest C),
+    "proposal" (the preview's content rebound to the real candidate, its
+    `id` = the preview id)}; the consent must name C as `content_sha256` and
+    the proposal's digest as `proposal_sha256`. In the stamp transaction
+    the project's preview slot must STILL be that preview holding C, with
+    that content (else StampRefused `preview_replaced` — a newer preview /
+    prepare replaced it, R11), and the render settings must be the
+    approved `render` (else StampRefused `consent_mismatch`); then the
+    record's proposal is the rebound one, its paths become the version-file
+    contract and the preview slot is cleared. `expected_release_date`
+    (YYYY-MM-DD, UTC; None = not bound): the date the approved changelog
+    section carries — a stamp on another UTC day raises StampRefused
+    `date_changed` (R12), nothing written.
+    `expected_changelog_settings` (None = not bound): the settings that
+    choose the changelog file the caller's last derivation used
+    (core.changelog_file.choice_settings: {managed, explicit, path}) —
+    compared with the project row inside the stamp transaction; another
+    value raises StampRefused `consent_mismatch` {changed: ["changelog"]},
+    nothing written. Race-safe: the transaction also writes the project row
+    (current_version), so on PostgreSQL a setting committed after its
+    snapshot fails it with a serialization conflict (nothing written), and
+    SQLite serializes every writer.
+    With `consume_preview` a change of the live unreleased entries since
+    the approval (`expected_entries`) is StampRefused `consent_mismatch`
+    {changed: ["entries"]} instead of a plain ValueError.
     K-106 executor binding: `expected_executor` ('dct' | 'own'; None = not
     bound) — the executor the caller's plan / consent was approved for; a
     consent naming its `executor` binds the same way (the two must agree,
@@ -783,6 +953,20 @@ def release_entries(
             f"'{consented_by}'; nothing released."
         )
     expected_by = expected_by or consented_by
+    if consume_proposal and consume_preview is not None:
+        raise ValueError("consume_proposal and consume_preview are mutually exclusive — a "
+                         "release consumes the approved prepare OR the approved preview; "
+                         "nothing released.")
+    if consume_preview is not None:
+        consume_preview = _validate_consume_preview(consume_preview, given["consent"],
+                                                    given["proposal"])
+        given["proposal"] = consume_preview["proposal"]
+    if expected_release_date is not None and (
+            not isinstance(expected_release_date, str)
+            or not _RELEASE_DATE_RE.fullmatch(expected_release_date)):
+        raise ValueError(f"expected_release_date must be YYYY-MM-DD, got "
+                         f"{expected_release_date!r}; nothing released.")
+    changelog_settings = _validate_changelog_settings(expected_changelog_settings)
     approval = (given["consent"] or {}).get("proposal_sha256") if consume_proposal else None
     root = normalize_worktree(checkout_root)
     ensure_fits(release_records.releases, {"checkout_root": root})
@@ -886,7 +1070,8 @@ def release_entries(
                     f"nothing released."
                 )
         release_records.check_proof_scope(proof_map, resolved)
-        _check_plan_binding(conn, pid, to_stamp, stampable, expected)
+        _check_plan_binding(conn, pid, to_stamp, stampable, expected,
+                            consent=consume_preview is not None)
         release_records.check_expected_executor(conn, pid, project_slug, expected_by)
         if current and compare_versions(version, current) < 0:
             raise ValueError(
@@ -903,8 +1088,19 @@ def release_entries(
         if consume_proposal:
             approved = _approved_proposal(conn, pid, project_slug, approval, given["proposal"])
             given["proposal"] = approved
+        if consume_preview is not None:
+            _consume_preview(conn, pid, consume_preview, given["render"])
+        if changelog_settings is not None:
+            _check_changelog_settings(conn, pid, changelog_settings)
 
         now = datetime.now(UTC)
+        if expected_release_date is not None and now.date().isoformat() != expected_release_date:
+            raise StampRefused(
+                f"the approved changelog section is dated {expected_release_date} but the "
+                f"stamp would release on {now.date().isoformat()} (UTC) — the date changed "
+                f"since the approval; nothing released, preview again.",
+                {"date_changed": {"approved": expected_release_date,
+                                  "now": now.date().isoformat()}})
         released = 0
         if to_stamp:
             released = conn.execute(
@@ -933,6 +1129,9 @@ def release_entries(
         if consume_proposal:
             release_records.store_version_files(conn, pid, given["proposal"]["paths"], now)
             release_records.clear_pending_proposal(conn, pid)
+        if consume_preview is not None:
+            release_records.store_version_files(conn, pid, given["proposal"]["paths"], now)
+            release_records.clear_preview(conn, pid)
         result["released"] = released
         result["current_version"] = version
         if mode == "all" and len(branches) > 1:

@@ -485,10 +485,11 @@ PINNED_PLAN_KEYS = [
     "unfinished_release", "range", "entries", "foreign_citations", "reverts",
     "squash_commits", "attestation_groups", "proof", "index", "version_files",
     "changelog_file", "warnings", "resume", "snapshot", "snapshot_digest",
+    "pending_consent",
 ]
 PINNED_CANDIDATE_KEYS = [
     "schema_version", "project", "checkout", "range", "confirmed", "uncertain",
-    "other_branch", "already_proven", "staged_files", "warnings",
+    "other_branch", "already_proven", "staged_files", "secret_like", "warnings",
 ]
 
 
@@ -498,9 +499,17 @@ def test_json_documents_keep_their_top_level_keys(cli_engine, repo, monkeypatch,
     monkeypatch.chdir(repo)
     run_cli(monkeypatch, ["release", "plan", "-P", "proj-r", "--patch", "--json"])
     plan = json.loads(capsys.readouterr().out)
-    assert list(plan) == PINNED_PLAN_KEYS and plan["schema_version"] == 4
+    assert list(plan) == PINNED_PLAN_KEYS and plan["schema_version"] == 5
     assert set(plan["executor"]) == {"project", "record"}
-    assert plan["version"] == {"current": "1.0.0", "target": "1.0.1", "bump": "patch"}
+    # Schema 5: the suggestion for the snapshot's selection (nothing selected
+    # here: a version-only patch), outside the snapshot; no consent pending.
+    assert plan["version"] == {
+        "current": "1.0.0", "target": "1.0.1", "bump": "patch",
+        "suggested": {"bump": "patch", "target": "1.0.1", "reason": "version_only",
+                      "safe": True, "taken": [],
+                      "alternatives": [{"bump": "minor", "target": "1.1.0"},
+                                       {"bump": "major", "target": "2.0.0"}]}}
+    assert plan["pending_consent"] is None
     assert set(plan["entries"]) == {"proven", "unproven"}
     assert set(plan["range"]) == {
         "candidate_sha", "base_tag", "base_sha", "base_version", "base_distance",
@@ -512,7 +521,7 @@ def test_json_documents_keep_their_top_level_keys(cli_engine, repo, monkeypatch,
     assert len(plan["snapshot_digest"]) == 64 and plan["resume"] is None
     run_cli(monkeypatch, ["clog", "candidates", "-P", "proj-r", "--json"])
     candidates = json.loads(capsys.readouterr().out)
-    assert list(candidates) == PINNED_CANDIDATE_KEYS and candidates["schema_version"] == 4
+    assert list(candidates) == PINNED_CANDIDATE_KEYS and candidates["schema_version"] == 5
 
 
 def test_release_plan_cli_refuses_outside_a_checkout(cli_engine, repo, monkeypatch, tmp_path, capsys):

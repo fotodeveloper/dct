@@ -191,7 +191,7 @@ def test_a_dct_release_is_resumed_although_the_project_is_own_now(text, engine, 
     rows, stamps, before = release_rows(engine), stamped_versions(engine), world(engine, repo)
 
     plan = first_plan(body, run)
-    assert plan["schema_version"] == 4 and plan["kind"] == "resume"
+    assert plan["schema_version"] == 5 and plan["kind"] == "resume"
     assert plan["executor"] == {"project": "own", "record": {
         "version": "1.1.0", "status": "stamped", "executor": "dct", "progress_owner": "dct",
         "consent": True}}

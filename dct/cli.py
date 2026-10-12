@@ -1215,7 +1215,7 @@ def _run_effects(action: str, project_slug: str, as_json: bool, call) -> dict:
 
 
 REMOVED_CONFIRM_VERSION_FILES = (
-    "--confirm-version-files was removed (K-76): the version-file set is no longer "
+    "--confirm-version-files was removed: the version-file set is no longer "
     "confirmed after the stamp. Run `dct release prepare --version V (--entries … | "
     "--no-entries) --plan-digest D`, review the proposed files and pass its "
     "proposal_sha256 as --proposal-digest; nothing released.")
@@ -1268,14 +1268,15 @@ RELEASE_PUSH_EPILOG = RELEASE_EXECUTOR_EPILOG + RELEASE_LOCK_EPILOG + (
 
 def _add_push_flags(parser) -> None:
     """The push target of `release apply` / `clog release` (K-97 F2; K-123:
-    all three are required there for a new release that pushes) and of
-    `release takeover` (its preview derives what is not given)."""
+    all three are required there for a new release that pushes), of
+    `release takeover` (its preview derives what is not given) and of
+    `release prepare --preview` (the same: default the upstream)."""
     parser.add_argument(
         "--push-remote",
         help="Remote to push the release commit and tag to. apply / clog release: REQUIRED "
              "for a new release that pushes, with --push-branch and --push-url (the "
-             "push_target `dct release prepare` showed). takeover: default the branch's "
-             "upstream")
+             "push_target `dct release prepare` showed). takeover, prepare --preview: "
+             "default the branch's upstream")
     parser.add_argument(
         "--push-branch",
         help="Branch of that remote. apply / clog release: REQUIRED with --push-remote. "
@@ -1356,8 +1357,85 @@ def cmd_release_apply(args):
     snapshot_digest of `dct release plan` with the same version and
     selection; the plan is re-derived for the candidate apply pins and a
     different snapshot is refused before any write. --proposal-digest is the
-    proposal_sha256 of `dct release prepare` (required for a new release)."""
+    proposal_sha256 of `dct release prepare` (required for a new release).
+
+    `--consent C`: the one-dialog release (effects.apply_consent) — the
+    screen of `prepare --preview` whose consent_digest is C; every binding
+    flag of the path above is refused with it (`consent_flag_conflict`)."""
+    if args.consent is not None:
+        return _apply_consent_from_args(args)
+    parser = args.apply_parser
+    if args.plan_digest is None:
+        parser.error("the following arguments are required: --plan-digest (or --consent)")
+    if args.entries is None and not args.no_entries:
+        parser.error("one of the arguments --entries --no-entries is required (or --consent)")
     _apply_from_args(args, strict=False)
+
+
+# The flags of the D/P path that bind a release — `apply --consent` takes
+# none of them: the preview's consent view binds them all (R1).
+_CONSENT_BINDING_FLAGS = (("version", "--version"), ("entries", "--entries"),
+                          ("no_entries", "--no-entries"), ("plan_digest", "--plan-digest"),
+                          ("proposal_digest", "--proposal-digest"),
+                          ("push_remote", "--push-remote"), ("push_branch", "--push-branch"),
+                          ("push_url", "--push-url"), ("no_push", "--no-push"))
+
+
+def _apply_consent_from_args(args) -> None:
+    from dct.workflows.release.effects import (
+        NOTHING_MADE,
+        ReleaseRefused,
+        apply_consent,
+    )
+
+    _refuse_removed_flag(args)
+    engine = _get_engine()
+    project_slug = args.project or _detect_project(engine)
+    conflicts = _prepare_flags_in_use(args, _CONSENT_BINDING_FLAGS)
+    if args.bump is not None:
+        conflicts.append(f"--{args.bump}")
+
+    def call() -> dict:
+        if conflicts:
+            raise ReleaseRefused(
+                f"--consent releases exactly the screen the owner approved — it takes no "
+                f"{', '.join(sorted(conflicts))} (the preview binds the version, the entries "
+                f"and the push target); preview again with them instead; nothing done.",
+                details={"consent_flag_conflict": sorted(conflicts),
+                         "made": dict(NOTHING_MADE)})
+        return apply_consent(engine, project_slug, args.consent, confirm=args.confirm)
+
+    out = _run_effects("apply", project_slug, args.json, call)
+    if args.json:
+        return
+    details = out["details"]
+    made = details["made"]
+    for name, label in (("work_commit", "your changes committed as"),
+                        ("attest_commit", "entries attested in")):
+        if made[name]:
+            print(f"  {label} {made[name][:12]}")
+    print(f"✓ Released {details['released']} entries as {out['version']} "
+          f"(mode: {details['mode']}) — current version: {details['current_version']}")
+    target = details.get("push_target")
+    print(f"  pushed to {target['remote']} {target['url']} ({target['branch']}, "
+          f"{target['tag']})" if target else "  not pushed (a local release)")
+    _print_effects(out)
+
+
+_PREVIEW_ONLY_FLAGS = (("attest", "--attest"), ("message_file", "--message-file"),
+                       ("include_untracked", "--include-untracked"),
+                       ("push_remote", "--push-remote"), ("push_branch", "--push-branch"),
+                       ("push_url", "--push-url"), ("no_push", "--no-push"),
+                       ("no_variants", "--no-variants"))
+
+
+def _prepare_flags_in_use(args, names) -> list[str]:
+    """The flags of `names` ((dest, flag) pairs) the command line GAVE —
+    by presence, never truthiness: a value flag is absent only as None
+    (its default; `--version ""` is present), a store_true flag only as
+    False (its default). An empty value never reads as "no flag"."""
+    return [flag for name, flag in names
+            if (value := getattr(args, name, None)) is not None and value is not False]
 
 
 def cmd_release_prepare(args):
@@ -1365,7 +1443,30 @@ def cmd_release_prepare(args):
     the version-sync script runs once, isolated (a temporary worktree of
     the pinned candidate, or a copy of a project outside git), and its
     result is stored as the project's pending version-file proposal for the
-    owner to approve (`apply --proposal-digest`). Nothing is stamped."""
+    owner to approve (`apply --proposal-digest`). Nothing is stamped.
+
+    `--preview`: the one-dialog release's screen (effects.preview_release —
+    the consent view of each variant and its digest, stored in the
+    project's preview slot; nothing committed). `--discard-preview`: clear
+    that slot (effects.discard_preview)."""
+    parser = args.prepare_parser
+    if args.discard_preview:
+        extra = _prepare_flags_in_use(args, (
+            ("version", "--version"), ("bump", "--patch/--minor/--major"),
+            ("entries", "--entries"), ("no_entries", "--no-entries"), *_PREVIEW_ONLY_FLAGS))
+        if extra:
+            parser.error(f"--discard-preview takes no other flag than -P and --json "
+                         f"(got {', '.join(extra)})")
+        return _discard_preview_from_args(args)
+    if args.preview:
+        return _preview_from_args(args)
+    extra = _prepare_flags_in_use(args, _PREVIEW_ONLY_FLAGS)
+    if extra:
+        parser.error(f"{', '.join(extra)} only with --preview")
+    if args.plan_digest is None:
+        parser.error("the following arguments are required: --plan-digest (or --preview)")
+    if args.entries is None and not args.no_entries:
+        parser.error("one of the arguments --entries --no-entries is required (or --preview)")
     from dct.workflows.release.effects import prepare_release
 
     engine = _get_engine()
@@ -1410,6 +1511,62 @@ def cmd_release_prepare(args):
     print(f"  next: dct release apply --version {out['version']} … --plan-digest "
           f"{details['plan_digest']} --proposal-digest {details['proposal_sha256']} {push} "
           f"--confirm")
+    _print_effects(out)
+
+
+def _discard_preview_from_args(args) -> None:
+    from dct.workflows.release.effects import discard_preview
+
+    engine = _get_engine()
+    project_slug = args.project or _detect_project(engine)
+    out = _run_effects("prepare", project_slug, args.json,
+                       lambda: discard_preview(engine, project_slug))
+    if args.json:
+        return
+    discarded = out["details"]["discarded"]
+    print(f"✓ Discarded the preview {discarded}" if discarded else
+          "✓ No preview to discard — nothing changed")
+    _print_effects(out)
+
+
+def _preview_from_args(args) -> None:
+    from dct.workflows.release.effects import preview_release
+
+    engine = _get_engine()
+    project_slug = args.project or _detect_project(engine)
+    entry_ids = None if args.no_entries else _release_ids(args.entries)
+    attest_ids = _release_ids(args.attest, "--attest")
+    out = _run_effects("prepare", project_slug, args.json, lambda: preview_release(
+        engine, project_slug, version=args.version or None,
+        bump_type=None if args.version else args.bump, entry_ids=entry_ids,
+        no_entries=args.no_entries, attest_ids=attest_ids, message_file=args.message_file,
+        include_untracked=args.include_untracked or (), push_remote=args.push_remote,
+        push_branch=args.push_branch, push_url=args.push_url, no_push=args.no_push,
+        variants=not args.no_variants))
+    if args.json:
+        return
+    details = out["details"]
+    work = details["work"]
+    if work:
+        print(f"Work in progress ({work['subject']}):")
+        for item in work["paths"]:
+            print(f"  {item['change']:<8} {item['path']} (staged: {item['staged']})")
+        if work["untracked_left"]:
+            print(f"  left out (untracked): {', '.join(work['untracked_left'])}")
+    for item in details["variants"]:
+        view, display = item["consent"], item["display"]
+        selected = ", ".join(f"#{e['id']}" for e in display["entries"]["selected"]) or "none"
+        waiting = ", ".join(f"#{e['id']} ({e['reason']})"
+                            for e in display["entries"]["waiting"]) or "none"
+        push = view["push"]
+        where = ("not pushed" if push is None else
+                 f"pushed to {push['remote']} {push['branch']} ({push['url']})"
+                 if push["mode"] == "push" else f"not pushed ({push['reason']})")
+        print(f"{item['name']}: {view['version']['target']} — entries {selected}; waiting "
+              f"{waiting}; {where}")
+        print(f"  consent digest {item['consent_digest']}")
+    if details["all_unavailable"]:
+        print(f"  no \"with all\" variant: {details['all_unavailable']}")
     _print_effects(out)
 
 
@@ -1870,7 +2027,7 @@ def cmd_release_plan(args):
         print(f"Next: dct release prepare --version {plan['version']['target'] or 'V'} "
               f"{'--entries ' + ','.join(map(str, selected)) if selected else '--no-entries'} "
               f"--plan-digest {plan['snapshot_digest']} — runs the version sync isolated and "
-              f"shows the version files for approval (K-76)")
+              f"shows the version files for approval")
     for warning in plan["warnings"]:
         print(f"  ⚠ {warning}", file=sys.stderr)
 
@@ -1881,7 +2038,8 @@ def cmd_clog_candidates(args):
     confirmed (client provenance of THIS checkout and branch) vs uncertain
     (server / no provenance, or any entry on a detached HEAD — never
     attached automatically), minus the ids the range already proves, plus
-    the staged file list. --json prints the stable document
+    the staged file list and the changed files whose path looks like a
+    secret (the release preview's predicate). --json prints the stable document
     (dct.workflows.release.CANDIDATE_KEYS).
     """
     import json
@@ -1912,6 +2070,12 @@ def cmd_clog_candidates(args):
         print(f"Already proven in the range: "
               f"{', '.join(f'#{i}' for i in result['already_proven'])}")
     print(f"Staged files ({len(result['staged_files'])}): {', '.join(result['staged_files'])}")
+    for item in result["secret_like"]:
+        if item["staged"]:
+            print(f"  ⚠ {item['path']} looks like a secret and is staged — unstage it: "
+                  f"{item['unstage']}")
+        else:
+            print(f"  ⚠ {item['path']} looks like a secret — never staged by a commit dialog")
     for warning in result["warnings"]:
         print(f"  ⚠ {warning}", file=sys.stderr)
 
@@ -2827,7 +2991,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_proj_rexec = p_proj_sub.add_parser(
         "release-executor",
         help="Get/set who performs the project's release effects: dct (default) or own "
-             "(the project's own release tool, K-85)",
+             "(the project's own release tool)",
     )
     p_proj_rexec.add_argument("slug")
     p_proj_rexec.add_argument("executor", nargs="?", choices=["dct", "own"],
@@ -2835,7 +2999,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_proj_prrefs = p_proj_sub.add_parser(
         "changelog-pr-refs",
-        help="Get/set rendering `(#N)` PR references in the changelog (opt-in, K-90)",
+        help="Get/set rendering `(#N)` PR references in the changelog (opt-in)",
     )
     p_proj_prrefs.add_argument("slug")
     p_proj_prrefs.add_argument("state", nargs="?", choices=["on", "off"],
@@ -3009,7 +3173,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--confirm-version-files", action="store_true", help=argparse.SUPPRESS)
     p_clog_release.add_argument(
         "--confirm", action="store_true",
-        help="Required: it stamps, writes, commits, tags and pushes (K-96 D1)")
+        help="Required: it stamps, writes, commits, tags and pushes")
     _add_push_flags(p_clog_release)
     p_clog_release.add_argument("--json", action="store_true", help="Stable JSON document")
     p_clog_release.epilog = (
@@ -3079,7 +3243,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_clog_cand = p_clog_sub.add_parser(
         "candidates",
-        help="Changelog candidates for the commit being prepared (read-only, K-53)")
+        help="Changelog candidates for the commit being prepared (read-only)")
     p_clog_cand.add_argument("--project", "-P")
     p_clog_cand.add_argument("--json", action="store_true", help="Stable JSON document")
 
@@ -3159,16 +3323,24 @@ def build_parser() -> argparse.ArgumentParser:
     p_rel_apply_v.add_argument("--patch", dest="bump", action="store_const", const="patch")
     p_rel_apply_v.add_argument("--minor", dest="bump", action="store_const", const="minor")
     p_rel_apply_v.add_argument("--major", dest="bump", action="store_const", const="major")
-    p_rel_apply_sel = p_rel_apply.add_mutually_exclusive_group(required=True)
+    p_rel_apply_sel = p_rel_apply.add_mutually_exclusive_group()
     p_rel_apply_sel.add_argument(
-        "--entries", help="Comma-separated entry ids — each proven by the plan")
+        "--entries", help="Comma-separated entry ids — each proven by the plan (required "
+                          "without --consent)")
     p_rel_apply_sel.add_argument(
         "--no-entries", action="store_true", help="Version-only release")
     p_rel_apply.add_argument("--confirm", action="store_true", help="Required")
     p_rel_apply.add_argument(
-        "--plan-digest", required=True,
-        help="Required: the snapshot_digest of the approved `dct release plan --version V "
-             "--entries … --json` (the release is refused when the re-derived plan differs)")
+        "--consent", metavar="C",
+        help="Release EXACTLY the screen the owner approved: the consent_digest of a variant "
+             "of `dct release prepare --preview` (it commits your uncommitted changes and "
+             "makes the attestation commit as that screen showed). Takes no --version / bump "
+             "/ --entries / --no-entries / digest / push flag — the preview binds them all")
+    p_rel_apply.add_argument(
+        "--plan-digest",
+        help="Required without --consent: the snapshot_digest of the approved `dct release "
+             "plan --version V --entries … --json` (the release is refused when the "
+             "re-derived plan differs)")
     p_rel_apply.add_argument(
         "--proposal-digest",
         help="Required for a new release: the proposal_sha256 of the approved `dct release "
@@ -3177,7 +3349,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--confirm-version-files", action="store_true", help=argparse.SUPPRESS)
     _add_push_flags(p_rel_apply)
     p_rel_apply.add_argument("--json", action="store_true", help="Stable JSON document")
-    p_rel_apply.epilog = RELEASE_PUSH_EPILOG
+    p_rel_apply.set_defaults(apply_parser=p_rel_apply)
+    p_rel_apply.epilog = RELEASE_PUSH_EPILOG + (
+        " --consent C: the one-dialog release — the work-in-progress commit and the "
+        "attestation commit are made through the same hook lifecycle BEFORE the stamp, the "
+        "content is re-derived and compared with C before and after them, and a re-run of "
+        "the same command adopts what an interrupted one made.")
 
     p_rel_prepare = p_release_sub.add_parser(
         "prepare", help="Run the version sync isolated and store the version-file proposal "
@@ -3188,16 +3365,43 @@ def build_parser() -> argparse.ArgumentParser:
     p_rel_prepare_v.add_argument("--patch", dest="bump", action="store_const", const="patch")
     p_rel_prepare_v.add_argument("--minor", dest="bump", action="store_const", const="minor")
     p_rel_prepare_v.add_argument("--major", dest="bump", action="store_const", const="major")
-    p_rel_prepare_sel = p_rel_prepare.add_mutually_exclusive_group(required=True)
+    p_rel_prepare_sel = p_rel_prepare.add_mutually_exclusive_group()
     p_rel_prepare_sel.add_argument(
-        "--entries", help="Comma-separated entry ids — each proven by the plan")
+        "--entries", help="Comma-separated entry ids — each proven by the plan (required "
+                          "without --preview, else default: every id proven at the "
+                          "candidate)")
     p_rel_prepare_sel.add_argument(
         "--no-entries", action="store_true", help="Version-only release")
+    p_rel_prepare_mode = p_rel_prepare.add_mutually_exclusive_group()
+    p_rel_prepare_mode.add_argument(
+        "--plan-digest",
+        help="Required without --preview: the snapshot_digest of the approved `dct release "
+             "plan` (same version and selection)")
+    p_rel_prepare_mode.add_argument(
+        "--preview", action="store_true",
+        help="The one-screen release: compute what the release would be — the commit of "
+             "your uncommitted changes, the entries, the changelog section, the version "
+             "files, the push — and store it for `apply --consent`; nothing committed")
+    p_rel_prepare_mode.add_argument(
+        "--discard-preview", action="store_true",
+        help="Drop the stored preview (the owner declined it); only with -P and --json")
     p_rel_prepare.add_argument(
-        "--plan-digest", required=True,
-        help="Required: the snapshot_digest of the approved `dct release plan` (same version "
-             "and selection)")
+        "--attest", help="--preview: comma-separated waiting entry ids the shown release "
+                         "also marks as done (an empty attestation commit; not made now)")
+    p_rel_prepare.add_argument(
+        "--message-file",
+        help="--preview: the commit message of your uncommitted changes — required when the "
+             "work tree has any, refused when it is clean")
+    p_rel_prepare.add_argument(
+        "--include-untracked", action="append", metavar="PATH",
+        help="--preview: an untracked (not ignored) file to commit with your changes; "
+             "repeatable (untracked release artifacts are included automatically)")
+    _add_push_flags(p_rel_prepare)
+    p_rel_prepare.add_argument(
+        "--no-variants", action="store_true",
+        help='--preview: do not compute the "release with all waiting entries" variant')
     p_rel_prepare.add_argument("--json", action="store_true", help="Stable JSON document")
+    p_rel_prepare.set_defaults(prepare_parser=p_rel_prepare)
     p_rel_prepare.epilog = (
         "Effects: runs scripts/dct-version-sync.sh (or scripts/version-sync.sh) of the "
         "candidate ONCE with V in a temporary detached worktree (a project outside git: in a "
@@ -3211,7 +3415,11 @@ def build_parser() -> argparse.ArgumentParser:
         "checkout — virtualenvs, node_modules, build output — and no submodule content), "
         "stdin closed, no terminal, GIT_* repository variables dropped, a timeout; a script "
         "that needs anything else fails with that contract — dct never runs it in your "
-        "checkout instead. " + RELEASE_LOCK_EPILOG + RELEASE_EXECUTOR_EPILOG)
+        "checkout instead. --preview runs the same sync on a synthetic commit of your "
+        "uncommitted changes (built in a temporary index — your index, work tree and "
+        "branches are untouched), stores the preview for `dct release apply --consent` and "
+        "pins its blobs by refs/dct/release-previews/<project>/<preview id> (a preview and "
+        "a prepare replace each other). " + RELEASE_LOCK_EPILOG + RELEASE_EXECUTOR_EPILOG)
 
     p_rel_resume = p_release_sub.add_parser(
         "resume", help="Finish the unfinished release (verifies every effect first; executes "

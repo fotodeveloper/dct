@@ -193,18 +193,12 @@ def set_version(engine: sa.Engine, slug: str, version: str) -> dict | None:
 def set_manages_changelog(engine: sa.Engine, slug: str, value: bool) -> dict | None:
     """Opt a project in/out of dct changelog-hook enforcement (#222).
 
+    One of the settings that choose the release's changelog file: written
+    under the stamp's project lock (_set_release_setting, K-44).
     Returns the updated project row, or None when the slug does not resolve to
     a live project.
     """
-    with engine.begin() as conn:
-        result = conn.execute(
-            projects.update()
-            .where(projects.c.slug == slug, projects.c.deleted_at.is_(None))
-            .values(manages_changelog=value, updated_at=datetime.now(UTC))
-        )
-        if result.rowcount == 0:
-            return None
-    return get_project(engine, slug)
+    return _set_release_setting(engine, slug, manages_changelog=value)
 
 
 def project_manages_changelog(engine: sa.Engine, slug: str) -> bool:
@@ -236,6 +230,7 @@ def set_changelog_path(engine: sa.Engine, slug: str, relpath: str) -> dict | Non
     is stripped and any '..' escape is rejected — so /release can only ever
     write inside the project tree.
 
+    Written under the stamp's project lock (_set_release_setting, K-44).
     Returns the updated project row, or None when the slug does not resolve to a
     live project. Raises ValueError on an empty path or a '..' escape
     (nothing written — the marker stays as it was).
@@ -245,20 +240,21 @@ def set_changelog_path(engine: sa.Engine, slug: str, relpath: str) -> dict | Non
     rel = os.path.normpath(relpath.strip().lstrip("/"))
     if rel.startswith("..") or os.path.isabs(rel):
         raise ValueError("changelog_path must stay within the project root (no '..' escape)")
-    return _set_project_value(engine, slug, changelog_path=rel.replace(os.sep, "/"),
-                              changelog_path_explicit=True)
+    return _set_release_setting(engine, slug, changelog_path=rel.replace(os.sep, "/"),
+                                changelog_path_explicit=True)
 
 
 def reset_changelog_path(engine: sa.Engine, slug: str) -> dict | None:
     """Go back to DETECTING the changelog file (#876 K-14): changelog_path
     the default 'changelog.md', changelog_path_explicit false — the release
     then finds the tracked changelog of the project root
-    (core.changelog_file.resolve_changelog). Returns the updated project
+    (core.changelog_file.resolve_changelog). Written under the stamp's
+    project lock (_set_release_setting, K-44). Returns the updated project
     row, or None when the slug does not resolve to a live project."""
     from dct.core.changelog_file import DEFAULT_CHANGELOG_PATH
 
-    return _set_project_value(engine, slug, changelog_path=DEFAULT_CHANGELOG_PATH,
-                              changelog_path_explicit=False)
+    return _set_release_setting(engine, slug, changelog_path=DEFAULT_CHANGELOG_PATH,
+                                changelog_path_explicit=False)
 
 
 def _set_project_value(engine: sa.Engine, slug: str, **values) -> dict | None:
@@ -270,6 +266,27 @@ def _set_project_value(engine: sa.Engine, slug: str, **values) -> dict | None:
         )
         if result.rowcount == 0:
             return None
+    return get_project(engine, slug)
+
+
+def _set_release_setting(engine: sa.Engine, slug: str, **values) -> dict | None:
+    """Write project settings the release stamp checks in its own
+    transaction (the executor, the changelog-file choice, the PR render)
+    inside project_transaction(write=True) — the SAME project lock as the
+    stamp (K-106, K-44): a change either precedes the stamp's comparison
+    (the stamp refuses consent_mismatch) or waits until the stamp committed
+    (the record keeps what the stamp saw). None when the slug does not
+    resolve to a live project."""
+    from dct.db import project_transaction
+
+    if get_project(engine, slug) is None:
+        return None
+    try:
+        with project_transaction(engine, slug, write=True) as (conn, pid):
+            conn.execute(projects.update().where(projects.c.id == pid).values(
+                **values, updated_at=datetime.now(UTC)))
+    except ValueError:  # the project was deleted between the two reads
+        return None
     return get_project(engine, slug)
 
 
@@ -287,29 +304,21 @@ def set_release_executor(engine: sa.Engine, slug: str, executor: str) -> dict | 
     or None when the slug does not resolve to a live project. ValueError
     for any other value."""
     from dct.core.releases import validate_executor
-    from dct.db import project_transaction
 
-    value = validate_executor(executor)
-    if get_project(engine, slug) is None:
-        return None
-    try:
-        with project_transaction(engine, slug, write=True) as (conn, pid):
-            conn.execute(projects.update().where(projects.c.id == pid).values(
-                release_executor=value, updated_at=datetime.now(UTC)))
-    except ValueError:  # the project was deleted between the two reads
-        return None
-    return get_project(engine, slug)
+    return _set_release_setting(engine, slug, release_executor=validate_executor(executor))
 
 
 def set_changelog_pr_refs(engine: sa.Engine, slug: str, enabled: bool) -> dict | None:
     """Opt the project's changelog render into `(#N)` PR references (K-90;
     default off). Persisted per release at stamp time (releases.render), so
-    a change never alters a release already stamped. Returns the updated
+    a change never alters a release already stamped; written under the
+    stamp's project lock (_set_release_setting, K-44), so a change waits for
+    a running stamp or makes it refuse consent_mismatch. Returns the updated
     project row, or None when the slug does not resolve to a live project.
     TypeError unless `enabled` is a bool."""
     if not isinstance(enabled, bool):
         raise TypeError(f"changelog_pr_refs must be true or false, got {enabled!r}")
-    return _set_project_value(engine, slug, changelog_pr_refs=enabled)
+    return _set_release_setting(engine, slug, changelog_pr_refs=enabled)
 
 
 def update_project(

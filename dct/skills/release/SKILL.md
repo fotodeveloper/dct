@@ -62,8 +62,9 @@ Run `dct release plan --json`.
   CLI." Do NOT fall back to the MCP tools: the ledger tools alone cannot
   verify the changelog file, the version files, the commit, the tag or the
   push.
-- `schema_version` lower than 4 (the plan has no `executor` or no
-  `changelog_file` key — an older CLI) → STOP with the same message.
+- `schema_version` lower than 5 (the plan has no `executor`,
+  `changelog_file`, `version.suggested` or `pending_consent` key — an
+  older CLI) → STOP with the same message.
 - Exit 1 (the checkout could not be verified, project not found) → show the
   message and STOP. Never retry from another directory.
 

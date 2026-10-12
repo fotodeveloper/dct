@@ -318,10 +318,12 @@ def test_release_documented_keys_exist_in_the_workflow_schemas():
                     "prepared", "taken_over", "confirmed", "conflict"):
         assert outcome in OUTCOMES and f"`{outcome}`" in flat, outcome
     # K-111 / K-119: the routing keys are the plan's real ones (schema 3);
-    # #876: schema 4 added changelog_file.
+    # #876: schema 4 added changelog_file; schema 5 version.suggested and
+    # pending_consent.
     from dct.workflows.release.plan import SCHEMA_VERSION
 
-    assert SCHEMA_VERSION == 4 and "executor" in PLAN_KEYS and "changelog_file" in PLAN_KEYS
+    assert SCHEMA_VERSION == 5 and "executor" in PLAN_KEYS and "changelog_file" in PLAN_KEYS
+    assert "pending_consent" in PLAN_KEYS
     for key in ("executor.project", "executor.record"):
         assert f"`{key}" in flat, key
 
@@ -389,7 +391,7 @@ def test_release_dialog_respects_the_executor_and_the_stored_consent(text):
     flat = " ".join(text().split())
     assert "dct project release-executor" not in flat  # K-111: one read, the plan
     assert "`executor.project" in flat and "`executor.record" in flat and "`own`" in flat
-    assert "`schema_version` lower than 4" in flat  # the capability check (K-114, #876)
+    assert "`schema_version` lower than 5" in flat  # the capability check (K-114, #876, schema 5)
     assert re.search(r"no new approval", flat, re.IGNORECASE)
     assert "dct release resume --json" in flat
     assert "`conflict`" in flat and "75" in flat and "details.observed_effects" in flat
@@ -616,17 +618,26 @@ def test_every_executable_release_names_the_complete_push_target(text):
     show (one that carries `--confirm`) names the complete approved target
     (`--push-remote`, `--push-branch`, `--push-url`) or `--no-push`. The
     no-flag form, which pushed to whatever the upstream was at apply time,
-    is gone from all of them."""
+    is gone from all of them. `apply --consent C` is the exception by
+    construction: the approved consent view binds the push target, and a
+    push flag beside it is refused (consent_flag_conflict)."""
     body = text()
-    usages = [set(flags) for group, sub, flags in _commands(body)
-              if (group, sub) in {("release", "apply"), ("clog", "release")}
-              and "--confirm" in flags]
-    assert usages, "no executable apply / alias usage"
+    executable = [set(flags) for group, sub, flags in _commands(body)
+                  if (group, sub) in {("release", "apply"), ("clog", "release")}
+                  and "--confirm" in flags]
+    usages = [flags for flags in executable if "--consent" not in flags]
+    assert executable, "no executable apply / alias usage"
     for flags in usages:
         # (the workflow doc's command table shows both alternatives in one line)
         assert _PUSH_SET <= flags or (
             "--no-push" in flags and not _PUSH_SET & flags), sorted(flags)
-    assert any(_PUSH_SET <= flags for flags in usages), "no pushing usage shown"
+    for flags in executable:
+        if "--consent" in flags:
+            assert not (_PUSH_SET | {"--no-push"}) & flags, sorted(flags)
+    # Phase 2: the release dialogs apply only `--consent` (the push target is
+    # in the previewed content); the other documents still show the D/P path.
+    if usages or "--consent" not in set().union(*executable):
+        assert any(_PUSH_SET <= flags for flags in usages), "no pushing usage shown"
 
 
 def test_cli_help_states_the_complete_push_target():
