@@ -29,7 +29,9 @@ Use `mcp__dct__list_plan_sections(plan_id=X, ...)` with `section_type="uncertain
 for each active plan, OR construct a direct query via the CLI
 (`dct plan resolve-uncertain --dry-run` if available).
 
-Present a compact table:
+Build a compact table — it travels inside the Step 3 dialog, as the preview
+of each strategy option, on "Details" pages when longer than 15 lines
+(Rules: "The screen travels inside the dialog"):
 ```
 plan               depth  heading
 ─────────────────  ─────  ─────────────────────────────────────
@@ -77,6 +79,17 @@ concluded they are all narrative text.
 
 ## Rules
 
+- **The screen travels inside the dialog.** What the owner must read before
+  answering is the preview of the option it belongs to, at most 15 lines as
+  the dialog shows them. The dialog wraps long lines itself, about 60
+  characters wide: a paragraph is one line, never broken by hand (a second
+  break leaves single words on a line), and a list or table line stays under
+  60 characters. Message text written before a dialog is never the screen: it
+  can land in the thinking block, which the owner sees only as a one-line
+  summary, so no question or option says "shown above". A longer screen is
+  split into pages of at most 15 lines: the option's preview shows page 1, and
+  one more single-select question, "Details", has one option per page (2 to
+  4), each with that page as its preview; its answer is not a decision.
 - Never silently accept LLM output without user approval at the strategy step.
 - Cost-aware — report estimated LLM cost upfront before running batch.
 - Graceful fallback if `claude` CLI missing — fall back to manual mode.

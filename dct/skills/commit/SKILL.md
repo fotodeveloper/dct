@@ -185,9 +185,9 @@ schema `docs/release-workflow.md`):
 
 ### Step 6: Commit — one screen, then `git commit` WITHOUT another `git add`
 
-Print the screen as plain message text (never inside the dialog — it truncates
-long text): the staged files, the full message and the entries the trailer
-marks as done.
+The screen — the staged files, the full message and the entries the trailer
+marks as done — travels inside the dialog, as the preview of the "Commit"
+option (Rules: "The screen travels inside the dialog"):
 
 ```
 Commit on feat/x — 2 files
@@ -201,17 +201,18 @@ Message:
 Entries marked as done: #12 [added] Checkpoint CRUD · #15 [fixed] Empty title crash
 ```
 
-Then ONE `AskUserQuestion` that only references it — "Commit as shown above?"
-→ "Commit" / "Change — I will say what" / "Stop". NEVER commit without the
-owner's "Commit" on this screen.
+ONE `AskUserQuestion` — "Commit 2 files on feat/x?" → "Commit" (its preview:
+the screen) / "Change — I will say what" / "Stop". A screen longer than 15
+lines (many files, a long body) continues on the "Details" pages of the same
+dialog. NEVER commit without the owner's "Commit" on this screen.
 
 - **"Commit"** → run the commit below, exactly what Step 4 staged.
 - **"Change"** → apply what the owner says. A change of the message only
   (wording, type, scope, a trailer dropped or added for this one commit) is
-  applied and the screen is printed again. A change that touches the files (add or drop a path,
-  re-stage) changes the index, so the selection is stale: stage it by the
-  Step 4 rules, redo Step 5 against the new `git diff --cached`, then print
-  the screen again.
+  applied and the dialog is asked again with the new screen. A change that
+  touches the files (add or drop a path, re-stage) changes the index, so the
+  selection is stale: stage it by the Step 4 rules, redo Step 5 against the
+  new `git diff --cached`, then ask the dialog again with the new screen.
 - **"Stop"** → nothing is committed; the index stays as it is.
 
 **Trailers** follow the project's stored preferences from the Step 1
@@ -287,6 +288,17 @@ Report: `✓ Committed abc1234 — feat(core): add checkpoint CRUD (v0.1.0) · C
 
 ## Rules (hard)
 
+- **The screen travels inside the dialog.** What the owner must read before
+  answering is the preview of the option it belongs to, at most 15 lines as
+  the dialog shows them. The dialog wraps long lines itself, about 60
+  characters wide: a paragraph is one line, never broken by hand (a second
+  break leaves single words on a line), and a list or table line stays under
+  60 characters. Message text written before a dialog is never the screen: it
+  can land in the thinking block, which the owner sees only as a one-line
+  summary, so no question or option says "shown above". A longer screen is
+  split into pages of at most 15 lines: the option's preview shows page 1, and
+  one more single-select question, "Details", has one option per page (2 to
+  4), each with that page as its preview; its answer is not a decision.
 - NEVER commit without the owner's "Commit" on the Step 6 screen (files,
   message, entries); "Stop" commits nothing.
 - NEVER select the `Changelog:` trailer before the staging is final, and NEVER

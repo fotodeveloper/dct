@@ -23,10 +23,11 @@ step.
 
 A typical release asks ONE AskUserQuestion. Before it the owner sees one
 line, "Checking proj-a…", and nothing else: the plan, the preview of the
-whole release and the checks run silently. The screen and its question go
-in ONE turn. The two-turn pattern (long content as plain text first, the
-question in the next turn) is only for "show details" and for a refusal
-that needs a decision.
+whole release and the checks run silently. The screen travels INSIDE that
+dialog (Rules: "The screen travels inside the dialog") — it is the preview
+of the "Release" option — never as message text before it: such text can
+land in the thinking block, which the owner sees only as a one-line
+summary.
 
 Steps 0-5 are the typical path. **Rare cases** (after Step 5) and the
 Resume path are read only when a step points there; the Legacy path only
@@ -336,6 +337,16 @@ this order:
    a commit was made (`details.made` of the refusal that led here): "Stop
    — nothing is released; your changes stay committed as abc1234."
 
+The screen is in Q1's previews: "Release" (in each of its forms) carries the
+screen of the shown variant, "Release with all N" the screen of the "all"
+variant, "Change something" one line per thing it can change, "Stop" what
+stays as it is. A screen longer than 15 lines: the option's preview is a
+summary page — the headline, one line per block with its count ("Goes in: 25
+entries — on the Details pages") and the "Then:" lines — and the whole
+screen, in order, is on the pages of one more single-select question,
+"Details" (after Q2; for a first version, after Q1), each page at most 15
+lines; its answer is not a decision.
+
 **Q2 — the version.** Question: "Which version?" Options:
 
 - Keep, listed first and marked recommended, built from V_shown: "Keep
@@ -414,7 +425,10 @@ only when the owner asks about that version's history.
 ## Rare cases
 
 Read a part of this section, and the Resume path after it, only when a step
-above points there.
+above points there. Wherever this section, the Resume path or the Legacy path
+(reached only when the owner asks for it) says to show something and then ask, what is shown is the preview of the
+option it belongs to (pages when longer than 15 lines — Rules); something
+shown with no question after it is the final text of the turn.
 
 ### A project released with its own tool
 
@@ -565,8 +579,8 @@ showed:
    details" (the section, the
    version script's output, each entry's proof — a PR number WITH its
    origin, `pr_source`: `git` = recognised in the repository; `client` =
-   declared by a client, never presented as git's recognition — as plain
-   text first, then the screen again); Other: "edit #2: <new text>" →
+   declared by a client, never presented as git's recognition — on the
+   "Details" pages of the screen's dialog, asked again); Other: "edit #2: <new text>" →
    `mcp__dct__update_changelog`, "delete #2" (gone for good) →
    `mcp__dct__delete_changelog`, and for `first_version` only (it has no
    Q2) "version <V>" → `--version <V>` on the next preview.
@@ -774,8 +788,8 @@ Preview and apply refusals, in plain words — one row per key:
 | `not_unproven`, `not_attestable`, `no_git` | (yours: an id that cannot be marked or selected; a selected entry without proof, `unproven`, is the release table's row) | drop it, preview again |
 | `attest_without_entries` | (yours: `--attest` beside `--no-entries` — marking entries as done that nothing releases) | drop `--no-entries` (the "Release with all N" row of Step 4 replaces the selection), preview again |
 | `remote_ahead` | "origin/main has commits you don't have. Run `git pull` (if git says your local changes would be overwritten, save them first with /commit), then run /release again." — after a commit was made, add "(your changes are already committed as abc1234)" | stop |
-| `remote_tag_exists` | "v0.3.0 already exists on origin. Pick another version." | the previous screen again IN FULL (its preview is still the stored one — a refused preview stores nothing), this sentence above it; no previous screen (the version came from "Which version is this release?") → that question again, this sentence above it |
-| `version_lower`, `version_taken`, `version_invalid` | `version_lower` (`version`, `current`): "0.1.0 is lower than the current version 0.2.0. Pick another version."; `version_taken` (`version`, `status`): "0.2.0 was already released. Pick another version." (status `abandoned`: "0.2.0 was used by a release that was abandoned. Pick another version."); `version_invalid` (`version`): "1.x isn't a version — use numbers like 1.2.3. Pick another version." | the previous screen again IN FULL (a refused preview stores nothing, so it is still the stored one), this sentence above it — its Q2 (a first version: "Change something") picks another version → `dct release prepare --preview --version <V2>` with every earlier flag and the new screen; no previous screen (the version came from "Which version is this release?") → that question again, this sentence above it, then the preview with `--version <V2>` and a new screen — never the CLI's message alone |
+| `remote_tag_exists` | "v0.3.0 already exists on origin. Pick another version." | the previous screen again IN FULL (its preview is still the stored one — a refused preview stores nothing), this sentence opening its question text; no previous screen (the version came from "Which version is this release?") → that question again, this sentence opening its question text |
+| `version_lower`, `version_taken`, `version_invalid` | `version_lower` (`version`, `current`): "0.1.0 is lower than the current version 0.2.0. Pick another version."; `version_taken` (`version`, `status`): "0.2.0 was already released. Pick another version." (status `abandoned`: "0.2.0 was used by a release that was abandoned. Pick another version."); `version_invalid` (`version`): "1.x isn't a version — use numbers like 1.2.3. Pick another version." | the previous screen again IN FULL (a refused preview stores nothing, so it is still the stored one), this sentence opening its question text — its Q2 (a first version: "Change something") picks another version → `dct release prepare --preview --version <V2>` with every earlier flag and the new screen; no previous screen (the version came from "Which version is this release?") → that question again, this sentence opening its question text, then the preview with `--version <V2>` and a new screen — never the CLI's message alone |
 | `version_unresolved` | (a question, not a sentence: no version can be suggested — the current version cannot be read, or every nearby version is taken) "Which version is this release?" (Other: type it) | Rare cases, "Before the screen": that question, then preview again with `--version <V>` — never the CLI's message and stop |
 | `preview_too_large` | "These changes are too large for one release screen. Commit them with /commit, then run /release again." | stop |
 | `checkout_changed` with `details.sync` | "Your version script (scripts/dct-version-sync.sh) changed files in your project (<files>). It may change only the version files, in its own copy. Fix it, commit it, then run /release again." | stop |
@@ -1025,7 +1039,8 @@ each refusal and for finishing:
 ## Question count
 
 A dialog is one AskUserQuestion; an answer is one question inside it. The
-tests count answers (decisions), not dialogs.
+tests count answers (decisions), not dialogs. The "Details" question of a
+screen longer than 15 lines is reading, not a decision, and is not counted.
 
 | path | dialogs | answers |
 | --- | --- | --- |
@@ -1045,6 +1060,17 @@ tests count answers (decisions), not dialogs.
 
 ## Rules
 
+- **The screen travels inside the dialog.** What the owner must read before
+  answering is the preview of the option it belongs to, at most 15 lines as
+  the dialog shows them. The dialog wraps long lines itself, about 60
+  characters wide: a paragraph is one line, never broken by hand (a second
+  break leaves single words on a line), and a list or table line stays under
+  60 characters. Message text written before a dialog is never the screen: it
+  can land in the thinking block, which the owner sees only as a one-line
+  summary, so no question or option says "shown above". A longer screen is
+  split into pages of at most 15 lines: the option's preview shows page 1, and
+  one more single-select question, "Details", has one option per page (2 to
+  4), each with that page as its preview; its answer is not a decision.
 - The owner decides on ONE screen; "Release" IS the yes. Nothing is
   committed, stamped, tagged or pushed before it, and the version released
   is the one the screen shows — dct's proposal listed first in Q2, changed

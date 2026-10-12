@@ -49,10 +49,11 @@ sub-dict and sections needing review.
 
 ### Step 5: Optional drill-down
 
-Ask via `AskUserQuestion`:
-- "Show details for a specific plan?"
-- Options: one per plan (`#12 — Plans/roadmaps schema`), or "Done".
-- On selection: `mcp__dct__get_plan(id)` full dump + structured section tree.
+The table is the final text of the turn — a report with no decision attached,
+so no dialog follows it: text written before a dialog can land in the
+thinking block, which the user sees only as a one-line summary. End it with one line: "Name a plan to see its sections." When the
+user names one: `mcp__dct__get_plan(id)` full dump + structured section
+tree.
 
 ## Rules
 
@@ -75,4 +76,4 @@ Ask via `AskUserQuestion`:
 >   12  plan   active  6/10      0          2026-04-17    v0.2.0 implementation
 >   ...
 >
->   Any plan to drill into?
+>   Name a plan to see its sections.

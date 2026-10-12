@@ -6,6 +6,18 @@ versions. Do not couple logic to skill existence — the workflows below
 describe what each skill does so an assistant can perform the steps manually
 via MCP tools when the named skill is unavailable.
 
+**The screen travels inside the dialog.** What the owner must read before
+answering is the preview of the option it belongs to, at most 15 lines as the
+dialog shows them. The dialog wraps long lines itself, about 60 characters
+wide: a paragraph is one line, never broken by hand (a second break leaves
+single words on a line), and a list or table line stays under 60 characters.
+Message text written before a dialog is never the screen: it can land in the
+thinking block, which the owner sees only as a one-line summary, so no
+question or option says "shown above". A longer screen is split into pages of
+at most 15 lines: the option's preview shows page 1, and one more
+single-select question, "Details", has one option per page (2 to 4), each with
+that page as its preview; its answer is not a decision.
+
 **Write ops return a minimal ack**, not the full record — the created/updated
 `id` plus a few post-state scalars. **Remember the `id`** returned by
 `create_item` / `add_checkpoint` / `create_handoff` (etc.); you need it for
@@ -38,22 +50,23 @@ command. Without the skill:
    When `others` is truncated, or holds fewer matching rows than the count,
    fetch the complete list first: `list_handoffs(project="")`, keeping only
    the matching scope.
-3. Print the handoff prompt as plain message text, never inside a dialog (the
-   dialog truncates long text). With no question to follow — one handoff
-   consumed on an unambiguous "continue" and a concrete next step (step 5) —
-   print it and continue in the same turn: check that step and start on it.
-   Only where the user must decide after reading (several handoffs, a stale,
-   contradictory or unclear step) is the printed text a turn of its own, the
-   question in the next one. With several matching handoffs, ask ONLY which
-   one ("Continue #N" for the newest, printed in full; "Show #M in full" for
-   the others; "None — start fresh") — not the first action yet. Showing an
-   older one is a read: `get_handoff(M)`, without consuming it, then print its
-   full prompt and ask whether to continue it; nothing is consumed by showing
-   it. Only an unambiguous instruction to continue a handoff the user has read
-   in full consumes it:
+3. A handoff the user must read before deciding travels inside the dialog,
+   as the preview of its option (the screen rule above). With no question to
+   follow — one handoff consumed on an unambiguous "continue" and a concrete
+   next step (step 5) — check that step and start on it in the same turn;
+   the report names the handoff (the user saved it at /handoff). With several
+   matching handoffs, ask ONLY which one — "Continue #N" per handoff, newest
+   first, at most 3, each with that handoff's full prompt as its preview
+   (`get_handoff(M)` for the ones `others` carries only as a 200-char
+   preview — a read, without consuming it), and "None — start fresh" — not
+   the first action yet. A chosen handoff longer than its 15-line preview is
+   asked about once more ("Continue handoff #M?", its prompt on "Details"
+   pages) before anything is consumed; showing an older handoff in full stays
+   a read — nothing is consumed by showing it. Only an unambiguous instruction to
+   continue a handoff the user has read in full consumes it:
    `pickup_work(project="", consume="true", handoff_id=N, include="none", consumed_by="<agent> @ <slug> <iso_utc>Z")`
    — `include="none"` skips the snapshot re-read (step 1 already has it).
-4. Report which handoff was consumed: `Picked up handoff #<id> (consumed)` —
+4. Report which handoff was consumed: `Picked up handoff #<id> (consumed) — "<first sentence of its prompt>"` —
    without a question, this line is where the user learns of it. The consumed
    row stays in the ledger.
 5. The next step: when the consumed handoff names a concrete step (an item id
@@ -79,18 +92,21 @@ don't retry in a loop.
 
 ## `/handoff` fallback
 
-The skill is a preflight, one printed draft and ONE question — Save / Change /
-Cancel — then one atomic call. Without the skill:
+The skill is a preflight, ONE question — Save / Change / Cancel — with the
+draft inside it, then one atomic call. Without the skill:
 
 1. `get_context_snapshot(project="")` — sprint/gates/decisions feed the draft.
-2. Print the draft as plain message text (never inside a dialog), with the sprint and scope decisions as lines of the draft — `Sprint: unchanged` and `Scope: none` by default — never as questions of their own.
+2. Draft the handoff with the sprint and scope decisions as lines of the draft — `Sprint: unchanged` and `Scope: none` by default — never as questions of their own.
    Sprints are MULTI-SESSION (ADR #57): the default is an unchanged sprint, the
    normal edge is ADDITIVE (add discovered items / cut scope), and a full
    replace is conscious replanning.
-3. Ask ONE question: "Save" / "Change" / "Cancel". "Change" → apply what the
-   user says (prompt text, sprint, scope), print the revised draft again and
-   ask again; with several active sprints a sprint change also asks which
-   sprint. "Cancel" → nothing is written.
+3. Ask ONE question: "Save" / "Change" / "Cancel" — the draft (and the
+   context_summary) word for word as the preview of "Save", on "Details"
+   pages when longer than 15 lines; the question text and option labels carry
+   none of it. "Change" → apply what the user says (prompt text, sprint,
+   scope) and ask again with the revised draft in the previews; with several
+   active sprints a sprint change also asks which sprint. "Cancel" → nothing
+   is written.
 4. On "Save": `handoff_work(prompt=..., created_by="<agent> @ <slug> <iso_utc>Z", project="",
    item_ids="__keep__" (default) | "22,21,6" (replace), add_item_ids="22,6",
    remove_item_ids="7", sprint=<id-or-code when several active>, scope=...,
@@ -208,9 +224,8 @@ checkout.
 
 A typical release asks ONE AskUserQuestion with two questions. Before it
 the owner sees one line, "Checking proj-a…", and nothing else. The screen
-and its question go in one turn; the two-turn pattern (long content first,
-the question in the next turn) is only for "show details" and for a refusal
-that needs a decision. Steps 0-5 are the typical path; **Rare cases** (after
+travels inside that dialog — the preview of the "Release" option (the screen
+rule above) — never as message text before it. Steps 0-5 are the typical path; **Rare cases** (after
 step 5) and the Resume path are read only when a step points there, the
 Legacy path only when the owner asks for it. What the owner reads uses
 plain words; identifiers appear only on the final "Technical details" line
@@ -453,6 +468,15 @@ again". The steps are the `/release` skill's, one for one:
    "Stop" ("Nothing is released; nothing in your project changes." — after
    a commit was made: "Stop — nothing is released; your changes stay
    committed as abc1234.").
+   The screen is in Q1's previews: "Release" (in each of its forms) carries
+   the screen of the shown variant, "Release with all N" the screen of the
+   "all" variant, "Change something" one line per thing it can change,
+   "Stop" what stays as it is. A screen longer than 15 lines: the option's
+   preview is a summary page — the headline, one line per block with its
+   count ("Goes in: 25 entries — on the Details pages") and the "Then:"
+   lines — and the whole screen, in order, is on the pages of one more
+   single-select question, "Details" (after Q2; for a first version, after
+   Q1), each page at most 15 lines; its answer is not a decision.
    **Q2 — the version** ("Which version?"): Keep, listed first and marked
    recommended, built from V_shown — "Keep 0.1.1 (recommended)"; when the
    "all" variant exists and V_all differs, the label names both: "Keep the
@@ -516,7 +540,11 @@ again". The steps are the `/release` skill's, one for one:
    record is that one short sentence; "record 0.1.0" (the legacy path) is
    mentioned only when the owner asks about that version's history.
 
-**Rare cases** — read a part only when a step above points there.
+**Rare cases** — read a part only when a step above points there. Wherever
+Rare cases, the resume path or the Legacy path (reached only when the owner
+asks for it) says to show something and then ask, what is shown is the preview of the option it belongs to (pages
+when longer than 15 lines — the screen rule above); something shown with no
+question after it is the final text of the turn.
 
 *A project released with its own tool.* dct performs none of its effects
 (`prepare` / `apply` / `resume` refuse — `details.executor`). Say ONE
@@ -635,7 +663,8 @@ never offered) →
 "Show details" — the section, the script's output, each entry's proof with
 a PR number WITH its origin, `pr_source`: `git` = recognised in the
 repository; `client` = declared by a client, never presented as git's
-recognition —; Other: "edit #2: <new text>" → `update_changelog`, "delete
+recognition — on the "Details" pages of the screen's dialog, asked again;
+Other: "edit #2: <new text>" → `update_changelog`, "delete
 #2" → `delete_changelog`, and for `first_version` only (it has no Q2)
 "version <V>" → `--version <V>` on the next preview. Each preview keeps every earlier flag; then the
 screen again. Version files cannot be changed there: "The file changes come
@@ -796,8 +825,8 @@ table as the skill's):
 | `not_unproven`, `not_attestable`, `no_git` | (yours: an id that cannot be marked or selected; a selected entry without proof, `unproven`, is the release table's row) | drop it, preview again |
 | `attest_without_entries` | (yours: `--attest` beside `--no-entries` — marking entries as done that nothing releases) | drop `--no-entries` (the "Release with all N" row of step 4 replaces the selection), preview again |
 | `remote_ahead` | "origin/main has commits you don't have. Run `git pull` (if git says your local changes would be overwritten, save them first with /commit), then run /release again." — after a commit was made, add "(your changes are already committed as abc1234)" | stop |
-| `remote_tag_exists` | "v0.3.0 already exists on origin. Pick another version." | the previous screen again IN FULL (its preview is still the stored one — a refused preview stores nothing), this sentence above it; no previous screen (the version came from "Which version is this release?") → that question again, this sentence above it |
-| `version_lower`, `version_taken`, `version_invalid` | `version_lower` (`version`, `current`): "0.1.0 is lower than the current version 0.2.0. Pick another version."; `version_taken` (`version`, `status`): "0.2.0 was already released. Pick another version." (status `abandoned`: "0.2.0 was used by a release that was abandoned. Pick another version."); `version_invalid` (`version`): "1.x isn't a version — use numbers like 1.2.3. Pick another version." | the previous screen again IN FULL (a refused preview stores nothing, so it is still the stored one), this sentence above it — its Q2 (a first version: "Change something") picks another version → `dct release prepare --preview --version <V2>` with every earlier flag and the new screen; no previous screen (the version came from "Which version is this release?") → that question again, this sentence above it, then the preview with `--version <V2>` and a new screen — never the CLI's message alone |
+| `remote_tag_exists` | "v0.3.0 already exists on origin. Pick another version." | the previous screen again IN FULL (its preview is still the stored one — a refused preview stores nothing), this sentence opening its question text; no previous screen (the version came from "Which version is this release?") → that question again, this sentence opening its question text |
+| `version_lower`, `version_taken`, `version_invalid` | `version_lower` (`version`, `current`): "0.1.0 is lower than the current version 0.2.0. Pick another version."; `version_taken` (`version`, `status`): "0.2.0 was already released. Pick another version." (status `abandoned`: "0.2.0 was used by a release that was abandoned. Pick another version."); `version_invalid` (`version`): "1.x isn't a version — use numbers like 1.2.3. Pick another version." | the previous screen again IN FULL (a refused preview stores nothing, so it is still the stored one), this sentence opening its question text — its Q2 (a first version: "Change something") picks another version → `dct release prepare --preview --version <V2>` with every earlier flag and the new screen; no previous screen (the version came from "Which version is this release?") → that question again, this sentence opening its question text, then the preview with `--version <V2>` and a new screen — never the CLI's message alone |
 | `version_unresolved` | (a question, not a sentence: no version can be suggested — the current version cannot be read, or every nearby version is taken) "Which version is this release?" (Other: type it) | Rare cases, "Before the screen": that question, then preview again with `--version <V>` — never the CLI's message and stop |
 | `preview_too_large` | "These changes are too large for one release screen. Commit them with /commit, then run /release again." | stop |
 | `checkout_changed` with `details.sync` | "Your version script (scripts/dct-version-sync.sh) changed files in your project (<files>). It may change only the version files, in its own copy. Fix it, commit it, then run /release again." | stop |
@@ -971,7 +1000,9 @@ and for finishing:
 | the record ends at `committed` (`details.finish`) | way `takeover` → the takeover of the resume path above (preview, the owner approves that digest, resume); way `ledger` → whoever performs the missing tag and push records them ([executor](release-workflow.md#executor-k-85); the only way for an `own` record) |
 
 **Question count** — a dialog is one AskUserQuestion; an answer is one
-question inside it (the count is in answers, the decisions):
+question inside it (the count is in answers, the decisions; the "Details"
+question of a screen longer than 15 lines is reading, not a decision, and is
+not counted):
 
 | path | dialogs | answers |
 | --- | --- | --- |
@@ -1007,7 +1038,7 @@ committed.
 
    A secret-like path that is already staged STOPS the commit before the screen: say so in one plain sentence and show its `unstage` command exactly as the candidates give it (quoted, with the `--` separator: `git restore --staged -- .env`; before the first commit `git rm --cached -q -- .env`). Never run that command yourself and never change the user's index; if the file really belongs in the repository, the user commits it with git directly.
 6. **Then select the trailer** against the complete staged diff (`git diff --cached`) — the index is now final. `dct clog candidates --json`: keep the `confirmed` candidates whose entry text / `source_file` describe what is staged (ask when unsure). `uncertain` candidates are matched too but attached only after the owner confirms them and `update_changelog(entry_id, branch=<current>, worktree=<toplevel>)` fixes both fields against the actual checkout — never automatically. Detached HEAD → no confirmed list, every entry of this checkout is uncertain: ask (confirm with `worktree` only). No match, but `other_branch` entries describe the change → offer `update_changelog(entry_id, branch=<current>)`. Ids in `already_proven` are never cited again. Without the CLI: `list_changelog(project, unreleased_only=true)` and the same classification by hand (client provenance of this branch + toplevel = confirmed; `branch_source` not `client` = uncertain).
-7. **One screen.** Print as plain message text the staged files, the full message and the entries the `Changelog:` trailer marks as done, then ask ONE question: "Commit" / "Change" / "Stop". Never commit without the owner's "Commit" on that screen. "Change" → apply it; a change that touches the files (a path added or dropped, a re-stage) changes the index, so the selection is stale: stage by step 5, select again by step 6, then show the screen again. "Stop" → nothing is committed. Trailers follow the project's stored preferences, applied without a question: `commit_co_authored_by` true → `Co-Authored-By:`; `commit_session_link` true → the session link the client gives for this session — a session link is written only on a stored true (yes); false → none. null = not answered yet (never a "no"): ask ONCE, before the screen, then store the answers with `dct project trailers <slug> --co-authored-by on|off --session-link on|off` and apply them. The project's own rules win: when its `CLAUDE.md` / `AGENTS.md` forbids a trailer, it is never written whatever is stored (dct's own repository forbids a session link). Not a dct project → `Co-Authored-By` by default, never a session link. "Change" can drop or add a trailer for this one commit.
+7. **One screen.** The staged files, the full message and the entries the `Changelog:` trailer marks as done travel inside the dialog — the preview of "Commit" ("Details" pages when longer than 15 lines; the screen rule above) — in ONE question: "Commit" / "Change" / "Stop". Never commit without the owner's "Commit" on that screen. "Change" → apply it; a change that touches the files (a path added or dropped, a re-stage) changes the index, so the selection is stale: stage by step 5, select again by step 6, then show the screen again. "Stop" → nothing is committed. Trailers follow the project's stored preferences, applied without a question: `commit_co_authored_by` true → `Co-Authored-By:`; `commit_session_link` true → the session link the client gives for this session — a session link is written only on a stored true (yes); false → none. null = not answered yet (never a "no"): ask ONCE, before the screen, then store the answers with `dct project trailers <slug> --co-authored-by on|off --session-link on|off` and apply them. The project's own rules win: when its `CLAUDE.md` / `AGENTS.md` forbids a trailer, it is never written whatever is stored (dct's own repository forbids a session link). Not a dct project → `Co-Authored-By` by default, never a session link. "Change" can drop or add a trailer for this one commit.
 8. **Then commit — WITHOUT another `git add`.** HEREDOC: `git commit -m "<type>(<scope>): <description> (v<version>) …"`; the final trailer block is `Changelog: <ids>` (when any were selected) followed by `Co-Authored-By:`. A trailer-format example inside the body is quoted (`> Changelog: 12`). A revert keeps git's standard message: `git revert --no-commit <sha>` stages it, the subject is `Revert "<original subject>"` and the body has `This reverts commit <full sha>.`.
 9. Verify: `git log --oneline -3`, report the commit hash and the attached changelog ids.
 10. On hook rejection: fix the reported issue. ANY change to the index afterwards (re-staging, a new file from the fix) means the selection is stale: re-run step 6 against the new `git diff --cached`, show the screen again, then create a NEW commit (never `--amend`, never `--no-verify`).

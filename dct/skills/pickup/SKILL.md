@@ -9,8 +9,8 @@ description: >-
 # /pickup — Session Resume
 
 Open a new session by loading the previous session's handoff prompt + sprint
-state in ONE composed call, print the handoff for the user to read, then
-start on its next step — or ask what to do first when that step is not clear.
+state in ONE composed call, then start on the handoff's next step — or show
+the handoff inside a dialog and ask, when there is something to decide.
 
 No ToolSearch preload needed for the main path: `pickup_work` (and
 `get_item`) are alwaysLoad residents. `get_handoff` and `list_handoffs` are
@@ -71,35 +71,25 @@ One call returns everything Step 2 needs:
 `AskUserQuestion` ("Which project are we working on?" → slugs + "Cancel"),
 then re-call `pickup_work(<slug>, ...)` the same way.
 
-### Step 2: Print the handoff, then start or decide
+### Step 2: Start, or show the handoff inside the dialog
 
-A handoff to show is ALWAYS printed in full as plain message text, never
-inside a dialog — this is NON-NEGOTIABLE. **Why: the `AskUserQuestion`
-dialog truncates and hides long text**, so a handoff prompt carried inside
-the question (or an option label, description or `preview`) is a prompt the
-user CANNOT read.
-
-Whether the printing is a turn of its own depends on whether the user must
-decide something after reading it:
+A handoff the user must read before deciding travels INSIDE the dialog
+(Rules: "The screen travels inside the dialog"): text printed before a dialog
+can land in the thinking block, which the user sees only as a one-line
+summary.
 
 - **The auto-start path — no question follows** (one handoff consumed on an
-  unambiguous "continue", Step 4 below): print the handoff and continue in
-  the same turn — check its next step (`get_item`, the pending `gates`) and
-  start on it. A turn that only prints would make the user answer when there
-  is nothing to decide. When that check finds the step stale,
-  contradictory or unclear, end the turn after the printed handoff and ask
-  the first action in the next turn — the dialog never shares a turn with
-  the text it refers to.
-- **The user must decide** (several matching handoffs, Step 3): the printed
-  text is its own turn, before the question.
+  unambiguous "continue", Step 4 below): the user already read and saved this
+  handoff at /handoff. Check its next step (`get_item`, the pending `gates`)
+  and start on it in the same turn; the Step 5 report names the handoff and
+  the step. "Show the handoff" prints it as the final text of a turn. When the
+  check finds the step stale, contradictory or unclear, Step 4's question
+  carries the handoff in its previews.
+- **The user must decide** (several matching handoffs, Step 3): each handoff
+  is the preview of its option.
 
-**Turn 1 — print the handoff prompt(s) as plain message text, nothing else**
-— when a question follows: no tool call in this turn, the dialog comes in
-the next one. Emit the FULL prompt verbatim — `picked_up.prompt`
-when one was consumed, otherwise `handoff.latest.prompt` — (and its
-`context_summary` if present), clearly delimited, with the header line
-`Handoff #N [scope: X] from <created_at> by <created_by>` (add `— consumed`
-when it was):
+A handoff as a screen — header line, then the prompt verbatim, one line per
+paragraph (the dialog wraps it), then its `context_summary` when present:
 
 ```
 Handoff #N [scope: X] from <created_at> by <created_by> — consumed
@@ -110,31 +100,28 @@ Handoff #N [scope: X] from <created_at> by <created_by> — consumed
 
 **Several matching handoffs** (nothing consumed; the count from Step 1 ≥ 2):
 offer only the matching ones — with a scope, only handoffs of that scope,
-never another workstream's. Print the newest in full the same way and list
-the others as `#N [scope] — <preview>`, one per line. When `handoff.others`
-is truncated, or holds fewer matching rows than the count says, the list is
-not complete: fetch it first with `mcp__dct__list_handoffs(project="")`
-(unconsumed, previews; keep only the matching scope) and list from that.
+never another workstream's. When `handoff.others` is truncated, or holds
+fewer matching rows than the count says, the list is not complete: fetch it
+first with `mcp__dct__list_handoffs(project="")` (unconsumed, previews; keep
+only the matching scope). `handoff.latest` carries the full prompt; read the
+full prompt of each other handoff you offer with `mcp__dct__get_handoff(M)` —
+a read, without consuming it.
 
-### Step 3: Several handoffs — pick the id, read it in full, then continue
+### Step 3: Several handoffs — pick one after reading it
 
-**Turn 2 — ONE `AskUserQuestion`, only "which handoff"** (never together with
-the first action — that is decided only after the chosen handoff was read):
-- question: "N handoffs listed above. Which one?"
-- options: "Continue #N (shown in full above)" for the newest; "Show #M in
-  full" for each other one (id only — the previews were printed in Turn 1);
-  "None — start fresh".
+**ONE `AskUserQuestion`, only "which handoff"** (never together with the
+first action — that is decided only after the chosen handoff was read):
+- question: "Which handoff do we continue? (N waiting)"
+- options: "Continue #N" for each matching handoff, newest first, at most 3 —
+  each with that handoff's screen as its preview; "None — start fresh". With
+  more than 3, the question names the rest by id ("also #12, #9 — name one
+  under Other").
 
-A choice made from a 200-char preview is no consent to run a plan nobody has
-read:
+A choice made from a text nobody could read is no consent to run its plan:
 
-- **"Show #M in full"** (or "show the older one") → `mcp__dct__get_handoff(M)`
-  — a read, without consuming it — and print its full prompt (and
-  `context_summary`) the Turn 1 way. Then ask ONE question: "Continue #M
-  shown above?" → "Continue #M" / "Back to the list" / "None — start fresh".
-  Showing it stays a read: nothing is consumed by it.
-- **"Continue #N"** — an unambiguous instruction to continue a handoff the
-  user has read in full → only now consume it:
+- **"Continue #N" on a handoff whose whole screen fit in its preview** (at
+  most 15 lines) — an unambiguous instruction to continue a handoff the user
+  has read in full → only now consume it:
   ```
   mcp__dct__pickup_work(project="", consume="true", handoff_id=N,
                         include="none",
@@ -142,6 +129,11 @@ read:
   ```
   `include="none"` keeps the consume cheap (Step 1 already delivered the
   state). Then Step 4.
+- **"Continue #M" on a longer handoff** (its preview showed only page 1), or
+  "show the older one" → nothing is consumed yet: ask ONE question
+  "Continue handoff #M?" → "Continue #M" (preview: page 1) / "Back to the
+  list" / "None — start fresh", with every page on its "Details" pages.
+  Showing it stays a read; "Continue #M" here consumes it as above.
 - **"None — start fresh"** → consume nothing; optionally `delete_handoff(id)`
   (deferred tool — load only if the user explicitly wants a discard).
 
@@ -160,7 +152,8 @@ and the pending `gates` of the snapshot.
 - **The step is stale, contradictory or unclear** (the item is resolved, the
   checkpoint done, a gate blocks it, two handoffs disagree, the user asked for
   something else, or no step is named) → ask the first action — ONE
-  `AskUserQuestion` that only references what was printed:
+  `AskUserQuestion`, the consumed handoff's screen as the preview of its
+  first option (pages when longer):
   - question: "First action for this session?"
   - options: "Open #<first-sprint-item> and start on its checkpoints" /
     "Review all sprint items first" / "Look at stale in_progress first (#X)" /
@@ -178,14 +171,15 @@ empty:
 - Sprint empty BUT open items exist: "Pick sprint items now — run /handoff" / "Browse open items — /track-list" / "Just start working — I'll tell you what".
 - Sprint empty AND no open items: "Create the first item — run /track" / "Import existing tracking data — run /dct-import" / "Exit — not the right project".
 
-Show the sprint items as a compact table (from `sprint.items`) plus summary:
-sprint_size, sprint_completion, handoffs_pending, and the opened item's
-pending checkpoints (from `sprint.checkpoints`) as the next-step plan.
+The Step 5 report carries the sprint items as a compact table (from
+`sprint.items`) plus summary: sprint_size, sprint_completion,
+handoffs_pending, and the opened item's pending checkpoints (from
+`sprint.checkpoints`) as the next-step plan.
 
 ### Step 5: Report
 
 ```
-✓ Picked up handoff #N (consumed)
+✓ Picked up handoff #N (consumed) — "<first sentence of its prompt>"
   Sprint: 3 items, 1/3 done
   Starting with #22 — "Optimize MCP response format"
   Plan: 4 pending checkpoints in this item
@@ -203,13 +197,24 @@ work is in flight.
 
 ## Rules
 
+- **The screen travels inside the dialog.** What the owner must read before
+  answering is the preview of the option it belongs to, at most 15 lines as
+  the dialog shows them. The dialog wraps long lines itself, about 60
+  characters wide: a paragraph is one line, never broken by hand (a second
+  break leaves single words on a line), and a list or table line stays under
+  60 characters. Message text written before a dialog is never the screen: it
+  can land in the thinking block, which the owner sees only as a one-line
+  summary, so no question or option says "shown above". A longer screen is
+  split into pages of at most 15 lines: the option's preview shows page 1, and
+  one more single-select question, "Details", has one option per page (2 to
+  4), each with that page as its preview; its answer is not a decision.
 - **Every decision is an `AskUserQuestion`.** No plain-text Y/N prompts.
-- **Long text NEVER goes inside an `AskUserQuestion`.** The dialog truncates
-  and hides it. Before a dialog, a handoff prompt, context_summary or snapshot
-  the user must read is printed as plain message text in its own turn FIRST;
-  the dialog that follows only references it ("shown above") with short,
-  self-contained options. With no dialog to follow (the auto-start path of
-  Step 4) the handoff is printed and the work starts in the same turn.
+- **Long text never goes into the question text or an option label or
+  description** — they stay short and self-contained. A handoff prompt or
+  context_summary the user must read before deciding is a preview of that
+  dialog (pages when longer than 15 lines), word for word. With no dialog
+  (the auto-start path of Step 4) the work starts at once and the report
+  names the handoff.
 - **Two consumes, nothing else.** The Step 1 AUTO consume of the single
   matching handoff on an instruction to continue, and `consume="true",
   handoff_id=N` for the handoff the user chose to continue after reading it in

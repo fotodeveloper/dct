@@ -38,7 +38,7 @@ because CWD is not a registered project): `mcp__dct__list_projects()` +
 `AskUserQuestion` ("Which project is this handoff for?" → slugs + "Cancel"),
 then re-run preflight with the chosen slug.
 
-### Step 2: The draft and ONE question (TWO TURNS — print, THEN ask)
+### Step 2: The draft and ONE question (the draft travels inside the dialog)
 
 Auto-draft at once — no setup questions. Draft 2-4 sentences: what was
 accomplished (resolved items / recent changelog), what's next (first 1-2
@@ -62,19 +62,17 @@ never questions of their own:
   `dct/hooks/dct-task-mirror.sh` mirror): kept for the next /pickup unless a
   Change resolves it or promotes its checkpoints.
 
-The approval is TWO TURNS and this is NON-NEGOTIABLE. **Why: the
-`AskUserQuestion` dialog truncates and hides long text**, so a draft carried
-inside the question, an option label, an option description or an option
-`preview` is a draft the user CANNOT read — they would be approving text they
-have never seen.
+The approval is ONE dialog, and the draft travels INSIDE it (Rules: "The
+screen travels inside the dialog"). **Why:** text printed before a dialog can
+land in the thinking block, which the user sees only as a one-line summary —
+a dialog that asks about a draft printed "above" is then answered blind, as
+happened in the #877 dogfood.
 
-**Turn 1 — print the draft as plain message text, nothing else.** No tool call
-in this turn. Emit the FULL draft prompt verbatim (and the full
-`context_summary` if one was drafted), clearly delimited, followed by the
-decision lines:
+The screen is the draft with its decision lines — the prompt as written, one
+line per paragraph (the dialog wraps it; what is saved is the prompt word for
+word), each decision line under 60 characters:
 
 ```
-Draft handoff:
 --- BEGIN DRAFT ---
 <the full prompt text, verbatim>
 --- END DRAFT ---
@@ -83,30 +81,32 @@ Could add: #22, #6 (P1, not in the sprint)
 Scope: none
 CC tasks: keep #31            (only when the probe found one)
 
-Draft context_summary:        (only when one was drafted)
---- BEGIN CONTEXT SUMMARY ---
+--- BEGIN CONTEXT SUMMARY ---  (only when one was drafted)
 <the full context_summary, verbatim>
 --- END CONTEXT SUMMARY ---
 ```
 
-**Turn 2 — ONE single-select `AskUserQuestion` that REFERENCES the draft above
-and contains NONE of its content.** Question text and every option label and
-description stay short and self-contained; do NOT use the `preview` field for
-the draft:
-- question: "Save the handoff shown above?"
+ONE `AskUserQuestion`:
+- question: "Save this handoff for the next session?"
 - options:
-  - "Save the handoff shown above" (recommended)
+  - "Save" (recommended) — its preview: the screen (its page 1 when the
+    screen is longer than 15 lines)
   - "Change — I will say what" — prompt text, sprint, scope or CC tasks
   - "Cancel — write nothing"
-- NEVER embed draft content in the question or in any option field. The dialog
-  references what the previous turn printed; the printed turn is what the user
-  reads.
+- A screen longer than 15 lines is split into pages of at most 15 lines, and
+  the dialog gets a second single-select question, "Details", with one option
+  per page ("Page 2 of 3"), each with that page as its preview. Every word of
+  the draft and of the context_summary is on a page — nothing is shortened. A
+  draft that needs more than 4 pages is too long for a handoff: shorten it
+  before asking.
+- The question text and the option labels and descriptions carry none of the
+  draft: it is only in the previews.
 
 **"Change"** → collect what to change in a free-text follow-up (in plain
 words: "add #22", "cut #7", "replan to 22, 21, 6", "scope g1", "resolve the CC
 tasks", "sprint only, no prompt", new prompt text), apply it to the draft, then
-REPEAT Step 2 from Turn 1: print the revised draft again and ask again — the
-user must read the revision before saving it too. A sprint change shows on the
+ask Step 2's dialog again with the revised draft in its previews — the user
+must read the revision before saving it too. A sprint change shows on the
 `Sprint:` line as `add #22, #6` / `cut #7` / `replace → #22, #21, #6
 (removing #7; resolved members stay as history)`. Removing a resolved /
 wont_fix member is REFUSED by the server — terminal members are the sprint's
@@ -117,7 +117,7 @@ and `handoff_work` rejects an empty replace.
 **Target sprint** — when a Change modifies the sprint AND
 `summary.active_sprint_count >= 2`, ask "Which active sprint gets these
 items?" (one option per `sprint.active_sprints` entry: `#id (code) — name,
-size N`) before reprinting, and show the answer as a `Target sprint:` line.
+size N`) before asking again, and show the answer as a `Target sprint:` line.
 `handoff_work` REFUSES to guess among several actives (and so does every
 current-sprint helper).
 
@@ -140,12 +140,12 @@ mcp__dct__handoff_work(
 ```
 
 Every line of the saved draft maps to an argument, so nothing the user
-approved is lost: the prompt → `prompt`, the `Draft context_summary` block →
+approved is lost: the prompt → `prompt`, the `CONTEXT SUMMARY` block →
 `context_summary`, `Sprint:` → `item_ids` / `add_item_ids` /
 `remove_item_ids`, `Target sprint:` → `sprint`, `Scope:` → `scope`,
 `CC tasks:` → its own calls below. The context_summary is passed verbatim —
-exactly the text printed on the draft the user saved; never shorten or
-regenerate it after "Save" (the next /pickup prints it as written).
+exactly the text on the draft the user saved; never shorten or regenerate it
+after "Save" (the next /pickup shows it as written).
 
 Sprint membership and the handoff row are written in ONE DB transaction —
 a failed sprint write leaves NO handoff (and vice versa), so there is no
@@ -209,6 +209,17 @@ Next session: /pickup
 
 ## Rules
 
+- **The screen travels inside the dialog.** What the owner must read before
+  answering is the preview of the option it belongs to, at most 15 lines as
+  the dialog shows them. The dialog wraps long lines itself, about 60
+  characters wide: a paragraph is one line, never broken by hand (a second
+  break leaves single words on a line), and a list or table line stays under
+  60 characters. Message text written before a dialog is never the screen: it
+  can land in the thinking block, which the owner sees only as a one-line
+  summary, so no question or option says "shown above". A longer screen is
+  split into pages of at most 15 lines: the option's preview shows page 1, and
+  one more single-select question, "Details", has one option per page (2 to
+  4), each with that page as its preview; its answer is not a decision.
 - **Every user decision is an `AskUserQuestion` call.** No plain-text prompts.
 - Never modify sprint membership without the user's "Save" on a draft whose
   `Sprint:` line shows the change. The default is "unchanged" — a sprint spans
@@ -218,13 +229,12 @@ Next session: /pickup
   a replace leaves them in place and a remove of one is refused. Never try to
   "clean up" a sprint by dropping resolved items — that destroys
   `sprint_completion`.
-- Never write a handoff before the user's "Save" on the printed draft (the
-  two-turn Step 2: printed draft, then the one question).
-- **Long text NEVER goes inside an `AskUserQuestion`.** The dialog truncates
-  and hides it. Any handoff prompt, context_summary or snapshot the user must
-  read is printed as plain message text in its own turn FIRST; the dialog that
-  follows only references it ("shown above") with short, self-contained
-  options.
+- Never write a handoff before the user's "Save" on the draft the dialog
+  showed (Step 2: the draft in the previews, then the one question).
+- **Long text never goes into the question text or an option label or
+  description** — they stay short and self-contained. The handoff prompt and
+  the context_summary the user must read are previews of that dialog (pages
+  when longer than 15 lines), word for word.
 - `created_by` MUST be non-empty; include model id + project + UTC timestamp
   (`handoff_work` refuses blanks).
 - With several active sprints, the target sprint is a USER decision (the

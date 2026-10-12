@@ -527,14 +527,16 @@ def test_pickup_still_asks_which_among_several_handoffs(text):
 
 
 @pytest.mark.parametrize("text", PICKUP)
-def test_pickup_still_prints_the_handoff_prompt_as_plain_text(text):
-    """No question about the handoff does not mean no reading: the prompt
-    the user must read is printed as plain message text, never inside a
-    dialog (the dialog truncates long text)."""
+def test_pickup_shows_the_handoff_inside_the_dialog(text):
+    """No question about the handoff does not mean no reading: a handoff the
+    user must read before deciding is the preview of its option (K-73 d1 —
+    text printed before a dialog can land in the thinking block, which the
+    user sees only as a one-line summary)."""
     hits = [s for s in _sentences(text())
-            if re.search(r"prompt", s, re.IGNORECASE)
-            and re.search(r"plain (message )?text", s, re.IGNORECASE)]
-    assert hits, "the handoff prompt is no longer printed as plain text"
+            if re.search(r"\bhandoffs?\b", s, re.IGNORECASE)
+            and re.search(r"\bpreview of (its|the) option\b|\bpreview of its option\b", s,
+                          re.IGNORECASE)]
+    assert hits, "the handoff the user must read is not carried inside the dialog"
 
 
 def test_pickup_skill_drops_the_single_handoff_dialog():
@@ -763,8 +765,8 @@ def test_handoff_skill_has_no_separate_sprint_and_scope_questions():
 
 
 def test_handoff_skill_draft_block_carries_sprint_and_scope_lines():
-    """Turn 1 prints the draft: the sprint and scope decisions are lines in
-    it (read before the one question), not dialog options."""
+    """The draft the dialog previews carries the sprint and scope decisions
+    as lines (read inside the one question), not as dialog options."""
     body = _skill("handoff")
     blocks = [b for b in re.findall(r"```\n?(.*?)```", body, re.DOTALL) if "BEGIN DRAFT" in b]
     assert blocks, "no printed draft block"
@@ -774,14 +776,15 @@ def test_handoff_skill_draft_block_carries_sprint_and_scope_lines():
         f"the draft does not carry the default lines 'Sprint: unchanged' / 'Scope: none': {blocks}"
 
 
-def test_handoff_change_prints_the_revision_before_saving():
-    """Change keeps the two-turn rule: the revised draft is printed again and
-    only then asked about."""
+def test_handoff_change_shows_the_revision_before_saving():
+    """A Change is never saved unseen: the dialog is asked again with the
+    revised draft in its previews. ("print" alone is no evidence — the word
+    hides inside "sprint".)"""
     hits = [p for p in _paragraphs(_skill("handoff"))
             if re.search(r"[\"“`*]Change\b", p)
-            and re.search(r"revis|again|repeat", p, re.IGNORECASE)
-            and re.search(r"print|Turn 1", p, re.IGNORECASE)]
-    assert hits, "a Change is saved without printing the revision first"
+            and re.search(r"\bagain with the revised draft in its previews\b", p, re.IGNORECASE)
+            and re.search(r"\bread the revision before saving\b", p, re.IGNORECASE)]
+    assert hits, "a Change is saved without showing the revision first"
 
 
 def test_handoff_cancel_writes_nothing():
@@ -799,13 +802,14 @@ def test_handoff_keeps_the_conditional_target_sprint_question():
     assert re.search(r"handoff_work` REFUSES to guess|errors rather than guessing", flat)
 
 
-def test_handoff_keeps_the_sprint_and_the_two_turn_safety_rules():
+def test_handoff_keeps_the_sprint_and_the_draft_safety_rules():
     """One question does not loosen what the question guards: the sprint
-    changes only as the saved draft says, and the draft the user approves
-    is printed before the dialog, never inside it."""
+    changes only as the saved draft says, and the draft the user approves is
+    in the dialog's previews, never in its question text or option labels."""
     flat = _flat(_skill("handoff"))
     assert re.search(r"never modify sprint membership without", flat, re.IGNORECASE)
-    assert "Long text NEVER goes inside an `AskUserQuestion`" in flat
+    assert ("Long text never goes into the question text or an option label or "
+            "description") in flat
     assert "NEVER send `item_ids=\"\"`" in flat
 
 
@@ -1386,37 +1390,32 @@ def test_pickup_a_stale_or_unclear_step_still_asks(text):
 
 # ── B3 (K-60): the auto-start path prints the handoff and starts in ONE turn ──
 
-# A demand that the printed handoff stand alone: a turn of its own, or no
-# tool call while it is printed.
+# A demand that a printed handoff stand alone: a turn of its own, or no tool
+# call while it is printed.
 OWN_TURN = re.compile(r"\b(its own turn|own turn|separate turn|no tool calls?)\b", re.IGNORECASE)
-# What justifies that turn: a question / dialog the user answers after reading.
-A_QUESTION_FOLLOWS = re.compile(r"\b(question|dialog|AskUserQuestion|asks?|decide)\b",
-                                re.IGNORECASE)
 
 
 @pytest.mark.parametrize("text", PICKUP)
-def test_pickup_auto_start_prints_the_handoff_and_starts_in_the_same_turn(text):
+def test_pickup_auto_start_starts_in_the_same_turn_and_names_the_handoff(text):
     """K-60: an unambiguous "continue", ONE matching handoff and a concrete,
-    current next step → the handoff is printed and the work starts in the
-    SAME turn, after the item / checkpoint and gates check — no turn that
-    only waits for a reply nobody has to give."""
+    current next step → the work starts in the SAME turn, after the item /
+    checkpoint and gates check, and the report names the handoff — no turn
+    that only waits for a reply nobody has to give."""
     hits = [s for s in _sentences(text())
             if re.search(r"\bsame turn\b", s, re.IGNORECASE)
-            and re.search(r"\bprint", s, re.IGNORECASE)
-            and re.search(r"\b(start|continu)\w*", s, re.IGNORECASE)
+            and re.search(r"\bstart\w*", s, re.IGNORECASE)
+            and re.search(r"\breport names the handoff\b", s, re.IGNORECASE)
             and not _negated_at(s, re.search(r"\bsame turn\b", s, re.IGNORECASE).start())]
-    assert hits, "the auto-start path still stops after printing the handoff"
+    assert hits, "the auto-start path does not start at once and name the handoff"
 
 
 @pytest.mark.parametrize("text", PICKUP)
-def test_pickup_a_turn_of_its_own_only_where_the_user_must_decide(text):
-    """The separate print turn exists for a dialog that follows (several
-    handoffs, a stale / contradictory / unclear step): every sentence that
-    demands it is tied to that question — an unconditional "its own turn,
-    no tool call" blocks the auto-start of K-60."""
+def test_pickup_has_no_separate_print_turn(text):
+    """K-73 (d1) replaced the print-then-ask turns: a handoff to read is a
+    preview of the dialog that asks about it, and the auto-start path has no
+    dialog at all — no sentence may demand a turn of its own for printing
+    (it would also block the auto-start of K-60)."""
     loose = [s for s in _sentences(text())
              if (m := OWN_TURN.search(s))
-             # "no tool call" carries its own "no": only "own turn" can be negated
-             and (m.group(0).lower().startswith("no ") or not _negated_at(s, m.start()))
-             and not A_QUESTION_FOLLOWS.search(s)]
-    assert not loose, f"a turn of its own is demanded where no question follows: {loose}"
+             and (m.group(0).lower().startswith("no ") or not _negated_at(s, m.start()))]
+    assert not loose, f"a separate print turn is still demanded: {loose}"

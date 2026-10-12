@@ -71,12 +71,15 @@ First `AskUserQuestion`:
   plus `"All detected files"`, `"Pick subset (I'll list)"`, `"Cancel"`.
 - On subset: follow-up multi-select AskUserQuestion.
 
-For each selected file, show the proposed table then `AskUserQuestion`:
+For each selected file, ONE `AskUserQuestion` with the proposed table inside
+it — the preview of "Import all as listed", on "Details" pages when longer
+than 15 lines (Rules: "The screen travels inside the dialog"):
 - question: "Proceed with <file>? (N entries, M ambiguous)"
 - options:
-  - `"Import all as shown"`
+  - `"Import all as listed"`
   - `"Resolve ambiguities one-by-one"` — one AskUserQuestion per flagged row
-  - `"Edit first"` — free-text AskUserQuestion, parse corrections, re-show
+  - `"Edit first"` — free-text AskUserQuestion, parse corrections, ask
+    again with the corrected table
   - `"Skip this file"`
   - `"Cancel import"`
 
@@ -327,6 +330,17 @@ If the file is pure prose without structure, offer to import as a single
 
 ## Rules
 
+- **The screen travels inside the dialog.** What the owner must read before
+  answering is the preview of the option it belongs to, at most 15 lines as
+  the dialog shows them. The dialog wraps long lines itself, about 60
+  characters wide: a paragraph is one line, never broken by hand (a second
+  break leaves single words on a line), and a list or table line stays under
+  60 characters. Message text written before a dialog is never the screen: it
+  can land in the thinking block, which the owner sees only as a one-line
+  summary, so no question or option says "shown above". A longer screen is
+  split into pages of at most 15 lines: the option's preview shows page 1, and
+  one more single-select question, "Details", has one option per page (2 to
+  4), each with that page as its preview; its answer is not a decision.
 - **Every user decision is AskUserQuestion** — no plain-text prompts.
 - **Plan-like files → `ingest_plan_file`** — v0.2 pipeline owns ULID injection
   and first-import state semantics. Do not re-implement these inline.
