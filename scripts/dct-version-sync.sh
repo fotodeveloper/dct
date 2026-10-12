@@ -9,6 +9,10 @@
 # candidate — it must be committed there) when found at:
 #   scripts/dct-version-sync.sh  OR  scripts/version-sync.sh
 #
+# It must change ONLY the version files: prepare runs it BEFORE the owner
+# approves the release, and its isolated checkout is no sandbox — never
+# build, tag, push, publish or call a release command from here.
+#
 # Usage: ./scripts/dct-version-sync.sh <new_version>
 
 set -euo pipefail
