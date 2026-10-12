@@ -20,3 +20,8 @@ correct them at once with `update_changelog` (pass your `branch` and
 with the appropriate category and linked item ID when known. Do not describe
 planned or unverified behavior as delivered. Return the entry ID. Recording a
 change is not permission to commit, bump, publish or release.
+
+Language: A quoted question, option, screen or report fixes what it says, not
+its wording: write it in the language of the conversation. Keep unchanged:
+identifiers, commands, paths, file contents, commit messages, changelog
+entries, short titles and anything shown verbatim.

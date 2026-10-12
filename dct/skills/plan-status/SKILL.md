@@ -57,6 +57,10 @@ tree.
 
 ## Rules
 
+- **Language.** A quoted question, option, screen or report fixes what it
+  says, not its wording: write it in the language of the conversation. Keep
+  unchanged: identifiers, commands, paths, file contents, commit messages,
+  changelog entries, short titles and anything shown verbatim.
 - Read-only — never modify plans / sections / checkpoints from this skill.
 - Respect `format="structured"` default — pretty-print only at the final
   rendering step, not in the MCP calls themselves.

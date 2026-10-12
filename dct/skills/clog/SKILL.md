@@ -82,3 +82,10 @@ a helper:
 Each entry is a separate `add_changelog` call. Don't concatenate changes
 into one entry — it makes the generated changelog.md harder to skim at
 release time.
+
+## Rules
+
+- **Language.** A quoted question, option, screen or report fixes what it
+  says, not its wording: write it in the language of the conversation. Keep
+  unchanged: identifiers, commands, paths, file contents, commit messages,
+  changelog entries, short titles and anything shown verbatim.

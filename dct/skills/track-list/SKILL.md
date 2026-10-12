@@ -128,6 +128,10 @@ Showing 13 open items in dct. Use /track-list --include-resolved to show closed.
 
 ## Rules
 
+- **Language.** A quoted question, option, screen or report fixes what it
+  says, not its wording: write it in the language of the conversation. Keep
+  unchanged: identifiers, commands, paths, file contents, commit messages,
+  changelog entries, short titles and anything shown verbatim.
 - **Always parse with ID normalization regex**. Do not reject `#42` because of the hash sign.
 - **Default hides resolved** — do not surprise the user with closed items unless they ask.
 - **Prefer subagent for cross-project** when ≥2 projects have ≥20 open items each. Tell the user: "Cross-project aggregation — delegating to subagent".

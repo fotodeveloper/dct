@@ -78,3 +78,10 @@ out of scope") resolves without a confirmation question: call
 One line per item; add `· 2 task checkpoints left open` when there are. A
 wrong resolve is corrected by reopening the item: `/track-update #42 reopen`
 (`update_item(42, status="open")`, which also clears `resolved_at`).
+
+## Rules
+
+- **Language.** A quoted question, option, screen or report fixes what it
+  says, not its wording: write it in the language of the conversation. Keep
+  unchanged: identifiers, commands, paths, file contents, commit messages,
+  changelog entries, short titles and anything shown verbatim.

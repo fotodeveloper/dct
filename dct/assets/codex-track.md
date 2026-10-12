@@ -27,3 +27,8 @@ rather than deleting them. Include a user-validation gate for user-facing featur
 when project conventions require one. Do not claim completion without evidence or
 silently bypass pending gates. Use `resolve_item` for closing and report returned
 IDs and status. Do not commit or release unless explicitly authorized.
+
+Language: A quoted question, option, screen or report fixes what it says, not
+its wording: write it in the language of the conversation. Keep unchanged:
+identifiers, commands, paths, file contents, commit messages, changelog
+entries, short titles and anything shown verbatim.

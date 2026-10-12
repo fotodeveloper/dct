@@ -6,6 +6,11 @@ versions. Do not couple logic to skill existence — the workflows below
 describe what each skill does so an assistant can perform the steps manually
 via MCP tools when the named skill is unavailable.
 
+**Language.** A quoted question, option, screen or report fixes what it says,
+not its wording: write it in the language of the conversation. Keep unchanged:
+identifiers, commands, paths, file contents, commit messages, changelog
+entries, short titles and anything shown verbatim.
+
 **The screen travels inside the dialog.** What the owner must read before
 answering is the preview of the option it belongs to, at most 15 lines as the
 dialog shows them. The dialog wraps long lines itself, about 60 characters

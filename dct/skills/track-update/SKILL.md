@@ -142,6 +142,10 @@ line too:
 
 ## Rules
 
+- **Language.** A quoted question, option, screen or report fixes what it
+  says, not its wording: write it in the language of the conversation. Keep
+  unchanged: identifiers, commands, paths, file contents, commit messages,
+  changelog entries, short titles and anything shown verbatim.
 - **Every status/priority change carries a reason** (`update_item(…, reason="…")`) — no "I'll explain later" allowed.
 - **No confirmation question on an unambiguous instruction** — update, then
   acknowledge in one line (old → new). A batch is one update, not one question per item.

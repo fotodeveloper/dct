@@ -39,3 +39,8 @@ helps parallel sessions distinguish their handoffs.
 The composed call writes membership and handoff atomically. On error, report it
 without blind retries. If the user skips saving, write no handoff. Report the
 returned `handoff_id` and the precise resume point.
+
+Language: A quoted question, option, screen or report fixes what it says, not
+its wording: write it in the language of the conversation. Keep unchanged:
+identifiers, commands, paths, file contents, commit messages, changelog
+entries, short titles and anything shown verbatim.

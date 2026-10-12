@@ -116,6 +116,10 @@ would bury a P1 in the backlog.
 
 ## Rules
 
+- **Language.** A quoted question, option, screen or report fixes what it
+  says, not its wording: write it in the language of the conversation. Keep
+  unchanged: identifiers, commands, paths, file contents, commit messages,
+  changelog entries, short titles and anything shown verbatim.
 - **Never ask about type** if the phrase maps cleanly per the table, or
   carries no type cue at all (→ `todo`). Claude's job is to read the
   language, not interrogate the user.
