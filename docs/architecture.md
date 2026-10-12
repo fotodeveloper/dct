@@ -22,7 +22,7 @@ Register dct once and it is available in every Claude Code session. Opening a ne
 SQLAlchemy Core tables (not the ORM) with a `deleted_at` column for soft deletes (ledger pattern — nothing is ever hard-deleted). 14 tables:
 
 **Core**:
-- `projects` — slug, name, path, current_version, manages_changelog, changelog_path + changelog_path_explicit (#876 K-14: the marker says whether the path is the owner's choice — `dct project changelog-path <slug> <path>`, also exactly `changelog.md`; false = "detect": `core.changelog_file` finds the tracked changelog of the project root and the default `changelog.md` is used only when none exists; `--detect` goes back to it. Added by a one-shot bootstrap block that marked stored non-default paths explicit and the historical default not), version_files / version_files_confirmed_at / version_files_history (K-73: the owner-confirmed JSON list of repo-relative files a release must change; NULL = not learned; every replaced list is appended to the history), release_executor (K-85: `dct` default \| `own`; `dct project release-executor`), changelog_pr_refs (K-90: render `(#N)` PR references, default off; `dct project changelog-pr-refs`), release_proposal (K-76: the PENDING version-file proposal of `dct release prepare` — canonical JSON, replaced by a new prepare, consumed and cleared by the stamp that approves it; NULL = nothing prepared)
+- `projects` — slug, name, path, current_version, manages_changelog, changelog_path + changelog_path_explicit (#876 K-14: the marker says whether the path is the owner's choice — `dct project changelog-path <slug> <path>`, also exactly `changelog.md`; false = "detect": `core.changelog_file` finds the tracked changelog of the project root and the default `changelog.md` is used only when none exists; `--detect` goes back to it. Added by a one-shot bootstrap block that marked stored non-default paths explicit and the historical default not), version_files / version_files_confirmed_at / version_files_history (K-73: the owner-confirmed JSON list of repo-relative files a release must change; NULL = not learned; every replaced list is appended to the history), release_executor (K-85: `dct` default \| `own`; `dct project release-executor`), changelog_pr_refs (K-90: render `(#N)` PR references, default off; `dct project changelog-pr-refs`), release_proposal (K-76: the PENDING version-file proposal of `dct release prepare` — canonical JSON, replaced by a new prepare, consumed and cleared by the stamp that approves it; NULL = nothing prepared), commit_co_authored_by / commit_session_link (the commit-trailer preferences — add a `Co-Authored-By` trailer / a session or artifact link; each NULL = not answered yet, false = a stored "no", true = a stored "yes"; asked once at the project's first configuration, set with `dct project trailers`, read by /commit through `list_projects`; a project's own rules forbidding a trailer still win over a stored "yes". Nullable, added without backfill by a self-healing bootstrap block)
 - `items` — project_id, type, title, short_title (nullable 50-char label, #817), priority, status, component, source_file, source_lines, resolution, tags (**DEPRECATED** — see below). Sprint membership is **not** a column: `in_current_sprint` is derived at read time from `item_sprints` (#216 dropped the legacy boolean).
 - `item_notes` — item_id, note (append-only)
 - `item_checkpoints` — item_id, text, status, kind, sort_order
@@ -61,6 +61,7 @@ Full DDL lives in:
 - `migrations/010_release_pending_proposal.sql`
 - `migrations/011_release_tag_push_proof.sql`
 - `migrations/012_release_preview.sql`
+- `migrations/013_commit_trailer_preferences.sql`
 
 At runtime, the engine creates every MISSING table with all its indexes (`_create_missing_tables` — race-safe against a concurrent bootstrap: a duplicate table / index / relation error rolls the attempt back, the whole schema of those tables is re-checked and finished, at most `SCHEMA_CREATE_ATTEMPTS` tries, any other error propagates; tables that already exist are left to the explicit blocks below — except the release-ledger tables (`INDEX_HEALED_TABLES`, K-93 A2), whose missing required indexes every bootstrap completes, warning once instead of failing when existing rows violate a unique index) plus an idempotent `_apply_schema_updates()` that:
 - adds later columns in place (e.g. `item_checkpoints.kind` for gate checkpoints; new columns go through the duplicate-safe `_add_column_if_missing` — `ADD COLUMN IF NOT EXISTS` under a 5 s `lock_timeout` on PostgreSQL, a re-checked "duplicate column" error on SQLite),
@@ -183,6 +184,11 @@ Two layers, one entry point:
 - **`dct project rename <slug> [--slug X] [--name Y] [--path P]`** — in-place
   rename; `project_id` and all FKs (items, changelog, checkpoints, handoffs)
   are preserved. Slug collisions with live projects are rejected.
+- **`dct project trailers <slug> [--co-authored-by on|off] [--session-link on|off]`**
+  — the project's commit-trailer preferences, asked ONCE at its first
+  configuration and stored with the project; /commit applies them without
+  another question. Without a flag it prints the stored answers; a flag left
+  out keeps that answer. Each is on, off or "not answered" (NULL).
 
 The `/dct-init` skill orchestrates both layers interactively (probes bootstrap
 state, permissions allowlist, project-local conflicts, version-sync scripts,

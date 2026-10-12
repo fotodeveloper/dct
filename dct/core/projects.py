@@ -5,7 +5,7 @@ from datetime import UTC, datetime
 
 import sqlalchemy as sa
 
-from dct.db import projects, row_to_dict
+from dct.db import COMMIT_TRAILER_COLUMNS, projects, row_to_dict
 
 
 def create_project(
@@ -319,6 +319,53 @@ def set_changelog_pr_refs(engine: sa.Engine, slug: str, enabled: bool) -> dict |
     if not isinstance(enabled, bool):
         raise TypeError(f"changelog_pr_refs must be true or false, got {enabled!r}")
     return _set_release_setting(engine, slug, changelog_pr_refs=enabled)
+
+
+def get_commit_trailers(engine: sa.Engine, slug: str) -> dict | None:
+    """The project's stored commit-trailer preferences:
+    {co_authored_by, session_link}, each None (not answered yet — the
+    question was never asked), False (a stored "no") or True (a stored
+    "yes"). None when the slug does not resolve to a live project.
+
+    The answer is asked ONCE, at the project's first configuration; /commit
+    applies it without another question. A project's own instructions that
+    forbid a trailer (dct's own repository bans a session link) still win
+    over a stored "yes"."""
+    project = get_project(engine, slug)
+    if project is None:
+        return None
+    return {key: project[column] for key, column in COMMIT_TRAILER_COLUMNS.items()}
+
+
+def set_commit_trailers(
+    engine: sa.Engine,
+    slug: str,
+    *,
+    co_authored_by: bool | None = None,
+    session_link: bool | None = None,
+) -> dict | None:
+    """Store the owner's answer about commit trailers: whether /commit adds a
+    `Co-Authored-By` trailer (`co_authored_by`) and a session / artifact link
+    (`session_link`). Each keyword is the answer True / False; None (the
+    default) leaves that preference as stored — an unanswered one stays
+    unanswered. There is no way back to "not answered" here: an answer is
+    changed, never withdrawn.
+
+    Returns the updated project row, or None when the slug does not resolve
+    to a live project. ValueError when neither preference is given; TypeError
+    when a given value is not a bool (a string such as "off" or 0 / 1 is
+    never taken as an answer). Validation runs before any write, so a
+    refused call writes nothing."""
+    answers = {"co_authored_by": co_authored_by, "session_link": session_link}
+    given = {key: value for key, value in answers.items() if value is not None}
+    if not given:
+        raise ValueError("set_commit_trailers: give co_authored_by and/or session_link")
+    for key, value in given.items():
+        if not isinstance(value, bool):
+            raise TypeError(f"{key} must be true or false, got {value!r}")
+    return _set_project_value(
+        engine, slug, **{COMMIT_TRAILER_COLUMNS[key]: value for key, value in given.items()}
+    )
 
 
 def update_project(

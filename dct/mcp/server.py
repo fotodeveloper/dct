@@ -329,7 +329,7 @@ CHANGELOG_COLS = [
 CHECKPOINT_COLS = ["id", "status", "sort_order", "text"]
 TAG_COLS = ["id", "name", "item_count", "created_at", "description"]
 PROJECT_COLS = ["id", "slug", "current_version", "name", "path", "changelog_path",
-                "changelog_path_explicit"]
+                "changelog_path_explicit", "commit_co_authored_by", "commit_session_link"]
 HANDOFF_COLS = [
     "id", "scope", "created_by", "created_at", "consumed_at", "prompt",
 ]
@@ -379,6 +379,13 @@ def list_projects(format: str = "structured"):
         project's path relative to its own repository toplevel (a monorepo
         subdirectory maps to the same subdirectory of a linked worktree) —
         not against `path`, which names the main checkout.
+        commit_co_authored_by / commit_session_link are the project's stored
+        commit-trailer preferences (add a `Co-Authored-By` trailer / a
+        session or artifact link), each null = NOT ANSWERED YET (ask once,
+        then store the answer with `dct project trailers <slug>
+        --co-authored-by on|off --session-link on|off`), false = a stored
+        "no", true = a stored "yes". /commit applies a stored answer without
+        asking; the project's own rules forbidding a trailer still win.
     """
     from dct.core.projects import list_projects as _list
     rows = _list(_get_engine())

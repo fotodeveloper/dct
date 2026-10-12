@@ -107,6 +107,14 @@ projects = sa.Table(
     # progress state (set_preview; a preview and a prepare replace each
     # other's slot; --discard-preview clears it). NULL = no preview.
     sa.Column("release_preview", sa.Text),
+    # Commit-trailer preferences, asked ONCE at the project's first
+    # configuration and applied by /commit without another question
+    # (core.projects.set_commit_trailers; `dct project trailers`). Each is a
+    # tri-state: NULL = not answered yet, false = a stored "no", true = a
+    # stored "yes". No server default and no backfill: a project registered
+    # before the question existed has not answered it.
+    sa.Column("commit_co_authored_by", sa.Boolean),
+    sa.Column("commit_session_link", sa.Boolean),
     sa.Column("created_at", sa.DateTime, nullable=False, server_default=sa.text("CURRENT_TIMESTAMP")),
     sa.Column("updated_at", sa.DateTime, nullable=False, server_default=sa.text("CURRENT_TIMESTAMP")),
     sa.Column("deleted_at", sa.DateTime),
@@ -969,6 +977,16 @@ RELEASE_LEDGER_COLUMNS: dict[str, tuple[tuple[str, str], ...]] = {
 }
 
 
+# Commit-trailer preference → its projects column (core.projects reads and
+# writes through this map); _apply_schema_updates heals the columns onto an
+# existing database (nullable BOOLEAN, no backfill). Each is a tri-state:
+# NULL = not answered yet, false = a stored "no", true = a stored "yes".
+COMMIT_TRAILER_COLUMNS: dict[str, str] = {
+    "co_authored_by": "commit_co_authored_by",
+    "session_link": "commit_session_link",
+}
+
+
 def _heal_changelog_path_marker(engine: sa.Engine) -> None:
     """#876 K-22 — CONVERGENT, on every bootstrap: a stored changelog_path
     other than the default with the explicit marker unset is the owner's
@@ -1096,6 +1114,14 @@ def _apply_schema_updates(engine: sa.Engine) -> None:
     _add_column_if_missing(engine, "projects", "changelog_path_explicit",
                            _ddl_type(engine, "BOOLEAN NOT NULL DEFAULT {false}"))
     _heal_changelog_path_marker(engine)
+
+    # Commit-trailer preferences (NULL = not answered yet). Nullable, no
+    # backfill — a stored "no" is only ever the owner's answer, never a
+    # guess. The duplicate-safe helper re-checks each column, so bootstraps
+    # 2-3 issue no DDL and write nothing.
+    for column in COMMIT_TRAILER_COLUMNS.values():
+        if column not in proj_cols:
+            _add_column_if_missing(engine, "projects", column, "BOOLEAN")
 
     # v0.4.0: add item_checkpoints.kind column + partial index for gate lookup.
     # See item #33 (gate checkpoints). Pre-v0.4 checkpoints default to kind='task'

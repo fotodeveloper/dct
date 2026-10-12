@@ -523,6 +523,34 @@ def cmd_project_changelog_pr_refs(args):
           else f"{args.slug}: {state}")
 
 
+def _trailer_answer(value: bool | None) -> str:
+    """One commit-trailer preference in words: on / off / not answered."""
+    return "not answered" if value is None else ("on" if value else "off")
+
+
+def cmd_project_trailers(args):
+    """`dct project trailers <slug> [--co-authored-by on|off]
+    [--session-link on|off]` — get or store the project's commit-trailer
+    preferences (asked once at the project's first configuration; /commit
+    applies them without another question). A flag left out keeps that
+    preference as stored."""
+    from dct.core.projects import get_commit_trailers, set_commit_trailers
+
+    engine = _get_engine()
+    answers = {key: getattr(args, key) for key in ("co_authored_by", "session_link")}
+    given = {key: value == "on" for key, value in answers.items() if value is not None}
+    stored = None
+    if not given or set_commit_trailers(engine, args.slug, **given) is not None:
+        stored = get_commit_trailers(engine, args.slug)
+    if stored is None:
+        print(f"✗ Project '{args.slug}' not found", file=sys.stderr)
+        sys.exit(1)
+    arrow = " → " if given else " "
+    shown = (f"Co-Authored-By{arrow}{_trailer_answer(stored['co_authored_by'])} · "
+             f"session link{arrow}{_trailer_answer(stored['session_link'])}")
+    print(f"✓ {args.slug}: {shown}" if given else f"{args.slug}: {shown}")
+
+
 def cmd_project_manages_changelog(args):
     """Hook query — exit 0 if the project opts into dct changelog enforcement,
     else exit 1. Silent by design (the changelog hook reads only the exit code).
@@ -3005,6 +3033,22 @@ def build_parser() -> argparse.ArgumentParser:
     p_proj_prrefs.add_argument("state", nargs="?", choices=["on", "off"],
                                help="Omit to query the current value")
 
+    p_proj_trailers = p_proj_sub.add_parser(
+        "trailers",
+        help="Get/store the project's commit-trailer preferences (asked once; /commit "
+             "applies them without asking). Each is on, off or not answered yet",
+    )
+    p_proj_trailers.add_argument("slug")
+    p_proj_trailers.add_argument(
+        "--co-authored-by", choices=["on", "off"],
+        help="Add a Co-Authored-By trailer to commits (omit to keep the stored answer)",
+    )
+    p_proj_trailers.add_argument(
+        "--session-link", choices=["on", "off"],
+        help="Add a session / artifact link to commits (omit to keep the stored answer; "
+             "a project whose own rules forbid it keeps it out regardless)",
+    )
+
     p_proj_mc = p_proj_sub.add_parser(
         "manages-changelog",
         help="Exit 0 if the project opts into dct changelog enforcement, else 1 (hook query)",
@@ -3786,6 +3830,7 @@ PROJECT_COMMAND_MAP = {
     "changelog-path": cmd_project_changelog_path,
     "release-executor": cmd_project_release_executor,
     "changelog-pr-refs": cmd_project_changelog_pr_refs,
+    "trailers": cmd_project_trailers,
 }
 
 PLAN_COMMAND_MAP = {
