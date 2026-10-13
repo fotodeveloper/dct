@@ -65,7 +65,13 @@ dct/core/provenance.py   — [one impl] Write-path creation provenance
                            entry point calls set_provenance(from_environment(
                            ...)) once; unknown stays NULL
 dct/core/projects.py     — Projects CRUD (+ realpath-canonical CWD detection)
-dct/core/items.py        — Items / notes / checkpoints CRUD
+dct/core/items.py        — Items / notes / checkpoints CRUD; item creation
+                           on the caller's connection: create_item_conn (full
+                           validation, live project, tags) — used by
+                           create_item, promote_checkpoint_to_item,
+                           promote_finding_to_item and promote_section_to_item;
+                           the task mirror inserts its own item directly in its
+                           composed transaction
 dct/core/changelog.py    — Changelog entries CRUD + release stamping (the stamp
                            is the ONLY writer of versions, K-102: add_entry
                            refuses one; import_released_entry = old history);
@@ -136,6 +142,14 @@ dct/workflows/session.py — [one impl] G1 composed ops: get_context_snapshot /
                            pickup_work / handoff_work (one impl for MCP,
                            CLI and skills; single transaction each)
 dct/workflows/task_mirror.py — Append-only client plan/task observations
+dct/workflows/triage.py  — [one impl] Triage findings ledger (#909): cycles,
+                           batch-atomic record / decide / suggest of findings,
+                           close (CLOSED payload), promotion to an item,
+                           recurrence by normalised fingerprint, reviewer
+                           precision, CARDS / CLOSED export for the triage
+                           page; classify() is the one port of the template's
+                           class rule; writers of an open cycle serialise on
+                           its row (db.lock_cycle_row)
 dct/workflows/release/   — Release workflow (K-72): proof layer, read-only for
                            index, refs, work tree and database (the plan may
                            write unreferenced git objects to build the future
@@ -193,7 +207,7 @@ dct/hooks/               — Packaged Claude Code hooks (symlinked by dct init);
 
 ## Database Schema
 
-SQLAlchemy Core tables (not the ORM) with a `deleted_at` column for soft deletes (ledger pattern — nothing is ever hard-deleted). 14 tables:
+SQLAlchemy Core tables (not the ORM) with a `deleted_at` column for soft deletes (ledger pattern — nothing is ever hard-deleted). 18 tables:
 
 **Core**:
 - `projects` — slug, name, path, current_version, manages_changelog, changelog_path + changelog_path_explicit (#876 K-14: the marker says whether the path is the owner's choice — `dct project changelog-path <slug> <path>`, also exactly `changelog.md`; false = "detect": `core.changelog_file` finds the tracked changelog of the project root and the default `changelog.md` is used only when none exists; `--detect` goes back to it. Added by a one-shot bootstrap block that marked stored non-default paths explicit and the historical default not), version_files / version_files_confirmed_at / version_files_history (K-73: the owner-confirmed JSON list of repo-relative files a release must change; NULL = not learned; every replaced list is appended to the history), release_executor (K-85: `dct` default \| `own`; `dct project release-executor`), changelog_pr_refs (K-90: render `(#N)` PR references, default off; `dct project changelog-pr-refs`), release_proposal (K-76: the PENDING version-file proposal of `dct release prepare` — canonical JSON, replaced by a new prepare, consumed and cleared by the stamp that approves it; NULL = nothing prepared), commit_co_authored_by / commit_session_link (the commit-trailer preferences — add a `Co-Authored-By` trailer / a session or artifact link; each NULL = not answered yet, false = a stored "no", true = a stored "yes"; asked once at the project's first configuration, set with `dct project trailers`, read by /commit through `list_projects`; a project's own rules forbidding a trailer still win over a stored "yes". Nullable, added without backfill by a self-healing bootstrap block)
@@ -216,6 +230,13 @@ SQLAlchemy Core tables (not the ORM) with a `deleted_at` column for soft deletes
 - `tags` — global tag dictionary: name (UNIQUE among active rows), description. Deliberately **no `project_id`** — the dictionary is user-scoped, so one name means the same thing in every project, while the item lists that filter on it stay project-scoped.
 - `item_tags` — link table (item_id, tag_id, assigned_at, removed_at), mirroring `item_sprints`: composite PK, links are soft-removed and reactivated in place.
 
+**Triage findings ledger** (#909, `dct/workflows/triage.py`):
+- `triage_cycles` — one review round: project_id, code (e.g. `rev-877-r2`, UNIQUE per project among live rows), topic, scope (what was reviewed), base_commit, rubric_version (default 2), artifact_url, created_by, opened_at, closed_at (NULL = open), closed_source / closed_notes (the CLOSED block's source and notes).
+- `findings` — cycle_id, seq (the K-n number, UNIQUE per cycle among live rows), fingerprint + fingerprint_norm (the recurrence identity, normalisation v1 below), title; the rubric v2 fields under full names: impact (S, 0-3), reachability (O, `0`-`3` \| `?`), evidence (E, 0-3), fix_cost (K, S \| M \| L), origin (diff \| pre \| latent), finding_type — all six NOT NULL (rubric §1, K-4); suggested_decision / suggested_opt / suggested_note / suggested_by / suggested_at (an agent's proposal — the template's SUGGESTED — never a decision); the template flags conflict / violation (default true) / dispute / open_design; area (where), reviewer (the CARD's `src`: `codex`, `panel:security`, … — not `source`, which is the provenance column), context; class_rec (classify()) / class_override / class_reason; decision (NULL = undecided) / decision_opt / decision_note (the owner's comment verbatim) / decided_at / decided_by (who decided) / decision_source (where the owner's words are recorded) — the last three NULL while undecided and written together (K-5 / decision_actor_type / decision_actor_client / decision_session_id / decision_actor_source (the LAST decision's writer, read from the provenance context in the same UPDATE as decided_at, refreshed as a set on every overwrite and NULL before a decision — an audit record, never backfilled, not authentication; the row's creation provenance stays untouched); an audit record distinct from the provenance columns, not authentication); item_id (promoted to), first_seen_id (self-FK: the earliest live finding of the project with the same fingerprint_norm; NULL = first). Indexed on cycle_id and fingerprint_norm. fingerprint_norm uses normalisation v1 (NFC + lower + whitespace collapse + fixed-point trailing punctuation strip, `triage.normalize_fingerprint`); the ledger shipped with it, so no reconciliation of earlier norms exists.
+- `finding_options` — finding_id, key (UNIQUE per finding among live rows), text, why, is_root, is_recommended (at most one per finding, checked in code).
+
+Value domains (rubric enums, decisions, classes) are validated by the workflow, not by CHECK constraints; every VARCHAR goes through `ensure_fits`. The three tables carry the provenance columns and are in `INDEX_HEALED_TABLES`.
+
 `items.tags` (the old JSON-array-in-TEXT column) is **deprecated and frozen**:
 nothing writes it any more, `_backfill_item_tags` is its only sanctioned reader,
 and it is dropped at 2.0.0.
@@ -236,10 +257,12 @@ Full DDL lives in:
 - `migrations/011_release_tag_push_proof.sql`
 - `migrations/012_release_preview.sql`
 - `migrations/013_commit_trailer_preferences.sql`
+- `migrations/014_triage_findings.sql`
 
-At runtime, the engine creates every MISSING table with all its indexes (`_create_missing_tables` — race-safe against a concurrent bootstrap: a duplicate table / index / relation error rolls the attempt back, the whole schema of those tables is re-checked and finished, at most `SCHEMA_CREATE_ATTEMPTS` tries, any other error propagates; tables that already exist are left to the explicit blocks below — except the release-ledger tables (`INDEX_HEALED_TABLES`, K-93 A2), whose missing required indexes every bootstrap completes, warning once instead of failing when existing rows violate a unique index) plus an idempotent `_apply_schema_updates()` that:
+At runtime, the engine creates every MISSING table with all its indexes (`_create_missing_tables` — race-safe against a concurrent bootstrap: a duplicate table / index / relation error rolls the attempt back, the whole schema of those tables is re-checked and finished, at most `SCHEMA_CREATE_ATTEMPTS` tries, any other error propagates; tables that already exist are left to the explicit blocks below — except the release-ledger and triage-ledger tables (`INDEX_HEALED_TABLES`, K-93 A2 / #909), whose missing required indexes every bootstrap completes, warning once instead of failing when existing rows violate a unique index) plus an idempotent `_apply_schema_updates()` that:
 - adds later columns in place (e.g. `item_checkpoints.kind` for gate checkpoints; new columns go through the duplicate-safe `_add_column_if_missing` — `ADD COLUMN IF NOT EXISTS` under a 5 s `lock_timeout` on PostgreSQL, a re-checked "duplicate column" error on SQLite),
-- handles dialect-specific bool literals (PostgreSQL strict, SQLite permissive), and
+- handles dialect-specific bool literals (PostgreSQL strict, SQLite permissive),
+- sets NOT NULL on `findings.origin` / `finding_type` of a ledger created while they were nullable (`_heal_triage_not_null`, #909 K-4): PostgreSQL only, and only for a column without NULL rows — a NULL is never filled with a guessed value; such rows leave the column as it is and a stderr warning names them on every bootstrap until they are fixed by hand. SQLite keeps the existing column nullable (no ALTER COLUMN without a table rebuild); the workflow's write-time validation guards it,
 - auto-migrates legacy `items.in_current_sprint=TRUE` flags into the new `item_sprints` table as a per-project "legacy sprint" (then drops the column), and
 - backfills `tags` / `item_tags` from the frozen `items.tags` JSON column (`_backfill_item_tags`): tolerant parse (bad JSON is dropped with a stderr note, never raised), per-item anti-join guard so re-tagged items are never re-seeded, and a one-shot stderr similarity report suggesting `dct tags merge` for near-duplicates — a suggestion, never a block.
 
@@ -248,6 +271,58 @@ Schema updates run on the first engine bootstrap of a new-code session — verif
 Read-only commands (`dct release plan` / `status`, `dct clog candidates`, the previews of `dct release reconstruct` / `takeover` / `version-files`) never bootstrap (K-84): they open the database read-only (`core.engine.readonly_engine` — SQLite `mode=ro` without a journal-mode change or file creation, PostgreSQL READ ONLY transactions), check that every table and column of the current schema exists (`db.check_schema_ready`) and otherwise refuse with a message naming `dct db upgrade`, the explicit bootstrap. Caveat: on a SQLite database already in WAL mode SQLite itself may create the `-wal` / `-shm` sidecar files for any reader, also a read-only one — the database file, its schema and its data stay unchanged.
 
 SQLite URLs are built and parsed in ONE place (K-99): `dct.paths.sqlite_url(path)` renders through SQLAlchemy's own URL object and `dct.paths.sqlite_database_path(url)` parses with `make_url` — never by concatenating or slicing `sqlite:///`. SQLAlchemy 2.1 percent-decodes the database part of a URL and 2.0 does not, so a hand-built URL names another file on 2.1 as soon as the path holds a `%`; the helpers behave the same on both (the supported floor stays `sqlalchemy>=2.0.52`). A path the installed SQLAlchemy cannot express (a `?` on the 2.0 line) is refused instead of silently opening another file. A URL you write by hand into `dct.toml` follows the rules of the SQLAlchemy you run.
+
+### Concurrency contracts
+
+Two helpers in `dct/db.py` serialise writers that read-then-write:
+
+- `project_transaction(engine, slug, write=True)` — composed project-level
+  writers (releases, sprint and handoff ops, #430): a PostgreSQL advisory lock
+  on the project id taken before a REPEATABLE READ transaction, `BEGIN
+  IMMEDIATE` on SQLite; waits are bounded to five seconds.
+- `lock_row(conn, table, row_id)` — the row-level variant (#910, generalised
+  by #909): `SELECT … FOR NO KEY UPDATE` on the row (live rows only; returns
+  whether it exists) with a transaction-local `lock_timeout` of five seconds on
+  PostgreSQL, `BEGIN IMMEDIATE` before the read on SQLite. Two wrappers name
+  its contracts:
+- `lock_item_row(conn, item_id)` — the gate contract (#910). It is
+  the existence check of every participant in the gate contract — the
+  terminal transition (`update_item` / `resolve_item`, whose gate guard reads
+  pending gates and writes the status in one transaction) and every writer
+  that creates or reopens a gate checkpoint (`add_checkpoint`,
+  `checkpoints.set_status`) — so a gate lands either before the guard reads
+  or after the status is written, never in between. Any new writer that can
+  make a closed item's gates pending, or that must see the latest gates,
+  takes this lock first. Lock-in: `tests/test_gate_race.py` (PG lane and a
+  file SQLite database, the competitor proven blocked before the holder
+  commits).
+- `lock_cycle_row(conn, cycle_id)` — the open-cycle contract of the triage
+  ledger (#909): every writer that requires an open cycle (record / decide /
+  suggest findings) and `close_triage` take it, so nothing is written into a
+  cycle after its close. Where it sits among each operation's locks: Lock
+  order below. Lock-in: `tests/test_triage_schema.py`.
+
+#### Lock order
+
+The row locks each operation takes explicitly, in the order it takes them
+(all through `lock_row` or its wrappers; one transaction each):
+
+| Operation | Explicit locks, in order |
+|---|---|
+| `record_findings` | project row → cycle row (first_seen is project-wide, so recorders of one project queue on the project first) |
+| `decide_findings` | cycle row → the promoted item row of each finding re-decided reject / note (`lock_item_row`, K-2) |
+| `suggest_findings`, `close_triage` | cycle row |
+| `promote_finding_to_item` | cycle row → finding row; the new item then takes FK `KEY SHARE` locks (project row on insert, item row on the finding's back-link) |
+| `promote_checkpoint_to_item`, `promote_section_to_item` | their own checkpoint / section row; the new item takes FK `KEY SHARE` locks as above |
+| gate contract (`update_item` / `resolve_item`, `add_checkpoint`, `checkpoints.set_status`) | item row (`lock_item_row`) |
+
+Not every operation starts at the project row: only `record_findings`
+takes it. The implicit `KEY SHARE` locks that PostgreSQL takes on the
+referenced row of every foreign-key insert or update do not conflict with
+`lock_row`, because it locks `FOR NO KEY UPDATE` (no key column is ever
+changed under it), not `FOR UPDATE` — so, for example, a promotion inserting
+an item of a project whose row a recorder holds does not wait on it. The
+helpers still exclude each other: two `lock_row` calls on one row queue.
 
 ## Configuration
 
