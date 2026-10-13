@@ -2,8 +2,10 @@
 name: dct-init
 disable-model-invocation: true
 description: |
-  [dct] Initialize dct for the current project — dual-mode: runs global bootstrap if
-  missing, then registers the current directory as a dct project. Often the
+  [dct] Initialize dct for the current project — dual-mode: checks the global
+  setup (offers to repair a partial Claude integration; a first setup is
+  `dct init`, run by the owner in a terminal), then registers the current
+  directory as a dct project. Often the
   owner's first contact with dct: ONE dialog says what dct is and what
   registering stores, shows the detected name, folder and version, and asks
   only the real choices, each with its why — whether every release writes the
@@ -38,19 +40,89 @@ Check three things in parallel:
 2. Skills: does `~/.claude/skills/track` exist (as symlink or dir)?
 3. Hooks: does `~/.claude/hooks/dct-check-changelog.sh` exist?
 
-Derive `bootstrap_complete` = all three present.
+Derive `bootstrap_complete` = all three present. The short dct pointer in
+`~/.claude/CLAUDE.md` is NOT part of it: it is the owner's choice, offered by
+`dct init` itself, and it only names the reference — never paste the
+reference into `CLAUDE.md`.
+
+The skill never runs `dct init`: it is interactive (it asks for the
+database in a terminal) and a Bash call has no terminal, so its first
+prompt fails. It never runs `dct upgrade` either: that also upgrades the
+package.
 
 If NOT complete:
-  AskUserQuestion:
-    question: "dct isn't fully set up for Claude Code yet (its tools, skills and hooks). Run `dct init` now?"
-    header: "Bootstrap"
-    options:
-      - "Yes — run bootstrap (recommended)" — "Installs dct's MCP server, skills and hooks for your user; nothing in this folder changes."
-      - "Abort — I'll fix it manually"
-  On "yes": Bash `dct init`, capture output, show summary. Re-probe after.
-  On "abort": print instructions and exit.
+- the dct MCP tools answer in this session (`mcp__dct__list_projects`
+  returns, even an empty list) — dct's database is set up and a part of the
+  Claude integration is missing: ask the repair question below, its
+  question naming what is missing. On "Repair" probe again after it; on
+  "Not now" stop with the line "Bootstrap: incomplete — `dct integrate
+  repair claude` completes it".
+- otherwise: no question. The final text says that dct is not set up for
+  Claude Code here: if dct was never set up on this machine, run `dct init`
+  in your own terminal (it asks for the database and installs the
+  integration); if it was (its config and database exist), `dct integrate
+  repair claude` restores the Claude integration without touching them.
+  Then `/dct-init` again. Stop.
 
-If complete: continue to Step 2.
+If complete: run the reference check, then continue to Step 2.
+
+**The reference** — an asset check, never part of the bootstrap: is
+`~/.claude/dct-reference.md` (the dct reference read on demand, which the
+pointer in `~/.claude/CLAUDE.md` names) installed and current? The skill
+never decides that itself — a copy's header or a link's target proves
+nothing (an edited copy keeps its header; only dct knows which links it
+recorded). It reads dct's own diagnosis, the one the installer and the
+repair act on. Run via Bash (read-only: it opens no database):
+
+```
+dct doctor --client claude --json
+```
+
+In its JSON, take `integrations` → the entry with `"client": "claude"` →
+its `checks` → the row with `"check": "reference"`: its `state` is
+`current`, `missing`, `outdated` or `foreign`, its `message` names the path
+(and the link target), its `remedy` the fix. The command exits with code 1
+whenever any check fails (the optional `CLAUDE.md` pointer, a hook file, a
+Python dependency); a valid JSON on stdout still carries the diagnosis —
+read the reference row from it, never take the exit code for no answer. The
+other rows are not this check's business and never block the registration.
+Only when stdout holds no JSON or no reference row, the reports say
+"Reference: unknown — `dct doctor --client claude` did not report it" and
+the skill continues to Step 2.
+
+- **`current`** — nothing to say; continue to Step 2.
+- **`missing`** (typical after the package was upgraded without `dct
+  upgrade`) or **`outdated`** (dct's, from an older package: an old
+  unchanged copy or a link from a previous install) — ask the repair
+  question below, then continue to Step 2 whatever the answer: the
+  reference never blocks the registration.
+- **`foreign`** (not dct's: the owner's own file, a copy edited since dct
+  wrote it, or a link dct did not create) — every dct installer leaves it
+  untouched, so repair is never offered as its fix and no question is
+  asked. The report says "Reference: <the row's `message`, naming the path
+  and the link target> — <its `remedy`>": move it aside (to an unused
+  name) or replace it first, keeping what the owner needs from it; then
+  `dct integrate repair claude` installs dct's. Continue to
+  Step 2.
+
+**The repair question** — ONE `AskUserQuestion`; the repair runs only after
+the owner's "Repair" answer, because it changes more than the missing piece:
+
+  question: "<What is missing or outdated — e.g. dct's reference for Claude, or its hooks.> Repair dct's Claude integration now?"
+  header: "Repair"
+  options:
+    - "Repair (recommended)" — "Runs `dct integrate repair claude`: registers dct's MCP server in ~/.claude.json (an existing dct entry is kept), links dct's skills and hooks into ~/.claude, wires the hooks into ~/.claude/settings.json, installs ~/.claude/dct-reference.md and adds or refreshes dct's short pointer in ~/.claude/CLAUDE.md, even if you declined it before. It leaves dct's database, its config, the package and this folder alone."
+    - "Not now" — "Nothing changes; the report names the command."
+
+On "Repair": run `dct integrate repair claude`, show its output and probe
+again (the bootstrap probe and `dct doctor --client claude --json`). If the
+reference row then reads `foreign`, handle it as above.
+
+The `Reference:` line of the reports (Step 2's status, Step 7) is shown only
+when the reference is not `current`: "Reference: missing — `dct integrate
+repair claude` installs it (the full Claude integration repair)",
+"Reference: outdated — `dct integrate repair claude` refreshes it (the full
+Claude integration repair)", the foreign line or the unknown line above.
 
 ### Step 2: Probe current project registration (before any setup question)
 
@@ -85,7 +157,8 @@ permissions.allow in ~/.claude/settings.json"; "Version sync:
 scripts/dct-version-sync.sh without the dct sentinel", "Version sync:
 scripts/version-sync.sh — run by every release as the version sync, before
 you approve" or "Version sync: none — `dct project version-sync-script
-<slug>` adds one"; "Commit lines: not answered".
+<slug>` adds one"; "Commit lines: not answered"; when the reference is
+not `current`, its `Reference:` line from Step 1.
 
 Then stop: the status is the final text of the turn. The one exception: a
 commit-line preference that is not answered (the project was registered
@@ -323,10 +396,13 @@ The final text of the turn:
 ✓ Project:      <slug> registered at <path>, version <v>
 ✓ Version sync: scripts/dct-version-sync.sh writes the version into pyproject.toml — commit it (/commit) before the first release
 ✓ Commit lines: Co-Authored-By on · session link off
+⚠ Reference:    missing — `dct integrate repair claude` installs it (the full Claude integration repair)
   Next: /dct-import (tracking files found) · /track to add the first item
 ```
 
-The report ends the skill — no closing question. The `Next:` line is a
+The `Reference:` line appears only when the reference is not `current`
+(Step 1: missing, outdated, foreign or unknown, with that state's line). The report ends the skill —
+no closing question. The `Next:` line is a
 hint, not a menu: name `/dct-import` first when the project path holds
 plausible tracking files (any of `ROADMAP.md`, `TODOS.md`, `BACKLOG.md`,
 `SPRINT*.md`, `PLAN*.md`, `CHANGELOG.md`, `changelog.md`,
@@ -359,8 +435,12 @@ nothing), so the hint says where to go — the owner runs it when they want.
 - **Show what was detected; ask only real choices.** Folder, name and
   version are shown in the "Register" preview, never asked one by one;
   "Change the name or version" covers the unusual case.
-- **Single source of truth for bootstrap.** Skill calls `dct init`
-  under the hood; never re-implements MCP/skill/hook installation.
+- **Single source of truth for bootstrap.** The skill never
+  re-implements MCP/skill/hook installation and never runs `dct init`
+  (interactive — the owner runs it in a terminal) or `dct upgrade` (it also
+  upgrades the package). A partial Claude integration or a missing
+  reference is repaired with `dct integrate repair claude`, run only after
+  the owner's "Repair" answer to Step 1's repair question.
 - **Single source of truth for registration and the script.** Skill calls
   `dct project add` and `dct project version-sync-script`; never writes the
   DB directly and never copies or hand-edits a version-sync script.

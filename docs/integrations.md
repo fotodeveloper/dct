@@ -34,6 +34,40 @@ operations bootstrap the database as usual. The existing interactive `dct init` 
 installs Claude Code. `dct integrate install claude` explicitly installs its
 MCP, skills, hooks and managed instructions.
 
+### Claude Code instructions: pointer + reference
+
+The Claude Code instructions come in two parts. The full dct reference
+(`dct/assets/dct-reference.md`) is installed as `~/.claude/dct-reference.md` on
+every install path — `dct init` (also with `--no-attach-snippet`),
+`dct integrate install|repair claude` and `dct upgrade` — as a symlink into
+the package, or a marked copy where symlinks are unavailable. The managed
+block in `~/.claude/CLAUDE.md` is only a short pointer naming that file as
+plain text (no `@` import, which would load the whole reference in every
+session); it is attached with consent, and a block still holding the old full
+text is refreshed to the pointer, with content outside the markers untouched.
+
+Ownership of `~/.claude/dct-reference.md` is proven, never guessed. dct's are:
+a symlink into the running package's assets (including the older link to
+`assets/claude-md-snippet.md`), a symlink whose exact target dct recorded when
+it created it (`~/.claude/.dct-managed-links.json`, so the link re-points after
+the package moves to a new virtual environment, a new Python or between an
+editable and a wheel install), and an unchanged marked copy. These are
+re-pointed or refreshed. Anything else (your own file, an edited copy, a link
+dct did not create, also a dangling one or one into another `dct/assets`
+directory) is preserved: install, upgrade, repair and doctor report it as
+"not dct's" with its path and link target. Move or replace that file yourself
+before a repair can install the reference; repairing alone would preserve it
+again. Doctor reports the reference as missing, outdated or not dct's, each
+with its remedy. A missing reference is installed by
+`dct integrate repair claude`, which repairs the whole Claude integration: it
+registers the MCP server (an existing entry is kept), installs skills and hook
+files, wires the hooks into `~/.claude/settings.json`, adds or refreshes the
+pointer block in `~/.claude/CLAUDE.md` and installs the reference. A file or
+link that appears at an install path while dct is creating it is never
+overwritten (reference, skills and hooks alike). Uninstall removes only an
+owned reference. The client-neutral reference location for Codex is a
+separate change.
+
 ## Codex: supported explicit workflows in development builds
 
 The adapter configures `dct server` in `$CODEX_HOME/config.toml` (default
@@ -133,7 +167,7 @@ manual protocol integration, without a claim of client-specific acceptance.
 | Changelog checks / stop reminders | Claude hooks | Experimental native hooks; review/trust and dependencies required | No packaged adapter |
 | Plan-file autoscan | Claude edit/write events | Experimental `apply_patch` events; shell edits need explicit rescan | CLI rescan or MCP `ingest_plan_file` |
 | Native plan mirroring | Claude TaskCreate/TodoWrite | Experimental and conditional on actual `update_plan` events | No packaged mirror |
-| Managed instructions | CLAUDE.md | AGENTS.md; conflicts reported | Manual |
+| Managed instructions | CLAUDE.md pointer + `~/.claude/dct-reference.md` | AGENTS.md; conflicts reported | Manual |
 | Integration diagnostics | Development `doctor` | Development `doctor`; runtime trust checked separately | Core runtime checks only |
 
 Hook installation and trust are separate from explicit skills. Treat each

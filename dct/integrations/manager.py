@@ -37,6 +37,13 @@ def refresh_integrations() -> list[dict]:
     Unlike an explicit install/repair, upgrade does not introduce managed
     instruction blocks or wire new hooks. Existing legacy entry points remain
     the implementation used by the Claude adapter.
+
+    Each result: ``{"client", "ok", "removed", "checks", "remedies"}`` plus
+    ``"error"`` (the failing checks' messages) when not ok, and for Claude
+    ``"reference"`` (the ``install_reference`` result, K-66). ``remedies``
+    lists, per failing check, its own remedy when the check carries one
+    (a foreign reference must be moved aside first — a repair would only
+    preserve it again), otherwise the client's ``dct integrate repair``.
     """
     results = []
     for name in ("claude", "codex"):
@@ -44,10 +51,14 @@ def refresh_integrations() -> list[dict]:
         try:
             if not adapter.detect():
                 continue
+            extra = {}
             if name == "claude":
                 from dct.integrations import claude
                 claude.install_skills()
                 claude.install_hook()
+                # K-36: the reference the CLAUDE.md block points at is an
+                # asset, refreshed with skills/hooks — not instruction opt-in.
+                extra["reference"] = claude.install_reference()
                 removed = claude.prune_dangling_symlinks()
                 if claude.CLAUDE_MD.is_file() and claude.SNIPPET_START in claude.CLAUDE_MD.read_text(encoding="utf-8"):
                     claude.attach_claude_md_snippet()
@@ -63,15 +74,23 @@ def refresh_integrations() -> list[dict]:
             # Upgrade refreshes opted-in assets, not the complete integration.
             # Missing instruction blocks or hook wiring are not upgrade failures.
             asset_names = {"skills", "hook_assets"}
+            if name == "claude":
+                asset_names.add("reference")
             if name == "codex":
                 asset_names.update({"hooks", "hooks_trust", "hook_dependencies"})
             asset_checks = [check for check in adapter.doctor()
                             if check["check"] in asset_names
                             or check["check"].startswith("skill:")]
-            failures = [check["message"] for check in asset_checks if check["status"] == "error"]
-            result = {"client": name, "ok": not failures, "removed": removed, "checks": asset_checks}
-            if failures:
-                result["error"] = "; ".join(failures)
+            failing = [check for check in asset_checks if check["status"] == "error"]
+            remedies = []
+            for check in failing:
+                remedy = check.get("remedy") or f"Run `dct integrate repair {name}`."
+                if remedy not in remedies:
+                    remedies.append(remedy)
+            result = {"client": name, "ok": not failing, "removed": removed, "checks": asset_checks,
+                      "remedies": remedies, **extra}
+            if failing:
+                result["error"] = "; ".join(check["message"] for check in failing)
             results.append(result)
         except Exception as exc:  # noqa: BLE001 — report per-client failure, continue others
             results.append({"client": name, "ok": False, "error": str(exc)})

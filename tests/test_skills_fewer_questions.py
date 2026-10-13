@@ -43,7 +43,7 @@ from __future__ import annotations
 import re
 
 import pytest
-from test_skill_prose_changelog import _codex, _fallbacks, _skill, _snippet
+from test_skill_prose_changelog import _codex, _fallbacks, _reference, _skill
 
 # ── text helpers ─────────────────────────────────────────────────────────────
 
@@ -390,7 +390,7 @@ CHECKPOINT_TEXTS = [
     pytest.param(lambda: _skill("track"), id="track-skill"),
     pytest.param(lambda: _fallback("track"), id="track-fallback"),
     pytest.param(lambda: _skill("track-update"), id="track-update-skill"),
-    pytest.param(_snippet, id="claude-md-snippet"),
+    pytest.param(_reference, id="dct-reference"),
     pytest.param(lambda: _codex("track"), id="codex-track"),
 ]
 
@@ -415,7 +415,7 @@ def test_checkpoint_count_is_a_minimum_never_a_range_or_cap(text):
 @pytest.mark.parametrize("text", [
     pytest.param(lambda: _skill("track"), id="track-skill"),
     pytest.param(lambda: _fallback("track"), id="track-fallback"),
-    pytest.param(_snippet, id="claude-md-snippet"),
+    pytest.param(_reference, id="dct-reference"),
 ])
 def test_creating_an_item_does_not_force_checkpoints(text):
     body = text()
@@ -440,7 +440,7 @@ START_OF_WORK = (r"\b(when|once|as) (the )?(work|you|the user|someone)[^.]{0,40}
 @pytest.mark.parametrize("text", [
     pytest.param(lambda: _skill("track"), id="track-skill"),
     pytest.param(lambda: _fallback("track"), id="track-fallback"),
-    pytest.param(_snippet, id="claude-md-snippet"),
+    pytest.param(_reference, id="dct-reference"),
 ])
 def test_creation_points_the_plan_to_the_start_of_work(text):
     """The plan is not dropped, it moves: the text says checkpoints are
@@ -481,13 +481,13 @@ def test_track_update_start_work_respects_an_existing_plan():
         f"the start-work proposal ignores the item's existing checkpoints: {paragraphs}"
 
 
-def test_snippet_proposes_at_least_three_checkpoints_when_work_starts():
-    """The snippet lands in every user's CLAUDE.md: it must carry the same
+def test_reference_proposes_at_least_three_checkpoints_when_work_starts():
+    """The reference every Claude user is pointed at: it must carry the same
     rule as the skills — at least 3, and at the start of work."""
-    paragraphs = [p for p in _paragraphs(_snippet())
+    paragraphs = [p for p in _paragraphs(_reference())
                   if re.search(r"checkpoint", p, re.IGNORECASE)
                   and re.search(AT_LEAST_THREE, p, re.IGNORECASE)]
-    assert paragraphs, "the CLAUDE.md snippet does not state the at-least-3 plan"
+    assert paragraphs, "the dct reference does not state the at-least-3 plan"
     assert any(re.search(START_OF_WORK, p, re.IGNORECASE) for p in paragraphs), \
         f"the at-least-3 plan is not tied to the start of work: {paragraphs}"
 
@@ -932,7 +932,7 @@ def test_done_never_bypasses_evidence_or_closes_an_unnamed_gate(text):
 TYPE_DEFAULT = [
     pytest.param(lambda: _skill("track"), id="track-skill"),
     pytest.param(lambda: _fallback("track"), id="track-fallback"),
-    pytest.param(_snippet, id="claude-md-snippet"),
+    pytest.param(_reference, id="dct-reference"),
 ]
 
 
@@ -974,7 +974,7 @@ PLAN_RULE_TEXTS = [
     pytest.param(lambda: _skill("track"), id="track-skill"),
     pytest.param(lambda: _fallback("track"), id="track-fallback"),
     pytest.param(lambda: _skill("track-update"), id="track-update-skill"),
-    pytest.param(_snippet, id="claude-md-snippet"),
+    pytest.param(_reference, id="dct-reference"),
 ]
 
 NON_TRIVIAL_FEATURE = (r"\bnon-trivial\b[^.]{0,40}\bfeature[^.]{0,30}\bimprovement|"
@@ -1008,7 +1008,7 @@ def test_the_minimum_of_three_has_one_shared_qualifier(text):
 
 @pytest.mark.parametrize("text", [
     pytest.param(lambda: _skill("track-update"), id="track-update-skill"),
-    pytest.param(_snippet, id="claude-md-snippet"),
+    pytest.param(_reference, id="dct-reference"),
 ])
 def test_a_small_fix_gets_no_artificial_plan(text):
     """A one-line fix or a small bug starts without checkpoints; a complex
@@ -1025,8 +1025,8 @@ def test_a_small_fix_gets_no_artificial_plan(text):
     assert no_minimum, "other items still get a minimum taken from their type"
 
 
-# ── K-53: the snippet points to /release, no third copy of the CLI ───────────
-# (in test_skill_prose_changelog.py, next to the other snippet / release pins)
+# ── K-53: the reference points to /release, no third copy of the CLI ─────────
+# (in test_skill_prose_changelog.py, next to the other reference / release pins)
 
 
 # ── K-54 / K-56: /commit — one secret-path predicate, new files like any other ─
@@ -1122,10 +1122,10 @@ def test_commit_new_files_follow_the_same_scope_rules(text):
 
 # ── K-55: stored commit-trailer preferences ─────────────────────────────────
 
-COMMIT_AND_SNIPPET = [
+COMMIT_AND_REFERENCE = [
     *COMMIT,
-    pytest.param(lambda: _section_between(_snippet(), "**Committing**", "**Releasing**"),
-                 id="claude-md-snippet"),
+    pytest.param(lambda: _section_between(_reference(), "**Committing**", "**Releasing**"),
+                 id="dct-reference"),
 ]
 
 
@@ -1133,7 +1133,7 @@ def _section_between(body: str, start: str, end: str) -> str:
     return body[body.index(start): body.index(end, body.index(start))]
 
 
-@pytest.mark.parametrize("text", COMMIT_AND_SNIPPET)
+@pytest.mark.parametrize("text", COMMIT_AND_REFERENCE)
 def test_commit_applies_the_stored_trailer_preferences_without_asking(text):
     flat = _flat(text())
     assert re.search(r"\bstored\b[^.]{0,120}\b(without (a |any )?(question|asking)|"

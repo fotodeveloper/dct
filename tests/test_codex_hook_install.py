@@ -365,6 +365,7 @@ def test_upgrade_does_not_gate_claude_on_optional_hook_wiring(monkeypatch):
                         lambda name: ClaudeAdapter() if name == 'claude' else MissingAdapter())
     monkeypatch.setattr('dct.integrations.claude.install_skills', lambda: None)
     monkeypatch.setattr('dct.integrations.claude.install_hook', lambda: None)
+    monkeypatch.setattr('dct.integrations.claude.install_reference', lambda: None)
     monkeypatch.setattr('dct.integrations.claude.prune_dangling_symlinks', list)
 
     result = manager.refresh_integrations()

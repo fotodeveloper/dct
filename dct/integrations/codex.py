@@ -15,6 +15,7 @@ from dct.integrations.base import (
     is_managed_copy,
     managed_instructions,
     mark_managed_copy,
+    read_exact_text,
 )
 
 ASSETS = Path(__file__).resolve().parent.parent / "assets"
@@ -540,7 +541,7 @@ class CodexIntegration(ClientIntegration):
         elif 'dct' in _table(data, 'mcp_servers'):
             retained.append('mcp: pre-existing or customized registration')
         if self.instructions_path.exists():
-            text = self.instructions_path.read_text(encoding='utf-8')
+            text = read_exact_text(self.instructions_path)
             if text.count(START) == text.count(END) == 1 and text.index(START) < text.index(END):
                 left, right = text.index(START), text.index(END) + len(END)
                 atomic_write(self.instructions_path, text[:left] + text[right:])

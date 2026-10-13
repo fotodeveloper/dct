@@ -15,6 +15,7 @@ def test_claude_mcp_rejects_disabled_and_missing_binary(tmp_path, monkeypatch):
     monkeypatch.setattr(claude, 'CLAUDE_SETTINGS', tmp_path / 'settings')
     monkeypatch.setattr(claude, 'CLAUDE_SKILLS_DIR', tmp_path / 'skills')
     monkeypatch.setattr(claude, 'CLAUDE_HOOKS_DIR', tmp_path / 'hooks')
+    monkeypatch.setattr(claude, 'CLAUDE_REFERENCE', tmp_path / 'dct-reference.md')
     monkeypatch.setattr(claude.shutil, 'which', lambda *args, **kwargs: None)
     for entry in ({'command': 'missing', 'args': ['server']},
                   {'command': sys.executable, 'disabled': True, 'args': ['server']}):
@@ -66,7 +67,7 @@ def test_claude_doctor_rejects_old_managed_skill(tmp_path, monkeypatch):
     mark_managed_copy(installed / 'pickup')
     monkeypatch.setattr(claude, 'SKILLS_DIR', source)
     monkeypatch.setattr(claude, 'CLAUDE_SKILLS_DIR', installed)
-    for name in ('CLAUDE_JSON', 'CLAUDE_MD', 'CLAUDE_SETTINGS', 'CLAUDE_HOOKS_DIR'):
+    for name in ('CLAUDE_JSON', 'CLAUDE_MD', 'CLAUDE_SETTINGS', 'CLAUDE_HOOKS_DIR', 'CLAUDE_REFERENCE'):
         monkeypatch.setattr(claude, name, tmp_path / name)
     checks = claude.ClaudeIntegration().doctor()
     assert next(c for c in checks if c['check'] == 'skills')['status'] == 'error'
@@ -76,7 +77,8 @@ def test_claude_mcp_uses_configured_path_environment(tmp_path, monkeypatch):
     executable = tmp_path / 'only-in-configured-path'
     executable.write_text('#!/bin/sh\nexit 0\n')
     executable.chmod(0o755)
-    for name in ('CLAUDE_JSON', 'CLAUDE_MD', 'CLAUDE_SETTINGS', 'CLAUDE_HOOKS_DIR', 'CLAUDE_SKILLS_DIR'):
+    for name in ('CLAUDE_JSON', 'CLAUDE_MD', 'CLAUDE_SETTINGS', 'CLAUDE_HOOKS_DIR', 'CLAUDE_SKILLS_DIR',
+                 'CLAUDE_REFERENCE'):
         monkeypatch.setattr(claude, name, tmp_path / name)
     claude.CLAUDE_JSON.write_text(json.dumps({'mcpServers': {'dct': {
         'command': executable.name, 'args': ['server'], 'env': {'PATH': str(tmp_path)},

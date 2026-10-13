@@ -258,7 +258,12 @@ def cmd_init(args):
             break
 
     # Install hook, skills, and register MCP server (user scope)
-    from dct.integrations.claude import install_hook, install_skills, register_mcp
+    from dct.integrations.claude import (
+        install_hook,
+        install_reference,
+        install_skills,
+        register_mcp,
+    )
 
     ok, msg = register_mcp(config)
     if ok:
@@ -267,6 +272,13 @@ def cmd_init(args):
         print("  ✓ Global hook installed")
     if install_skills(config):
         print("  ✓ Skills installed")
+    # The dct reference read on demand (K-36) — an installed asset like the
+    # skills, independent of the CLAUDE.md consent below.
+    reference = install_reference(config)
+    mark = "⚠" if reference["status"] == "preserved" else "✓"
+    print(f"  {mark} {reference['message']}")
+    if reference.get("remedy"):
+        print(f"    → {reference['remedy']}")
 
     # Wire hooks into ~/.claude/settings.json (idempotent; consent-gated).
     # args.wire_hooks: True (--wire-hooks) / False (--no-wire-hooks) / None (ask
@@ -296,15 +308,17 @@ def cmd_init(args):
     else:
         print("  ⚠ Hooks not wired — run `dct hooks wire` later (see docs/hooks.md).")
 
-    # Attach the CLAUDE.md snippet (idempotent; consent-gated — it teaches the
-    # assistant when to reach for dct, so plain "track this" works reliably).
+    # Attach the CLAUDE.md pointer (idempotent; consent-gated — a short block
+    # naming ~/.claude/dct-reference.md, so the assistant knows dct exists and
+    # where to read when to reach for it; plain "track this" works reliably).
     # args.attach_snippet: True (--attach-snippet) / False (--no-attach-snippet)
     # / None (ask on a tty, skip when non-interactive).
     attach = getattr(args, "attach_snippet", None)
     if attach is None:
         if sys.stdin.isatty():
             answer = input(
-                "Add dct usage instructions to ~/.claude/CLAUDE.md? [Y/n]: "
+                "Add a short dct pointer to ~/.claude/CLAUDE.md "
+                "(it names ~/.claude/dct-reference.md, read on demand)? [Y/n]: "
             ).strip().lower()
             attach = answer != "n"
         else:
@@ -314,20 +328,20 @@ def cmd_init(args):
         try:
             result = attach_claude_md_snippet()
         except ValueError as e:
-            print(f"  ⚠ CLAUDE.md snippet skipped: {e}")
+            print(f"  ⚠ CLAUDE.md pointer skipped: {e}")
         else:
             verb = {
                 "added": "added to",
                 "refreshed": "refreshed in",
                 "unchanged": "already present in",
             }[result["status"]]
-            print(f"  ✓ dct snippet {verb} {result['path']}")
+            print(f"  ✓ dct pointer {verb} {result['path']}")
             if result["backup"]:
                 print(f"    (backup: {result['backup']})")
     else:
         print(
-            "  ⚠ Snippet not attached — re-run with --attach-snippet, or paste "
-            "dct/assets/claude-md-snippet.md yourself."
+            "  ⚠ CLAUDE.md pointer not attached — re-run with --attach-snippet, or "
+            "paste the block below '---' in dct/assets/claude-md-snippet.md yourself."
         )
 
     print("\nTo register more projects:  dct project add <slug> <path>")
@@ -2606,7 +2620,10 @@ def cmd_upgrade(args):
                 print(f"    Removed dangling link: {path}")
         else:
             print(f"  ⚠ {result['client']}: {result['error']}", file=sys.stderr)
-            print(f"    Run `dct integrate repair {result['client']}` (legacy Claude: `dct init`).", file=sys.stderr)
+            # K-66: each failing check's own remedy (a foreign reference must
+            # be moved aside first); the generic repair only without one.
+            for remedy in result.get("remedies") or [f"Run `dct integrate repair {result['client']}`."]:
+                print(f"    → {remedy}", file=sys.stderr)
 
     print("\nWhat takes effect when:")
     print("  Now (this shell):            dct CLI, hooks, skill bodies")
@@ -2916,6 +2933,8 @@ def _print_integration_result(result: dict, as_json: bool) -> None:
             print(f"{result['client']}: {'ready' if result.get('ok') else 'attention required'}")
     for row in result.get("checks", []):
         print(f"  {row['status']}: {row['check']} — {row['message']}")
+        if row.get("remedy") and row["status"] != "ok":
+            print(f"    → {row['remedy']}")
     for integration in result.get("integrations", []):
         _print_integration_result(integration, False)
     if "error" in result:
@@ -2986,11 +3005,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_init.add_argument(
         "--attach-snippet", dest="attach_snippet", action="store_true", default=None,
-        help="Append the dct snippet to ~/.claude/CLAUDE.md without prompting",
+        help="Append the short dct pointer (names ~/.claude/dct-reference.md) "
+             "to ~/.claude/CLAUDE.md without prompting",
     )
     p_init.add_argument(
         "--no-attach-snippet", dest="attach_snippet", action="store_false",
-        help="Skip the ~/.claude/CLAUDE.md snippet attach",
+        help="Skip the ~/.claude/CLAUDE.md pointer (the reference is installed anyway)",
     )
 
     # hooks

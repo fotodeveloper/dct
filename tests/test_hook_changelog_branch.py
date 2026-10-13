@@ -518,7 +518,8 @@ def test_doctor_flags_a_copied_install_missing_its_lib(tmp_path, installed, monk
     copy_dir = installed(copy=True)
     monkeypatch.setattr(claude, "CLAUDE_HOOKS_DIR", copy_dir)
     for attr, name in (("CLAUDE_JSON", "claude.json"), ("CLAUDE_MD", "CLAUDE.md"),
-                       ("CLAUDE_SETTINGS", "settings.json"), ("CLAUDE_SKILLS_DIR", "skills")):
+                       ("CLAUDE_SETTINGS", "settings.json"), ("CLAUDE_SKILLS_DIR", "skills"),
+                       ("CLAUDE_REFERENCE", "dct-reference.md")):
         monkeypatch.setattr(claude, attr, tmp_path / name)
 
     def hook_assets():
@@ -547,7 +548,7 @@ def test_dct_upgrade_heals_a_drifted_hook_lib_and_doctor_is_clean_again(
     claude_json.write_text(json.dumps({"mcpServers": {"dct": {"command": "dct", "args": ["server"]}}}))
     monkeypatch.setattr(claude, "CLAUDE_JSON", claude_json)
     for attr, name in (("CLAUDE_MD", "CLAUDE.md"), ("CLAUDE_SETTINGS", "settings.json"),
-                       ("CLAUDE_SKILLS_DIR", "skills")):
+                       ("CLAUDE_SKILLS_DIR", "skills"), ("CLAUDE_REFERENCE", "dct-reference.md")):
         monkeypatch.setattr(claude, attr, tmp_path / name)
     monkeypatch.setattr(codex.CodexIntegration, "detect", lambda self: False)
     monkeypatch.setattr(update, "detect_install_method", lambda *a, **k: "editable")

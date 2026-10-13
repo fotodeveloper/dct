@@ -59,8 +59,9 @@ SITE_COUNTS = [
 # worth failing a build over.
 README_PATTERNS = [(r"(\d+) MCP tools", "tools", False)]
 
-# The packaged CLAUDE.md snippet (attached to users' global config by
-# `dct init`) renders the tool count too. It sat outside this gate and
+# The packaged dct reference (installed as ~/.claude/dct-reference.md by
+# `dct init`; before K-36 it was the attached CLAUDE.md snippet) renders the
+# tool count too. It sat outside this gate and
 # silently drifted to "52 total" once (#341/#611) — same exact tier as README.
 SNIPPET_PATTERNS = [(r"\*\*MCP tools\*\* — (\d+) total", "tools", False)]
 
@@ -235,7 +236,7 @@ def main() -> int:
 
     targets = [
         (REPO / "README.md", README_PATTERNS),
-        (REPO / "dct/assets/claude-md-snippet.md", SNIPPET_PATTERNS),
+        (REPO / "dct/assets/dct-reference.md", SNIPPET_PATTERNS),
     ]
     if args.site:
         targets += [(args.site / rel, pats) for rel, pats in SITE_PATTERNS.items()]

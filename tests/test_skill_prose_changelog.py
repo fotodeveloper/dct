@@ -29,7 +29,10 @@ from dct.workflows.release.proof import (
 ROOT = Path(__file__).resolve().parent.parent
 FALLBACKS = ROOT / "docs" / "assistant-fallbacks.md"
 WORKFLOW_DOC = ROOT / "docs" / "release-workflow.md"
-SNIPPET = ROOT / "dct" / "assets" / "claude-md-snippet.md"
+# K-36: the reference every Claude user is pointed at, read on demand (the
+# guide formerly attached as the CLAUDE.md snippet). The short pointer that
+# lands in CLAUDE.md is pinned in test_claude_md_snippet.py.
+REFERENCE = ROOT / "dct" / "assets" / "dct-reference.md"
 
 
 def _skill(name: str) -> str:
@@ -44,8 +47,8 @@ def _fallbacks() -> str:
     return FALLBACKS.read_text(encoding="utf-8")
 
 
-def _snippet() -> str:
-    return SNIPPET.read_text(encoding="utf-8")
+def _reference() -> str:
+    return REFERENCE.read_text(encoding="utf-8")
 
 
 def _trailer_regex() -> re.Pattern:
@@ -167,8 +170,8 @@ DIALOG_DOCS = [
     pytest.param(_release_fallback, id="release-fallback"),
     pytest.param(lambda: _skill("commit"), id="commit-skill"),
     pytest.param(_commit_fallback, id="commit-fallback"),
-    pytest.param(lambda: _section(_snippet(), "**Committing**", "**Session end**"),
-                 id="claude-md-snippet"),
+    pytest.param(lambda: _section(_reference(), "**Committing**", "**Session end**"),
+                 id="dct-reference"),
 ]
 
 
@@ -513,35 +516,36 @@ def test_release_dialog_routes_an_unfinished_release_before_the_project_setting(
     assert re.search(r"ONE (plan )?result", flat)
 
 
-def _snippet_releasing() -> str:
-    return _section(_snippet(), "**Releasing**", "**Session end**")
+def _reference_releasing() -> str:
+    return _section(_reference(), "**Releasing**", "**Session end**")
 
 
-def test_snippet_release_paragraph_only_points_to_the_skill_and_the_fallback():
-    """#877 K-53 (replaces the K-111 pin, which made the snippet a third copy
-    of the release sequence): the always-loaded snippet sends the assistant
-    to `/release` and to the authoritative `/release` fallback; the CLI
+def test_reference_release_paragraph_only_points_to_the_skill_and_the_fallback():
+    """#877 K-53 (replaces the K-111 pin, which made the reference — then the
+    CLAUDE.md snippet — a third copy of the release sequence): the reference
+    every Claude user is pointed at sends the assistant to `/release` and to
+    the authoritative `/release` fallback; the CLI
     sequence, the routing keys and the flags live ONLY in those two. The ban
     is limited to the Releasing paragraph — the same flags may be described
     elsewhere."""
-    body = _snippet_releasing()
+    body = _reference_releasing()
     flat = " ".join(body.split())
     assert "/release" in flat and "assistant-fallbacks.md" in flat
-    assert not _commands(body), f"the snippet still carries release commands: {_commands(body)}"
+    assert not _commands(body), f"the reference still carries release commands: {_commands(body)}"
     for copy in ("--plan-digest", "--proposal-digest", "--consent", "--push-", "--confirm",
                  "executor.", "attest", "takeover", "prepare", "apply"):
         assert copy not in flat, f"a piece of the CLI sequence is still copied here: {copy}"
 
 
-def test_snippet_promises_one_screen_only_for_the_typical_case():
+def test_reference_promises_one_screen_only_for_the_typical_case():
     """"The typical case has one screen" — never one question in every
     exception (a changelog file to settle, an unreadable version, Change
     something add rounds)."""
-    for sentence in re.split(r"(?<=[.!?])\s+", " ".join(_snippet_releasing().split())):
+    for sentence in re.split(r"(?<=[.!?])\s+", " ".join(_reference_releasing().split())):
         if re.search(r"\b(one|ONE|a single|single) (question|dialog|screen)\b", sentence):
             assert re.search(r"\btypical", sentence), f"an unconditional promise: {sentence}"
     assert re.search(r"\btypical[^.]{0,60}\bone screen\b",
-                     " ".join(_snippet_releasing().split()))
+                     " ".join(_reference_releasing().split()))
 
 
 # ── resume without a second question (K-112) ────────────────────────────────
@@ -742,7 +746,7 @@ _ALIAS_RE = re.compile(r"clog release(?![-\w])([^`\n]*)")
 
 @pytest.mark.parametrize("text", [
     *RELEASE_DIALOGS,
-    pytest.param(_snippet, id="claude-md-snippet"),
+    pytest.param(_reference, id="dct-reference"),
     pytest.param(lambda: (ROOT / "README.md").read_text(encoding="utf-8"), id="readme"),
 ])
 def test_every_executable_clog_release_usage_respects_the_shared_consent(text):
@@ -764,8 +768,8 @@ _PUSH_SET = {"--push-remote", "--push-branch", "--push-url"}
 
 @pytest.mark.parametrize("text", [
     *RELEASE_DIALOGS,
-    # (the CLAUDE.md snippet shows no release command at all since K-53 —
-    # test_snippet_release_paragraph_only_points_to_the_skill_and_the_fallback)
+    # (the dct reference shows no release command at all since K-53 —
+    # test_reference_release_paragraph_only_points_to_the_skill_and_the_fallback)
     pytest.param(lambda: (ROOT / "README.md").read_text(encoding="utf-8"), id="readme"),
     pytest.param(lambda: _workflow_doc(), id="release-workflow"),
 ])

@@ -4,7 +4,9 @@ import json
 import shlex
 from pathlib import Path
 
-from dct.integrations import claude
+import pytest
+
+from dct.integrations import claude, codex
 
 
 def test_copied_skill_refresh_preserves_user_directory(tmp_path, monkeypatch):
@@ -115,6 +117,7 @@ def test_uninstall_removes_only_owned_assets(tmp_path, monkeypatch):
     monkeypatch.setattr(claude, 'CLAUDE_HOOKS_DIR', tmp_path / 'hooks')
     monkeypatch.setattr(claude, 'CLAUDE_MD', tmp_path / 'CLAUDE.md')
     monkeypatch.setattr(claude, 'CLAUDE_JSON', config)
+    monkeypatch.setattr(claude, 'CLAUDE_REFERENCE', tmp_path / 'dct-reference.md')
     result = claude.ClaudeIntegration().uninstall()
     assert result['removed']
     assert not (installed / 'pickup').exists()
@@ -126,6 +129,7 @@ def test_uninstall_removes_only_owned_assets(tmp_path, monkeypatch):
 
 def test_claude_detection_requires_dct_and_doctor_reports_missing(tmp_path, monkeypatch):
     monkeypatch.setattr(claude, 'CLAUDE_JSON', tmp_path / 'claude.json')
+    monkeypatch.setattr(claude, 'CLAUDE_REFERENCE', tmp_path / 'dct-reference.md')
     monkeypatch.setattr(claude, 'CLAUDE_MD', tmp_path / 'CLAUDE.md')
     monkeypatch.setattr(claude, 'CLAUDE_SKILLS_DIR', tmp_path / 'skills')
     monkeypatch.setattr(claude, 'CLAUDE_HOOKS_DIR', tmp_path / 'hooks')
@@ -139,6 +143,7 @@ def test_claude_detection_requires_dct_and_doctor_reports_missing(tmp_path, monk
 
 def test_full_claude_adapter_installs_all_required_surfaces(tmp_path, monkeypatch):
     monkeypatch.setattr(claude, 'CLAUDE_JSON', tmp_path / 'claude.json')
+    monkeypatch.setattr(claude, 'CLAUDE_REFERENCE', tmp_path / 'dct-reference.md')
     monkeypatch.setattr(claude, 'CLAUDE_MD', tmp_path / 'CLAUDE.md')
     monkeypatch.setattr(claude, 'CLAUDE_SKILLS_DIR', tmp_path / 'skills')
     monkeypatch.setattr(claude, 'CLAUDE_HOOKS_DIR', tmp_path / 'hooks')
@@ -151,3 +156,129 @@ def test_full_claude_adapter_installs_all_required_surfaces(tmp_path, monkeypatc
     monkeypatch.setattr(claude.shutil, 'which', lambda name, **kwargs: '/tmp/test-dct' if name == 'dct' else None)
     assert adapter.detect()
     assert all(row['status'] == 'ok' for row in adapter.doctor())
+
+
+# ── K-67: bytes outside the managed markers stay identical ───────────────────
+
+
+def _claude_attach(path):
+    return claude.attach_claude_md_snippet(path)
+
+
+def _codex_install(path, monkeypatch):
+    adapter = codex.CodexIntegration()
+    monkeypatch.setattr(adapter, 'instructions_path', path)
+    return adapter.install_instructions()
+
+
+@pytest.fixture(params=['claude', 'codex'])
+def client(request, monkeypatch):
+    """(install(path) -> result, start marker, end marker) per client."""
+    if request.param == 'claude':
+        return (_claude_attach, claude.SNIPPET_START, claude.SNIPPET_END)
+    return (lambda path: _codex_install(path, monkeypatch), codex.START, codex.END)
+
+
+def _outside(raw: bytes, start: str, end: str) -> tuple[bytes, bytes]:
+    left = raw.index(start.encode())
+    right = raw.index(end.encode()) + len(end.encode())
+    return raw[:left], raw[right:]
+
+
+PREFIX = b'# rules\r\n\r\n- keep CRLF\r\n'
+SUFFIX = b'\r\n## after\r\nmixed LF line\nno final newline'
+
+
+def test_refresh_keeps_crlf_prefix_and_suffix_byte_identical(tmp_path, client):
+    install, start, end = client
+    path = tmp_path / 'rules.md'
+    path.write_bytes(PREFIX + f'{start}\r\nOLD\r\n{end}'.encode() + SUFFIX)
+
+    result = install(path)
+
+    raw = path.read_bytes()
+    assert result['status'] == 'refreshed'
+    assert _outside(raw, start, end) == (PREFIX, SUFFIX)
+    block = raw[len(PREFIX):len(raw) - len(SUFFIX)]
+    assert b'OLD' not in block
+    assert block.count(b'\n') == block.count(b'\r\n')  # one style inside the block
+
+
+def test_repeat_on_crlf_file_is_unchanged_without_write_or_backup(tmp_path, client):
+    install, start, end = client
+    path = tmp_path / 'rules.md'
+    path.write_bytes(PREFIX + f'{start}\r\nOLD\r\n{end}'.encode() + SUFFIX)
+    install(path)
+    before = path.read_bytes()
+    stamp = path.stat().st_mtime_ns
+    backups = set(tmp_path.glob('rules.md.bak-dct-*'))
+
+    result = install(path)
+
+    assert result == {'status': 'unchanged', 'backup': None, 'path': str(path)}
+    assert path.read_bytes() == before
+    assert path.stat().st_mtime_ns == stamp
+    assert set(tmp_path.glob('rules.md.bak-dct-*')) == backups
+
+
+@pytest.mark.parametrize('existing', [
+    b'# rules\r\n- crlf\r\n',
+    b'# rules\r\n- no final newline',
+    b'# lf rules\n- mixed\r\n- lines\n',
+    b'  \n',
+])
+def test_append_keeps_existing_bytes_as_prefix(tmp_path, client, existing):
+    install, _start, end = client
+    path = tmp_path / 'rules.md'
+    path.write_bytes(existing)
+
+    assert install(path)['status'] == 'added'
+
+    raw = path.read_bytes()
+    assert raw.startswith(existing)
+    eol = b'\r\n' if existing.startswith(b'# rules\r\n') else b'\n'
+    assert raw.endswith(end.encode() + eol)
+    tail = raw[len(existing):]
+    assert tail.replace(eol, b'').count(b'\n') == 0  # block written in the file's style
+    assert install(path)['status'] == 'unchanged'
+
+
+@pytest.mark.parametrize('broken', ['{start}\r\nno end\r\n', '{end}\r\n', '{end}\r\n{start}\r\n',
+                                    '{start}\r\n{start}\r\n{end}\r\n'])
+def test_malformed_markers_in_crlf_file_write_nothing(tmp_path, client, broken):
+    install, start, end = client
+    path = tmp_path / 'rules.md'
+    original = PREFIX + broken.format(start=start, end=end).encode()
+    path.write_bytes(original)
+
+    with pytest.raises(ValueError, match='nothing was written'):
+        install(path)
+
+    assert path.read_bytes() == original
+    assert not list(tmp_path.glob('rules.md.bak-dct-*'))
+
+
+def test_uninstall_keeps_crlf_outside_the_block(tmp_path, monkeypatch):
+    path = tmp_path / 'CLAUDE.md'
+    monkeypatch.setattr(claude, 'CLAUDE_MD', path)
+    for name in ('CLAUDE_JSON', 'CLAUDE_SETTINGS', 'CLAUDE_SKILLS_DIR', 'CLAUDE_HOOKS_DIR', 'CLAUDE_REFERENCE'):
+        monkeypatch.setattr(claude, name, tmp_path / name)
+    path.write_bytes(PREFIX + f'{claude.SNIPPET_START}\r\nx\r\n{claude.SNIPPET_END}'.encode() + SUFFIX)
+
+    claude.ClaudeIntegration().uninstall()
+
+    assert path.read_bytes() == PREFIX + SUFFIX
+
+
+def test_codex_uninstall_keeps_crlf_outside_the_block(tmp_path, monkeypatch):
+    adapter = codex.CodexIntegration()
+    path = tmp_path / 'AGENTS.md'
+    monkeypatch.setattr(adapter, 'instructions_path', path)
+    monkeypatch.setattr(adapter, 'config_path', tmp_path / 'config.toml')
+    monkeypatch.setattr(adapter, 'skills_path', tmp_path / 'skills')
+    monkeypatch.setattr(adapter, '_uninstall_hooks', lambda: ([], []))
+    path.write_bytes(PREFIX + f'{codex.START}\r\nx\r\n{codex.END}'.encode() + SUFFIX)
+
+    adapter.uninstall()
+
+    assert path.read_bytes() == PREFIX + SUFFIX

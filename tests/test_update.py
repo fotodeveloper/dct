@@ -502,7 +502,8 @@ def test_register_probe_join_noop_when_opted_out(tmp_path, monkeypatch):
 
 def test_upgrade_warns_when_relink_fails(monkeypatch, capsys):
     """FIX 7: when the skill/hook re-link raises, print a warning naming the error
-    and suggesting `dct init` — NOT the success line."""
+    and suggesting `dct integrate repair claude` — NOT the success line, and
+    never the interactive `dct init` (#917 K-66)."""
     from dct.integrations.codex import CodexIntegration
 
     monkeypatch.setattr(update, "detect_install_method", lambda *a, **k: "editable")
@@ -516,7 +517,8 @@ def test_upgrade_warns_when_relink_fails(monkeypatch, capsys):
     cli.cmd_upgrade(_ns())
     out = capsys.readouterr()
     assert "disk full" in out.err
-    assert "dct init" in out.err
+    assert "dct integrate repair claude" in out.err
+    assert "dct init" not in out.err
     assert "Skills and hooks re-linked" not in out.out
 
 
