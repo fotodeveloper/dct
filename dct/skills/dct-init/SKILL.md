@@ -344,9 +344,17 @@ every commit of this project. Asked once; once stored, never asked again:
     - "Both — Co-Authored-By and a link to the assistant session" — "The link points to this conversation — never in a public repository, the conversation can hold private content."
     - "Session link only"
 
-The project's own rules win over a stored yes: when its CLAUDE.md forbids
-one of these lines (a public repository that bans session links), say so
-in the question and leave out the options that add it.
+The project's own rules win over a stored yes: read them from the
+project's instruction files on disk in the project folder — `AGENTS.md`
+and, where the project still keeps rules there, `CLAUDE.md` /
+`CLAUDE.local.md` (also `.claude/CLAUDE.md`); a project with only
+`AGENTS.md` is read the same way. Never rely on the client's automatic
+`@import` expansion: a line `@<path>` in one of them means: read `<path>`
+yourself. When the project's own rules in any of them forbid one of these
+lines (a public repository that bans session links), say so in the
+question and leave out the options that add it: the line is never offered
+to approve again, and Step 6 stores it as `off`. The same holds for the
+once-only question of Step 2.
 
 **Q4 — the allowlist** (only when Step 3 found no dct entry):
 
