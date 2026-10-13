@@ -6,15 +6,20 @@ used to copy verbatim; they live here so the monkeypatch target — the one
 seam through which a test file reaches the in-memory DB — is stated once.
 """
 
+import importlib
 import os
+import pkgutil
 import re
 import shutil
 import subprocess
 import sys
+import tempfile
+from pathlib import Path, PurePath
 
 import pytest
 import sqlalchemy as sa
 
+import dct
 from dct.db import create_tables, get_engine
 
 # PG test lane (#426). Unset (the default) → in-memory SQLite, one fresh
@@ -185,6 +190,148 @@ def _suite_isolation(tmp_path_factory):
                 os.environ.pop(key, None)
             else:
                 os.environ[key] = value
+
+
+# --- Home isolation (K-51) --------------------------------------------------
+# The Claude and Codex integrations write into the user's home (~/.claude,
+# ~/.claude.json, ~/.codex, ~/.agents); dct.paths resolves config/data dirs and
+# the legacy ~/.claude from it. A test that reaches one of those writers
+# without patching every path would rewrite the developer's private files.
+# Captured ONCE at conftest import, before any isolation: the guard tests
+# (test_home_isolation.py) compare every dct value against it.
+REAL_HOME = Path(os.path.expanduser("~"))
+
+# Code and interpreter locations: a checkout or venv may live inside the real
+# home, but a path under them (a module's __file__, packaged assets) is not
+# derived from the home and is never re-rooted. Matched LEXICALLY (each root
+# as given and resolved): a home file that is a symlink INTO the checkout
+# (an installed ~/.claude/dct-reference.md) is still home state.
+CODE_ROOTS = tuple({
+    Path(resolve(root))
+    for root in (REPO_ROOT, os.path.dirname(os.path.abspath(dct.__file__)),
+                 sys.prefix, sys.base_prefix, sys.exec_prefix)
+    for resolve in (os.path.abspath, os.path.realpath)
+})
+
+# Home variables cleared for every test: unset, each location falls back to
+# the fake HOME, so a test that sets HOME itself moves all of them along.
+_DERIVED_HOME_ENV = ("CODEX_HOME", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME",
+                     "XDG_STATE_HOME", "CLAUDE_CONFIG_DIR")
+
+
+def import_all_dct_modules() -> None:
+    """Import every dct module, so each import-time constant exists and falls
+    under the re-rooting below (an optional extra that is not installed only
+    leaves its own modules out)."""
+    for info in pkgutil.walk_packages(dct.__path__, "dct."):
+        try:
+            importlib.import_module(info.name)
+        except ModuleNotFoundError as exc:
+            if (exc.name or "").split(".")[0] == "dct":
+                raise
+
+
+def _relative_to(path: PurePath, root) -> PurePath | None:
+    try:
+        return path.relative_to(root)
+    except ValueError:
+        return None
+
+
+def _home_relative(path: PurePath, fake_root: Path) -> PurePath | None:
+    """`path` relative to the home it was derived from — the real home or an
+    earlier test's fake home (a module first imported during a test computes
+    its constants under that test's home) — or None when it is not
+    home-derived."""
+    rel = _relative_to(path, fake_root)
+    if rel is not None:
+        return PurePath(*rel.parts[1:]) if rel.parts else None
+    if any(_relative_to(path, root) is not None for root in CODE_ROOTS):
+        return None
+    for home in (REAL_HOME, Path(os.path.realpath(REAL_HOME))):
+        rel = _relative_to(path, home)
+        if rel is not None:
+            return rel
+    return None
+
+
+def _home_derived_constants(fake_root: Path):
+    """(module, attribute, path relative to its home) for every module-level
+    Path of a loaded dct module that was computed from a home directory."""
+    for name, module in list(sys.modules.items()):
+        if module is None or not (name == "dct" or name.startswith("dct.")):
+            continue
+        for attr, value in list(vars(module).items()):
+            if attr.startswith("__") or not issubclass(type(value), PurePath):
+                continue
+            rel = _home_relative(value, fake_root)
+            if rel is not None:
+                yield module, attr, rel
+
+
+@pytest.fixture(scope="session")
+def _fake_home_root(tmp_path_factory):
+    """Parent of every per-test fake home. Importing all dct modules first
+    computes every import-time constant under the REAL home, so each one is
+    exercised by the re-rooting — and by the guard in test_home_isolation."""
+    import_all_dct_modules()
+    return tmp_path_factory.mktemp("homes")
+
+
+def direct_git_dir(bin_dir: Path) -> Path | None:
+    """A directory whose `git` is the real binary behind macOS's xcrun shim,
+    or None when PATH's git is not that shim.
+
+    /usr/bin/git is an xcrun shim whose tool-lookup cache does not match a
+    changed HOME: under a fresh fake home every git spawn re-resolves the
+    developer dir (~65 ms; inside a write-restricted sandbox the cache cannot
+    be written at all), and a release test spawns ~300 of them — 20-30 s per
+    test. Resolved ONCE, under the real home; the symlink keeps git's own
+    exec path (git-core next to the real binary)."""
+    found = shutil.which("git")
+    if sys.platform != "darwin" or found is None or os.path.realpath(found) != "/usr/bin/git":
+        return None
+    try:
+        real = subprocess.run(["xcrun", "--find", "git"], capture_output=True, text=True,
+                              timeout=30, check=True).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if not real or not os.path.isfile(real):
+        return None
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    (bin_dir / "git").symlink_to(real)
+    return bin_dir
+
+
+@pytest.fixture(scope="session")
+def _direct_git(tmp_path_factory):
+    return direct_git_dir(tmp_path_factory.mktemp("direct-git"))
+
+
+@pytest.fixture(autouse=True)
+def _home_isolation(_fake_home_root, _direct_git, monkeypatch):
+    """A fresh, empty fake home for every test (K-51).
+
+    HOME / USERPROFILE point at it (inherited by subprocesses: hooks, git,
+    child interpreters); CODEX_HOME, XDG_* and CLAUDE_CONFIG_DIR are unset so
+    they resolve under it; and every module-level Path a dct module computed
+    from a home at import time (claude.CLAUDE_*, setup's re-exports, any
+    future one) is re-rooted onto it. Tests that exercise home resolution set
+    their own artificial HOME / CODEX_HOME / XDG_* on top with monkeypatch.
+    Git reads ~/.gitconfig through HOME: a test that commits through dct uses
+    the `git_identity` fixture. On macOS `git` on PATH is the real binary, not
+    the xcrun shim (see `direct_git_dir`).
+    """
+    home = Path(tempfile.mkdtemp(prefix="home-", dir=_fake_home_root))
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
+    if _direct_git is not None:
+        monkeypatch.setenv("PATH", f"{_direct_git}{os.pathsep}{os.environ.get('PATH', '')}")
+    for var in _DERIVED_HOME_ENV:
+        monkeypatch.delenv(var, raising=False)
+    for module, attr, rel in list(_home_derived_constants(_fake_home_root)):
+        monkeypatch.setattr(module, attr, home / rel)
+    return home
 
 
 @pytest.fixture
