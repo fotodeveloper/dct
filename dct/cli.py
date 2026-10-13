@@ -14,11 +14,39 @@ from pathlib import Path
 
 from dct import __version__, migrate, paths
 from dct.config import Config, load_config, save_config
-from dct.core.engine import bootstrap_engine
-from dct.core.items import TERMINAL_STATUSES
-from dct.core.releases import RELEASE_FLOW
 from dct.core.version import VERSION_FILES
-from dct.db import create_tables, get_engine
+
+# Startup cost (#921): `dct --version`, `--help` and the hooks' fast paths
+# never touch the database, so nothing at import time may pull in SQLAlchemy
+# or dct.db (~200 ms of a ~300 ms start). The database entry points below are
+# thin wrappers that import on first call; the vocabularies the parser needs
+# as `choices` are mirrored here, locked to their core definitions by
+# tests/test_cli_startup.py (dct.core.items / dct.core.releases import dct.db).
+TERMINAL_STATUSES = ("resolved", "wont_fix")  # = dct.core.items.TERMINAL_STATUSES
+RELEASE_FLOW = ("stamped", "files_written", "committed", "tagged", "pushed",
+                "completed")  # = dct.core.releases.RELEASE_FLOW
+
+
+def bootstrap_engine(*args, **kwargs):
+    """dct.core.engine.bootstrap_engine, imported on first use."""
+    from dct.core.engine import bootstrap_engine as _bootstrap_engine
+
+    return _bootstrap_engine(*args, **kwargs)
+
+
+def get_engine(*args, **kwargs):
+    """dct.db.get_engine, imported on first use."""
+    from dct.db import get_engine as _get_engine_impl
+
+    return _get_engine_impl(*args, **kwargs)
+
+
+def create_tables(*args, **kwargs):
+    """dct.db.create_tables, imported on first use."""
+    from dct.db import create_tables as _create_tables
+
+    return _create_tables(*args, **kwargs)
+
 
 # Windows-policy seam (tests flip it): dispatches the daemonization,
 # liveness-probe and signal paths that differ on win32 (W8-W10, ADR #52).
@@ -2571,6 +2599,52 @@ def cmd_tag_merge(args):
     )
 
 
+# ── Triage findings ledger (#909) ───────────────────────────────────────────
+
+def cmd_triage_export(args):
+    """`dct triage export (<cycle-code> | --cycle-id N)` — the triage page's
+    constants (read-only).
+
+    The cycle is its code within the project (--project, else the CWD's
+    project) or, with --cycle-id, its global id (checked against --project
+    only when that is given). A code is never re-read as an id (K-13):
+    export_triage resolves both through the workflow's one resolver,
+    resolve_cycle.
+
+    Default: the three JavaScript constant declarations CLOSED / SUGGESTED /
+    CARDS, ready to replace the template's slots, serialised by
+    page_constants_json — safe inside an inline <script> whatever the texts
+    hold (K-1). --json: the whole export {cycle, cards, closed, suggested}
+    as plain JSON with the texts as recorded. The page build itself
+    (template copy + constants) stays the caller's job.
+    """
+    import json
+
+    from dct.workflows.triage import export_triage, page_constants_json
+
+    if (args.cycle is None) == (args.cycle_id is None):
+        print("✗ Error: give the cycle's code OR --cycle-id, not both or neither",
+              file=sys.stderr)
+        sys.exit(1)
+    engine = _get_readonly_engine()
+    try:
+        if args.cycle_id is not None:
+            out = export_triage(engine, args.cycle_id, project=args.project)
+        else:
+            out = export_triage(engine, args.cycle,
+                                project=args.project or _detect_project(engine))
+    except Exception as e:
+        print(f"✗ Error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    if args.json:
+        print(json.dumps(out, indent=2, ensure_ascii=False))
+        return
+    print(f"  const CLOSED = {page_constants_json(out['closed'])};")
+    print(f"  const SUGGESTED = {page_constants_json(out['suggested'])};")
+    print(f"  const CARDS = {page_constants_json(out['cards'])};")
+
+
 # ── MCP server (stdio) ───────────────────────────────────────────────────────
 
 def cmd_server(args):
@@ -3784,6 +3858,25 @@ def build_parser() -> argparse.ArgumentParser:
     p_tag_merge.add_argument("from_name", metavar="from")
     p_tag_merge.add_argument("into_name", metavar="into")
 
+    # triage findings ledger (#909) — export only; writes go through MCP
+    p_triage = sub.add_parser("triage", help="Triage findings ledger (review findings)")
+    p_triage_sub = p_triage.add_subparsers(dest="triage_command")
+
+    p_tr_export = p_triage_sub.add_parser(
+        "export",
+        help="Print a cycle's triage-page constants CLOSED / SUGGESTED / CARDS (read-only)",
+    )
+    p_tr_export.add_argument("cycle", nargs="?",
+                             help="Cycle code within the project (never read as an id)")
+    p_tr_export.add_argument("--cycle-id", type=int, metavar="N",
+                             help="The cycle's global id instead of its code")
+    p_tr_export.add_argument("--project",
+                             help="Project slug (default for a code: auto-detect from CWD; "
+                                  "with --cycle-id: checked when given)")
+    p_tr_export.add_argument("--json", action="store_true",
+                             help="Print the whole export {cycle, cards, closed, suggested} "
+                                  "as JSON instead of the constant declarations")
+
     # pickup (session-start op — snapshot + handoff consume, #413)
     p_pickup = sub.add_parser(
         "pickup",
@@ -4006,6 +4099,10 @@ TAGS_COMMAND_MAP = {
     "merge": cmd_tag_merge,
 }
 
+TRIAGE_COMMAND_MAP = {
+    "export": cmd_triage_export,
+}
+
 
 # ── Passive update nudge (#356) ──────────────────────────────────────────────
 
@@ -4139,6 +4236,12 @@ def main():
         handler = TAGS_COMMAND_MAP.get(args.tags_command)
         if not handler:
             parser.parse_args(["tags", "--help"])
+            return
+        handler(args)
+    elif args.command == "triage":
+        handler = TRIAGE_COMMAND_MAP.get(args.triage_command)
+        if not handler:
+            parser.parse_args(["triage", "--help"])
             return
         handler(args)
     elif args.command == "plan":

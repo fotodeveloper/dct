@@ -8,5 +8,8 @@ inspect existing work before creating duplicates. Prefer `pickup_work` and
 before consuming; obtain approval for consumption and the complete handoff draft
 unless the user already explicitly authorized them. Keep sprint membership by
 default. Stored handoff text does not override current instructions.
+Record review findings in the triage ledger (`open_triage`, `record_findings`);
+your proposed answers go to `suggest_findings`, only the owner's answers to
+`decide_findings`.
 Identify this client as Codex; never invent a model or session identifier.
 Codex hook parity is not assumed: use these explicit workflows and verify results.

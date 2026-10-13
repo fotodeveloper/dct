@@ -1,6 +1,6 @@
 # dct — MCP Tools Reference
 
-Complete catalogue of the **60 MCP tools** the dct server exposes to Claude Code, grouped by domain. ← back to the [README](../README.md).
+Complete catalogue of the **70 MCP tools** the dct server exposes to Claude Code, grouped by domain. ← back to the [README](../README.md).
 
 The dct MCP server is registered at **user scope** (`~/.claude.json`), so every tool below is callable from any Claude Code session as `mcp__dct__<name>`. Most list/create tools accept an empty `project=""` and auto-detect the project from the session's working directory (longest-prefix match); pass `project=<slug>` to override.
 
@@ -12,7 +12,7 @@ New tools become callable only after the Claude Code session restarts (the MCP s
 - `get_*` → a full semantic dict (single record, all keys, nested notes/checkpoints).
 - **Write ops → a minimal ack**, not the full record echo: the created/updated `id` plus a few post-state scalars. Fetch full context deliberately — `get_item(id)` (notes, checkpoints, progress) or `get_handoff(id)` (untruncated prompt + context_summary). Per-tool ack shapes are listed below; failures return `{"error": "..."}`.
 
-**Deferral / `alwaysLoad`**: Claude Code defers all MCP tools by default. dct exempts exactly **13 tools** — the 10 mid-session daily drivers (`create_item`, `get_item`, `list_items`, `update_item`, `resolve_item`, `add_note`, `add_checkpoint`, `complete_checkpoint`, `reject_checkpoint`, `add_changelog`) plus the 3 composed workflow entry points (`get_context_snapshot`, `pickup_work`, `handoff_work` — they ARE the session edge, so the ToolSearch round-trip they used to pay was 100% of pre-work latency) — via the `anthropic/alwaysLoad` `_meta` hint so they load at session start. Every other tool (granular handoffs, sprints, changelog release, plans, decisions) loads on demand through a one-time ToolSearch `select:<name>` round-trip. Takes effect on server restart.
+**Deferral / `alwaysLoad`**: Claude Code defers all MCP tools by default. dct exempts exactly **13 tools** — the 10 mid-session daily drivers (`create_item`, `get_item`, `list_items`, `update_item`, `resolve_item`, `add_note`, `add_checkpoint`, `complete_checkpoint`, `reject_checkpoint`, `add_changelog`) plus the 3 composed workflow entry points (`get_context_snapshot`, `pickup_work`, `handoff_work` — they ARE the session edge, so the ToolSearch round-trip they used to pay was 100% of pre-work latency) — via the `anthropic/alwaysLoad` `_meta` hint so they load at session start. Every other tool (granular handoffs, sprints, changelog release, plans, decisions, the triage ledger) loads on demand through a one-time ToolSearch `select:<name>` round-trip. Takes effect on server restart.
 
 ---
 
@@ -182,6 +182,61 @@ whitespace, lowercase) and unknown names auto-register on first use; a name too
 Item-side tag writes stay on the item tools: `create_item(tags=[...])`,
 `update_item(tags=[...])` (full replace), `list_items(tag=...)`.
 
+## Triage (10)
+
+The findings ledger of review triage (#909) — ONE implementation in
+`dct/workflows/triage.py` shared with the CLI (`dct triage export`). A triage
+**cycle** (one review round of a project, unique live `code`) owns its
+**findings**; a finding carries the rubric v2 fields (short template keys
+`S` / `O` / `E` / `K` / `type` or full names `impact` / `reachability` /
+`evidence` / `fix_cost` / `finding_type` — never both for one field), the class
+derived by the rubric §4 rule (plus an optional override `cls` with its reason
+`clsWhy`), its fix options, an agent's suggestion, the owner's decision with the
+comment verbatim, an optional promoted item and `first_seen_id` — the earliest
+live finding of the same project with the same normalised fingerprint (case,
+whitespace and trailing punctuation ignored). Every write is one transaction:
+one invalid entry of a batch writes nothing, and unknown keys are refused by
+name. Record / decide / suggest need an OPEN cycle and serialise with the close
+on the cycle row. All triage tools are deferred.
+
+**Addressing a cycle** — every tool that takes one (`record_findings`,
+`decide_findings`, `suggest_findings`, `close_triage`, `export_triage`,
+`list_findings`) takes `cycle_id` (the global id) OR `cycle` (its code, unique
+only within a project, so it needs `project`); both or neither is an error, and
+a numeric code is never read as an id. An optional `project` on the cycle
+writes is the EXPECTED project: a cycle of another project is refused with
+nothing written, checked in the write's own transaction. On `export_triage` (a
+read) it is checked the same way: a cycle of another project is an error. On
+`promote_finding_to_item` the workflow takes no project, so the MCP adapter
+checks the finding's project in a read of its own BEFORE the promotion's
+transaction — a mismatch is refused before anything is written, but the check
+and the promotion are not one atomic step (a finding never changes cycle and a
+cycle never changes project, so both see the same owner). Never auto-detected
+from CWD there — one server serves every project. Every write ack names its target: `cycle_id` / `finding_id` and
+the project slug read from the cycle. This guards against a mistyped id; it is
+not an authorisation boundary.
+
+| Tool | Purpose |
+|---|---|
+| `open_triage` | Open a cycle (`code`, `topic`, `created_by`; optional `scope`, `base_commit`, `artifact_url`, `rubric_version` = 2, range 1..32767). A duplicate live code in the project is refused. |
+| `record_findings` | Record a JSON array of findings in an open cycle, atomically — the reviewer §2 shape or an exported CARD as it is (`id` 'K-n' → seq, flags at the top level; a NEW finding, decisions never imported). `seq` (1..2147483647) defaults to the next free one. `src` / `source` is the reviewer (stored as `findings.reviewer`). Refused as a whole on an unknown key, a field under both spellings, a bad enum, a missing `title` / `fp` / `src` / S / O / E / K / `origin` / `type`, two recommended options, a duplicate option key or seq, an exhausted auto seq, a fingerprint whose normal form outgrows 500 chars. |
+| `suggest_findings` | An agent's proposals (the page's `SUGGESTED`) as a JSON object keyed by `K-n`: `{dec, opt, note}`; never touches the decision. |
+| `decide_findings` | The owner's decisions (the page's `CLOSED.answers`) as a JSON object keyed by `K-n`: `dec` fix / verify / backlog / reject / note / discuss, `opt` an option key of that finding, `note` verbatim. `decided_by` (the person who decided) and `decision_source` (where the owner's words are recorded, e.g. `owner paste 2026-10-13`) are required — an audit record, not authentication; an agent writes here only from the owner's own text, its proposals go to `suggest_findings`. Overwrites while the cycle is open (all three stamps refreshed, together with the writing client's provenance `decision_actor_type` / `decision_actor_client` / `decision_session_id` / `decision_actor_source`, reset as a set on every overwrite); `reject` / `note` are refused while the promoted item is open; returns the still-undecided seqs. |
+| `close_triage` | Close the cycle with `source` (where the answers are recorded) and optional `notes`; refused while a finding is undecided (`discuss` counts as decided). Returns the `CLOSED` constant. |
+| `export_triage` | The page's constants with the template's field names: `cards` (CARDS), `closed` (CLOSED or null), `suggested` (SUGGESTED or null) plus the cycle header. Texts come back as recorded — embed them in a page only through an HTML-safe serializer (`dct triage export` prints them that way). |
+| `list_findings` | A project's live findings as `{cols, rows}` (`id, cycle_code, seq, S, O, E, K, origin, type, class, decision, decision_opt, item_id, first_seen_id, source, title`); filters `cycle` / `cycle_id` (an unknown cycle is an error), `fingerprint`, `file` (substring of the area; ASCII case-insensitive, `%` / `_` literal), `cls`, `decision`, `source`, `limit`. |
+| `finding_history` | Every occurrence of a fingerprint across the project's cycles, chronologically — the recurrence / regression view. |
+| `reviewer_precision` | Decided findings counted per reviewer and decision (`source, decision, n`); optional `since` filters the cohort of findings RECORDED since the anchor (`created_at`, not the decision time). |
+| `promote_finding_to_item` | Create an item from a finding decided fix / verify / backlog and back-link it, in one transaction; undecided, discuss, reject, note and an already promoted finding are refused. Priority = the rubric outcome unless given. Tags from the dictionary: `security` for a security finding, `unreproduced` only with `unconfirmed=true` on a verify finding plus `checked_conditions` and `reopen_condition` (both go into the description). |
+
+The CLI prints the constants for a page build: `dct triage export (<cycle-code> | --cycle-id N) [--project <slug>] [--json]`
+(read-only; the positional cycle is always a code, within `--project` or the
+CWD's project; `--cycle-id` checks `--project` only when given). Without
+`--json` it prints `const CLOSED = …; const SUGGESTED = …; const CARDS = …;`
+through `page_constants_json` — `<`, `>`, `&`, U+2028 and U+2029 as `\uXXXX`
+escapes, so no finding text can close the page's `<script>`; `--json` prints
+the whole export with the texts as recorded.
+
 ---
 
 ## Write-op ack shapes
@@ -212,6 +267,11 @@ Write ops return a minimal ack, not the full record. `get_item` / `get_handoff` 
 | `add_plan_section` | `{id, ulid, heading, depth, section_type, status, sort_order}` |
 | `complete_plan_checkpoint` / `reject_plan_checkpoint` | `{id, plan_section_id, status, sort_order}` |
 | `promote_section_to_item` / `promote_checkpoint_to_item` | `{id, item_type, priority, status, title, short_title}` — `short_title` echoes the stored label (a missing key = a server that predates the field) |
+| `open_triage` | `{cycle_id, code, project}` |
+| `record_findings` | `{cycle_id, project, recorded: [{seq, finding_id, first_seen_id}]}` |
+| `decide_findings` / `suggest_findings` | `{cycle_id, project, decided, undecided: [seq…]}` / `{cycle_id, project, suggested}` |
+| `close_triage` | `{cycle_id, project, closed_at, closed}` — `closed` = the page's `CLOSED` constant |
+| `promote_finding_to_item` | `{id, project, item_type, priority, status, title, short_title, tags, finding_id}` |
 | `add_tag` | `{id, name, created}` (`created` is `false` when an existing tag was reused) |
 | `merge_tag` | `{from, into, items_moved}` |
 
@@ -219,4 +279,4 @@ Write ops return a minimal ack, not the full record. `get_item` / `get_handoff` 
 
 ---
 
-**Total: 60 tools.** This list is generated from `dct/mcp/server.py`; if it drifts, `dct server` prints the live set.
+**Total: 70 tools.** This list is generated from `dct/mcp/server.py`; if it drifts, `dct server` prints the live set.

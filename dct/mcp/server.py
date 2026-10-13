@@ -89,6 +89,11 @@ _INSTRUCTIONS = (
         "  handoff_work(prompt, created_by, item_ids=...) = sprint + handoff atomically.\n"
         "- Mid-session \"where do we stand?\": get_context_snapshot(include=...).\n"
         "  The granular tools above remain for surgical operations.\n\n"
+        "TRIAGE LEDGER (review findings, rubric v2 — deferred tools): open_triage →\n"
+        "  record_findings (JSON array of findings; one bad finding = nothing written) →\n"
+        "  suggest_findings (an agent's proposals) / decide_findings (the owner's answers,\n"
+        "  verbatim) → close_triage. export_triage = the triage page's CARDS / CLOSED /\n"
+        "  SUGGESTED; list_findings, finding_history, reviewer_precision read the ledger.\n\n"
         "TOOL-CALL HYGIENE: pass every argument as its own top-level parameter — never\n"
         "nest one prose field in another. Free-text tools reject literal tool-call markup;\n"
         "a rejection means re-send with the fields split out."
@@ -210,14 +215,24 @@ def _reject_toolcall_markup(**fields) -> dict | None:
     List values (K-13: `tags` on create_item / update_item) are inspected
     ELEMENT BY ELEMENT — a mangled call can collapse siblings into one array
     entry just as easily as into a scalar field — and the offending element is
-    reported as 'field[i]'.
+    reported as 'field[i]'. Nested batch payloads (#909: record_findings'
+    `findings`, decide_findings' `decisions`) are walked recursively, every
+    dict VALUE included, and reported as 'field[i].key' / 'field.key'.
     """
     flat: list[tuple[str, object]] = []
-    for name, value in fields.items():
+
+    def walk(name: str, value) -> None:
         if isinstance(value, list | tuple):
-            flat.extend((f"{name}[{i}]", element) for i, element in enumerate(value))
+            for i, element in enumerate(value):
+                walk(f"{name}[{i}]", element)
+        elif isinstance(value, dict):
+            for key, element in value.items():
+                walk(f"{name}.{key}", element)
         else:
             flat.append((name, value))
+
+    for name, value in fields.items():
+        walk(name, value)
     for name, value in flat:
         if not isinstance(value, str) or not value:
             continue
@@ -3218,6 +3233,595 @@ def ingest_plan_file(
             project_slug=_resolve_project(project),
             auto_resolve_uncertain=auto_resolve_uncertain,
         )
+    except Exception as e:
+        return {"error": str(e)}
+
+
+# ── Triage findings ledger (#909) ─────────────────────────────────────────────
+# Thin MCP layer over dct/workflows/triage.py — ONE implementation shared with
+# the CLI (`dct triage export`); validation, atomicity and the open-cycle gate
+# live there. Deferred by design (no _ALWAYS_LOAD_META): used in review
+# sessions only.
+
+
+@mcp.tool(structured_output=False)
+def open_triage(
+    code: str,
+    topic: str,
+    created_by: str,
+    project: str = "",
+    scope: str = "",
+    base_commit: str = "",
+    artifact_url: str = "",
+    rubric_version: int = 2,
+) -> dict:
+    """Open a triage cycle — one review round whose findings are recorded, decided and closed.
+
+    REMEMBER the returned `cycle_id` — every other triage write takes it.
+    Each field below is a SEPARATE top-level parameter.
+
+    Args:
+        code: Cycle handle, unique among the project's live cycles (e.g.
+            "rev-877-r2"; ≤ 100 chars). A duplicate is refused.
+        topic: What the review was about (≤ 200 chars).
+        created_by: Who opened it — self-identify (e.g. "Claude Code
+            @ 2026-10-13T14:30Z"); ≤ 200 chars.
+        project: Slug. Empty = auto-detect from CWD.
+        scope: Optional — what was reviewed (diff range, files).
+        base_commit: Optional fixed base commit of the cycle (≤ 64 chars).
+        artifact_url: Optional URL of the triage page (≤ 500 chars).
+        rubric_version: Review rubric version (default 2; 1..32767).
+
+    Returns: slim ack {cycle_id, code, project}. {"error": "..."} on a
+        missing code / topic / created_by, a duplicate live code, an
+        over-long field (refused, never truncated), a rubric_version outside
+        1..32767, tool-call markup, or an unresolvable project.
+    """
+    if (err := _reject_toolcall_markup(
+        code=code, topic=topic, created_by=created_by, scope=scope,
+        base_commit=base_commit, artifact_url=artifact_url,
+    )):
+        return err
+    from dct.workflows.triage import open_triage as _open
+
+    try:
+        project_slug = _resolve_project(project, required=True)
+        assert project_slug is not None
+        return _open(
+            _get_engine(), project_slug, code, topic, created_by,
+            scope=scope or None, base_commit=base_commit or None,
+            rubric_version=rubric_version, artifact_url=artifact_url or None,
+        )
+    except Exception as e:
+        return {"error": str(e)}
+
+
+# Every write takes its target in the same shape (K-13 / K-11): the cycle as
+# `cycle_id` (global id) OR `cycle` (its code, which needs `project`), plus an
+# optional `project` that, when given, must be the cycle's project — checked
+# again by the workflow inside the write's own transaction. The ack echoes the
+# cycle's project slug, read from the cycle itself, never from the server's CWD.
+
+
+def _triage_cycle_target(cycle_id: int, cycle: str, project: str) -> tuple[int, str]:
+    """(cycle_id, cycle, project) of a triage tool → (the cycle's id, its
+    project's slug), through the workflow's ONE resolver (resolve_cycle).
+
+    Exactly one of cycle_id (0 = not given) / cycle ('' = not given); a code
+    is never re-read as an id, and a code without `project` is refused.
+    Raises ValueError on every refusal (the caller wraps it in {"error"})."""
+    import sqlalchemy as sa
+
+    from dct.db import projects, triage_cycles
+    from dct.workflows.triage import resolve_cycle
+
+    if cycle_id and cycle:
+        raise ValueError("Pass cycle_id OR cycle (a code, with project), not both")
+    if not cycle_id and not cycle:
+        raise ValueError("A cycle is required: cycle_id, or cycle (its code) with project")
+    with _get_engine().connect() as conn:
+        resolved = resolve_cycle(conn, project or None, cycle_id or cycle)
+        slug = conn.execute(
+            sa.select(projects.c.slug)
+            .select_from(triage_cycles.join(projects, projects.c.id == triage_cycles.c.project_id))
+            .where(triage_cycles.c.id == resolved)
+        ).scalar_one()
+    return resolved, slug
+
+
+def _finding_project(finding_id: int, project: str) -> str | None:
+    """The project slug of a live finding's cycle (K-11), or None when the
+    finding is missing / its id out of range (the workflow then refuses it by
+    name). A given `project` must be that slug, else ValueError.
+
+    A finding never changes cycle and a cycle never changes project, so this
+    read and the promotion's own transaction see the same owner; a cycle,
+    finding or project soft-deleted in between is refused by the promotion."""
+    import sqlalchemy as sa
+
+    from dct.db import findings, projects, triage_cycles
+    from dct.workflows.triage import INT_MAX
+
+    slug = None
+    if isinstance(finding_id, int) and not isinstance(finding_id, bool) \
+            and 1 <= finding_id <= INT_MAX:
+        with _get_engine().connect() as conn:
+            slug = conn.execute(
+                sa.select(projects.c.slug)
+                .select_from(
+                    findings.join(triage_cycles, triage_cycles.c.id == findings.c.cycle_id)
+                    .join(projects, projects.c.id == triage_cycles.c.project_id))
+                .where(findings.c.id == finding_id, findings.c.deleted_at.is_(None),
+                       triage_cycles.c.deleted_at.is_(None))
+            ).scalar()
+    if project and slug is not None and slug != project:
+        raise ValueError(f"Finding #{finding_id} does not belong to project '{project}'")
+    return slug
+
+
+@mcp.tool(structured_output=False)
+def record_findings(
+    findings: list[dict], cycle_id: int = 0, cycle: str = "", project: str = "",
+) -> dict:
+    """Record a BATCH of review findings in an OPEN triage cycle — atomically.
+
+    Pass `findings` as a JSON array of objects, one per finding, in the
+    reviewer output's rubric v2 shape OR an exported CARD as it is. Keys per
+    finding — the template's short key OR the full column name, never both
+    for one field:
+      title (required) · fp|fingerprint (required; "<invariant> violated at
+      <boundary> by <trigger>"; its normal form must fit 500 chars — never
+      truncated) · src|source (required; the REVIEWER, e.g. "codex",
+      "panel:security" — not provenance) · S|impact 0-3 · O|reachability 0-3
+      or "?" · E|evidence 0-3 · K|fix_cost "S"|"M"|"L" · origin
+      diff|pre|latent · type|finding_type security|spec|spec-gap|correctness|
+      robustness|perf|maintainability|opinion (S/O/E/K/origin/type required)
+      · area (file:line list) · ctx|context (string or array of paragraphs)
+      · seq|id (optional K-n number 1..2147483647, or the CARD's "K-<n>";
+      default = next free) · flags {conflict, violation (default true),
+      dispute, openDesign} (booleans) — or those four at the top level, as a
+      CARD carries them · cls|class_override fix|verify|quick|decide|backlog|
+      reject|note + clsWhy|class_reason (required with an override) ·
+      opts|options: array of {k|key, t|text, why, root|is_root,
+      rec|is_recommended} (at most one rec).
+    Example: [{"title": "...", "fp": "...", "src": "codex", "S": 2, "O": 1,
+    "E": 2, "K": "S", "origin": "diff", "type": "correctness",
+    "opts": [{"k": "a", "t": "...", "rec": true, "root": true}]}]
+    A re-recorded CARD is a NEW finding; decisions are never imported.
+
+    The class (class_rec) is derived by the rubric §4 rule; first_seen_id
+    links a recurring finding to the earliest live finding of the project
+    with the same normalised fingerprint (case, whitespace, trailing
+    punctuation ignored).
+
+    Args:
+        findings: Non-empty JSON array of finding objects (shape above).
+        cycle_id: The cycle's global id (from open_triage); 0 = not given.
+        cycle: The cycle's code instead (e.g. "rev-877-r2"); a code is unique
+            only within a project, so it needs `project`, and it is never
+            read as an id. Give cycle_id OR cycle — both or neither is an
+            error.
+        project: Optional slug (REQUIRED with `cycle`). When given, the cycle
+            must belong to it — checked in the write's own transaction; a
+            mismatch is an error with nothing written. Never auto-detected
+            from CWD: empty = cycle_id alone decides.
+
+    Returns: {cycle_id, project, recorded: [{seq, finding_id, first_seen_id}]}
+        in input order (first_seen_id null = first occurrence; project = the
+        cycle's slug). {"error": "..."} — and NOTHING written — on any invalid
+        finding: an unknown key (named in the message), a field under both
+        spellings, a bad enum or level, a missing required field, two
+        recommended options, a duplicate option key, a seq outside
+        1..2147483647, a duplicate or already-taken seq, an auto seq past
+        2147483647, an over-long value or normalised fingerprint, tool-call
+        markup; or a missing / closed / other project's cycle, both or
+        neither of cycle_id / cycle, a code without project.
+    """
+    if (err := _reject_toolcall_markup(findings=findings, cycle=cycle, project=project)):
+        return err
+    from dct.workflows.triage import record_findings as _record
+
+    try:
+        target, slug = _triage_cycle_target(cycle_id, cycle, project)
+        out = _record(_get_engine(), target, findings, project=project or None)
+        return {"cycle_id": out["cycle_id"], "project": slug, "recorded": out["recorded"]}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@mcp.tool(structured_output=False)
+def decide_findings(
+    decisions: dict[str, dict],
+    decided_by: str,
+    decision_source: str,
+    cycle_id: int = 0,
+    cycle: str = "",
+    project: str = "",
+) -> dict:
+    """Record the OWNER's decisions on findings of an OPEN triage cycle — atomically.
+
+    Write here ONLY what the owner said, from the owner's own text; an
+    agent's proposals (Codex, a coordinator's suggestion) go to
+    suggest_findings. Pass `decisions` as a JSON object keyed by "K-<n>" (or
+    the seq number), each value {dec, opt, note} — no other key:
+      dec (required): fix | verify | backlog | reject | note | discuss
+      opt: an option key of that finding ("" / omitted = none)
+      note: the owner's comment VERBATIM (never a paraphrase)
+    Example: {"K-1": {"dec": "fix", "opt": "a", "note": "..."},
+              "K-2": {"dec": "discuss", "note": "..."}}
+    A decision overwrites a previous one while the cycle is open (decided_at,
+    decided_by, decision_source refreshed, together with the writing client's
+    decision_actor_type / decision_actor_client / decision_session_id /
+    decision_actor_source taken from the provenance context — all reset as a
+    set on every overwrite); a closed cycle refuses. 'reject'
+    / 'note' never create items, and are refused for a finding whose
+    promoted item is still open (close that item first).
+
+    decided_by / decision_source are an AUDIT record of who decided and where
+    the words are — not authentication: they cannot prove consent, so never
+    fill them for a decision the owner did not make.
+
+    Args:
+        decisions: Non-empty JSON object keyed by "K-<n>" (shape above).
+        decided_by: Required — the PERSON who decided (the owner, e.g.
+            "owner"), not the client writing it; ≤ 200 chars.
+        decision_source: Required — where the owner's words are recorded
+            (e.g. "owner paste 2026-10-13", "chat 2026-10-13 14:30", a file
+            path); ≤ 200 chars.
+        cycle_id: The cycle's global id (from open_triage); 0 = not given.
+        cycle: The cycle's code instead (e.g. "rev-877-r2"); a code is unique
+            only within a project, so it needs `project`, and it is never
+            read as an id. Give cycle_id OR cycle — both or neither is an
+            error.
+        project: Optional slug (REQUIRED with `cycle`). When given, the cycle
+            must belong to it — checked in the write's own transaction; a
+            mismatch is an error with nothing written. Never auto-detected
+            from CWD: empty = cycle_id alone decides.
+
+    Returns: {cycle_id, project, decided: n, undecided: [seq…]} — undecided =
+        the live findings still without a decision. {"error": "..."} —
+        nothing written — on an unknown key (in an entry or a K-n with no live
+        finding), a K-n addressed twice, an invalid dec, an opt that is not an
+        option of that finding, reject / note on a finding promoted to an
+        open item, an empty / over-long decided_by or decision_source,
+        tool-call markup, or a missing / closed / other project's cycle, both
+        or neither of cycle_id / cycle, a code without project.
+    """
+    if (err := _reject_toolcall_markup(
+        decisions=decisions, decided_by=decided_by, decision_source=decision_source,
+        cycle=cycle, project=project,
+    )):
+        return err
+    from dct.workflows.triage import decide_findings as _decide
+
+    try:
+        target, slug = _triage_cycle_target(cycle_id, cycle, project)
+        out = _decide(_get_engine(), target, decisions, decided_by=decided_by,
+                      decision_source=decision_source, project=project or None)
+        return {"cycle_id": target, "project": slug, **out}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@mcp.tool(structured_output=False)
+def suggest_findings(
+    by: str,
+    suggestions: dict[str, dict],
+    cycle_id: int = 0,
+    cycle: str = "",
+    project: str = "",
+) -> dict:
+    """Record an AGENT's proposed answers (the page's SUGGESTED) — proposals, never decisions.
+
+    Same shape and validation as decide_findings, but writes only the
+    suggestion columns: the owner's decision is never touched. Allowed while
+    the cycle is open; a later call overwrites a finding's suggestion.
+
+    Args:
+        by: Who proposes (e.g. "Codex"); ≤ 100 chars. The export's
+            SUGGESTED.by is the latest proposer.
+        suggestions: Non-empty JSON object keyed by "K-<n>" (or seq), each
+            {dec, opt, note} and no other key — dec fix | verify | backlog |
+            reject | note | discuss, opt an option key of that finding
+            ("" = none), note the proposed comment.
+        cycle_id: The cycle's global id (from open_triage); 0 = not given.
+        cycle: The cycle's code instead (e.g. "rev-877-r2"); a code is unique
+            only within a project, so it needs `project`, and it is never
+            read as an id. Give cycle_id OR cycle — both or neither is an
+            error.
+        project: Optional slug (REQUIRED with `cycle`). When given, the cycle
+            must belong to it — checked in the write's own transaction; a
+            mismatch is an error with nothing written. Never auto-detected
+            from CWD: empty = cycle_id alone decides.
+
+    Returns: {cycle_id, project, suggested: n}. {"error": "..."} — nothing
+        written — on the same entry refusals as decide_findings, an empty /
+        over-long `by`, tool-call markup, or a missing / closed / other
+        project's cycle, both or neither of cycle_id / cycle, a code without
+        project.
+    """
+    if (err := _reject_toolcall_markup(
+        by=by, suggestions=suggestions, cycle=cycle, project=project,
+    )):
+        return err
+    from dct.workflows.triage import suggest_findings as _suggest
+
+    try:
+        target, slug = _triage_cycle_target(cycle_id, cycle, project)
+        out = _suggest(_get_engine(), target, by, suggestions, project=project or None)
+        return {"cycle_id": target, "project": slug, **out}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@mcp.tool(structured_output=False)
+def close_triage(
+    source: str,
+    cycle_id: int = 0,
+    cycle: str = "",
+    project: str = "",
+    notes: list[str] | None = None,
+) -> dict:
+    """Close a triage cycle with the owner's recorded answers (the page's CLOSED).
+
+    Refused while any live finding is undecided; a 'discuss' decision counts
+    as decided (a card the owner left open). After the close, findings,
+    decisions and suggestions of the cycle are refused.
+
+    Args:
+        source: Where the owner's answers are recorded (chat, a dct note, a
+            file) — CLOSED.source; required, ≤ 200 chars.
+        cycle_id: The cycle's global id (from open_triage); 0 = not given.
+        cycle: The cycle's code instead (e.g. "rev-877-r2"); a code is unique
+            only within a project, so it needs `project`, and it is never
+            read as an id. Give cycle_id OR cycle — both or neither is an
+            error.
+        project: Optional slug (REQUIRED with `cycle`). When given, the cycle
+            must belong to it — checked in the write's own transaction; a
+            mismatch is an error with nothing written. Never auto-detected
+            from CWD: empty = cycle_id alone decides.
+        notes: Optional paragraphs for the page's closed panel — pass as a
+            JSON array of strings (what was executed, what the answers do
+            NOT approve). Omit or null = none.
+
+    Returns: {cycle_id, project, closed_at, closed} — closed = the CLOSED
+        constant {date, source, rubric, notes, answers: {"K-n": {dec, opt,
+        note}}}. {"error": "..."} — nothing written — on undecided findings
+        (listed as K-n), an empty or over-long source, tool-call markup, or a
+        missing / already closed / other project's cycle, both or neither of
+        cycle_id / cycle, a code without project.
+    """
+    if (err := _reject_toolcall_markup(
+        source=source, notes=notes, cycle=cycle, project=project,
+    )):
+        return err
+    from dct.workflows.triage import close_triage as _close
+
+    try:
+        target, slug = _triage_cycle_target(cycle_id, cycle, project)
+        out = _close(_get_engine(), target, source=source, notes=notes,
+                     project=project or None)
+        return {"cycle_id": out["cycle_id"], "project": slug,
+                "closed_at": out["closed_at"], "closed": out["closed"]}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@mcp.tool(structured_output=False)
+def list_findings(
+    project: str = "",
+    cycle: str = "",
+    cycle_id: int = 0,
+    fingerprint: str = "",
+    file: str = "",
+    cls: str = "",
+    decision: str = "",
+    source: str = "",
+    limit: int = 50,
+) -> dict:
+    """List a project's live review findings in compact {cols, rows} form.
+
+    cols: id, cycle_code, seq, S, O, E, K, origin, type, class (the override
+    or the derived class), decision, decision_opt, item_id, first_seen_id,
+    source, title. Newest cycle first, then by seq. Every filter is optional
+    ("" / 0 = no filter).
+
+    Args:
+        project: Slug. Empty = auto-detect from CWD.
+        cycle: A cycle's code (e.g. "rev-877-r2") within `project`; never
+            read as an id.
+        cycle_id: A cycle's id (0 = none); it must belong to `project`. Give
+            `cycle` OR `cycle_id`.
+        fingerprint: Matched on the normalised form (case, whitespace,
+            trailing punctuation ignored).
+        file: Substring of the finding's area (file:line list); ASCII
+            letters match case-insensitively, `%` and `_` literally.
+        cls: Effective class — fix | verify | quick | decide | backlog |
+            reject | note.
+        decision: fix | verify | backlog | reject | note | discuss.
+        source: The reviewer, exactly as recorded (e.g. "codex").
+        limit: Max rows (default 50); 0 = no limit.
+
+    Returns: {"cols": [...], "rows": [[...]]}. {"error": "..."} on both
+        cycle and cycle_id, an unknown cycle or one of another project, an
+        invalid cls / decision, a negative limit, or an unresolvable project.
+    """
+    from dct.workflows.triage import list_findings as _list
+
+    if cycle and cycle_id:
+        return {"error": "Pass cycle (code) OR cycle_id, not both"}
+    try:
+        project_slug = _resolve_project(project, required=True)
+        assert project_slug is not None
+        return _list(
+            _get_engine(), project_slug,
+            cycle=cycle_id if cycle_id else (cycle or None),
+            fingerprint=fingerprint or None, file=file or None, cls=cls or None,
+            decision=decision or None, source=source or None, limit=limit,
+        )
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@mcp.tool(structured_output=False)
+def finding_history(fingerprint: str, project: str = "") -> dict:
+    """Every occurrence of one finding across a project's triage cycles — the recurrence view.
+
+    Matches the normalised fingerprint (case, whitespace, trailing
+    punctuation ignored); a rephrased fingerprint is a different finding.
+
+    Args:
+        fingerprint: The finding's fingerprint (required).
+        project: Slug. Empty = auto-detect from CWD.
+
+    Returns: {"cols": [id, cycle_code, opened_at, seq, decision,
+        decision_opt, item_id], "rows": [[...]]}, chronological.
+        {"error": "..."} on an empty fingerprint or an unresolvable project.
+    """
+    from dct.workflows.triage import finding_history as _history
+
+    try:
+        project_slug = _resolve_project(project, required=True)
+        assert project_slug is not None
+        return _history(_get_engine(), project_slug, fingerprint)
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@mcp.tool(structured_output=False)
+def reviewer_precision(project: str = "", since: str = "") -> dict:
+    """Decided findings counted per reviewer and decision — how often each source is right.
+
+    Undecided findings are not counted.
+
+    Args:
+        project: Slug. Empty = auto-detect from CWD.
+        since: Only the cohort of findings RECORDED since an anchor
+            (findings.created_at — not when they were decided) —
+            "last_release" | "all" | "<N>h" | ISO date/datetime. Empty
+            (default) = all time.
+
+    Returns: {"cols": ["source", "decision", "n"], "rows": [[...]]}.
+        {"error": "..."} on an invalid `since` or an unresolvable project.
+    """
+    from dct.workflows.triage import reviewer_precision as _precision
+
+    try:
+        project_slug = _resolve_project(project, required=True)
+        assert project_slug is not None
+        return _precision(_get_engine(), project_slug, since=since or None)
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@mcp.tool(structured_output=False)
+def export_triage(cycle_id: int = 0, cycle: str = "", project: str = "") -> dict:
+    """Export a triage cycle as the triage page's constants (read-only).
+
+    Field names are EXACTLY the page template's, so the values paste into
+    a copy of the template (the page build stays the caller's job; the CLI
+    twin is `dct triage export`). The texts are returned as recorded,
+    unescaped: embed them in a page only through an HTML-safe serializer
+    (`dct triage export` prints them that way), never as raw JSON in a
+    <script>.
+
+    Args:
+        cycle_id: The cycle's global id (from open_triage); 0 = not given.
+        cycle: The cycle's code instead (e.g. "rev-877-r2"); a code is unique
+            only within a project, so it needs `project`, and it is never
+            read as an id. Give cycle_id OR cycle — both or neither is an
+            error.
+        project: Optional slug (REQUIRED with `cycle`). When given, the cycle
+            must belong to it — else an error. Never auto-detected from CWD:
+            empty = cycle_id alone decides.
+
+    Returns: {cycle, cards, closed, suggested}: cycle = {id, project, code,
+        topic, scope, base_commit, rubric_version, artifact_url, created_by,
+        opened_at, closed_at}; cards = CARDS by seq — {id "K-n", title, area,
+        src, S, O, E, K, origin, type, fp, ctx [..], opts [{k, rec, root, t,
+        why}]} plus conflict / violation / dispute / openDesign when set and
+        cls + clsWhy for an override; closed = CLOSED {date, source, rubric,
+        notes, answers} once closed, else null; suggested = SUGGESTED {by,
+        date, answers} when any finding carries a suggestion, else null.
+        {"error": "..."} on a missing or other project's cycle, both or
+        neither of cycle_id / cycle, a code without project.
+    """
+    from dct.workflows.triage import export_triage as _export
+
+    try:
+        target, _slug = _triage_cycle_target(cycle_id, cycle, project)
+        return _export(_get_engine(), target, project=project or None)
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@mcp.tool(structured_output=False)
+def promote_finding_to_item(
+    finding_id: int,
+    project: str = "",
+    item_type: str = "issue",
+    priority: str = "",
+    component: str = "",
+    unconfirmed: bool = False,
+    checked_conditions: str = "",
+    reopen_condition: str = "",
+) -> dict:
+    """Create a tracked item from a DECIDED finding and back-link it (one transaction).
+
+    Only a finding decided fix / verify / backlog is promoted; undecided,
+    discuss, reject and note are refused. Project = the finding's cycle's
+    project; title = the finding's title; description = cycle + K-n,
+    fingerprint, where, context, the chosen option and the owner's comment.
+    Tags come from the tag dictionary (no similarity bypass): `security` for
+    a security finding; `unreproduced` ONLY with unconfirmed=true — the
+    explicit result of a verification attempt that did NOT reproduce a
+    'verify' finding ('verify' alone orders a check, it reports none).
+
+    Args:
+        finding_id: The finding (`id` column of list_findings / recorded[].finding_id).
+        project: Optional slug; when given, the finding must belong to it,
+            else an error. Checked by this tool in a read of its own BEFORE
+            the promotion's transaction (the workflow takes no project) — a
+            mismatch is refused before anything is written, but the check is
+            not atomic with the promotion. Never auto-detected from CWD.
+        item_type: issue (default) | todo | feature | idea | improvement.
+        priority: P1 | P2 | P3 | future. Empty = the rubric outcome of the
+            decision (fix → P1; verify → P1 when Fix now once confirmed,
+            else P2; backlog → P2 for S≥2, else P3); an explicit value wins.
+        component: Optional component name (≤ 100 chars).
+        unconfirmed: true = the verification was attempted and did not
+            reproduce the finding (a 'verify' finding only) → tag
+            `unreproduced`; then checked_conditions and reopen_condition are
+            both REQUIRED and go into the description. Default false.
+        checked_conditions: What the attempt checked (only with unconfirmed=true).
+        reopen_condition: When to reopen the item (only with unconfirmed=true).
+
+    Returns: slim ack {id, project, item_type, priority, status, title,
+        short_title, tags, finding_id} (the new item; project = its slug).
+        {"error": "..."} — no item, no back-link — when the finding is
+        missing, of another project, already promoted (names the item),
+        undecided or decided discuss / reject / note, unconfirmed on a
+        non-'verify' finding or without both texts, the texts without
+        unconfirmed, the project soft-deleted, an invalid enum, an over-long
+        component or tool-call markup.
+    """
+    if (err := _reject_toolcall_markup(
+        project=project, component=component, checked_conditions=checked_conditions,
+        reopen_condition=reopen_condition,
+    )):
+        return err
+    from dct.workflows.triage import promote_finding_to_item as _promote
+
+    try:
+        slug = _finding_project(finding_id, project)
+        d = _promote(
+            _get_engine(), finding_id, item_type=item_type,
+            priority=priority or None, component=component or None,
+            unconfirmed=unconfirmed, checked_conditions=checked_conditions or None,
+            reopen_condition=reopen_condition or None,
+        )
+        return {**_promote_ack(d), "project": slug, "tags": d["tags"],
+                "finding_id": finding_id}
     except Exception as e:
         return {"error": str(e)}
 
