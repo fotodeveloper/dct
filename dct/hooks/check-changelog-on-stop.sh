@@ -24,11 +24,41 @@ changed=$(git diff --name-only 2>/dev/null; git diff --cached --name-only 2>/dev
 [ -z "$changed" ] && exit 0
 changed=$(echo "$changed" | sort -u)
 
-# Exempt patterns — docs/tests/config/meta files never require a changelog.
-exempt_re="^\.(claude|github|cursor|vscode|gstack)/|^docs/|^scripts/|^tests/|^test_|conftest\.py$|CLAUDE\.md$|README\.md$|LICENSE|\.gitignore$|^changelog|^CHANGELOG|^VERSION$|pyproject\.toml$|Cargo\.toml$|package\.json$"
+# The shared lib (K-48) holds the count, the guidance AND the exemption
+# policy shared with the commit hook (K-59). Sourcing it is pure shell (no
+# dct, no Python), so the fast paths below stay free of cold starts.
+# Locate the lib next to this script's REAL path (a symlinked install points
+# into the package) or next to the invoked path (a copied install carries a
+# copy). Portable symlink walk: plain `readlink`, no GNU `-f`.
+_dirof() { case "$1" in */*) printf '%s' "${1%/*}" ;; *) printf . ;; esac; }
+_self=${BASH_SOURCE[0]}
+_hops=0
+while [ -L "$_self" ] && [ "$_hops" -lt 40 ]; do
+  _link=$(readlink "$_self") || break
+  case "$_link" in /*) _self=$_link ;; *) _self=$(_dirof "$_self")/$_link ;; esac
+  _hops=$((_hops + 1))
+done
+_lib=""
+for _dir in "$(_dirof "$_self")" "$(_dirof "${BASH_SOURCE[0]}")"; do
+  if [ -f "$_dir/dct-changelog-count.lib.sh" ]; then
+    _lib=$_dir/dct-changelog-count.lib.sh
+    break
+  fi
+done
+_lib_ok=false
+if [ -n "$_lib" ] && . "$_lib"; then
+  _lib_ok=true
+fi
 
 # ── Fast path 2: every change is exempt → nothing to remind about (0 Python). ──
-app_files=$(echo "$changed" | grep -vE "$exempt_re")
+# Exempt files: docs/tests/config/meta and the project instruction files.
+# Without the lib this hook keeps REMINDING (its failure policy): every
+# changed file counts as an app file.
+if [ "$_lib_ok" = true ]; then
+  app_files=$(printf '%s\n' "$changed" | dct_changelog_app_files)
+else
+  app_files=$changed
+fi
 [ -z "$app_files" ] && exit 0
 
 # ── Fast path 3: changelog itself was touched → already satisfied (0 Python). ──
@@ -104,27 +134,8 @@ fi
 # blocking commit hook, THIS hook's failure policy is to keep REMINDING: a
 # missing lib or a failing count yields the generic reminder (non-blocking,
 # so erring towards the reminder costs nothing).
-#
-# Locate the lib next to this script's REAL path (a symlinked install points
-# into the package) or next to the invoked path (a copied install carries a
-# copy). Portable symlink walk: plain `readlink`, no GNU `-f`.
-_dirof() { case "$1" in */*) printf '%s' "${1%/*}" ;; *) printf . ;; esac; }
-_self=${BASH_SOURCE[0]}
-_hops=0
-while [ -L "$_self" ] && [ "$_hops" -lt 40 ]; do
-  _link=$(readlink "$_self") || break
-  case "$_link" in /*) _self=$_link ;; *) _self=$(_dirof "$_self")/$_link ;; esac
-  _hops=$((_hops + 1))
-done
-_lib=""
-for _dir in "$(_dirof "$_self")" "$(_dirof "${BASH_SOURCE[0]}")"; do
-  if [ -f "$_dir/dct-changelog-count.lib.sh" ]; then
-    _lib=$_dir/dct-changelog-count.lib.sh
-    break
-  fi
-done
 guidance=""
-if [ -n "$_lib" ] && . "$_lib"; then
+if [ "$_lib_ok" = true ]; then
   dct_changelog_count "$project"
   case "$DCT_CL_COUNT" in
     ''|*[!0-9]*) ;;                        # broken count → remind generically

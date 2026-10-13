@@ -68,75 +68,9 @@ if [ -z "$staged" ]; then
   exit 0  # Nothing staged
 fi
 
-# Exempt patterns — files that don't require changelog entries
-exempt_patterns=(
-  "^\.claude/"
-  "^\.github/"
-  "^\.cursor/"
-  "^\.vscode/"
-  "^\.gstack/"
-  "^docs/"
-  "^scripts/"
-  "^tests/"
-  "^test_"
-  "conftest\.py$"
-  "CLAUDE\.md$"
-  "CLAUDE\.local\.md$"
-  "AGENTS\.md$"
-  "README\.md$"
-  "LICENSE"
-  "\.gitignore$"
-  "^changelog"
-  "^CHANGELOG"
-  "^VERSION$"
-  "pyproject\.toml$"
-  "Cargo\.toml$"
-  "package\.json$"
-  "biome\.json$"
-  "Dockerfile"
-  "docker-compose"
-)
-
-# Check if ALL staged files are exempt
-has_app_code=false
-while IFS= read -r file; do
-  is_exempt=false
-  for pattern in "${exempt_patterns[@]}"; do
-    if echo "$file" | grep -qE "$pattern"; then
-      is_exempt=true
-      break
-    fi
-  done
-  if [ "$is_exempt" = false ]; then
-    has_app_code=true
-    break
-  fi
-done <<< "$staged"
-
-if [ "$has_app_code" = false ]; then
-  exit 0  # All files are exempt
-fi
-
-# Check for changelog in staged files
-has_changelog=false
-while IFS= read -r file; do
-  case "$file" in
-    changelog*|CHANGELOG*|changelog_unreleased*) has_changelog=true; break ;;
-  esac
-done <<< "$staged"
-
-# If no changelog file staged, check dct database for unreleased entries of
-# THIS branch (#801) — entries written on other branches describe code this
-# commit does not contain, so they do not satisfy the gate; unbranched and
-# server-detected entries still count (K-36). The count logic and the deny
-# guidance live in the shared lib (K-48); THIS hook's failure policy is
-# fail-OPEN: no lib, or no integer even from the project-wide fallback (dct or
-# its database is broken) → let the commit through — a hook must never block
-# the host operation because of its own failure.
-if [ "$has_changelog" = true ]; then
-  exit 0
-fi
-
+# The shared lib (K-48) holds the count, the guidance AND the exemption
+# policy shared with the Stop hook (K-59). THIS hook's failure policy is
+# fail-OPEN: no lib → let the commit through.
 # Locate the lib next to this script's REAL path (a symlinked install points
 # into the package) or next to the invoked path (a copied install carries a
 # copy). Portable symlink walk: plain `readlink`, no GNU `-f`.
@@ -158,6 +92,33 @@ done
 [ -n "$_lib" ] || exit 0
 # shellcheck source=dct-changelog-count.lib.sh
 . "$_lib" || exit 0
+
+# Exempt files (docs/tests/config/meta, the project instruction files) never
+# require a changelog entry: when every staged file is exempt, pass through.
+app_files=$(printf '%s\n' "$staged" | dct_changelog_app_files)
+if [ -z "$app_files" ]; then
+  exit 0  # All files are exempt
+fi
+
+# Check for changelog in staged files
+has_changelog=false
+while IFS= read -r file; do
+  case "$file" in
+    changelog*|CHANGELOG*|changelog_unreleased*) has_changelog=true; break ;;
+  esac
+done <<< "$staged"
+
+# If no changelog file staged, check dct database for unreleased entries of
+# THIS branch (#801) — entries written on other branches describe code this
+# commit does not contain, so they do not satisfy the gate; unbranched and
+# server-detected entries still count (K-36). The count logic and the deny
+# guidance live in the shared lib (K-48); THIS hook's failure policy is
+# fail-OPEN: no integer even from the project-wide fallback (dct or its
+# database is broken) → let the commit through — a hook must never block the
+# host operation because of its own failure.
+if [ "$has_changelog" = true ]; then
+  exit 0
+fi
 
 dct_changelog_count "$project"
 case "$DCT_CL_COUNT" in ''|*[!0-9]*) exit 0 ;; esac

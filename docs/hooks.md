@@ -187,8 +187,9 @@ out. Measured fast paths: non-task tool and task dispatch both under ~10 ms.
 Ordering is cheapest-first:
 
 1. **git change-detection runs first.** No changed files → `exit 0` with zero
-   Python. Only exempt files changed (docs/tests/config/…) → `exit 0`. The
-   changelog itself changed → `exit 0`.
+   Python. Only exempt files changed (docs/tests/config/…, see the shared
+   exemption policy below) → `exit 0`. The changelog itself changed →
+   `exit 0`.
 2. Only when un-exempt app files changed without a changelog touch does the
    hook need the project verdict (`dct project detect` + `dct project
    manages-changelog`). That verdict is **cached per project-root path**: cache
@@ -246,6 +247,14 @@ dct_changelog_guidance           # the deny / reminder text for the path taken
   first (pasted unedited, bash refuses the `<` redirection and runs nothing).
   The branch argument is quoted WHOLE with `printf %q`, so the edited line
   runs nothing but `dct`. The deny JSON itself is built by `jq --arg`.
+- **One exemption policy (K-59).** Which changed files need an entry at all
+  is decided by ONE predicate in the lib, `dct_changelog_app_files` (a stdin
+  filter that prints the non-exempt paths): docs, tests, scripts, editor and
+  CI config, version/manifest files, and the project instruction files —
+  `AGENTS.md` (canonical), plus `CLAUDE.md` and `CLAUDE.local.md` for the
+  projects that use them. It is pure shell + `grep`, so the Stop hook still
+  takes its exempt-only exit without starting `dct`.
+  `tests/test_hook_exemption_parity.py` runs both hooks on the same paths.
 - **Own failure.** When even the fallback yields no integer (dct or its
   database is broken), or the lib cannot be found, the two hooks deliberately
   differ — the lib only reports, each hook applies its own policy:
@@ -254,7 +263,8 @@ dct_changelog_guidance           # the deny / reminder text for the path taken
     own failure.
   - `check-changelog-on-stop.sh` (non-blocking) **keeps reminding** — the
     generic "Use /clog" reminder, since erring towards a reminder costs
-    nothing. A missing `dct` still exits silently in both hooks.
+    nothing; without the lib it cannot tell exempt files apart, so every
+    changed file counts. A missing `dct` still exits silently in both hooks.
 
 ### Where the hooks find the lib
 

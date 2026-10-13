@@ -5,9 +5,24 @@
 # fallback, and the guidance text (#801, K-33, K-48). Each hook keeps its OWN
 # failure policy — this file only reports what happened, it never exits.
 #
+# It also holds the ONE changelog-exemption policy of both hooks (K-59), so a
+# doc/meta file can never be exempt in one hook and not in the other.
+#
 # Installed next to the hooks under the same name (symlink, or a copy where
 # symlinks are unavailable); a symlinked hook also finds it next to its real
 # path inside the package. Bash 3.2 compatible (macOS /bin/bash).
+
+# dct_changelog_app_files
+#   Filter: reads changed repo-relative paths (one per line) on stdin and
+#   prints those that need a changelog entry — everything except the
+#   docs/tests/config/meta files below. Pure shell + grep: no dct, no Python,
+#   so a hook can take its exempt-only fast exit before any cold start.
+#   AGENTS.md is the canonical project instruction file; CLAUDE.md and
+#   CLAUDE.local.md stay exempt for the dct users' projects that use them.
+#   Empty lines are dropped; the exit status is always 0.
+dct_changelog_app_files() {
+  grep -vE '^$|^\.(claude|github|cursor|vscode|gstack)/|^docs/|^scripts/|^tests/|^test_|conftest\.py$|AGENTS\.md$|CLAUDE\.md$|CLAUDE\.local\.md$|README\.md$|LICENSE|\.gitignore$|^changelog|^CHANGELOG|^VERSION$|pyproject\.toml$|Cargo\.toml$|package\.json$|biome\.json$|Dockerfile|docker-compose' || true
+}
 
 # dct_changelog_count PROJECT
 #   Counts unreleased changelog entries that may satisfy a commit on the
