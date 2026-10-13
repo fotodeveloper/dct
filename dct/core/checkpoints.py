@@ -4,16 +4,18 @@ from datetime import UTC, datetime
 
 import sqlalchemy as sa
 
+from dct.core.limits import ensure_fits
 from dct.core.text import item_label
 from dct.db import item_checkpoints, items, row_to_dict
 
 VALID_STATUSES = {"pending", "done", "rejected"}
 
 # Known checkpoint kinds. 'task' is the default and does NOT block resolve_item.
-# Any non-'task' value is treated as a gate — resolve_item refuses until done
-# or rejected. The set is intentionally open (see `kind` column docstring in
-# db.py) — OSS users may define custom gate kinds; the validator accepts any
-# non-empty string, the whitelist is advisory (warning for typos in future).
+# Every kind outside NON_GATE_KINDS is a gate — resolve_item refuses until done
+# or rejected. The set is intentionally OPEN (see the `kind` column comment in
+# db.py) — users may define custom gate kinds. add_checkpoint refuses only a
+# blank kind and one longer than the column (ensure_fits); KNOWN_KINDS is a
+# list of the documented kinds, never a whitelist.
 KNOWN_KINDS = {"task", "dogfood", "security", "approval", "review", "cc-task"}
 
 # The kinds that do NOT gate resolve_item: 'task' (plain step) and 'cc-task'
@@ -28,6 +30,9 @@ def _validate_status(status: str) -> str:
     if status not in VALID_STATUSES:
         raise ValueError(f"Invalid status: '{status}'. Valid: {', '.join(sorted(VALID_STATUSES))}")
     return status
+
+
+_CHECKPOINT_LABELS = {"kind": "Checkpoint kind", "text": "Checkpoint text"}
 
 
 def _validate_kind(kind: str) -> str:
@@ -52,12 +57,18 @@ def add_checkpoint(
               - 'approval' — stakeholder sign-off
               - 'review'   — code review
               - 'cc-task'  — mirrored from Claude Code TaskCreate (non-blocking)
-              Any non-'task' kind blocks `resolve_item` until the checkpoint is
-              completed or rejected (reject = 'not applicable').
+              Every kind but 'task' / 'cc-task' blocks `resolve_item` until
+              the checkpoint is completed or rejected (reject = 'not
+              applicable'). Any non-blank kind is accepted; a blank one, or
+              one longer than the `kind` column, raises ValueError (refused,
+              never truncated). The text has no length limit.
     """
     if not text or not text.strip():
         raise ValueError("Checkpoint text cannot be empty")
     _validate_kind(kind)
+    # K-65: widths come from the schema; the text column is unbounded, so
+    # only the kind can be refused here.
+    ensure_fits(item_checkpoints, {"kind": kind, "text": text}, _CHECKPOINT_LABELS)
 
     with engine.begin() as conn:
         exists = conn.execute(

@@ -23,7 +23,7 @@ items instead of duplicating them; on `update_item` `short_title` is optional â€
 omit it (or pass `""`) to keep the stored label, pass it only to change the
 label (`'__clear__'` removes it; a whitespace-only value also clears it).
 For accepted non-trivial implementation add at least 3 checkpoints before coding (as many as the work needs, no upper cap; none for a small fix), complete each as verified, reject abandoned checkpoints
-rather than deleting them. Include a user-validation gate for user-facing features
+rather than deleting them â€” a gate checkpoint is rejected only on the user's decision (full gate policy: the `add_checkpoint` tool description). Include a user-validation gate for user-facing features
 when project conventions require one. Do not claim completion without evidence or
 silently bypass pending gates. Use `resolve_item` for closing and report returned
 IDs and status. Do not commit or release unless explicitly authorized.

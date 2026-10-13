@@ -67,7 +67,9 @@ _INSTRUCTIONS = (
         "   minimum, never a cap). None at creation; a small fix needs none; another\n"
         "   item may get some, with no fixed minimum taken from its type.\n"
         "3. complete_checkpoint(id) as each step finishes (real-time, NOT batched);\n"
-        "   reject_checkpoint irrelevant ones. Then resolve_item (no auto-transition).\n\n"
+        "   reject_checkpoint irrelevant ones within the agreed scope — a gate only\n"
+        "   on the user's decision (full gate policy: add_checkpoint). Then\n"
+        "   resolve_item (no auto-transition).\n\n"
         "SPRINT & HANDOFFS:\n"
         "- set_sprint(project, item_ids='22,21,6') atomically replaces the sprint;\n"
         "  resolve_item clears the DERIVED in_current_sprint flag — membership itself\n"
@@ -599,10 +601,15 @@ def update_item(
     in_current_sprint flag — the sprint MEMBERSHIP is retained as the sprint's
     completion history; reopening (open/in_progress) clears resolved_at.
     GATE GUARD: a terminal status runs the SAME guard as resolve_item — with a
-    gate checkpoint pending (kind not in {'task','cc-task'}) the WHOLE call is
-    refused: {"error": "Cannot resolve item #N: ... gate checkpoint(s)
-    pending ..."}, no field, tag or reason note written; pending gates are never
-    rejected for you. Complete (done) or reject (not applicable) them first.
+    gate checkpoint pending (policy: add_checkpoint) the WHOLE call is
+    refused with the same message: {"error": "Cannot resolve item #N: K gate
+    checkpoint(s) pending — ..."} naming up to 5 gates (id, kind, text) plus
+    "(+M more — get_item(N) or `dct show N` lists them all)"; no field, tag
+    or reason note written; pending gates are never rejected for you.
+    complete_checkpoint a gate once its recorded condition is met — a
+    person's act (dogfood, approval) only on that person's confirmation —
+    reject_checkpoint one that does not apply only on the user's decision,
+    then retry.
     Sprint membership is not set here (`in_current_sprint` is read-only) — use
     set_sprint / assign_item_to_sprint / remove_item_from_sprint.
 
@@ -701,11 +708,16 @@ def resolve_item(item_id: int, status: str = "resolved", resolution: str = "") -
     """Resolve or close an item (terminal status). Auto-clears in_current_sprint
     and stamps resolved_at.
 
-    GATE GUARD: if the item has any pending gate checkpoint (kind not in
-    {'task','cc-task'} — e.g. 'dogfood', 'security', 'approval', 'review'), the
-    transition is REFUSED and the tool returns
-    {"error": "Cannot resolve item #N: ... gate checkpoint(s) pending ..."}.
-    Complete (done) or reject (not applicable) those gates first.
+    GATE GUARD: if the item has any pending gate checkpoint (any kind but
+    'task' / 'cc-task'; full policy in add_checkpoint), the transition is
+    REFUSED and the tool returns {"error": "Cannot resolve item #N: K gate
+    checkpoint(s) pending — ..."}: it names up to 5 pending gates by id, kind
+    and compacted text ("(+M more — get_item(N) or `dct show N` lists them
+    all)" for the rest) and says how to handle them — complete_checkpoint a
+    gate once its recorded condition is met (a person's act — dogfood,
+    approval — only on that person's confirmation), reject_checkpoint one
+    that consciously does not apply only on the user's decision, then retry.
+    Nothing is written on a refusal.
 
     PREFER THIS OVER update_item FOR TERMINAL TRANSITIONS — explicit intent.
     update_item(status="resolved"|"wont_fix") runs the SAME gate guard (one
@@ -718,8 +730,10 @@ def resolve_item(item_id: int, status: str = "resolved", resolution: str = "") -
 
     Returns: slim ack {id, status, resolved_at, progress} — progress is
         {done, pending, active}. NOT the full item dict. {"error": "..."} when
-        the item is missing or a pending gate blocks the transition (the gate
-        message is byte-identical to before).
+        the item is missing or soft-deleted ("Item #N not found", checked
+        before the gates, as update_item does), the status is not terminal,
+        or a pending gate blocks the transition (the gate message is the one
+        update_item returns, byte for byte).
     """
     from dct.core.items import resolve_item as _resolve
     try:
@@ -875,25 +889,52 @@ def add_checkpoint(item_id: int, text: str, kind: str = "task") -> dict:
 
     REMEMBER the returned `id` — needed for complete_checkpoint / reject_checkpoint.
 
+    GATE POLICY (the complete statement; other tools point here):
+    - A gate is ANY kind except 'task' and 'cc-task'. Known gate kinds:
+        'dogfood'  — the user validates a user-facing feature in a fresh session
+        'security' — security review required before release
+        'approval' — external stakeholder sign-off
+        'review'   — code review / PR approval
+      Unknown kinds are treated as gates (conservative).
+    - While any gate is pending, resolve_item — and update_item with a
+      terminal status (resolved / wont_fix), through the same check in the
+      same transaction — REFUSES to close the item and names the pending
+      gates.
+    - Close a gate by its recorded condition. Complete it
+      (complete_checkpoint) only once that condition is met: a technical
+      gate (a review, a security check) on its evidence; a gate whose
+      condition is a person's act (dogfood: the user's own check in a fresh
+      session; approval: a stakeholder's sign-off) only on that person's
+      confirmation — finished implementation, green tests or an instruction
+      to close the item do not replace it. The kind alone does not decide
+      who performs a gate: a review or security gate whose recorded
+      condition names a person who must do or accept it is completed only on
+      that person's confirmation. Reject a gate (reject_checkpoint —
+      consciously not applicable, ledger-preserved) only on the user's
+      decision. A consent the user already gave explicitly is not asked
+      again.
+    - Dogfood rule: every new user-facing feature item (e.g. a new screen,
+      command, endpoint, skill or MCP tool — anything a user exercises) ends
+      with a kind='dogfood' checkpoint. Exceptions:
+      internal refactors/docs/CI (no user-facing surface); bug fixes with a
+      regression test (the test IS the validation); features behind a
+      not-yet-enabled flag (gate deferred until the flip). When in doubt, add
+      the gate — rejecting is always available.
+
     Args:
         item_id: Target item.
         text: Concrete, actionable step description.
-        kind: Checkpoint class. Default 'task' (non-blocking). Gate kinds that
-              BLOCK resolve_item until done/rejected:
-                'dogfood'  — user-facing feature needs fresh-session validation
-                'security' — security review required before release
-                'approval' — external stakeholder sign-off
-                'review'   — code review / PR approval
+        kind: Checkpoint class. Default 'task' (non-blocking). A gate kind
+              (see GATE POLICY) blocks closing the item until done/rejected.
               'cc-task' — mirrored Claude Code TaskCreate entry (non-blocking,
-              cleaned up on /handoff).
-
-              User-facing features (new skill, CLI command, MCP tool) MUST
-              include a final `kind='dogfood'` checkpoint. See CLAUDE.md
-              "Gate checkpoints" section.
+              cleaned up on /handoff). Any non-blank kind up to 32 chars is
+              accepted (no whitelist).
 
     Returns: slim ack {id, item_id, item_title, kind, status, sort_order} —
         `item_title` is the parent item's title. NOT the checkpoint text echo.
-        {"error": "..."} on empty text or an unknown item_id.
+        {"error": "..."} on empty text, an empty or whitespace-only kind, a
+        kind longer than 32 chars (refused, never truncated), or an unknown
+        item_id.
     """
     from dct.core.checkpoints import add_checkpoint as _add
     try:
@@ -914,8 +955,13 @@ def complete_checkpoint(checkpoint_id: int) -> dict:
 
     CRITICAL: call IMMEDIATELY after the step completes. Do NOT batch completions
     at the end of a task — real-time updates give the user live progress visibility.
-    Completing a pending gate checkpoint (dogfood/security/approval/review)
-    satisfies it and clears that block on resolve_item.
+    Completing a pending gate checkpoint (any kind but task/cc-task — policy:
+    add_checkpoint) satisfies it and clears that block on resolve_item /
+    update_item(status=terminal). Complete a gate only once its recorded
+    condition is met — a gate whose condition is a person's act (dogfood: the
+    user's own check in a fresh session; approval: a stakeholder's sign-off)
+    only on that person's confirmation, which finished implementation or
+    green tests do not replace.
 
     Returns: slim ack {id, item_id, status, progress} — progress is the parent
         item's {done, pending, active} after the transition. NOT the checkpoint
@@ -944,9 +990,10 @@ def reject_checkpoint(checkpoint_id: int) -> dict:
 
     Use when scope changes or an initial assumption turns out wrong. Rejected
     checkpoints drop out of the `active` count, so they no longer weigh on the
-    done/active progress percent. For a gate checkpoint (kind dogfood/security/
-    approval/review) rejecting is the sanctioned "not applicable" skip that
-    unblocks resolve_item.
+    done/active progress percent. For a gate checkpoint (any kind but
+    task/cc-task — policy: add_checkpoint) rejecting is the sanctioned "not
+    applicable" skip that unblocks resolve_item / update_item(status=
+    terminal); reject a gate only on the user's decision.
 
     Returns: slim ack {id, item_id, status, progress} — progress is the parent
         item's {done, pending, active} after the rejection (which drops out of
@@ -971,8 +1018,9 @@ def reject_checkpoint(checkpoint_id: int) -> dict:
 @mcp.tool(structured_output=False)
 def reopen_checkpoint(checkpoint_id: int) -> dict:
     """Revert a checkpoint back to pending (status 'pending'), typically from done
-    or rejected. Re-opening a previously rejected gate makes it pending again and
-    re-blocks resolve_item.
+    or rejected. Re-opening a gate (any kind but task/cc-task — policy:
+    add_checkpoint) makes it pending again and re-blocks resolve_item /
+    update_item(status=terminal).
 
     Returns: slim ack {id, item_id, status, progress} — matches its
         complete/reject_checkpoint siblings; progress is the parent item's

@@ -1,5 +1,8 @@
 """Item CRUD operations with soft deletes and validation."""
 
+import json
+import re
+import unicodedata
 from datetime import UTC, datetime
 
 import sqlalchemy as sa
@@ -11,7 +14,7 @@ from dct.core.tags import (
     tag_id_for_name_conn,
     tags_for_items_conn,
 )
-from dct.core.text import is_blank_label
+from dct.core.text import is_blank_label, preview
 from dct.db import (
     item_checkpoints,
     item_notes,
@@ -43,6 +46,20 @@ OPEN_STATUSES = {"open", "in_progress"}
 # Priority values in display order, P1 first — the ranking behind
 # _priority_order_expr().
 PRIORITY_ORDER = ("P1", "P2", "P3", "future")
+
+# The gate refusal (_refuse_pending_gates_conn) names at most this many pending
+# gates — id, kind and text — and counts the rest in a tail that names the
+# full read path ("(+M more — get_item(N) or `dct show N` lists them all)").
+# Each text (and kind) is compacted to at most GATE_REFUSAL_TEXT_CHARS
+# (ellipsis included, text.preview) and encoded as one-line data
+# (_gate_literal), so the message stays one readable, unambiguous line however
+# many gates there are or whatever their texts contain. Presentation only:
+# the stored kind and condition are never changed.
+GATE_REFUSAL_LISTED = 5
+GATE_REFUSAL_TEXT_CHARS = 60
+
+# A kind shown bare in the refusal; any other kind is shown as a JSON string.
+_BARE_KIND = re.compile(r"[A-Za-z0-9_.-]+")
 
 
 def _priority_order_expr() -> sa.Case:
@@ -366,11 +383,45 @@ def get_item(engine: sa.Engine, item_id: int) -> dict | None:
     return d
 
 
+def _gate_literal(value: str) -> str:
+    """`value` as a one-line JSON string: quotes, backslashes and control
+    characters stay escaped data (K-62). json.dumps escapes U+0000–U+001F;
+    the rest of Cc (DEL, C1 such as U+0085 NEL) and the line / paragraph
+    separators U+2028 / U+2029 — line breaks to str.splitlines and to many
+    renderers — are escaped here too. Other Unicode stays readable."""
+    return "".join(
+        f"\\u{ord(ch):04x}" if unicodedata.category(ch) in {"Cc", "Zl", "Zp"} else ch
+        for ch in json.dumps(value, ensure_ascii=False)
+    )
+
+
+def _gate_entry(gate: dict) -> str:
+    """One refusal entry: `#<id> [<kind>] "<text>"`. The id comes from the
+    record; a kind that is a plain token is shown bare, any other kind as a
+    JSON string; the text is whitespace-collapsed, previewed and always a
+    JSON string — so neither field can pose as another entry."""
+    kind = gate["kind"]
+    if not _BARE_KIND.fullmatch(kind):
+        kind = _gate_literal(preview(kind, GATE_REFUSAL_TEXT_CHARS))
+    text = _gate_literal(preview(" ".join(gate["text"].split()), GATE_REFUSAL_TEXT_CHARS))
+    return f"#{gate['id']} [{kind}] {text}"
+
+
 def _refuse_pending_gates_conn(conn: sa.Connection, item_id: int) -> None:
     """The ONE gate guard of every terminal transition — resolve_item and
     update_item(status='resolved'|'wont_fix') alike, so no client (MCP, CLI,
     core) can close an item past a pending gate. Raises ValueError while any
     gate checkpoint of the item is pending; never rejects a gate itself.
+
+    The message — the ONE refusal text MCP and CLI both surface — starts
+    "Cannot resolve item #N: K gate checkpoint(s) pending", names the first
+    GATE_REFUSAL_LISTED gates in sort order as one-line entries
+    (_gate_entry), ends the list with "(+M more — get_item(N) or `dct show N`
+    lists them all)" when gates are left out, and says how to handle them in
+    client-neutral terms: complete a gate only once its recorded condition is
+    met — a person's act (dogfood, approval) only on that person's
+    confirmation — reject one only on the user's decision, and never re-ask a
+    consent already given. It names no repo-only file (K-22).
 
     It runs on the caller's connection, inside the transaction that writes
     the status: the refusal rolls back everything the call would write
@@ -380,12 +431,25 @@ def _refuse_pending_gates_conn(conn: sa.Connection, item_id: int) -> None:
 
     pending_gates = pending_gates_conn(conn, item_id)
     if pending_gates:
-        gate_summary = ", ".join(f"#{g['id']} [{g['kind']}]" for g in pending_gates[:3])
-        more = f" (+{len(pending_gates) - 3} more)" if len(pending_gates) > 3 else ""
+        listed = pending_gates[:GATE_REFUSAL_LISTED]
+        gate_summary = "; ".join(_gate_entry(g) for g in listed)
+        rest = len(pending_gates) - len(listed)
+        more = (
+            f" (+{rest} more — get_item({item_id}) or `dct show {item_id}` lists them all)"
+            if rest else ""
+        )
         raise ValueError(
             f"Cannot resolve item #{item_id}: {len(pending_gates)} gate checkpoint(s) "
-            f"pending — {gate_summary}{more}. Complete them (done) or reject them "
-            f"(not applicable) before resolving. See CLAUDE.md 'Gate checkpoints'."
+            f"pending — {gate_summary}{more}. Handle each gate by its recorded "
+            f"condition: complete it (MCP complete_checkpoint / CLI "
+            f"`dct checkpoint done <id>`) only once that condition is met — a gate "
+            f"whose condition is a person's act (dogfood: the user's own check in a "
+            f"fresh session; approval: a stakeholder's sign-off) only on that "
+            f"person's confirmation, which finished implementation, green tests or "
+            f"an instruction to close the item do not replace; reject one that "
+            f"consciously does not apply (MCP reject_checkpoint / CLI "
+            f"`dct checkpoint reject <id>`) only on the user's decision. A consent "
+            f"the user already gave explicitly is not asked again."
         )
 
 
@@ -507,11 +571,15 @@ def resolve_item(
     The check (_refuse_pending_gates_conn — shared with update_item's
     terminal transitions) runs in the transaction that writes the status.
 
-    Dogfood gate rationale: user-facing features (new skills, CLI commands,
-    MCP tools) carry a `kind='dogfood'` checkpoint as their last one — this
-    enforces that the feature was validated by the user in a fresh session,
-    not just self-reviewed by the implementer. See CLAUDE.md "Gate
-    checkpoints" section.
+    A missing or soft-deleted item returns None before the gate check (the
+    answer update_item gives), so it never draws a gate refusal.
+
+    Dogfood gate rationale: user-facing features (e.g. a new screen,
+    command, endpoint, skill or MCP tool) carry a `kind='dogfood'` checkpoint
+    as their last one — this enforces that the feature was validated by the
+    user in a fresh session, not just self-reviewed by the implementer. The full policy (gate kinds,
+    the dogfood rule and its exceptions) ships in the add_checkpoint MCP
+    tool description (dct/mcp/server.py).
     """
     _validate_enum(status, TERMINAL_STATUSES, "resolve status")
 
@@ -525,7 +593,17 @@ def resolve_item(
         values["resolution"] = resolution
 
     with engine.begin() as conn:
+        # K-63: a missing or soft-deleted item is "not found" (None) BEFORE the
+        # gate guard — the answer update_item gives — so a deleted item never
+        # draws a "handle its gates" refusal and nothing is written for it.
+        exists = conn.execute(
+            sa.select(items.c.id).where(items.c.id == item_id, items.c.deleted_at.is_(None))
+        ).first()
+        if exists is None:
+            return None
         _refuse_pending_gates_conn(conn, item_id)
+        # The UPDATE keeps the soft-delete guard (K-37): the SELECT above is a
+        # separate statement.
         result = conn.execute(items.update().where(items.c.id == item_id, items.c.deleted_at.is_(None)).values(**values))
         if result.rowcount == 0:
             return None

@@ -307,7 +307,8 @@ def test_isolation_between_items(engine):
 
 class TestGateCheckpoints:
     """Gate checkpoints (kind != 'task' except 'cc-task') block resolve_item
-    until completed or rejected. See #33 and CLAUDE.md "Gate checkpoints"."""
+    until completed or rejected (#33). The packaged policy statement is the
+    add_checkpoint MCP tool description (K-22, tests/test_gate_policy.py)."""
 
     def test_default_kind_is_task(self, engine, item):
         cp = add_checkpoint(engine, item["id"], "Normal step")

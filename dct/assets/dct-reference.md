@@ -109,7 +109,9 @@ fixed minimum taken from its type. Creating an item adds none.
 → `complete_checkpoint(id)` in real-time — do NOT batch completions at end.
 
 **Scope changes, step becomes irrelevant**
-→ `reject_checkpoint(id)` (ledger-preserving); never delete.
+→ `reject_checkpoint(id)` (ledger-preserving); never delete. A gate checkpoint
+is rejected only on the user's decision (full gate policy: the `add_checkpoint`
+tool description).
 
 **Committing** — "commit" / "save this" / "commit this"
 → `/commit` (parallel pre-flight probe, per-branch changelog guard, HEREDOC message with `(vX.Y.Z)`;

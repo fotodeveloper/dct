@@ -47,13 +47,23 @@ derived, read-only field. Sprint changes go through dedicated tools
 Status transitions:
 - "start" / "zacznij" / "rozpocznij" / "w toku" / "wip" / "in progress" → `status="in_progress"`
 - "pause" / "wstrzymaj" / "block" / "zablokuj" → keep status, add note explaining pause
-- "open" / "reopen" / "wznów" → `status="open"` (also clears `resolved_at` automatically — see CLAUDE.md terminal invariant)
+- "open" / "reopen" / "wznów" → `status="open"` (reopening a resolved / wont_fix item clears `resolved_at` automatically — no separate call)
 - "resolved" / "done" / "close" / "zamknij" / "wont fix" → closing is a
   terminal transition: follow the /track-resolve procedure (its pending-gate
   check, then `mcp__dct__resolve_item(item_id, status, resolution)`), never
-  `update_item` with a terminal status. A pending gate stops the close the
-  same way /track-resolve does — the server refuses it anyway — and no gate
-  is ever rejected to get the item closed: that is the user's own "skip it".
+  `update_item` with a terminal status. Pending gates are taken the way
+  /track-resolve takes them, by each gate's recorded condition: one whose
+  condition is really met with the evidence its text requires, current for
+  the state being closed, is completed within the close without asking for
+  a separate "done"; one whose evidence is missing or stale stays pending
+  and stops the close (the server refuses it anyway), and your own test
+  never replaces an independent review. A condition that needs a person's
+  act or acceptance (the kind alone does not decide) is completed only on
+  that person's confirmation — finished implementation, green tests or the
+  instruction to close the item do not replace it — and a confirmation that
+  person already gave explicitly is not asked again. No gate is ever
+  rejected to get the item closed: a gate is rejected only on the user's
+  own decision, their "skip it".
 
 Sprint membership (NOT via update_item):
 - "add to sprint" / "flag for sprint" / "na sprint" / "dodaj do sprintu" →

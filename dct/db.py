@@ -174,11 +174,12 @@ item_checkpoints = sa.Table(
     sa.Column("text", sa.Text, nullable=False),
     sa.Column("status", sa.String(10), nullable=False, server_default="pending"),
     sa.Column("sort_order", sa.Integer, nullable=False, server_default="0"),
-    # `kind` classifies the checkpoint as a 'task' (default, closeable by
-    # anyone) or a 'gate' (kind != 'task'). Pending gates block resolve_item.
-    # Open string column (not ENUM) so OSS users can define custom gate
-    # kinds; core validates against a whitelist in checkpoints.py but
-    # unknown kinds are treated as gates (conservative default).
+    # `kind` classifies the checkpoint as a non-gate ('task' — the default —
+    # or 'cc-task', the mirrored client todo) or a gate (every other kind).
+    # Pending gates block resolve_item. Open string column (not ENUM) so users
+    # can define custom gate kinds: core (checkpoints.add_checkpoint) refuses
+    # only a blank kind and one longer than this column (ensure_fits) — no
+    # whitelist — and unknown kinds are treated as gates (conservative).
     sa.Column("kind", sa.String(32), nullable=False, server_default="task"),
     sa.Column("created_at", sa.DateTime, nullable=False, server_default=sa.text("CURRENT_TIMESTAMP")),
     sa.Column("updated_at", sa.DateTime, nullable=False, server_default=sa.text("CURRENT_TIMESTAMP")),

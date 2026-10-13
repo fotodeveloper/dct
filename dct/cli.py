@@ -860,6 +860,13 @@ def cmd_show(args):
         for n in item["notes"]:
             print(f"  [{_fmt_date(n['created_at'])}] {n['note']}")
 
+    # The full list the resolve_item gate refusal points at (#917 K-56):
+    # every checkpoint with its kind and untruncated text.
+    if item.get("checkpoints"):
+        print(f"\n── Checkpoints ({len(item['checkpoints'])}) ──")
+        for c in item["checkpoints"]:
+            print(f"  #{c['id']} [{c['kind']}] {c['status']}: {c['text']}")
+
 
 def cmd_update(args):
     from dct.core.items import update_item
