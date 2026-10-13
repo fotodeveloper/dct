@@ -19,6 +19,8 @@ from dct.core.changelog import add_entry, list_entries, release_entries
 from dct.core.projects import create_project, get_project
 from dct.core.releases import advance_release, get_release, set_version_files
 
+pytestmark = pytest.mark.slow
+
 
 def _plain(tmp_path) -> str:
     """A directory CONFIRMED outside git (K-95 C1: a project without a

@@ -186,6 +186,7 @@ def test_cli_set_version_refuses_an_unsupported_version(cli_engine, monkeypatch,
     assert get_project(cli_engine, "proj-a")["current_version"] is None
 
 
+@pytest.mark.slow
 def test_cli_project_add_warns_about_an_unsupported_detected_version(
         cli_engine, monkeypatch, tmp_path, capsys):
     (tmp_path / "VERSION").write_text("1.0.0-beta.2\n")

@@ -93,7 +93,10 @@ from dct.db import projects
 from dct.workflows.release import build_plan
 from dct.workflows.release.effects import ReleaseRefused
 
-pytestmark = pytest.mark.skipif(shutil.which("git") is None, reason="git not installed")
+pytestmark = [
+    pytest.mark.slow,
+    pytest.mark.skipif(shutil.which("git") is None, reason="git not installed"),
+]
 
 ROOT = Path(__file__).resolve().parent.parent
 

@@ -18,7 +18,10 @@ from dct.core import releases as ledger
 from dct.core.changelog import add_entry, release_entries
 from dct.core.projects import create_project
 
-pytestmark = pytest.mark.skipif(shutil.which("git") is None, reason="git not installed")
+pytestmark = [
+    pytest.mark.slow,
+    pytest.mark.skipif(shutil.which("git") is None, reason="git not installed"),
+]
 
 ZERO = "0" * 64
 

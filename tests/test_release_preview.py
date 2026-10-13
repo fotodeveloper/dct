@@ -60,7 +60,10 @@ from dct.db import projects
 from dct.workflows.release import build_plan, effects
 from dct.workflows.release.effects import ATTEST_SUBJECT, prepare_release
 
-pytestmark = pytest.mark.skipif(shutil.which("git") is None, reason="git not installed")
+pytestmark = [
+    pytest.mark.slow,
+    pytest.mark.skipif(shutil.which("git") is None, reason="git not installed"),
+]
 
 # ── the shapes the contract fixes (sections A1, C3, E1) ──────────────────────
 

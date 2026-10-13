@@ -32,7 +32,10 @@ from dct.core.releases import get_release
 from dct.workflows.release import effects, oplock
 from dct.workflows.release.effects import ReleaseRefused
 
-pytestmark = pytest.mark.skipif(shutil.which("git") is None, reason="git not installed")
+pytestmark = [
+    pytest.mark.slow,
+    pytest.mark.skipif(shutil.which("git") is None, reason="git not installed"),
+]
 
 LOCKED = "another dct release operation"
 

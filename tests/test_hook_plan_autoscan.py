@@ -11,6 +11,8 @@ import pytest
 
 from dct.integrations.claude import HOOKS_DIR
 
+pytestmark = pytest.mark.slow
+
 HOOK_PATH = HOOKS_DIR / "dct-plan-autoscan.sh"
 
 

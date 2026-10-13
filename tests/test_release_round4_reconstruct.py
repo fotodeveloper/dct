@@ -70,7 +70,10 @@ from dct.workflows.release.effects import (
     resume_release,
 )
 
-pytestmark = pytest.mark.skipif(shutil.which("git") is None, reason="git not installed")
+pytestmark = [
+    pytest.mark.slow,
+    pytest.mark.skipif(shutil.which("git") is None, reason="git not installed"),
+]
 
 GOOD = "# Changelog\n\n" + released_section("2026-02-01") + "\n" + HISTORY[13:]
 PIN_REFS = "refs/dct/release-proposals"

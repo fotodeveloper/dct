@@ -18,6 +18,8 @@ from pathlib import Path
 import pytest
 from conftest import decorated_tool_count
 
+pytestmark = pytest.mark.slow
+
 # Client protocol eras the server must serve (release-notes claim: "one SDK,
 # both protocol eras"). Empirically (2026-07-30): pre-2026 versions are echoed
 # back verbatim; a 2026-07-28 request is negotiated DOWN to 2025-11-25 over

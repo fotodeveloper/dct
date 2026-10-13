@@ -99,7 +99,10 @@ from dct.workflows.release.effects import (
     reconstruct,
 )
 
-pytestmark = pytest.mark.skipif(shutil.which("git") is None, reason="git not installed")
+pytestmark = [
+    pytest.mark.slow,
+    pytest.mark.skipif(shutil.which("git") is None, reason="git not installed"),
+]
 
 ROOT = Path(__file__).resolve().parent.parent
 MARKER = "changelog_path_explicit"

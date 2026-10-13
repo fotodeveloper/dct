@@ -35,7 +35,7 @@ from conftest import (
     git,
     make_git_repo,
 )
-from test_procs import MIB, ROOT, Family
+from test_procs import MIB, ROOT, Family, start_interruptible
 from test_release_effects import SLUG as SLUG_R
 from test_release_effects import apply, make_release_repo, proven, remote_refs, resume
 from test_release_git_effects import hooks_dir, install_hook, local_tag
@@ -49,6 +49,7 @@ from dct.workflows.release import effects, oplock
 from dct.workflows.release.effects import ReleaseRefused
 
 pytestmark = [
+    pytest.mark.slow,
     pytest.mark.skipif(shutil.which("git") is None, reason="git not installed"),
     pytest.mark.skipif(not hasattr(os, "killpg"), reason="process groups are POSIX"),
 ]
@@ -128,11 +129,7 @@ def test_an_interrupted_prepare_leaves_no_script_process_behind(
               "ids": [eid], "repo": str(repo),
               "digest": approved_plan_digest(engine, SLUG, repo, version="1.1.0",
                                              entry_ids=[eid])}
-    script = tmp_path / "prepare.py"
-    script.write_text(PREPARE)
-    helper = subprocess.Popen([sys.executable, str(script), json.dumps(config)], cwd=ROOT,
-                              stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                              stderr=subprocess.PIPE, text=True)
+    helper = start_interruptible(tmp_path / "prepare.py", PREPARE, config)
     try:
         family.wait_ready(helper)
         isolated = (family.dir / "cwd").read_text()
@@ -219,11 +216,7 @@ def test_an_apply_interrupted_inside_a_commit_hook_stops_the_hook_and_stays_resu
     config = {"url": engine.url.render_as_string(hide_password=False), "slug": SLUG_R,
               "ids": [a], "repo": str(repo), "digest": digest, "proposal": proposal,
               "push": approved_push(repo)}
-    script = tmp_path / "apply.py"
-    script.write_text(APPLY)
-    helper = subprocess.Popen([sys.executable, str(script), json.dumps(config)], cwd=ROOT,
-                              stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                              stderr=subprocess.PIPE, text=True)
+    helper = start_interruptible(tmp_path / "apply.py", APPLY, config)
     try:
         family.wait_ready(helper)
         helper.send_signal(signum)

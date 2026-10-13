@@ -95,6 +95,7 @@ def test_unparseable_legacy_version_matches_only_itself(engine):
 # ── the full v1.6.0 flow: core + CLI + export ────────────────────────────────
 
 
+@pytest.mark.slow
 def test_v_prefixed_release_flow_core_cli_export(cli_engine, tmp_path, monkeypatch, capsys):
     engine = cli_engine
     # A path CONFIRMED outside git (K-95 C1: a pathless project is refused).

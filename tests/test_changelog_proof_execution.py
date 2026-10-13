@@ -34,7 +34,10 @@ from dct.workflows.release.proof import (
     ids_from_trailer_value,
 )
 
-pytestmark = pytest.mark.skipif(shutil.which("git") is None, reason="git not installed")
+pytestmark = [
+    pytest.mark.slow,
+    pytest.mark.skipif(shutil.which("git") is None, reason="git not installed"),
+]
 
 FALLBACKS = Path(__file__).resolve().parent.parent / "docs" / "assistant-fallbacks.md"
 

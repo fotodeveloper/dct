@@ -16,6 +16,8 @@ from dct.core.changelog import list_entries
 from dct.core.items import create_item as core_create_item
 from dct.core.projects import create_project
 
+pytestmark = pytest.mark.slow
+
 
 def _call(srv, name: str, args: dict):
     async def go():

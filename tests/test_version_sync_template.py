@@ -129,6 +129,7 @@ def test_render_refuses_an_unknown_version_file(bad):
 # ── the generated script, run for real ──────────────────────────────────────
 
 
+@pytest.mark.slow
 @pytest.mark.skipif(not BASH, reason="bash not available")
 @pytest.mark.parametrize("kind", VERSION_FILES)
 def test_the_generated_script_sets_only_the_version_field(tmp_path, kind):
@@ -147,6 +148,7 @@ def test_the_generated_script_sets_only_the_version_field(tmp_path, kind):
     assert detect_version(tmp_path) == ("0.3.0", kind)
 
 
+@pytest.mark.slow
 @pytest.mark.skipif(not BASH, reason="bash not available")
 def test_the_generated_script_is_idempotent_and_needs_its_argument(tmp_path):
     (tmp_path / "pyproject.toml").write_text(SAMPLES["pyproject.toml"][0], encoding="utf-8")
@@ -160,6 +162,7 @@ def test_the_generated_script_is_idempotent_and_needs_its_argument(tmp_path):
     assert (tmp_path / "pyproject.toml").read_text() == SAMPLES["pyproject.toml"][1]
 
 
+@pytest.mark.slow
 @pytest.mark.skipif(not BASH, reason="bash not available")
 def test_a_missing_version_file_fails_the_script_and_leaves_no_temp_file(tmp_path):
     write_script(tmp_path, "pyproject.toml")

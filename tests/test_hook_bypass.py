@@ -14,6 +14,8 @@ from conftest import require_tools
 
 from dct.integrations.claude import HOOKS_DIR
 
+pytestmark = pytest.mark.slow
+
 HOOK_PATH = HOOKS_DIR / "check-changelog.sh"
 
 

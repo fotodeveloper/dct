@@ -48,7 +48,10 @@ from dct.workflows.release.effects import (
     resume_release,
 )
 
-pytestmark = pytest.mark.skipif(shutil.which("git") is None, reason="git not installed")
+pytestmark = [
+    pytest.mark.slow,
+    pytest.mark.skipif(shutil.which("git") is None, reason="git not installed"),
+]
 
 SLUG = "proj-q"
 HISTORY = "# Changelog\n\n## [1.0.0] - 2026-01-01\n\n### Added\n\n- first\n"

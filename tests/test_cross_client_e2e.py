@@ -14,6 +14,8 @@ from test_server_wire import WireClient, isolated_wire_environment
 from dct.core.projects import create_project
 from dct.db import create_tables, get_engine
 
+pytestmark = pytest.mark.slow
+
 
 @pytest.fixture
 def wire_project(tmp_path):

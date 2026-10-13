@@ -75,7 +75,10 @@ from dct.core.releases import get_release
 from dct.export import export_changelog_md
 from dct.workflows.release.effects import ReleaseRefused, resume_release
 
-pytestmark = pytest.mark.skipif(shutil.which("git") is None, reason="git not installed")
+pytestmark = [
+    pytest.mark.slow,
+    pytest.mark.skipif(shutil.which("git") is None, reason="git not installed"),
+]
 
 
 @pytest.fixture(autouse=True)

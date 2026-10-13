@@ -25,6 +25,8 @@ from dct import paths
 from dct.integrations import claude, manager
 from dct.integrations.codex import CodexIntegration
 
+pytestmark = pytest.mark.slow
+
 _HOME_ENV = ("HOME", "USERPROFILE")
 # Unset, so each falls back to the fake HOME (dct.paths, CodexIntegration).
 _DERIVED_ENV = ("CODEX_HOME", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME",

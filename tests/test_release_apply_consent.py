@@ -88,7 +88,10 @@ from dct.workflows.release.effects import (
 from dct.workflows.release.plan import adoptable_chain, read_commits
 from dct.workflows.release.proof import proven_ids
 
-pytestmark = pytest.mark.skipif(shutil.which("git") is None, reason="git not installed")
+pytestmark = [
+    pytest.mark.slow,
+    pytest.mark.skipif(shutil.which("git") is None, reason="git not installed"),
+]
 
 NO_MADE = {"work_commit": None, "attest_commit": None}
 NEW_POINTS = ("before_work_commit", "after_work_commit", "after_work_index",

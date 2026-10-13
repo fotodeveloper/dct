@@ -330,6 +330,7 @@ def test_an_unparseable_current_never_asks_about_taken_versions():
 # ── gitinfo.version_tags (moved from the effects layer) ──────────────────────
 
 
+@pytest.mark.slow
 @needs_git
 def test_version_tags_finds_every_spelling_of_one_version(tmp_path):
     repo = make_git_repo(tmp_path / "tags")
@@ -367,6 +368,7 @@ def test_effects_has_no_second_tag_reader():
 # ── 4. the plan document ─────────────────────────────────────────────────────
 
 
+@pytest.mark.slow
 @needs_git
 def test_the_plan_suggests_for_the_snapshot_selection(engine, tmp_path):
     """The categories are those of the SELECTED entries: an unproven
@@ -387,6 +389,7 @@ def test_the_plan_suggests_for_the_snapshot_selection(engine, tmp_path):
                                                    [("minor", "1.1.0"), ("major", "2.0.0")])
 
 
+@pytest.mark.slow
 @needs_git
 def test_the_version_object_keeps_current_target_and_bump(engine, tmp_path):
     repo = project_repo(engine, tmp_path)
@@ -397,6 +400,7 @@ def test_the_version_object_keeps_current_target_and_bump(engine, tmp_path):
     assert version["suggested"]["target"] == "1.0.1"  # the selection's, not the requested bump
 
 
+@pytest.mark.slow
 @needs_git
 def test_the_suggestion_is_outside_the_snapshot_and_the_digest(engine, tmp_path):
     """A tag of the suggested version on a side branch changes ONLY the
@@ -419,6 +423,7 @@ def test_the_suggestion_is_outside_the_snapshot_and_the_digest(engine, tmp_path)
     assert "suggested" not in json.dumps(after["snapshot"])
 
 
+@pytest.mark.slow
 @needs_git
 @pytest.mark.parametrize("name, annotated", [
     ("v0.2.0", False), ("0.2.0", False), ("v0.2", False), ("V0.2.0", False), ("v0.2.0", True),
@@ -432,6 +437,7 @@ def test_a_local_tag_in_any_spelling_takes_the_version(engine, tmp_path, name, a
     assert suggested["safe"] is False and suggested["taken"] == ["0.2.0"]
 
 
+@pytest.mark.slow
 @needs_git
 def test_a_local_tag_and_an_abandoned_record_are_both_skipped(engine, tmp_path):
     """Contract example end to end: v0.2.0 tagged, a record of 0.2.1
@@ -448,6 +454,7 @@ def test_a_local_tag_and_an_abandoned_record_are_both_skipped(engine, tmp_path):
         "minor", "0.2.2", "tag_taken", False, [("patch", "0.1.6")], taken=["0.2.0", "0.2.1"])
 
 
+@pytest.mark.slow
 @needs_git
 def test_a_record_of_the_target_in_another_spelling_takes_it(engine, tmp_path):
     """A record stored as `0.2` is the same version as the target 0.2.0."""
@@ -460,6 +467,7 @@ def test_a_record_of_the_target_in_another_spelling_takes_it(engine, tmp_path):
     assert suggested["target"] == "0.2.1" and suggested["reason"] == "tag_taken"
 
 
+@pytest.mark.slow
 @needs_git
 def test_a_first_release_without_version_or_tag_is_0_1_0(engine, tmp_path):
     repo = project_repo(engine, tmp_path, current=None, tag=None)
@@ -468,6 +476,7 @@ def test_a_first_release_without_version_or_tag_is_0_1_0(engine, tmp_path):
     assert plan["version"]["suggested"] == expected(None, "0.1.0", "first_version", True)
 
 
+@pytest.mark.slow
 @needs_git
 def test_without_a_version_the_ancestor_tag_is_the_base(engine, tmp_path):
     repo = project_repo(engine, tmp_path, current=None, tag="v1.3.0")
@@ -478,6 +487,7 @@ def test_without_a_version_the_ancestor_tag_is_the_base(engine, tmp_path):
         "patch", "1.3.1", "after_tag", False, [("minor", "1.4.0"), ("major", "2.0.0")])
 
 
+@pytest.mark.slow
 @needs_git
 def test_an_unparseable_stored_version_gives_no_target_and_no_crash(engine, tmp_path):
     """A legacy current_version outside the contract (written before it
@@ -492,6 +502,7 @@ def test_an_unparseable_stored_version_gives_no_target_and_no_crash(engine, tmp_
     assert plan["snapshot_digest"] is not None
 
 
+@pytest.mark.slow
 def test_a_project_confirmed_outside_git_still_gets_a_suggestion(engine, tmp_path):
     """Outside git the selection is every entry (no_git) and only release
     records can take a version — the suggestion is computed, not null."""
@@ -508,6 +519,7 @@ def test_a_project_confirmed_outside_git_still_gets_a_suggestion(engine, tmp_pat
 # ── the plans without a suggestion ───────────────────────────────────────────
 
 
+@pytest.mark.slow
 @needs_git
 def test_a_resume_plan_has_no_suggestion(engine, tmp_path):
     repo = project_repo(engine, tmp_path)
@@ -527,6 +539,7 @@ def test_a_project_without_a_path_has_no_suggestion(engine, tmp_path):
     assert "suggested" in plan["version"] and plan["version"]["suggested"] is None
 
 
+@pytest.mark.slow
 @needs_git
 def test_an_own_executor_project_has_no_suggestion(engine, tmp_path):
     """Its own release tool picks the version; dct proposes none."""
@@ -541,6 +554,7 @@ def test_an_own_executor_project_has_no_suggestion(engine, tmp_path):
 # ── pending_consent (step 1: present, always null) ───────────────────────────
 
 
+@pytest.mark.slow
 @needs_git
 def test_pending_consent_is_present_and_null(engine, tmp_path):
     repo = project_repo(engine, tmp_path)
@@ -596,6 +610,7 @@ def test_every_suggestion_reason_is_documented(reason):
     assert f"`{reason}`" in _plan_section(), reason
 
 
+@pytest.mark.slow
 def test_version_of_imported_released_history_is_taken(engine, tmp_path):
     """A version only released changelog entries carry (imported history:
     no release record, no tag) is taken — a project without current_version

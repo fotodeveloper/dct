@@ -13,7 +13,10 @@ from dct.core import gitinfo
 from dct.core.gitinfo import git_context
 from dct.integrations import codex_hooks
 
-pytestmark = pytest.mark.skipif(shutil.which("git") is None, reason="git not available")
+pytestmark = [
+    pytest.mark.slow,
+    pytest.mark.skipif(shutil.which("git") is None, reason="git not available"),
+]
 
 
 def test_normal_branch_reports_branch_and_realpath_toplevel(tmp_path):

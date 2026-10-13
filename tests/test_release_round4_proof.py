@@ -28,7 +28,10 @@ from dct.export import export_changelog_md
 from dct.workflows.release import build_plan, commit_candidates
 from dct.workflows.release import plan as plan_module
 
-pytestmark = pytest.mark.skipif(shutil.which("git") is None, reason="git not installed")
+pytestmark = [
+    pytest.mark.slow,
+    pytest.mark.skipif(shutil.which("git") is None, reason="git not installed"),
+]
 
 B0, B1, B2 = b"B0\x00zero", b"B1\x00one", b"B2\x00two"
 

@@ -24,7 +24,10 @@ from dct.db import changelog_entries, releases
 from dct.workflows.release import build_plan
 from dct.workflows.release.effects import ReleaseRefused, apply_release
 
-pytestmark = pytest.mark.skipif(shutil.which("git") is None, reason="git not installed")
+pytestmark = [
+    pytest.mark.slow,
+    pytest.mark.skipif(shutil.which("git") is None, reason="git not installed"),
+]
 
 SLUG = "proj-b"
 

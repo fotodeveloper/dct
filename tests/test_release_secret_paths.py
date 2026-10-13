@@ -27,7 +27,10 @@ from dct.workflows.release import effects
 from dct.workflows.release import plan as planning
 from dct.workflows.release.plan import commit_candidates
 
-pytestmark = pytest.mark.skipif(shutil.which("git") is None, reason="git not installed")
+pytestmark = [
+    pytest.mark.slow,
+    pytest.mark.skipif(shutil.which("git") is None, reason="git not installed"),
+]
 
 SECRETS = [".env", ".env.local", ".env.production", "config/.env", "server.pem", "tls.key",
            "id_rsa", "keys/cert.p12", "credentials.json",

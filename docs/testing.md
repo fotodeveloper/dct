@@ -6,7 +6,9 @@ back to the [README](../README.md).
 ## The default suite
 
 ```bash
-.venv/bin/pytest -q          # in-memory SQLite, no services, no env vars
+.venv/bin/pytest -q -n auto --dist worksteal  # in-memory SQLite, one worker per core (pytest-xdist)
+.venv/bin/pytest -q          # the same suite serially
+.venv/bin/pytest -q -m "not slow"   # fast loop: only tests that start no process
 ```
 
 The `engine` fixture (`tests/conftest.py`) hands every test a private
@@ -20,6 +22,45 @@ tests run shell hooks that call the `dct` on `PATH`, which would otherwise read
 the developer's config and migrate their live database with this tree's code.
 Tests that exercise config or URL resolution clear these variables locally with
 `monkeypatch.delenv(..., raising=False)`.
+
+## Parallel runs (#921)
+
+pytest-xdist ships in the `dev` extra. `-n auto` starts one worker process per
+core; `--dist worksteal` lets an idle worker take queued tests from a busy one,
+so a slow module does not hold up a whole shard (xdist's default `load`
+scheduler also distributes dynamically, but never moves a test already queued
+on a busy worker). Each worker is its own process with its own session tmp dir
+(`.../popen-gwN/`): `_suite_isolation` gives it its own suite database, config
+and data dir, `_fake_home_root` its own fake homes, `_direct_git` its own git
+symlink — no session-scoped fixture shares a path between workers. CI runs
+the SQLite job with `-n auto --dist worksteal --durations=25`.
+
+The PostgreSQL lane stays serial: its per-test isolation drops the public
+schema of the ONE target database, so workers would drop each other's tables.
+`tests/conftest.py` refuses `-n` on that lane (`pytest_configure`).
+
+A test that signals a dct stand-in (Ctrl-C, SIGTERM, SIGHUP) must not depend on
+the dispositions the run inherited: a shell without job control starts a
+background job (`pytest … &` in a script, a parallel shard) with SIGINT
+ignored, and an ignored signal is inherited by every child. Such tests start
+the stand-in through `start_interruptible` and set the in-process dispositions
+with the `terminal_dispositions` fixture (`tests/test_procs.py`).
+
+## The `slow` marker (#921)
+
+Almost all of the suite's time goes to child processes — git, hooks, the
+`dct` CLI, process-group helpers. `slow` (registered in `pyproject.toml`)
+marks exactly those tests: per module (`pytestmark = pytest.mark.slow`, or a
+list including it) when at least a quarter of the module's tests start a
+process, otherwise per test (`@pytest.mark.slow`), so a mostly in-process
+module stays in the fast loop. `-m "not slow"` runs the in-process rest as a
+fast local loop; the full suite and CI always run everything.
+
+The rule is enforced, not remembered: the autouse `_slow_marker_drift`
+fixture (`tests/conftest.py`) records every `subprocess.Popen` a test starts
+and fails a test that is not marked `slow` with the first command it started.
+Processes started by session- or module-scoped fixtures and a bare `os.fork`
+are outside the check.
 
 ## The PostgreSQL lane (#426)
 
@@ -63,7 +104,7 @@ With docker:
 docker run --rm -d -p 5433:5432 -e POSTGRES_PASSWORD=dct \
   -e POSTGRES_USER=dct -e POSTGRES_DB=dct_ci --name dct-pg postgres:16
 DCT_TEST_DATABASE_URL=postgresql+psycopg://dct:dct@localhost:5433/dct_ci \
-  DCT_EXPECT_PG=1 .venv/bin/pytest -q -rs   # ~3.5 min vs ~16 s on SQLite
+  DCT_EXPECT_PG=1 .venv/bin/pytest -q -rs   # serial only, see above
 ```
 
 With a local server instead of docker: `createdb dct_ci_local` and point the URL

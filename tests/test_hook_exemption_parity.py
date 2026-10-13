@@ -24,6 +24,8 @@ from conftest import git, make_git_repo, require_tools
 
 from dct.integrations.claude import HOOKS_DIR
 
+pytestmark = pytest.mark.slow
+
 COMMIT_HOOK = HOOKS_DIR / "check-changelog.sh"
 STOP_HOOK = HOOKS_DIR / "check-changelog-on-stop.sh"
 LIB = HOOKS_DIR / "dct-changelog-count.lib.sh"

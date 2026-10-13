@@ -7,6 +7,10 @@ Task-9 contract). Default-resolution tests isolate HOME instead.
 
 import os
 import socket
+import subprocess
+import sys
+
+import pytest
 
 from dct import cli
 
@@ -80,25 +84,36 @@ def test_web_subparser_wired():
 
 # ── daemon stdio detach (regression: `$(dct web start)` must not hang) ─────────
 
+# A separate interpreter, not os.fork: forking a multi-threaded pytest-xdist
+# worker is unsafe (DeprecationWarning on 3.12+) and its child would run the
+# rest of the suite on an error. The child inherits the pipe as its stdout, as
+# a real `$(dct web start)` would, detaches, then writes one line.
+_DETACH_CHILD = """
+import sys
+from pathlib import Path
+from dct import cli
+cli._detach_stdio(Path(sys.argv[1]))
+print("daemon-log-line", flush=True)
+"""
+
+
+@pytest.mark.slow
 def test_detach_stdio_redirects_away_from_inherited_stdout(tmp_path):
     """The daemonized child must NOT keep writing to its inherited stdout — that
     is what made `$(dct web start)` block forever on the never-closing pipe.
     After _detach_stdio, fd 1 must point at the log file, leaving the inherited
     pipe with no open write end (parent reads EOF)."""
     log = tmp_path / "web.log"
-    r, w = os.pipe()  # stand-in for the caller's captured stdout pipe
-    pid = os.fork()
-    if pid == 0:  # child
-        os.dup2(w, 1)  # inherit the pipe as stdout, as a real `$(...)` would
-        os.close(r)
-        os.close(w)
-        cli._detach_stdio(log)
-        os.write(1, b"daemon-log-line\n")  # fd 1 is now the log file, not the pipe
-        os._exit(0)
-    os.close(w)
-    leaked = os.read(r, 4096)  # empty == child closed the inherited write end
-    os.close(r)
-    os.waitpid(pid, 0)
+    child = subprocess.Popen(
+        [sys.executable, "-c", _DETACH_CHILD, str(log)],
+        stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    try:
+        leaked, _ = child.communicate(timeout=30)
+    finally:
+        if child.poll() is None:  # controlled termination on a timeout
+            child.kill()
+            child.wait()
+    assert child.returncode == 0
     assert leaked == b""
     assert "daemon-log-line" in log.read_text()
 

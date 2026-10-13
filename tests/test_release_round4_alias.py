@@ -44,7 +44,10 @@ from dct.core.releases import get_pending_proposal, get_release
 from dct.workflows.release import effects
 from dct.workflows.release.effects import ReleaseRefused, SyncFailed
 
-pytestmark = pytest.mark.skipif(shutil.which("git") is None, reason="git not installed")
+pytestmark = [
+    pytest.mark.slow,
+    pytest.mark.skipif(shutil.which("git") is None, reason="git not installed"),
+]
 
 PIN_PREFIX = "refs/dct/release-proposals/"
 

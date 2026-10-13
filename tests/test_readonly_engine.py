@@ -33,6 +33,8 @@ from dct.db import (
     get_readonly_engine,
 )
 
+pytestmark = pytest.mark.slow
+
 READ_ONLY_COMMANDS = [
     ["release", "plan", "--project", "proj-a"],
     ["release", "plan", "--project", "proj-a", "--json"],

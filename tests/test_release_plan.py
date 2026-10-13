@@ -25,7 +25,10 @@ from dct.workflows.release import (
     commit_candidates,
 )
 
-pytestmark = pytest.mark.skipif(shutil.which("git") is None, reason="git not installed")
+pytestmark = [
+    pytest.mark.slow,
+    pytest.mark.skipif(shutil.which("git") is None, reason="git not installed"),
+]
 
 
 # ── helpers ──────────────────────────────────────────────────────────────────

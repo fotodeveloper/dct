@@ -16,6 +16,8 @@ import conftest
 import pytest
 from conftest import throwaway_refusal_reason
 
+pytestmark = pytest.mark.slow
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
 

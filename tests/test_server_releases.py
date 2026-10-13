@@ -7,6 +7,8 @@ import json
 import pytest
 from conftest import ledger_proofs
 
+pytestmark = pytest.mark.slow
+
 SHA = "0123456789abcdef0123456789abcdef01234567"
 SHA2 = "fedcba9876543210fedcba9876543210fedcba98"
 RECORD_KEYS = {"id", "version", "mode", "entry_ids", "candidate_sha", "checkout_root",

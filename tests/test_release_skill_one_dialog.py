@@ -1586,6 +1586,7 @@ def documented_apply(body: str, run, consent: str) -> tuple[int, dict]:
                      {"--consent": consent}))
 
 
+@pytest.mark.slow
 @pytest_git
 @pytest.mark.parametrize("text", RELEASE_DIALOGS)
 def test_documented_stop_makes_the_declined_screen_unappliable(text, engine, cli):
@@ -1609,6 +1610,7 @@ def test_documented_stop_makes_the_declined_screen_unappliable(text, engine, cli
     assert {e["id"]: e["version"] for e in list_entries(engine, SLUG)}[a] is None
 
 
+@pytest.mark.slow
 @pytest_git
 @pytest.mark.parametrize("text", RELEASE_DIALOGS)
 def test_documented_other_version_replaces_the_screen_the_owner_saw(text, engine, cli):
@@ -1638,6 +1640,7 @@ def test_documented_other_version_replaces_the_screen_the_owner_saw(text, engine
     assert remote_refs(repo)[f"refs/tags/v{other}"] == git(repo, "rev-parse", "HEAD")
 
 
+@pytest.mark.slow
 @pytest_git
 @pytest.mark.parametrize("text", RELEASE_DIALOGS)
 def test_documented_none_then_all_then_another_version_shows_the_entries_of_all(
@@ -1676,6 +1679,7 @@ def test_documented_none_then_all_then_another_version_shows_the_entries_of_all(
     assert get_release(engine, SLUG, v2)["entry_ids"] == sorted(selected)
 
 
+@pytest.mark.slow
 @pytest_git
 @pytest.mark.parametrize("text", RELEASE_DIALOGS)
 def test_documented_release_with_all_releases_the_waiting_entry_in_one_answer(
@@ -1750,6 +1754,7 @@ def test_11_the_push_choice_replaces_every_earlier_push_flag(text):
     assert "--push-url" not in other, other
 
 
+@pytest.mark.slow
 @pytest_git
 @pytest.mark.parametrize("text", RELEASE_DIALOGS)
 def test_documented_push_choice_previews_the_new_target_both_ways(text, engine, cli):

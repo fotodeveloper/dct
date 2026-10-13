@@ -232,6 +232,7 @@ def test_fix_canonicalizes_an_approximation_the_check_tolerates(checker, tmp_pat
     assert "~940 tests" in page.read_text(encoding="utf-8")
 
 
+@pytest.mark.slow
 def test_derived_hook_count_excludes_shared_hook_libs(checker):
     """A sourced *.lib.sh beside the hooks (K-48) is not a hook: the advertised
     hook count must equal the hooks the installer wires, not every *.sh file."""

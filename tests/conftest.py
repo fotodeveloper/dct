@@ -142,6 +142,18 @@ def pg_lane_refusal_reason(url: str, item_count: int | None) -> str | None:
     return throwaway_refusal_reason(url, LIVE_DATABASE_URL, item_count)
 
 
+def pytest_configure(config):
+    """The PG lane runs serially: its per-test isolation drops the ONE target
+    database's public schema, so parallel workers (pytest-xdist `-n`) would
+    drop each other's tables mid-test. Refused before any worker starts."""
+    if PG_TEST_URL and (os.environ.get("PYTEST_XDIST_WORKER")
+                        or config.getoption("numprocesses", default=None)):
+        raise pytest.UsageError(
+            "the PostgreSQL lane (DCT_TEST_DATABASE_URL) cannot run with pytest-xdist "
+            "(-n): every worker would DROP SCHEMA public of the same database. "
+            "Run it serially (-n 0 or no -n).")
+
+
 @pytest.fixture(scope="session")
 def pg_lane_target_guard():
     """Refuse a non-throwaway PG lane target ONCE, before any test runs DDL."""
@@ -332,6 +344,40 @@ def _home_isolation(_fake_home_root, _direct_git, monkeypatch):
     for module, attr, rel in list(_home_derived_constants(_fake_home_root)):
         monkeypatch.setattr(module, attr, home / rel)
     return home
+
+
+# --- The `slow` marker (#921) ----------------------------------------------
+# The suite's time goes to child processes (git, hooks, `dct` itself, signal
+# and process-group helpers), so `slow` means "this test starts a process":
+# `pytest -m "not slow"` is the fast in-process loop, the full suite and CI
+# still run everything. The rule cannot drift: a test that is not marked
+# slow and still starts a process through subprocess (run, Popen, check_output,
+# asyncio's subprocess transport) fails with the command it started. Spawns
+# by session- or module-scoped fixtures (before this fixture patches) and a
+# bare os.fork are outside the check.
+
+
+@pytest.fixture(autouse=True)
+def _slow_marker_drift(request, monkeypatch):
+    """Fail a test that starts a child process without the `slow` marker."""
+    if request.node.get_closest_marker("slow") is not None:
+        yield
+        return
+    started: list = []
+    original = subprocess.Popen.__init__
+
+    def recording_init(self, args, *rest, **kwargs):
+        started.append(args)
+        return original(self, args, *rest, **kwargs)
+
+    monkeypatch.setattr(subprocess.Popen, "__init__", recording_init)
+    yield
+    monkeypatch.setattr(subprocess.Popen, "__init__", original)
+    if started:
+        pytest.fail(
+            f"{request.node.nodeid} starts child processes but is not marked `slow` "
+            f"(first: {started[0]!r}). Mark its module with "
+            "`pytestmark = pytest.mark.slow` (#921, docs/testing.md).", pytrace=False)
 
 
 @pytest.fixture
@@ -740,6 +786,7 @@ class LockProbe:
         self.free = threading.Event()
         self.thread_id: int | None = None
         self.attempts = 0
+        self._competitor_dbapi = None
         sa.event.listen(engine, "before_cursor_execute", self._observe)
 
     def close(self):
@@ -764,6 +811,12 @@ class LockProbe:
 
         if threading.get_ident() != self.thread_id:
             return
+        if conn.dialect.name == "postgresql":
+            # The backend the competitor runs on right now (a competitor may
+            # open several connections in turn; the latest is the one that
+            # can be waiting). Read without a statement of its own, so the
+            # probe adds nothing to the race under test.
+            self._competitor_dbapi = cursor.connection
         if "pg_try_advisory_lock" in statement:
             self.attempts += 1
             if self.attempts >= 2:
@@ -793,6 +846,67 @@ class LockProbe:
             "the competitor never reached the held lock"
             + (" — the probe found it FREE" if self.free.is_set() else ""))
         assert not self.free.is_set()
+
+    def _competitor_pid(self) -> int | None:
+        dbapi = self._competitor_dbapi
+        # psycopg's `info.backend_pid` is libpq's PQbackendPID: the value
+        # pg_backend_pid() returns on that connection.
+        return None if dbapi is None else dbapi.info.backend_pid
+
+    def wait_until_row_blocked(self, holder: sa.Connection, timeout: float = 15) -> None:
+        """Positive proof that THIS competitor waits on a lock THIS holder
+        holds — a row lock (`lock_row`, `SELECT ... FOR UPDATE`) or any
+        other heavyweight lock of the holder's transaction.
+
+        - PostgreSQL: the holder's backend pid (`pg_backend_pid()` on
+          `holder`) is in `pg_blocking_pids(<competitor's backend pid>)`.
+          Never a global count of ungranted locks: another backend's wait
+          (a parallel worker, a leftover session) would pass for the proof.
+        - SQLite: the `BEGIN IMMEDIATE` probe of `wait_until_blocked` (the
+          database has one write lock, so "held" names the holder).
+        Bounded: a competitor that never blocks fails instead of hanging."""
+        import time
+
+        if self.engine.dialect.name != "postgresql":
+            self.wait_until_blocked(timeout)
+            return
+        holder_pid = holder.execute(sa.text("SELECT pg_backend_pid()")).scalar_one()
+        deadline = time.monotonic() + timeout
+        competitor_pid = None
+        with self.engine.connect() as watcher:
+            while time.monotonic() < deadline:
+                competitor_pid = self._competitor_pid()
+                if competitor_pid is not None and competitor_pid != holder_pid:
+                    blocked = watcher.execute(
+                        sa.text("SELECT CAST(:holder AS integer) = ANY(pg_blocking_pids(:competitor))"),
+                        {"holder": holder_pid, "competitor": competitor_pid},
+                    ).scalar_one()
+                    if blocked:
+                        return
+                watcher.rollback()  # a fresh snapshot of the lock table per poll
+                time.sleep(0.02)
+        raise AssertionError(
+            f"the competitor (backend {competitor_pid}) never blocked on a lock "
+            f"held by the holder (backend {holder_pid})")
+
+
+def hold_row_and_race(engine, probe: LockProbe, lock_fn, competitor, holder_write):
+    """The row-lock race in one place (K-16): a HOLDER connection runs
+    `lock_fn(conn)` (must return truthy — e.g. `lambda c: lock_item_row(c, id)`),
+    `competitor` runs in a worker thread and is PROVEN blocked on that lock
+    (`probe.wait_until_row_blocked`), then the holder runs `holder_write(conn)`
+    and commits. Returns the competitor's outcome — its result, or the
+    exception it raised (`LockProbe.capture`)."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    with ThreadPoolExecutor(max_workers=1) as pool, engine.connect() as holder:
+        with holder.begin():
+            assert lock_fn(holder), "the holder could not lock the row"
+            future = pool.submit(probe.capture, competitor)
+            probe.wait_until_row_blocked(holder)
+            assert not future.done(), "the competitor finished while the row was locked"
+            holder_write(holder)
+        return future.result(timeout=20)
 
 
 @pytest.fixture

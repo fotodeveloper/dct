@@ -13,6 +13,8 @@ from conftest import require_tools
 
 from dct.integrations import codex_hooks as hooks
 
+pytestmark = pytest.mark.slow
+
 
 def event(tmp_path, tool='Bash', phase='PreToolUse', **extra):
     return {'cwd': str(tmp_path), 'session_id': 'real-session', 'turn_id': 'real-turn',

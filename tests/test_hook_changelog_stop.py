@@ -21,6 +21,8 @@ import pytest
 
 from dct.integrations.claude import HOOKS_DIR
 
+pytestmark = pytest.mark.slow
+
 HOOK_PATH = HOOKS_DIR / "check-changelog-on-stop.sh"
 
 _HAS_GIT = shutil.which("git") is not None

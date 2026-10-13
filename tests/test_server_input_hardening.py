@@ -15,6 +15,8 @@ from dct.core.plans.crud import add_plan_section as core_add_section
 from dct.core.plans.crud import create_plan as core_create_plan
 from dct.core.projects import create_project
 
+pytestmark = pytest.mark.slow
+
 
 def _entries(srv, slug="test"):
     return {r["id"]: r for r in list_entries(srv._get_engine(), slug)}

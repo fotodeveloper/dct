@@ -46,8 +46,10 @@ import pytest
 from dct.core import procs
 from dct.workflows.release import oplock
 
-pytestmark = pytest.mark.skipif(not hasattr(os, "killpg"),
-                                reason="process groups are a POSIX mechanism")
+pytestmark = [
+    pytest.mark.slow,
+    pytest.mark.skipif(not hasattr(os, "killpg"), reason="process groups are a POSIX mechanism"),
+]
 
 ROOT = Path(__file__).resolve().parent.parent
 MIB = 1024 * 1024
@@ -419,14 +421,50 @@ with oplock.operation_lock(cfg["lock"], "helper") as held:
 '''
 
 
-def start_helper(tmp_path: Path, family: Family, lock: Path, **cfg) -> subprocess.Popen:
-    script = tmp_path / "helper.py"
-    script.write_text(HELPER)
-    config = {"dir": str(family.dir), "log": str(tmp_path / "events.log"), "lock": str(lock),
-              "argv": family.argv(cfg.pop("mode", "ignore")), **cfg}
+# The dispositions of a dct started from a terminal, where Ctrl-C, SIGTERM
+# and SIGHUP reach it. A test that interrupts dct relies on them, but a
+# process INHERITS an ignored signal: a shell without job control starts a
+# background job (`pytest … &` in a script, a CI step, a parallel shard) with
+# SIGINT and SIGQUIT ignored, and dct rightly leaves an ignored signal
+# ignored (test_an_ignored_signal_stays_ignored) — the interrupted dct would
+# then never stop. So the precondition is established, never inherited.
+TERMINAL_DISPOSITIONS = {signal.SIGINT: signal.default_int_handler,
+                         signal.SIGTERM: signal.SIG_DFL, signal.SIGHUP: signal.SIG_DFL}
+
+_TERMINAL_PRELUDE = r'''
+import signal as _signal
+_signal.signal(_signal.SIGINT, _signal.default_int_handler)
+_signal.signal(_signal.SIGTERM, _signal.SIG_DFL)
+_signal.signal(_signal.SIGHUP, _signal.SIG_DFL)
+'''
+
+
+@pytest.fixture
+def terminal_dispositions():
+    """TERMINAL_DISPOSITIONS in THIS process for the test, restored after."""
+    saved = {signum: signal.getsignal(signum) for signum in TERMINAL_DISPOSITIONS}
+    try:
+        for signum, handler in TERMINAL_DISPOSITIONS.items():
+            signal.signal(signum, handler)
+        yield
+    finally:
+        for signum, handler in saved.items():
+            signal.signal(signum, handler)
+
+
+def start_interruptible(script: Path, source: str, config: dict) -> subprocess.Popen:
+    """Run `source` (written to `script`) as a stand-in for dct in its own
+    process, with the TERMINAL_DISPOSITIONS whatever this run inherited."""
+    script.write_text(_TERMINAL_PRELUDE + source)
     return subprocess.Popen([sys.executable, str(script), json.dumps(config)], cwd=ROOT,
                             stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                             stderr=subprocess.PIPE, text=True)
+
+
+def start_helper(tmp_path: Path, family: Family, lock: Path, **cfg) -> subprocess.Popen:
+    config = {"dir": str(family.dir), "log": str(tmp_path / "events.log"), "lock": str(lock),
+              "argv": family.argv(cfg.pop("mode", "ignore")), **cfg}
+    return start_interruptible(tmp_path / "helper.py", HELPER, config)
 
 
 def events(tmp_path: Path) -> list[dict]:
@@ -593,7 +631,7 @@ def _handlers() -> dict:
     return {s: signal.getsignal(s) for s in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)}
 
 
-def test_signal_handlers_are_temporary_and_restored():
+def test_signal_handlers_are_temporary_and_restored(terminal_dispositions):
     before = _handlers()
     with procs.supervision():
         during = _handlers()

@@ -211,6 +211,7 @@ def _at(point: str, action):
     return hook
 
 
+@pytest.mark.slow
 @needs_git
 def test_fresh_apply_refuses_before_any_effect_when_b_joins_after_the_stamp(release_repo):
     """B is written with V right after the stamp of A (raw SQL — the API
@@ -244,6 +245,7 @@ def test_fresh_apply_refuses_before_any_effect_when_b_joins_after_the_stamp(rele
     assert sync_runs(log) == ["1.1.0"]  # the isolated prepare only
 
 
+@pytest.mark.slow
 @needs_git
 def test_fresh_apply_refuses_before_any_effect_when_the_record_is_not_dcts(release_repo):
     """The second barrier (K-106): the record the stamp returned carries
@@ -380,6 +382,7 @@ def test_set_release_executor_takes_the_project_write_lock(concurrent_engine, lo
     assert get_project(eng, SLUG)["release_executor"] == "own"
 
 
+@pytest.mark.slow
 @needs_git
 def test_apply_refuses_when_the_executor_switches_to_own_before_the_stamp(release_repo):
     """The barrier before the stamp (dct → own): another client switches the
@@ -528,6 +531,7 @@ def concurrent_repo(concurrent_engine, tmp_path, git_identity):
     return concurrent_engine, repo, log
 
 
+@pytest.mark.slow
 @needs_git
 def test_effects_never_run_past_an_abandon(concurrent_repo, monkeypatch):
     """A running apply (paused between two effects, holding the operation
@@ -905,6 +909,7 @@ def test_three_bootstraps_heal_the_proof_columns_then_converge(proj, capsys):
 # ── K-115 G4: the effects layer supplies the proofs it verified ─────────────
 
 
+@pytest.mark.slow
 @needs_git
 def test_apply_records_the_verified_tag_and_push(release_repo):
     from test_release_effects import SLUG as R
@@ -926,6 +931,7 @@ def test_apply_records_the_verified_tag_and_push(release_repo):
     assert record["consent"]["executor"] == "dct"
 
 
+@pytest.mark.slow
 @needs_git
 def test_a_local_release_records_the_tag_and_no_push(release_repo):
     from test_release_effects import SLUG as R
@@ -939,6 +945,7 @@ def test_a_local_release_records_the_tag_and_no_push(release_repo):
     assert _proof(record, "tag_proof")["name"] == "v1.1.0" and record["push_proof"] is None
 
 
+@pytest.mark.slow
 @needs_git
 def test_resume_records_the_identity_of_an_annotated_tag_it_found(release_repo):
     """The owner created an ANNOTATED tag at the release commit after an
@@ -969,6 +976,7 @@ def test_resume_records_the_identity_of_an_annotated_tag_it_found(release_repo):
     assert proof["object"] != head
 
 
+@pytest.mark.slow
 @needs_git
 @pytest.mark.parametrize("point", ["after_tagged", "after_pushed"])
 def test_resume_supplies_a_proof_an_older_record_lacks(release_repo, point):
@@ -999,6 +1007,7 @@ def test_resume_supplies_a_proof_an_older_record_lacks(release_repo, point):
     assert _proof(record, "push_proof")["target"] == record["consent"]["push_target"]
 
 
+@pytest.mark.slow
 @needs_git
 def test_reconstruct_records_the_tag_it_verified(release_repo):
     from test_release_effects import SLUG as R
@@ -1273,6 +1282,7 @@ def test_mcp_names_the_duplicates_on_read_and_refuses_them_on_write(mcp, proj):
         assert "2 live records of the same version" in out["error"]
 
 
+@pytest.mark.slow
 def test_cli_release_advance_takes_the_proofs_as_json(cli_engine, tmp_path, monkeypatch,
                                                      capsys):
     """`dct clog release-advance` — the same ledger rules: refused without

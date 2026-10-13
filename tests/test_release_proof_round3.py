@@ -17,7 +17,10 @@ from dct.core.gitinfo import CheckoutVerificationError
 from dct.core.projects import create_project, set_version
 from dct.workflows.release import build_plan, commit_candidates
 
-pytestmark = pytest.mark.skipif(shutil.which("git") is None, reason="git not installed")
+pytestmark = [
+    pytest.mark.slow,
+    pytest.mark.skipif(shutil.which("git") is None, reason="git not installed"),
+]
 
 
 def commit(repo, message: str, path: str = "f.txt", content: str | None = None) -> str:

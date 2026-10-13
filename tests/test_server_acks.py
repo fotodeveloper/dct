@@ -302,6 +302,7 @@ def test_add_changelog_ack_shape(srv):
     assert "entry" not in out
 
 
+@pytest.mark.slow
 def test_add_changelog_component_may_be_null(srv):
     out = srv.add_changelog("fixed", "a bug", project="test")
     assert set(out) == {"id", "project", "category", "component", "branch", "branch_source"}
@@ -322,6 +323,7 @@ _RELEASE_KEYS = {"project", "version", "current_version", "mode", "entry_ids",
                  "released", "already_released", "release"}
 
 
+@pytest.mark.slow
 def test_release_changelog_return_shape_selected(srv):
     a = srv.add_changelog("added", "a", project="test")["id"]
     out = srv.release_changelog(project="test", version="1.0.0", entry_ids=[a])
@@ -340,6 +342,7 @@ def test_release_changelog_return_shape_selected(srv):
         "1.0.0", [a], "stamped")
 
 
+@pytest.mark.slow
 def test_update_changelog_ack_shape(srv):
     eid = srv.add_changelog("added", "old", project="test")["id"]
     out = srv.update_changelog(eid, project="test", entry="new body text", category="fixed")
@@ -347,6 +350,7 @@ def test_update_changelog_ack_shape(srv):
     assert "entry" not in out
 
 
+@pytest.mark.slow
 def test_delete_changelog_ack(srv):
     eid = srv.add_changelog("added", "x", project="test")["id"]
     assert srv.delete_changelog(eid, project="test") == {"deleted": True, "id": eid}

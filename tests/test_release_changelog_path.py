@@ -78,7 +78,10 @@ from dct.workflows.release.effects import (
 )
 from dct.workflows.release.plan import PLAN_KEYS
 
-pytestmark = pytest.mark.skipif(shutil.which("git") is None, reason="git not installed")
+pytestmark = [
+    pytest.mark.slow,
+    pytest.mark.skipif(shutil.which("git") is None, reason="git not installed"),
+]
 
 SLUG = "proj-cl"
 NAMES = ("changelog", "changes", "history", "news", "releases")

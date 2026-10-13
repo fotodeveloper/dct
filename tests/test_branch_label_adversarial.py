@@ -246,6 +246,7 @@ def test_short_title_over_50_characters_is_refused_whatever_they_are(proj, label
 # ── resolve_checkout: inside a repository, but not a checkout of it ──────────
 
 
+@pytest.mark.slow
 @needs_git
 def test_resolve_checkout_from_inside_the_git_dir_is_no_context(tmp_path):
     root = make_git_repo(tmp_path / "repo")
@@ -253,12 +254,14 @@ def test_resolve_checkout_from_inside_the_git_dir_is_no_context(tmp_path):
     assert gitinfo.resolve_checkout(root, os.path.join(root, ".git", "refs")) is None
 
 
+@pytest.mark.slow
 @needs_git
 def test_resolve_checkout_with_a_file_as_cwd_is_no_context(tmp_path):
     root = make_git_repo(tmp_path / "repo")
     assert gitinfo.resolve_checkout(root, os.path.join(root, "README")) is None
 
 
+@pytest.mark.slow
 @needs_git
 def test_resolve_checkout_without_git_on_path_is_no_context(tmp_path, monkeypatch):
     root = make_git_repo(tmp_path / "repo")
@@ -266,6 +269,7 @@ def test_resolve_checkout_without_git_on_path_is_no_context(tmp_path, monkeypatc
     assert gitinfo.resolve_checkout(root, root) is None
 
 
+@pytest.mark.slow
 @needs_git
 def test_project_registered_at_a_linked_worktree_resolves_from_the_main_checkout(tmp_path):
     root = make_git_repo(tmp_path / "repo")
@@ -275,6 +279,7 @@ def test_project_registered_at_a_linked_worktree_resolves_from_the_main_checkout
     assert (out["repo_root"], out["project_root"], out["branch"]) == (root, root, "main")
 
 
+@pytest.mark.slow
 @needs_git
 def test_project_registered_through_a_symlink_maps_into_the_worktree(tmp_path):
     root = make_git_repo(tmp_path / "mono")

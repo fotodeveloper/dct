@@ -35,8 +35,8 @@ Changelog = "https://github.com/fotodeveloper/dct/blob/main/changelog.md"
 pg = ["psycopg[binary]>=3.3.5"]
 mcp = ["mcp>=2.2,<3"]  # SDK 2.x API; [cli] remains a host-side development extra
 web = ["flask>=3.1.3", "markdown>=3.10.3"]
-dev = ["pytest>=9.1.1", "pytest-cov>=7.1.0"]
-all = ["psycopg[binary]>=3.3.5", "mcp>=2.2,<3", "flask>=3.1.3", "markdown>=3.10.3", "pytest>=9.1.1", "pytest-cov>=7.1.0"]
+dev = ["pytest>=9.1.1", "pytest-cov>=7.1.0", "pytest-xdist>=3.8.0"]
+all = ["psycopg[binary]>=3.3.5", "mcp>=2.2,<3", "flask>=3.1.3", "markdown>=3.10.3", "pytest>=9.1.1", "pytest-cov>=7.1.0", "pytest-xdist>=3.8.0"]
 
 [project.scripts]
 dct = "dct.cli:main"
@@ -44,6 +44,9 @@ dct = "dct.cli:main"
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
+markers = [
+    "slow: starts child processes (git, hooks, the dct CLI, process groups); deselect with -m \"not slow\" for a fast loop — enforced by tests/conftest.py (#921)",
+]
 
 [tool.ruff.lint]
 # E701 (one-line `if x: y`) and E741 (short names like `l`) are accepted house

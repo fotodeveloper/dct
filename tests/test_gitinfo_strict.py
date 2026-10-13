@@ -27,6 +27,8 @@ from dct.core.gitinfo import (
     verify_release_checkout,
 )
 
+pytestmark = pytest.mark.slow
+
 needs_git = pytest.mark.skipif(shutil.which("git") is None, reason="git not available")
 
 

@@ -64,7 +64,10 @@ from dct.core.releases import get_release
 from dct.db import releases
 from dct.workflows.release.plan import PLAN_KEYS
 
-pytestmark = pytest.mark.skipif(shutil.which("git") is None, reason="git not installed")
+pytestmark = [
+    pytest.mark.slow,
+    pytest.mark.skipif(shutil.which("git") is None, reason="git not installed"),
+]
 
 DIALOGS = [
     pytest.param(lambda: _skill("release"), id="skill"),

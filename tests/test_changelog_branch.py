@@ -94,6 +94,7 @@ def test_resolve_rejects_unknown_detected_source(proj):
         resolve_branch_fields(proj, "proj-a", detected_source="guess")
 
 
+@pytest.mark.slow
 @needs_git
 def test_resolve_detects_inside_project_path_with_given_source(engine, tmp_path):
     root = make_git_repo(tmp_path / "repo", branch="feat/x")
@@ -103,6 +104,7 @@ def test_resolve_detects_inside_project_path_with_given_source(engine, tmp_path)
             "branch": "feat/x", "worktree": root, "branch_source": source}
 
 
+@pytest.mark.slow
 @needs_git
 def test_resolve_detects_a_linked_worktree_inside_the_project(engine, tmp_path):
     root = make_git_repo(tmp_path / "repo")
@@ -114,6 +116,7 @@ def test_resolve_detects_a_linked_worktree_inside_the_project(engine, tmp_path):
     assert out["worktree"] == str(linked.resolve())
 
 
+@pytest.mark.slow
 @needs_git
 def test_resolve_ignores_a_checkout_outside_the_project(engine, tmp_path):
     """The MCP server started in ANOTHER repo must not stamp that repo's branch."""
@@ -124,6 +127,7 @@ def test_resolve_ignores_a_checkout_outside_the_project(engine, tmp_path):
         "branch": None, "worktree": None, "branch_source": None}
 
 
+@pytest.mark.slow
 @needs_git
 def test_resolve_project_without_path_is_null(engine, tmp_path):
     root = make_git_repo(tmp_path / "repo")
@@ -131,6 +135,7 @@ def test_resolve_project_without_path_is_null(engine, tmp_path):
     assert resolve_branch_fields(engine, "proj-g", cwd=root)["branch_source"] is None
 
 
+@pytest.mark.slow
 @needs_git
 def test_resolve_detached_head_keeps_worktree(engine, tmp_path):
     root = make_git_repo(tmp_path / "repo")
@@ -140,6 +145,7 @@ def test_resolve_detached_head_keeps_worktree(engine, tmp_path):
         "branch": None, "worktree": root, "branch_source": "server"}
 
 
+@pytest.mark.slow
 @needs_git
 def test_resolve_over_long_detected_branch_becomes_null_never_blocks(engine, tmp_path):
     # Nested components: one ref-file name component may not exceed 255 bytes.
@@ -152,6 +158,7 @@ def test_resolve_over_long_detected_branch_becomes_null_never_blocks(engine, tmp
     add_entry(engine, "proj-g", "added", "still stored", **out)
 
 
+@pytest.mark.slow
 @needs_git
 def test_resolve_detects_a_linked_worktree_outside_the_project_path(engine, tmp_path):
     """K-34: same repository (git common dir), not "inside projects.path"."""
@@ -163,6 +170,7 @@ def test_resolve_detects_a_linked_worktree_outside_the_project_path(engine, tmp_
         "branch": "feat/out", "worktree": str(linked.resolve()), "branch_source": "client"}
 
 
+@pytest.mark.slow
 @needs_git
 def test_resolve_ignores_a_nested_foreign_repo_inside_the_project(engine, tmp_path):
     root = make_git_repo(tmp_path / "repo")
@@ -172,6 +180,7 @@ def test_resolve_ignores_a_nested_foreign_repo_inside_the_project(engine, tmp_pa
         "branch": None, "worktree": None, "branch_source": None}
 
 
+@pytest.mark.slow
 @needs_git
 def test_resolve_monorepo_subproject_stores_the_checkout_root(engine, tmp_path):
     root = make_git_repo(tmp_path / "mono", branch="main")
@@ -182,6 +191,7 @@ def test_resolve_monorepo_subproject_stores_the_checkout_root(engine, tmp_path):
     assert out == {"branch": "main", "worktree": root, "branch_source": "server"}
 
 
+@pytest.mark.slow
 @needs_git
 def test_resolve_process_cwd_is_read_only_when_detection_is_needed(engine, tmp_path, monkeypatch):
     from dct.core import gitinfo
@@ -201,6 +211,7 @@ def test_resolve_process_cwd_is_read_only_when_detection_is_needed(engine, tmp_p
                                  detected_source="server")["branch"] == "feat/x"
 
 
+@pytest.mark.slow
 @needs_git
 def test_resolve_deleted_process_cwd_is_no_context(engine, tmp_path, monkeypatch):
     import os

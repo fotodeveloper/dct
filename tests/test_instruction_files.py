@@ -532,6 +532,7 @@ def _touch(path: Path) -> None:
     path.write_text("x\n")
 
 
+@pytest.mark.slow
 def test_conflict_guard_finds_tracked_untracked_and_ignored_files(tmp_path):
     root = tmp_path / "repo"
     root.mkdir()

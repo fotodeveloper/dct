@@ -95,6 +95,8 @@ from dct.workflows.release.effects import (
     resume_release,
 )
 
+pytestmark = pytest.mark.slow
+
 ROOT = Path(__file__).resolve().parent.parent
 MARKER = "changelog_path_explicit"
 

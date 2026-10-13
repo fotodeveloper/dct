@@ -40,6 +40,7 @@ def test_doctor_does_not_collapse_venv_symlinks(tmp_path, monkeypatch):
     assert str(first) in found and str(second) in found
 
 
+@pytest.mark.slow
 def test_doctor_missing_runtime_is_actionable():
     checks = diagnostics.runtime_checks("/nonexistent/dct-test-python")
     assert checks[0]["status"] == "error"
@@ -64,6 +65,7 @@ def test_doctor_probes_configured_mcp_environment(tmp_path, monkeypatch):
     assert not checks
 
 
+@pytest.mark.slow
 def test_runtime_probe_cannot_import_cwd_checkout(tmp_path, monkeypatch):
     # A caller-controlled checkout must not shadow the package in another venv.
     (tmp_path / "dct").mkdir()

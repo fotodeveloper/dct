@@ -33,6 +33,8 @@ from dct.core.projects import create_project, get_project
 from dct.core.releases import RELEASE_FLOW, TERMINAL_STATUSES, get_release
 from dct.workflows.release import effects
 
+pytestmark = pytest.mark.slow
+
 ROOT = Path(__file__).resolve().parent.parent
 FALLBACKS = ROOT / "docs" / "assistant-fallbacks.md"
 WORKFLOW_DOC = ROOT / "docs" / "release-workflow.md"

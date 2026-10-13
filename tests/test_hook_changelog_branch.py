@@ -29,6 +29,8 @@ from dct.db import create_tables, get_engine
 from dct.integrations import claude
 from dct.integrations.claude import HOOKS_DIR
 
+pytestmark = pytest.mark.slow
+
 COMMIT_HOOK = HOOKS_DIR / "check-changelog.sh"
 STOP_HOOK = HOOKS_DIR / "check-changelog-on-stop.sh"
 LIB_NAME = "dct-changelog-count.lib.sh"

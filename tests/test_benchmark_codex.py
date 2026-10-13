@@ -14,6 +14,8 @@ from pathlib import Path
 
 import pytest
 
+pytestmark = pytest.mark.slow
+
 SCRIPT = Path(__file__).resolve().parent.parent / 'scripts' / 'benchmark_codex.py'
 MODEL = 'test-model'
 PAYLOAD = {'item_id': 42, 'checkpoint_id': 7, 'next_action': 'Verify migration'}
