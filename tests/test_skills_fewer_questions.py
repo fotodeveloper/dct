@@ -43,7 +43,7 @@ from __future__ import annotations
 import re
 
 import pytest
-from test_skill_prose_changelog import _fallbacks, _skill, _snippet
+from test_skill_prose_changelog import _codex, _fallbacks, _skill, _snippet
 
 # ── text helpers ─────────────────────────────────────────────────────────────
 
@@ -391,6 +391,7 @@ CHECKPOINT_TEXTS = [
     pytest.param(lambda: _fallback("track"), id="track-fallback"),
     pytest.param(lambda: _skill("track-update"), id="track-update-skill"),
     pytest.param(_snippet, id="claude-md-snippet"),
+    pytest.param(lambda: _codex("track"), id="codex-track"),
 ]
 
 # "3-7" read as a range caps the plan at seven; the owner's rule reads it
