@@ -6,7 +6,7 @@ import sqlalchemy as sa
 
 from dct.core.limits import ensure_fits
 from dct.core.text import item_label
-from dct.db import item_checkpoints, items, row_to_dict
+from dct.db import item_checkpoints, items, lock_item_row, row_to_dict
 
 VALID_STATUSES = {"pending", "done", "rejected"}
 
@@ -71,10 +71,9 @@ def add_checkpoint(
     ensure_fits(item_checkpoints, {"kind": kind, "text": text}, _CHECKPOINT_LABELS)
 
     with engine.begin() as conn:
-        exists = conn.execute(
-            sa.select(items.c.id).where(items.c.id == item_id, items.c.deleted_at.is_(None))
-        ).first()
-        if not exists:
+        # The existence check is the item row lock (#910): a gate created here
+        # lands before or after a concurrent close, never inside its guard.
+        if not lock_item_row(conn, item_id):
             raise ValueError(f"Item #{item_id} not found")
 
         if sort_order is None:
@@ -270,9 +269,18 @@ def get_checkpoint(engine: sa.Engine, checkpoint_id: int) -> dict | None:
 
 
 def set_status(engine: sa.Engine, checkpoint_id: int, status: str) -> dict | None:
+    """Set a checkpoint's status → its dict, or None for an unknown /
+    soft-deleted id. Reopening a gate re-blocks the close of its item, so the
+    write queues on the item row (#910) like add_checkpoint and the close."""
     _validate_status(status)
     now = datetime.now(UTC)
     with engine.begin() as conn:
+        owner = conn.execute(
+            sa.select(item_checkpoints.c.item_id)
+            .where(item_checkpoints.c.id == checkpoint_id, item_checkpoints.c.deleted_at.is_(None))
+        ).first()
+        if owner is None or not lock_item_row(conn, owner.item_id):
+            return None
         result = conn.execute(
             item_checkpoints.update()
             .where(item_checkpoints.c.id == checkpoint_id, item_checkpoints.c.deleted_at.is_(None))

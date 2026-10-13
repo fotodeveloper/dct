@@ -1,6 +1,9 @@
 """Tests for dct.core.plans.crud — plans + sections + checkpoints CRUD."""
 
+from datetime import UTC, datetime
+
 import pytest
+import sqlalchemy as sa
 
 from dct.core.plans.crud import (
     add_plan_checkpoint,
@@ -342,6 +345,103 @@ def test_promote_section_missing_raises(engine):
 def test_promote_checkpoint_missing_raises(engine):
     with pytest.raises(ValueError, match="not found"):
         promote_checkpoint_to_item(engine, 9999, item_type="todo")
+
+
+# ── promote_section_to_item: one transaction (#909 K-24) ────────────────────
+
+
+class _BackLinkFails:
+    """`plan_sections` whose UPDATE (the back-link write) fails; reads and
+    the row lock still see the real table."""
+
+    def __init__(self, table):
+        self._table = table
+
+    def __getattr__(self, name):
+        return getattr(self._table, name)
+
+    def __clause_element__(self):
+        return self._table
+
+    def update(self):
+        raise RuntimeError("back-link write failed")
+
+
+def _item_count(engine) -> int:
+    from dct.db import items
+
+    with engine.connect() as conn:
+        return conn.execute(sa.select(sa.func.count()).select_from(items)).scalar_one()
+
+
+def test_a_failing_back_link_write_leaves_no_section_item(engine, proj, monkeypatch):
+    """The item and the back-link land in ONE transaction: a failure of the
+    back-link UPDATE rolls the item back (it used to stay, orphaned)."""
+    from dct.core.plans import crud
+
+    p = create_plan(engine, "dct", slug="p", title="P", kind="plan")
+    s = add_plan_section(engine, p["id"], "Big feature", depth=2)
+    monkeypatch.setattr(crud, "plan_sections", _BackLinkFails(crud.plan_sections))
+
+    with pytest.raises(RuntimeError, match="back-link write failed"):
+        promote_section_to_item(engine, s["id"], item_type="feature")
+
+    monkeypatch.undo()
+    assert _item_count(engine) == 0
+    section = get_plan_section(engine, s["id"])
+    assert section is not None
+    assert section["converted_to_item_id"] is None
+
+
+def test_promoting_a_deleted_section_is_refused_and_creates_nothing(engine, proj):
+    p = create_plan(engine, "dct", slug="p", title="P", kind="plan")
+    s = add_plan_section(engine, p["id"], "Gone", depth=2)
+    assert delete_plan_section(engine, s["id"])
+    with pytest.raises(ValueError, match="not found"):
+        promote_section_to_item(engine, s["id"], item_type="todo")
+    assert _item_count(engine) == 0
+
+
+def test_a_section_promotion_waiting_on_a_deleted_section_creates_nothing(
+    concurrent_engine, lock_probe,
+):
+    """The competitor is PROVEN blocked on the section row while the holder
+    soft-deletes it; after the commit it must see the deletion and refuse."""
+    from conftest import hold_row_and_race
+
+    from dct.db import lock_row, plan_sections
+
+    eng = concurrent_engine
+    create_project(eng, slug="dct", name="DCT", path="/tmp/dct")
+    p = create_plan(eng, "dct", slug="p", title="P", kind="plan")
+    s = add_plan_section(eng, p["id"], "Raced", depth=2)
+
+    outcome = hold_row_and_race(
+        eng, lock_probe,
+        lambda conn: lock_row(conn, plan_sections, s["id"]),
+        lambda: promote_section_to_item(eng, s["id"], item_type="todo"),
+        lambda conn: conn.execute(
+            plan_sections.update().where(plan_sections.c.id == s["id"])
+            .values(deleted_at=datetime.now(UTC))
+        ),
+    )
+
+    assert isinstance(outcome, ValueError), outcome
+    assert "not found" in str(outcome)
+    assert _item_count(eng) == 0
+
+
+def test_a_repeated_section_promotion_is_not_refused(engine, proj):
+    """Re-promotion policy unchanged: each call creates a new item and the
+    back-link names the latest one."""
+    p = create_plan(engine, "dct", slug="p", title="P", kind="plan")
+    s = add_plan_section(engine, p["id"], "Twice", depth=2)
+    first = promote_section_to_item(engine, s["id"], item_type="todo")
+    second = promote_section_to_item(engine, s["id"], item_type="todo")
+    assert second["id"] != first["id"]
+    section = get_plan_section(engine, s["id"])
+    assert section is not None
+    assert section["converted_to_item_id"] == second["id"]
 
 
 # ── promote_section_to_sprint ────────────────────────────────────────────────

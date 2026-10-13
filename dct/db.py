@@ -35,6 +35,9 @@ PROVENANCE_TABLES = (
     "plans",
     "tags",
     "releases",
+    "triage_cycles",
+    "findings",
+    "finding_options",
 )
 
 
@@ -422,6 +425,132 @@ releases = sa.Table(
 )
 
 
+# ── #909: triage findings ledger ──────────────────────────────────────────────
+# A triage cycle (one review round of a project) owns findings; a finding
+# carries the rubric v2 fields under FULL column names (the export maps them
+# back to the template's short keys S / O / E / K / type), the coordinator's
+# class (class_rec derived by the workflow's classify(), class_override with
+# its reason), the owner's decision VERBATIM, the suggestions of an agent
+# (proposals, never decisions), an optional promotion to an item and the
+# recurrence link by normalised fingerprint. Value domains (rubric enums,
+# decisions, classes) are validated in dct/workflows/triage.py, not by CHECK
+# constraints — the house pattern of every status / kind column here.
+triage_cycles = sa.Table(
+    "triage_cycles",
+    metadata,
+    sa.Column("id", sa.Integer, primary_key=True, autoincrement=True),
+    sa.Column("project_id", sa.Integer, sa.ForeignKey("projects.id"), nullable=False),
+    sa.Column("code", sa.String(100), nullable=False),  # e.g. "rev-877-r2"; unique live per project
+    sa.Column("topic", sa.String(200), nullable=False),
+    sa.Column("scope", sa.Text),  # what was reviewed: diff range, files
+    sa.Column("base_commit", sa.String(64)),
+    sa.Column("rubric_version", sa.SmallInteger, nullable=False, server_default=sa.text("2")),
+    sa.Column("artifact_url", sa.String(500)),
+    sa.Column("created_by", sa.String(200), nullable=False),
+    sa.Column("opened_at", sa.DateTime, nullable=False, server_default=sa.text("CURRENT_TIMESTAMP")),
+    sa.Column("closed_at", sa.DateTime),  # NULL = open
+    sa.Column("closed_source", sa.String(200)),  # CLOSED.source: where the owner's answers are recorded
+    sa.Column("closed_notes", sa.Text),  # CLOSED.notes joined by blank lines
+    sa.Column("created_at", sa.DateTime, nullable=False, server_default=sa.text("CURRENT_TIMESTAMP")),
+    sa.Column("updated_at", sa.DateTime, nullable=False, server_default=sa.text("CURRENT_TIMESTAMP")),
+    sa.Column("deleted_at", sa.DateTime),
+    *_provenance_columns(),
+)
+
+findings = sa.Table(
+    "findings",
+    metadata,
+    sa.Column("id", sa.Integer, primary_key=True, autoincrement=True),
+    sa.Column("cycle_id", sa.Integer, sa.ForeignKey("triage_cycles.id"), nullable=False),
+    sa.Column("seq", sa.Integer, nullable=False),  # the K-n number inside the cycle
+    sa.Column("fingerprint", sa.String(500), nullable=False),
+    # Lowercase, whitespace collapsed, trailing punctuation stripped — the
+    # identity behind first_seen_id (a cache of the comparison, never the PK).
+    sa.Column("fingerprint_norm", sa.String(500), nullable=False),
+    sa.Column("title", sa.String(500), nullable=False),
+    # Rubric v2 fields (full names, owner 2026-10-13).
+    sa.Column("impact", sa.SmallInteger, nullable=False),  # S: 0-3
+    sa.Column("reachability", sa.String(1), nullable=False),  # O: '0'-'3' | '?'
+    sa.Column("evidence", sa.SmallInteger, nullable=False),  # E: 0-3
+    sa.Column("fix_cost", sa.String(1), nullable=False),  # K: S | M | L
+    # Required on every finding (rubric §1, K-4). An existing PostgreSQL
+    # table created before the constraint is healed by
+    # _heal_triage_not_null; an existing SQLite one keeps the column
+    # nullable and relies on the workflow's write-time validation.
+    sa.Column("origin", sa.String(8), nullable=False),  # diff | pre | latent
+    sa.Column("finding_type", sa.String(16), nullable=False),  # security | spec | spec-gap | ...
+    # The template's SUGGESTED slot — an agent's proposal, never a decision.
+    sa.Column("suggested_decision", sa.String(16)),
+    sa.Column("suggested_opt", sa.String(4)),
+    sa.Column("suggested_note", sa.Text),
+    sa.Column("suggested_by", sa.String(100)),
+    sa.Column("suggested_at", sa.DateTime),
+    # Template flags: conflict / violation:false / dispute / openDesign.
+    sa.Column("conflict", sa.Boolean, nullable=False, server_default=sa.false()),
+    sa.Column("violation", sa.Boolean, nullable=False, server_default=sa.true()),
+    sa.Column("dispute", sa.Boolean, nullable=False, server_default=sa.false()),
+    sa.Column("open_design", sa.Boolean, nullable=False, server_default=sa.false()),
+    sa.Column("area", sa.String(500)),  # where: file:line list
+    # The reviewer that reported it ("codex", "panel:security", "analiza") —
+    # the CARD's `src`. Not named `source`: that name is the provenance
+    # column every ledger table carries (_provenance_columns).
+    sa.Column("reviewer", sa.String(100), nullable=False),
+    sa.Column("context", sa.Text),  # ctx paragraphs, "\n\n"-joined
+    sa.Column("class_rec", sa.String(16), nullable=False),  # classify(): fix|verify|quick|decide|backlog|reject|note
+    sa.Column("class_override", sa.String(16)),
+    sa.Column("class_reason", sa.Text),  # required (in code) when class_override is set
+    sa.Column("decision", sa.String(16)),  # fix|verify|backlog|reject|note|discuss; NULL = undecided
+    sa.Column("decision_opt", sa.String(4)),  # option key
+    sa.Column("decision_note", sa.Text),  # the owner's comment VERBATIM
+    sa.Column("decided_at", sa.DateTime),
+    # Origin of the decision (K-5), NULL while undecided and written together
+    # with decided_at: decided_by = the person who decided (the owner),
+    # decision_source = where the owner's words are recorded (e.g. "owner
+    # paste 2026-10-13"). An audit record, not authentication: an agent can
+    # still write a false source.
+    sa.Column("decided_by", sa.String(200)),
+    sa.Column("decision_source", sa.String(200)),
+    # Provenance of the decision's WRITE (K-23): the client that recorded
+    # the last decision — the last decision's writer, per Q1; audit, not
+    # authentication. Written by decide_findings from get_provenance() in the
+    # same UPDATE as decided_at; every overwrite refreshes all four (an
+    # unknown field becomes NULL, never the previous client's value).
+    # NULL while undecided; never backfilled. The creation provenance block
+    # below (actor_type / actor_client / session_id / source) keeps naming
+    # the client that RECORDED the finding. decision_actor_source is the
+    # transport ('cli' | 'mcp'), not decision_source.
+    sa.Column("decision_actor_type", sa.String(16)),
+    sa.Column("decision_actor_client", sa.String(64)),
+    sa.Column("decision_session_id", sa.String(128)),
+    sa.Column("decision_actor_source", sa.String(16)),
+    sa.Column("item_id", sa.Integer, sa.ForeignKey("items.id")),  # promoted to this item
+    # Earliest live finding of the same project with an equal
+    # fingerprint_norm, set at record time; NULL = this is the first.
+    sa.Column("first_seen_id", sa.Integer, sa.ForeignKey("findings.id")),
+    sa.Column("created_at", sa.DateTime, nullable=False, server_default=sa.text("CURRENT_TIMESTAMP")),
+    sa.Column("updated_at", sa.DateTime, nullable=False, server_default=sa.text("CURRENT_TIMESTAMP")),
+    sa.Column("deleted_at", sa.DateTime),
+    *_provenance_columns(),
+)
+
+finding_options = sa.Table(
+    "finding_options",
+    metadata,
+    sa.Column("id", sa.Integer, primary_key=True, autoincrement=True),
+    sa.Column("finding_id", sa.Integer, sa.ForeignKey("findings.id"), nullable=False),
+    sa.Column("key", sa.String(4), nullable=False),  # "a", "b", ... unique live per finding
+    sa.Column("text", sa.Text, nullable=False),
+    sa.Column("why", sa.Text),
+    sa.Column("is_root", sa.Boolean, nullable=False, server_default=sa.false()),
+    # At most one recommended option per finding — checked in code.
+    sa.Column("is_recommended", sa.Boolean, nullable=False, server_default=sa.false()),
+    sa.Column("created_at", sa.DateTime, nullable=False, server_default=sa.text("CURRENT_TIMESTAMP")),
+    sa.Column("updated_at", sa.DateTime, nullable=False, server_default=sa.text("CURRENT_TIMESTAMP")),
+    sa.Column("deleted_at", sa.DateTime),
+    *_provenance_columns(),
+)
+
+
 sa.Index(
     "ix_projects_slug_active",
     projects.c.slug,
@@ -528,6 +657,35 @@ sa.Index(
     unique=True,
     sqlite_where=releases.c.deleted_at.is_(None),
     postgresql_where=releases.c.deleted_at.is_(None),
+)
+
+# #909: the triage ledger's uniqueness among LIVE rows (a soft-deleted cycle,
+# finding or option frees its code / seq / key) plus the recurrence lookup.
+sa.Index(
+    "ix_triage_cycles_project_code_live",
+    triage_cycles.c.project_id,
+    triage_cycles.c.code,
+    unique=True,
+    sqlite_where=triage_cycles.c.deleted_at.is_(None),
+    postgresql_where=triage_cycles.c.deleted_at.is_(None),
+)
+sa.Index(
+    "ix_findings_cycle_seq_live",
+    findings.c.cycle_id,
+    findings.c.seq,
+    unique=True,
+    sqlite_where=findings.c.deleted_at.is_(None),
+    postgresql_where=findings.c.deleted_at.is_(None),
+)
+sa.Index("ix_findings_cycle", findings.c.cycle_id)
+sa.Index("ix_findings_fingerprint_norm", findings.c.fingerprint_norm)
+sa.Index(
+    "ix_finding_options_finding_key_live",
+    finding_options.c.finding_id,
+    finding_options.c.key,
+    unique=True,
+    sqlite_where=finding_options.c.deleted_at.is_(None),
+    postgresql_where=finding_options.c.deleted_at.is_(None),
 )
 
 
@@ -698,6 +856,82 @@ def is_serialization_failure(exc: BaseException) -> bool:
     return code == "40001"
 
 
+def lock_row(conn: sa.Connection, table: sa.Table, row_id: int) -> bool:
+    """Serialise this transaction on row `row_id` of `table` and say whether
+    the row exists and is not soft-deleted (#910, generalised by #909).
+
+    For a guard that reads and then writes in one transaction against a
+    writer that can change what the guard read: on PostgreSQL at READ
+    COMMITTED nothing orders the two, so a write committed in between is
+    closed over. Every participant takes this lock as the existence check
+    of the row, BEFORE it reads what it guards, so both sides queue on that
+    row. `table` must be a metadata table with an `id` primary key and a
+    `deleted_at` column. Which rows an operation locks, and in which order,
+    is the caller's contract (lock_item_row, lock_cycle_row,
+    dct.workflows.triage).
+
+    PostgreSQL: `SELECT … FOR NO KEY UPDATE` on the row (#909 K-21), with a
+    transaction-local lock_timeout matching project_transaction's
+    five-second wait (a timeout surfaces as the driver's OperationalError,
+    SQLSTATE 55P03, after the rollback — nothing written). NO KEY UPDATE
+    conflicts with itself, FOR UPDATE, FOR SHARE and every UPDATE / DELETE
+    of the row, so the participants still exclude each other and a soft
+    delete (an UPDATE of deleted_at) still waits for the holder. It does NOT
+    conflict with FOR KEY SHARE, the lock PostgreSQL takes implicitly on a
+    referenced row when a foreign key is checked (an INSERT of an item, a
+    finding, an option or a checkpoint pointing at the locked row): such an
+    insert by another transaction no longer waits for the holder, which is
+    what lets a transaction holding a cycle row insert an item of a project
+    another transaction holds locked without the two deadlocking. A writer
+    that must exclude those inserts takes this lock itself. SQLite: the
+    driver's legacy mode opens no transaction before a SELECT, so the helper
+    issues `BEGIN IMMEDIATE` (reserving the whole database before reading,
+    as project_transaction does) unless the connection is already in a
+    transaction — one writer at a time, so no row-level order applies there.
+    Call it before the first statement that reads the guarded state.
+    """
+    if conn.dialect.name == "postgresql":
+        conn.execute(sa.text("SET LOCAL lock_timeout = '5000ms'"))
+        # key_share=True without read=True is FOR NO KEY UPDATE — not FOR
+        # KEY SHARE (that is read=True, key_share=True).
+        query = sa.select(table.c.id).with_for_update(key_share=True)
+    else:
+        if conn.dialect.name == "sqlite" and not conn.connection.dbapi_connection.in_transaction:
+            conn.exec_driver_sql("BEGIN IMMEDIATE")
+        query = sa.select(table.c.id)
+    row = conn.execute(
+        query.where(table.c.id == row_id, table.c.deleted_at.is_(None))
+    ).first()
+    return row is not None
+
+
+def lock_item_row(conn: sa.Connection, item_id: int) -> bool:
+    """lock_row on item `item_id` — the gate contract (#910).
+
+    The gate guard of a terminal transition reads the pending gates and
+    writes the status in one transaction; every such participant —
+    update_item / resolve_item on one side, add_checkpoint and
+    checkpoints.set_status on the other — takes this lock first, so a gate
+    lands either before the guard reads or after the status is written.
+    """
+    return lock_row(conn, items, item_id)
+
+
+def lock_cycle_row(conn: sa.Connection, cycle_id: int) -> bool:
+    """lock_row on triage cycle `cycle_id` — the open-cycle contract (#909).
+
+    Every writer that requires an OPEN cycle (record / decide / suggest
+    findings), close_triage and promote_finding_to_item take this lock
+    before they read the cycle's state, so a finding or a decision lands
+    either before the close reads the cycle or is refused after it, never
+    written into a closed cycle. It is the FIRST lock of decide / suggest /
+    close / promote; record_findings takes the project row before it
+    (first_seen is project-wide). The per-operation order is listed in the
+    dct.workflows.triage module docstring.
+    """
+    return lock_row(conn, triage_cycles, cycle_id)
+
+
 @contextlib.contextmanager
 def project_transaction(engine: sa.Engine, project_slug: str, *, write: bool = False):
     """A consistent project snapshot, optionally serializing composed writers.
@@ -833,8 +1067,9 @@ def _create_missing_tables(engine: sa.Engine) -> None:
     (table + every index) is completed — a table that exists does not prove
     its unique index exists. Tables that predate this bootstrap are left to
     _apply_schema_updates' explicit blocks (no silent index retrofit on an
-    old database) — except the release-ledger tables (INDEX_HEALED_TABLES,
-    K-93 A2), whose missing required indexes _heal_required_indexes
+    old database) — except the release-ledger and triage-ledger tables
+    (INDEX_HEALED_TABLES, K-93 A2 / #909), whose missing required indexes
+    _heal_required_indexes
     completes on every bootstrap. A concurrent-creation conflict (duplicate table / index /
     relation, see _is_concurrent_creation_conflict) rolls the attempt back
     and re-checks the whole set; any other error propagates; at most
@@ -855,12 +1090,14 @@ def _create_missing_tables(engine: sa.Engine) -> None:
     _heal_required_indexes(engine, existing)
 
 
-# K-93 A2: tables of the release-ledger feature whose REQUIRED indexes every
+# K-93 A2: tables of the release-ledger feature — and, by the same reasoning,
+# of the triage ledger (#909: its live-uniqueness indexes are the last guard
+# of cycle code / finding seq / option key) — whose REQUIRED indexes every
 # bootstrap completes even when the table already exists — SQLite commits
 # CREATE TABLE and CREATE INDEX separately, so a crash in between leaves the
 # table without its unique guard. Tables of older features keep the "no
 # silent retrofit" rule of _create_missing_tables.
-INDEX_HEALED_TABLES = ("releases",)
+INDEX_HEALED_TABLES = ("releases", "triage_cycles", "findings", "finding_options")
 
 
 def _heal_required_indexes(engine: sa.Engine, existed: set[str]) -> None:
@@ -978,6 +1215,92 @@ RELEASE_LEDGER_COLUMNS: dict[str, tuple[tuple[str, str], ...]] = {
 }
 
 
+# #909 K-5: decision-origin columns, and K-23: the decision writer's
+# provenance, added to `findings` after the ledger first reached development
+# databases. Nullable, no backfill (an undecided finding has none; a decision
+# recorded before them stays unattributed — never a guessed author, never
+# copied from the finding's creation provenance). Healed like
+# RELEASE_LEDGER_COLUMNS.
+TRIAGE_LEDGER_COLUMNS: dict[str, tuple[tuple[str, str], ...]] = {
+    "findings": (
+        ("decided_by", "VARCHAR(200)"),
+        ("decision_source", "VARCHAR(200)"),
+        ("decision_actor_type", "VARCHAR(16)"),
+        ("decision_actor_client", "VARCHAR(64)"),
+        ("decision_session_id", "VARCHAR(128)"),
+        ("decision_actor_source", "VARCHAR(16)"),
+    ),
+}
+
+# #909 K-4: columns that became NOT NULL after the ledger first reached
+# development databases — table → columns. See _heal_triage_not_null.
+TRIAGE_NOT_NULL_COLUMNS: dict[str, tuple[str, ...]] = {
+    "findings": ("origin", "finding_type"),
+}
+
+# At most this many row ids are named in the NOT NULL heal's warning.
+NOT_NULL_WARNING_IDS = 10
+
+
+def _heal_triage_not_null(engine: sa.Engine) -> None:
+    """#909 K-4 — make the TRIAGE_NOT_NULL_COLUMNS NOT NULL on an existing
+    PostgreSQL table that was created while they were nullable.
+
+    Guarded by a fresh inspector read: a column already NOT NULL costs one
+    catalog query and no DDL (bootstraps 2-3 are silent no-ops). A value is
+    NEVER guessed: when rows (live or soft-deleted — the constraint covers
+    every row) hold NULL, nothing is changed and one stderr warning per
+    column names the count and up to NOT_NULL_WARNING_IDS row ids, on every
+    bootstrap until the rows are fixed manually (the _heal_required_indexes
+    policy); the workflow's write-time validation keeps new rows complete
+    meanwhile. A NULL row committed between the count and the ALTER makes
+    the ALTER fail with an IntegrityError, reported the same way.
+
+    SQLite cannot add NOT NULL to an existing column without rebuilding the
+    table (under PRAGMA foreign_keys=ON, with finding_options referencing
+    it), so there the column stays nullable — no DDL, no output — and the
+    write-time validation is the guard. Such a table exists only on a
+    database bootstrapped by an unreleased development build."""
+    if engine.dialect.name != "postgresql":
+        return
+    tables_now = set(sa.inspect(engine).get_table_names())
+    for table, columns in TRIAGE_NOT_NULL_COLUMNS.items():
+        if table not in tables_now:
+            continue
+        nullable = [
+            c["name"] for c in sa.inspect(engine).get_columns(table)
+            if c["name"] in columns and c["nullable"]
+        ]
+        for column in nullable:
+            with engine.connect() as conn:
+                ids = [r[0] for r in conn.execute(sa.text(
+                    f"SELECT id FROM {table} WHERE {column} IS NULL ORDER BY id"
+                ))]
+            if not ids:
+                try:
+                    with engine.begin() as conn:
+                        conn.execute(sa.text("SET LOCAL lock_timeout = '5s'"))
+                        conn.execute(sa.text(
+                            f"ALTER TABLE {table} ALTER COLUMN {column} SET NOT NULL"
+                        ))
+                    continue
+                except sa.exc.IntegrityError:
+                    with engine.connect() as conn:
+                        ids = [r[0] for r in conn.execute(sa.text(
+                            f"SELECT id FROM {table} WHERE {column} IS NULL ORDER BY id"
+                        ))]
+            named = ", ".join(f"#{i}" for i in ids[:NOT_NULL_WARNING_IDS])
+            more = (f" (+{len(ids) - NOT_NULL_WARNING_IDS} more)"
+                    if len(ids) > NOT_NULL_WARNING_IDS else "")
+            print(
+                f"WARNING: dct could not make {table}.{column} NOT NULL: "
+                f"{len(ids)} row(s) have no value ({named}{more}). Nothing was "
+                f"changed — dct does not guess the value; set it on those rows "
+                f"manually and the next bootstrap applies the constraint.",
+                file=sys.stderr,
+            )
+
+
 # Commit-trailer preference → its projects column (core.projects reads and
 # writes through this map); _apply_schema_updates heals the columns onto an
 # existing database (nullable BOOLEAN, no backfill). Each is a tri-state:
@@ -1059,18 +1382,23 @@ def _apply_schema_updates(engine: sa.Engine) -> None:
 
     # K-60/K-61: release-record columns added after the `releases` table
     # first shipped on development databases, and K-73: the project's
-    # version-file contract. Nullable, no backfill (an older record simply has
-    # no release commit / manifest / proof yet). Each column is healed
+    # version-file contract, and #909 K-5 / K-23: the findings' decision-origin
+    # and decision-writer columns. Nullable, no backfill (an older record simply has no release
+    # commit / manifest / proof / decision author yet). Each column is healed
     # independently by the duplicate-safe helper; the inspector check keeps
     # bootstraps 2-3 free of DDL.
     tables_now = set(inspector.get_table_names())
-    for table, additions in RELEASE_LEDGER_COLUMNS.items():
+    for table, additions in (*RELEASE_LEDGER_COLUMNS.items(), *TRIAGE_LEDGER_COLUMNS.items()):
         if table not in tables_now:
             continue
         present = {c["name"] for c in inspector.get_columns(table)}
         for column, ddl_type in additions:
             if column not in present:
                 _add_column_if_missing(engine, table, column, _ddl_type(engine, ddl_type))
+
+    # #909 K-4: origin / finding_type NOT NULL on an existing findings table
+    # (PostgreSQL; never a guessed value — see _heal_triage_not_null).
+    _heal_triage_not_null(engine)
 
     # #222: opt-in changelog enforcement. Add projects.manages_changelog and,
     # on first add, backfill — a project KEEPS enforcement only if it already

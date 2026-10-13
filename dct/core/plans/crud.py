@@ -21,6 +21,7 @@ from dct.core.ids import new_ulid
 from dct.core.projects import resolve_project_id
 from dct.db import items as items_tbl
 from dct.db import (
+    lock_row,
     plan_checkpoints,
     plan_sections,
     plans,
@@ -530,35 +531,37 @@ def promote_section_to_item(
     Used when a section deserves its own lifecycle (e.g. "Sprint 3" becomes
     a tracked sprint-feature). The section remains in the plan as a
     read-only pointer — `converted_to_item_id` marks the promotion.
-    `short_title` is passed through to create_item (≤ 50 chars, refused not
-    truncated; None/"" = no label).
+    `short_title` is passed through to create_item_conn (≤ 50 chars, refused
+    not truncated; None/"" = no label). ONE transaction (#909 K-24), as
+    promote_checkpoint_to_item: the section row is locked first (lock_row —
+    also the not-found check, a soft-deleted section is refused), the item
+    is created by create_item_conn (the full create_item validation, live
+    project included) and the back-link is written; any refusal or failure
+    leaves neither an item nor a back-link. Each call creates a new item —
+    a repeated promotion is not refused (the back-link then names the
+    latest item).
     """
-    from dct.core.items import MAX_TITLE_LENGTH, create_item
-    section = get_plan_section(engine, section_id)
-    if section is None:
-        raise ValueError(f"Plan section #{section_id} not found")
-
-    # Derive project_slug via plan → project
+    from dct.core.items import MAX_TITLE_LENGTH, create_item_conn
     with engine.begin() as conn:
+        if not lock_row(conn, plan_sections, section_id):
+            raise ValueError(f"Plan section #{section_id} not found")
+        section_row = conn.execute(
+            sa.select(plan_sections.c.plan_id, plan_sections.c.heading)
+            .where(plan_sections.c.id == section_id)
+        ).first()
+        assert section_row is not None
         plan_row = conn.execute(
-            sa.select(plans.c.project_id).where(plans.c.id == section["plan_id"])
+            sa.select(plans.c.project_id).where(plans.c.id == section_row.plan_id)
         ).first()
         if plan_row is None:
-            raise ValueError(f"Plan #{section['plan_id']} not found for section")
-        from dct.db import projects as projects_tbl
-        project_row = conn.execute(
-            sa.select(projects_tbl.c.slug).where(projects_tbl.c.id == plan_row.project_id)
-        ).first()
-        assert project_row is not None
-        project_slug = project_row.slug
+            raise ValueError(f"Plan #{section_row.plan_id} not found for section")
 
-    effective_title = title or section["heading"][:MAX_TITLE_LENGTH]
-    item = create_item(
-        engine, project_slug, item_type, effective_title,
-        priority=priority, short_title=short_title,
-    )
-    now = datetime.now(UTC)
-    with engine.begin() as conn:
+        now = datetime.now(UTC)
+        effective_title = title or section_row.heading[:MAX_TITLE_LENGTH]
+        item = create_item_conn(
+            conn, plan_row.project_id, item_type, effective_title,
+            priority=priority, short_title=short_title,
+        )
         conn.execute(
             plan_sections.update()
             .where(plan_sections.c.id == section_id)
@@ -635,19 +638,23 @@ def promote_checkpoint_to_item(
 ) -> dict:
     """Create an items row from a plan_checkpoint and back-link.
 
-    `short_title` is passed through to create_item (≤ 50 chars, refused not
-    truncated; None/"" = no label).
+    `short_title` is passed through to create_item_conn (≤ 50 chars, refused
+    not truncated; None/"" = no label). ONE transaction (#909 K-17): the
+    checkpoint row is locked first (lock_row — concurrent promotions of the
+    same checkpoint queue on it), the item is created by create_item_conn
+    (the full create_item validation, live project included) and the
+    back-link is written; any refusal leaves neither an item nor a
+    back-link. Each call creates a new item — a repeated promotion is not
+    refused (the back-link then names the latest item).
     """
-    from dct.core.items import MAX_TITLE_LENGTH, create_item
+    from dct.core.items import MAX_TITLE_LENGTH, create_item_conn
     with engine.begin() as conn:
-        cp_row = conn.execute(
-            sa.select(plan_checkpoints).where(
-                plan_checkpoints.c.id == checkpoint_id,
-                plan_checkpoints.c.deleted_at.is_(None),
-            )
-        ).first()
-        if cp_row is None:
+        if not lock_row(conn, plan_checkpoints, checkpoint_id):
             raise ValueError(f"Plan checkpoint #{checkpoint_id} not found")
+        cp_row = conn.execute(
+            sa.select(plan_checkpoints).where(plan_checkpoints.c.id == checkpoint_id)
+        ).first()
+        assert cp_row is not None
         cp = row_to_dict(cp_row)
 
         section_row = conn.execute(
@@ -660,20 +667,13 @@ def promote_checkpoint_to_item(
             sa.select(plans.c.project_id).where(plans.c.id == section_row.plan_id)
         ).first()
         assert plan_row is not None
-        from dct.db import projects as projects_tbl
-        project_row = conn.execute(
-            sa.select(projects_tbl.c.slug).where(projects_tbl.c.id == plan_row.project_id)
-        ).first()
-        assert project_row is not None
-        project_slug = project_row.slug
 
-    effective_title = title or cp["text"][:MAX_TITLE_LENGTH]
-    item = create_item(
-        engine, project_slug, item_type, effective_title,
-        priority=priority, short_title=short_title,
-    )
-    now = datetime.now(UTC)
-    with engine.begin() as conn:
+        now = datetime.now(UTC)
+        effective_title = title or cp["text"][:MAX_TITLE_LENGTH]
+        item = create_item_conn(
+            conn, plan_row.project_id, item_type, effective_title,
+            priority=priority, short_title=short_title,
+        )
         conn.execute(
             plan_checkpoints.update()
             .where(plan_checkpoints.c.id == checkpoint_id)

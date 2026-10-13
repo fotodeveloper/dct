@@ -21,6 +21,8 @@ from dct.db import (
     item_sprints,
     item_tags,
     items,
+    lock_item_row,
+    projects,
     row_to_dict,
     sprints,
 )
@@ -244,7 +246,58 @@ def create_item(
     no orphan item, no dictionary row. `force_tags=True` bypasses that guard
     for machine callers (not exposed over MCP). `short_title` (#817) is the
     item's 2-4 word label, normalized by normalize_short_title (length
-    checked on the raw value, then stripped; empty → NULL)."""
+    checked on the raw value, then stripped; empty → NULL). One transaction
+    around create_item_conn — the item-creation path shared with the
+    promotions (the task mirror inserts its fixed-metadata items directly)."""
+    with engine.begin() as conn:
+        project_id = resolve_project_id(conn, project_slug)
+        return create_item_conn(
+            conn, project_id, item_type, title,
+            description=description, priority=priority, status=status,
+            component=component, source_file=source_file,
+            source_lines=source_lines, tags=tags,
+            force_tags=force_tags, short_title=short_title,
+        )
+
+
+def create_item_conn(
+    conn: sa.Connection,
+    project_id: int,
+    item_type: str,
+    title: str,
+    description: str | None = None,
+    priority: str = "P2",
+    status: str = "open",
+    component: str | None = None,
+    source_file: str | None = None,
+    source_lines: str | None = None,
+    tags: list[str] | None = None,
+    *,
+    force_tags: bool = False,
+    short_title: str | None = None,
+    now: datetime | None = None,
+) -> dict:
+    """Item creation on the caller's connection (#909 K-17/K-20/K-24) —
+    create_item, promote_checkpoint_to_item, promote_finding_to_item and
+    promote_section_to_item create their item here, so the item and the
+    caller's link land in ONE transaction under the same rules. Not every
+    item is created here: the task mirror (dct/workflows/task_mirror.py)
+    inserts its fixed-metadata item directly inside its own composed
+    transaction.
+
+    Validation, all before any write: title (non-blank, fits the column),
+    short_title (normalize_short_title), component / source_file /
+    source_lines widths (ensure_fits — refused, never truncated), item_type /
+    priority / status enums, then `project_id` must name a LIVE project (a
+    soft-deleted one → ValueError "Project '<slug>' not found", the same
+    refusal resolve_project_id gives create_item; an unknown id → "Project
+    #<id> not found"). Tags go through
+    set_item_tags_conn in the same transaction (a refused name raises and
+    the caller's transaction rolls the item back); provenance columns are
+    filled by their column defaults. `now` stamps created_at / updated_at
+    (None = the database default). Returns the full item dict with `tags`
+    and in_current_sprint=False (a brand-new item belongs to no sprint).
+    Raises ValueError on any refusal; never commits or rolls back itself."""
     _validate_title(title)
     short_title = normalize_short_title(short_title)
     ensure_fits(items, {
@@ -253,33 +306,38 @@ def create_item(
     _validate_enum(item_type, VALID_TYPES, "item_type")
     _validate_enum(priority, VALID_PRIORITIES, "priority")
     _validate_enum(status, VALID_STATUSES, "status")
+    project = conn.execute(
+        sa.select(projects.c.slug, projects.c.deleted_at).where(projects.c.id == project_id)
+    ).first()
+    if project is None:
+        raise ValueError(f"Project #{project_id} not found")
+    if project.deleted_at is not None:  # resolve_project_id's wording, by slug
+        raise ValueError(f"Project '{project.slug}' not found")
 
-    with engine.begin() as conn:
-        project_id = resolve_project_id(conn, project_slug)
-        row = conn.execute(
-            items.insert()
-            .values(
-                project_id=project_id,
-                item_type=item_type,
-                title=title,
-                short_title=short_title,
-                description=description,
-                priority=priority,
-                status=status,
-                component=component,
-                source_file=source_file,
-                source_lines=source_lines,
-            )
-            .returning(items)
-        ).first()
-        assert row is not None
-        # Same transaction as the INSERT: a refused tag rolls the item back too.
-        tag_names = set_item_tags_conn(
-            conn, row.id, tags if tags is not None else [], force=force_tags,
-        )
-        d = _item_to_dict(row, tag_names)
-        d["in_current_sprint"] = False  # a brand-new item belongs to no sprint
-        return d
+    values = {
+        "project_id": project_id,
+        "item_type": item_type,
+        "title": title,
+        "short_title": short_title,
+        "description": description,
+        "priority": priority,
+        "status": status,
+        "component": component,
+        "source_file": source_file,
+        "source_lines": source_lines,
+    }
+    if now is not None:
+        values["created_at"] = now
+        values["updated_at"] = now
+    row = conn.execute(items.insert().values(**values).returning(items)).first()
+    assert row is not None
+    # Same transaction as the INSERT: a refused tag rolls the item back too.
+    tag_names = set_item_tags_conn(
+        conn, row.id, tags if tags is not None else [], force=force_tags,
+    )
+    d = _item_to_dict(row, tag_names)
+    d["in_current_sprint"] = False  # a brand-new item belongs to no sprint
+    return d
 
 
 def list_items(
@@ -529,11 +587,10 @@ def update_item(engine: sa.Engine, item_id: int, **kwargs) -> dict | None:
 
     with engine.begin() as conn:
         # K-11: existence is checked BEFORE any tag resolution, so a typo'd id
-        # can never register tags in the dictionary as a side effect.
-        exists = conn.execute(
-            sa.select(items.c.id).where(items.c.id == item_id, items.c.deleted_at.is_(None))
-        ).first()
-        if exists is None:
+        # can never register tags in the dictionary as a side effect. The
+        # check is the item row lock (#910): a gate writer commits either
+        # before this transaction reads the gates or after it wrote the status.
+        if not lock_item_row(conn, item_id):
             return None
         # Gate guard BEFORE any write, in this transaction: a refusal raises
         # out of the `begin()` block, so nothing of this call is committed.
@@ -596,10 +653,8 @@ def resolve_item(
         # K-63: a missing or soft-deleted item is "not found" (None) BEFORE the
         # gate guard — the answer update_item gives — so a deleted item never
         # draws a "handle its gates" refusal and nothing is written for it.
-        exists = conn.execute(
-            sa.select(items.c.id).where(items.c.id == item_id, items.c.deleted_at.is_(None))
-        ).first()
-        if exists is None:
+        # The check is the item row lock (#910), shared with every gate writer.
+        if not lock_item_row(conn, item_id):
             return None
         _refuse_pending_gates_conn(conn, item_id)
         # The UPDATE keeps the soft-delete guard (K-37): the SELECT above is a

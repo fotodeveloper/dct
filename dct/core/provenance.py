@@ -7,7 +7,10 @@ core call sites stay untouched: each ENTRY POINT (CLI main, MCP server)
 calls ``set_provenance(from_environment(...))`` exactly once.
 
 Creation provenance only — updates never touch the columns; row-lifecycle
-auditing is consciously deferred (ADR #51 consequences).
+auditing is consciously deferred (ADR #51 consequences). One deliberate
+exception: ``findings.decision_actor_*`` records the writer of the LAST
+decision, written by decide_findings in the same UPDATE as decided_at (#909
+K-23) — separate columns, the creation columns stay untouched.
 
 Client detection is layered for the multi-agent future:
 - ``DCT_ACTOR_CLIENT`` / ``DCT_ACTOR_TYPE`` / ``DCT_SESSION_ID`` are the
