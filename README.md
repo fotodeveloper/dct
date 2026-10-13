@@ -437,7 +437,7 @@ dct reads its config from the platform config dir — `~/.config/dctools/dct.tom
 
 ```toml
 [database]
-url = "sqlite:////home/you/.local/share/dctools/dct.db"
+url = "sqlite:////path/to/dct.db"
 # or: url = "postgresql+psycopg://localhost:5432/dct"
 ```
 

@@ -267,7 +267,7 @@ def test_detect_file_url_without_flag_is_pip(monkeypatch):
     """A ``file:`` direct_url WITHOUT dir_info.editable (a local wheel or
     ``pip install .``) is NOT editable — it upgrades like any pip install."""
     monkeypatch.setattr(update, "_read_direct_url",
-                        lambda *a: {"url": "file:///home/x/dev/dct", "dir_info": {}})
+                        lambda *a: {"url": "file:///opt/x/dev/dct", "dir_info": {}})
     import sys
     monkeypatch.setattr(sys, "prefix", "/usr/local")
     monkeypatch.setattr(sys, "executable", "/usr/local/bin/python3")
@@ -278,7 +278,7 @@ def test_detect_non_dict_dir_info_degrades(monkeypatch):
     """Corrupt metadata: ``dir_info`` that is valid JSON but not an object must
     degrade to "not editable" — never AttributeError inside ``dct upgrade``."""
     monkeypatch.setattr(update, "_read_direct_url",
-                        lambda *a: {"url": "file:///home/x/dev/dct", "dir_info": "bogus"})
+                        lambda *a: {"url": "file:///opt/x/dev/dct", "dir_info": "bogus"})
     import sys
     monkeypatch.setattr(sys, "prefix", "/usr/local")
     monkeypatch.setattr(sys, "executable", "/usr/local/bin/python3")
@@ -309,16 +309,16 @@ def test_detect_no_direct_url_falls_to_prefix(monkeypatch):
 def test_detect_uv(monkeypatch):
     monkeypatch.setattr(update, "_read_direct_url", lambda *a: None)
     import sys
-    monkeypatch.setattr(sys, "prefix", "/home/x/.local/share/uv/tools/dctracker")
-    monkeypatch.setattr(sys, "executable", "/home/x/.local/share/uv/tools/dctracker/bin/python")
+    monkeypatch.setattr(sys, "prefix", "/opt/x/.local/share/uv/tools/dctracker")
+    monkeypatch.setattr(sys, "executable", "/opt/x/.local/share/uv/tools/dctracker/bin/python")
     assert update.detect_install_method() == "uv"
 
 
 def test_detect_pipx(monkeypatch):
     monkeypatch.setattr(update, "_read_direct_url", lambda *a: None)
     import sys
-    monkeypatch.setattr(sys, "prefix", "/home/x/.local/pipx/venvs/dctracker")
-    monkeypatch.setattr(sys, "executable", "/home/x/.local/pipx/venvs/dctracker/bin/python")
+    monkeypatch.setattr(sys, "prefix", "/opt/x/.local/pipx/venvs/dctracker")
+    monkeypatch.setattr(sys, "executable", "/opt/x/.local/pipx/venvs/dctracker/bin/python")
     assert update.detect_install_method() == "pipx"
 
 

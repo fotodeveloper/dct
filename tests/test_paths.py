@@ -141,16 +141,16 @@ def test_is_legacy_false_for_new_location(fake_home):
 # --- sqlite URL construction (Windows defect W3) ---
 
 def test_sqlite_url_posix():
-    assert paths.sqlite_url(Path("/home/u/dct.db")) == "sqlite:////home/u/dct.db"
+    assert paths.sqlite_url(Path("/srv/u/dct.db")) == "sqlite:////srv/u/dct.db"
 
 
 def test_sqlite_url_windows_uses_forward_slashes():
     """The flavour guarantee: a Windows path keeps its drive and uses forward
     slashes. Asserted on what SQLAlchemy READS back — the rendered text may
     percent-encode the drive colon on SQLAlchemy 2.1 (K-99)."""
-    url = paths.sqlite_url(PureWindowsPath(r"C:\Users\alice\dct.db"))
+    url = paths.sqlite_url(PureWindowsPath(r"C:\Work\alice\dct.db"))
     assert "\\" not in url
-    assert paths.sqlite_database_path(url) == "C:/Users/alice/dct.db"
+    assert paths.sqlite_database_path(url) == "C:/Work/alice/dct.db"
 
 
 # --- K-99: SQLite URLs independent of the SQLAlchemy version ---

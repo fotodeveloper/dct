@@ -762,7 +762,7 @@ def _cols(engine) -> list[str]:
 
 
 def test_k14_migration_heals_once_and_never_overrides_a_later_choice(engine, capsys):
-    """Three bootstraps (CLAUDE.md invariant): the first adds the marker —
+    """Three bootstraps (AGENTS.md invariant): the first adds the marker —
     a stored non-default path is explicit, the historical default is NOT
     (its intent is unknown) —, the second and third issue no DDL, write no
     marker, print nothing, and keep a choice made after the first."""

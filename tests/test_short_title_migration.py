@@ -1,6 +1,6 @@
 """items.short_title migration (#817, B1) — convergence and duplicate safety.
 
-CLAUDE.md invariant: a "re-run is a no-op" claim about a schema update MUST be
+AGENTS.md invariant: a "re-run is a no-op" claim about a schema update MUST be
 locked by a test that bootstraps THREE times. The runner always issues a few
 healing UPDATEs (legacy-sprint demote, K-42 restore), so "no writes" is not the
 claim here — the claim is NO DDL and NO output after the first heal, and no

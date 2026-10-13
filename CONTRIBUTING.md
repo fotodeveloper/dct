@@ -15,7 +15,40 @@ uv venv && uv pip install -e '.[all]'      # or: python -m venv .venv && pip ins
 
 The default test suite runs against in-memory SQLite. CI also runs the suite
 against an isolated PostgreSQL service; PostgreSQL is not required for local
-development. See [CLAUDE.md](CLAUDE.md) for the guarded throwaway-database lane.
+development. See [docs/testing.md](docs/testing.md) for the guarded throwaway-database lane.
+
+## Agent instructions
+
+`AGENTS.md` is the only project instruction file; there is deliberately no
+project `CLAUDE.md`, no `@AGENTS.md` loader and no symlink.
+
+- **Codex** reads `AGENTS.md` natively, from the repository root and from the
+  subdirectory it works in.
+- **Claude Code** reads `AGENTS.md` natively from v2.1.277 on, under the
+  default *Project instructions* setting (`claude-md-or-agents-md`) — and only
+  while no `CLAUDE.md`, `.claude/CLAUDE.md` or `CLAUDE.local.md` exists in the
+  working directory or any directory above it. Your user-level
+  `~/.claude/CLAUDE.md` (and an organization's managed one) does not count and
+  keeps loading alongside. Older versions, a disabled built-in plugin (`/plugin`)
+  or, before v2.1.281, some sessions (Bedrock, telemetry disabled) read
+  `CLAUDE.md` only; the first session after an upgrade may not pick it up yet.
+- **A private `CLAUDE.local.md`** switches `AGENTS.md` off under the default
+  setting. To keep both, set *Project instructions* to `claude-md-and-agents-md`
+  (`/config`, or in `~/.claude/settings.json` under `pluginConfigs` →
+  `"cc-plugin-agents-md@builtin"` → `options.instructionFiles`; the ID was
+  `agents-md@builtin` before v2.1.285).
+- The same holds in worktrees: neither a linked worktree elsewhere on disk
+  (`git worktree add`) nor a Claude Code worktree under
+  `<repo>/.claude/worktrees/<name>` — whose ancestors include the main
+  checkout — may have any of the three files in it or above it.
+
+`tests/test_instruction_files.py` fails when one of those files exists in the
+working tree (tracked, untracked or ignored) or, on your machine, in a
+directory above it; a `CLAUDE.local.md` passes only while your Claude Code
+settings select `claude-md-and-agents-md`. That ancestor check is local —
+CI's directories differ — and no test can protect the start of a session.
+Details:
+[Claude Code memory docs](https://code.claude.com/docs/en/memory#agents-md).
 
 ## Quality gates
 

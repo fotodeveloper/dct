@@ -1,6 +1,6 @@
 # dct — Architecture & Configuration
 
-Database schema, migrations, the full `dct.toml` reference, MCP scope precedence, and project auto-detection. ← back to the [README](../README.md).
+The module map, database schema, migrations, the full `dct.toml` reference, MCP scope precedence, and project auto-detection. ← back to the [README](../README.md).
 
 ## Global-by-design scope model
 
@@ -14,8 +14,182 @@ dct is a **cross-project tool** — every surface is user-scoped, not per-projec
 | Skills | `~/.claude/skills/<name>` | Symlinks → `<dct-install>/dct/skills/<name>` |
 | Claude hooks | `~/.claude/hooks/dct-*.sh` | Symlinks → `<dct-install>/dct/hooks/`, wired into `~/.claude/settings.json` |
 | Codex hooks | `$CODEX_HOME/hooks.json` | Native definitions calling the packaged Python bridge; explicit client trust is required |
+| dct reference | `~/.claude/dct-reference.md` | Symlink → `<dct-install>/dct/assets/dct-reference.md` (read on demand; the managed block in the user's `~/.claude/CLAUDE.md` points at it) |
 
 Register dct once and it is available in every Claude Code session. Opening a new project directory needs zero dct setup.
+
+## Module map
+
+The modules under `dct/` that have a role of their own (empty package
+`__init__.py` files are left out). A role is summarized from the module's
+docstring where it has one, otherwise from its code. Entries marked
+`[one impl]` are the single implementation of their concern: reuse them —
+never add a second copy of that logic. The map is an aid, not proof: search
+the code before adding similar logic; a module missing here is not by itself
+evidence of duplication.
+
+```
+dct/__init__.py          — Package version (__version__ from the installed
+                           dctracker metadata, constant fallback)
+dct/config.py            — Config loading (platform config dir + legacy
+                           ~/.claude fallback + env vars; ADR #52)
+dct/paths.py             — Platform-neutral config/data/cache/state dirs
+                           (XDG on POSIX, platformdirs on Windows); [one impl]
+                           the SQLite URL builder / parser (sqlite_url,
+                           sqlite_database_path — K-99: never concatenate or
+                           slice "sqlite:///", SQLAlchemy 2.0 and 2.1 parse
+                           the path differently)
+dct/migrate.py           — dct migrate-home (legacy → platform-neutral home)
+dct/update.py            — Passive update check (#356): check_for_update
+                           (24h cache, daemon-thread PyPI probe, never blocks
+                           or raises), get_cached_notice (no network); the
+                           install-method detection behind `dct upgrade`
+dct/db.py                — SQLAlchemy Core tables + engine factory + migrations
+dct/core/engine.py       — [one impl] Engine bootstrap: bootstrap_engine
+                           (config → engine → optional DDL; create=False runs
+                           none — the read-only web viewer) and
+                           readonly_engine (K-84: no DDL, no file creation,
+                           db.check_schema_ready; for every command that
+                           promises no side effects)
+dct/core/limits.py       — [one impl] ensure_fits: column-length guard shared
+                           by every core writer (#792) — a value longer than
+                           its VARCHAR(N) is refused, never truncated; limits
+                           read from the schema, never typed in
+dct/core/text.py         — [one impl] Free-text helpers shared by every
+                           surface: preview (the N-char ceiling, ellipsis
+                           included), item_label / visible_label, the CLEAR
+                           sentinel of free-text clears
+dct/core/provenance.py   — [one impl] Write-path creation provenance
+                           (actor_type / actor_client / session_id / source)
+                           filled by column defaults from a ContextVar; each
+                           entry point calls set_provenance(from_environment(
+                           ...)) once; unknown stays NULL
+dct/core/projects.py     — Projects CRUD (+ realpath-canonical CWD detection)
+dct/core/items.py        — Items / notes / checkpoints CRUD
+dct/core/changelog.py    — Changelog entries CRUD + release stamping (the stamp
+                           is the ONLY writer of versions, K-102: add_entry
+                           refuses one; import_released_entry = old history);
+                           [one impl] branch metadata rules (#801:
+                           resolve_branch_fields, decide_branch_fields,
+                           normalize_worktree)
+dct/core/releases.py     — [one impl] Release ledger (K-41/K-60/K-61): records
+                           written with the stamp, one state machine
+                           (TRANSITIONS; advance, abandon), immutable
+                           candidate, write-once release commit / manifest /
+                           proof, legacy reconstruction (its verification
+                           scope recorded, K-110), the controlled takeover of
+                           a record without consent (take_over_release, K-119
+                           M3 — the only way a record becomes dct's after its
+                           stamp), the project's version-file contract
+                           (K-73); the verified release_mode, executor and
+                           write-once consent / proposal / render; K-115:
+                           tag_proof / push_proof (a status is never proof),
+                           mutual consistency of a record's fields,
+                           duplicates of one version refuse writes; every
+                           mutation checks its actor (docs/release-workflow.md)
+dct/core/sprint.py       — Current-sprint ops; delegates to item_sprints; the
+                           conn-level readers shared by review_sprint and the
+                           session snapshot
+dct/core/sprints.py      — First-class sprints (single source of truth)
+dct/core/handoff.py      — Session handoffs (cross-session prompt ledger)
+dct/core/decisions.py    — ADR / sprint-amendment / open-question records
+dct/core/tags.py         — Global tag dictionary + item_tags links (similarity
+                           guard, merge)
+dct/core/analytics.py    — Read-only aggregation helpers for the web viewer
+                           (radar, backlog health, velocity): grouped queries,
+                           never a per-project loop
+dct/core/changelog_file.py — [one impl] Which file is a project's changelog
+                           (#876): the resolver (explicit path — projects.
+                           changelog_path_explicit — / detection among the
+                           candidate's tracked files; every path component
+                           checked in the tree and on disk; filter-aware
+                           work-tree check) for plan, effects and CLI;
+                           problems refuse before the stamp
+dct/core/version.py      — [one impl] Version contract (parse / normalize /
+                           compare / bump, X.Y | X.Y.Z, leading v dropped;
+                           storable_version gates every version write) +
+                           project-file autodetect (VERSION_FILES)
+dct/core/version_sync.py — The project's scripts/dct-version-sync.sh, written
+                           from the packaged generic template (K-76); never
+                           overwrites
+dct/core/gitinfo.py      — [one impl] Git readers (toplevel / branch / common
+                           dir / head) + resolve_checkout: same-repo checkout
+                           of a project (repo root vs project root),
+                           best-effort; the STRICT verify_release_checkout
+                           (confirmed repo / confirmed non-repo / error) gates
+                           the CLI release; git_read / git_write for the
+                           strict git commands
+dct/core/procs.py        — [one impl] Supervised process runner (K-108/K-113):
+                           own process group, TERM→KILL + reap on timeout /
+                           interruption / exception, bounded or
+                           complete-or-refuse capture, streamed lines; used by
+                           every strict git command and the release
+                           workflow's sync script
+dct/core/records.py      — [one impl] Shared STRICT project-row id validator
+                           (validate_project_rows)
+dct/core/checkpoints.py  — Item checkpoint helpers
+dct/core/ids.py          — ULID generation
+dct/core/plans/          — Plans subsystem: parser.py (pure MD parser),
+                           classify.py (rules + optional command), crud.py, ingest.py
+dct/services/            — Service layer (reserved for future shared app ops)
+dct/workflows/session.py — [one impl] G1 composed ops: get_context_snapshot /
+                           pickup_work / handoff_work (one impl for MCP,
+                           CLI and skills; single transaction each)
+dct/workflows/task_mirror.py — Append-only client plan/task observations
+dct/workflows/release/   — Release workflow (K-72): proof layer, read-only for
+                           index, refs, work tree and database (the plan may
+                           write unreferenced git objects to build the future
+                           tree of uncommitted work, as the preview does) —
+                           proof.py ([one impl] trailer / revert / squash
+                           rules), plan.py (`dct release plan`, `dct clog
+                           candidates`); effects layer — effects.py (`dct
+                           release attest / prepare / apply / resume / abandon
+                           / reconstruct / takeover / version-files`,
+                           alias `clog release`: the version sync runs once,
+                           isolated, in prepare; commits through the repo's
+                           hooks, tag, push; every effect verified before
+                           the ledger records it; schema: docs/release-workflow.md);
+                           oplock.py (the per-repository operation lock, K-96 D7)
+                           — dct/workflows never imports from dct/integrations
+dct/mcp/server.py        — MCP server, SDK 2.2 MCPServer (60 tools); the MCP
+                           layer is client-neutral (no host names);
+                           dct/server.py is a compat shim
+dct/cli.py               — argparse CLI entry point
+dct/export.py            — Keep a Changelog MD export
+dct/integrations/        — Host-client adapters; core / db / services /
+                           workflows / mcp never import from this package
+dct/integrations/base.py — [one impl] Shared contract (ClientIntegration) and
+                           conservative file ownership (atomic_write,
+                           managed_instructions, managed-copy markers)
+dct/integrations/manager.py — Client selection (get_integration) + shared
+                           lifecycle (status / install / refresh), no database
+                           bootstrap
+dct/integrations/claude.py — Claude Code adapter: MCP registration, skill/hook
+                           symlinks, settings.json wiring (`dct hooks wire`);
+                           dct/setup.py is a compat shim
+dct/integrations/codex.py — Codex MCP, workflow skills and managed AGENTS.md
+dct/integrations/codex_hooks.py — Native event bridge over shared hook policies
+dct/integrations/doctor.py — Read-only per-runtime dependency diagnostics
+dct/server.py, dct/setup.py — Compat shims; tests monkeypatch the
+                           implementation modules (dct/mcp/server.py,
+                           dct/integrations/claude.py), never the shims
+dct/assets/              — Indirection for packaged asset dirs (physical
+                           skills/ + hooks/ stay put until 2.0.0 — host
+                           symlinks point into them) + packaged text assets
+                           (the user-level CLAUDE.md snippet and the
+                           dct-reference.md it points at, the Codex
+                           instructions and skills, the version-sync script
+                           template)
+dct/web/                 — Read-only Flask dashboard (dct web): app.py
+                           (factory; bootstrap_engine(create=False), never
+                           DDL), blueprints/ (one per view), changes.py (SSE
+                           change token), serializers.py (JSON-native +
+                           sanitized markdown)
+dct/skills/              — Packaged Claude Code skills (symlinked by dct init)
+dct/hooks/               — Packaged Claude Code hooks (symlinked by dct init);
+                           [one impl] dct-changelog-count.lib.sh, the shared
+                           changelog-count library both changelog hooks source
+```
 
 ## Database Schema
 
@@ -84,7 +258,7 @@ The full reference (all sections; `dct init` writes a subset with sensible defau
 ```toml
 [database]
 url = "postgresql+psycopg://localhost:5432/dct"
-# or: url = "sqlite:////home/you/.local/share/dctools/dct.db"
+# or: url = "sqlite:////path/to/dct.db"   # four slashes: an absolute path
 
 [plans]
 # Resolution is enabled; local classification rules require no model

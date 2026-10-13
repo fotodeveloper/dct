@@ -12,7 +12,7 @@ tri-state column on `projects`:
 Surfaces: core getter/setter (dct.core.projects), `dct project trailers`,
 and the MCP `list_projects` read path /commit already uses.
 
-CLAUDE.md invariant: the schema update is locked by a THREE-bootstrap test
+AGENTS.md invariant: the schema update is locked by a THREE-bootstrap test
 (no DDL, no writes to the columns, no output after the first heal).
 Runs on both lanes: the `engine` fixture is in-memory SQLite by default and
 the throwaway PostgreSQL database on the PG lane.

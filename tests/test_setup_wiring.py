@@ -132,7 +132,7 @@ class TestWireHooksMerge:
                 "PostToolUse": [
                     {"matcher": "TaskCreate|TaskUpdate", "hooks": [
                         {"type": "command",
-                         "command": "bash /Users/someone/.claude/hooks/dct-task-mirror.sh"},
+                         "command": "bash /opt/someone/.claude/hooks/dct-task-mirror.sh"},
                     ]},
                 ],
             },

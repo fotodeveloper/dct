@@ -79,7 +79,7 @@ class TestLiveDatabaseRule:
         assert (
             throwaway_refusal_reason(
                 "postgresql+psycopg://u:p@localhost:5432/dct_ci",
-                live_url="sqlite:////home/u/.local/share/dctools/dct.db",
+                live_url="sqlite:////srv/u/.local/share/dctools/dct.db",
             )
             is None
         )

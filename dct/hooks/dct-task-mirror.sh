@@ -13,7 +13,7 @@
 # titled "CC task list — session <id>". cc-task is non-blocking for
 # resolve_item gate semantics.
 #
-# Follows the five hook rules from dct CLAUDE.md:
+# Follows the five hook rules from dct docs/hooks.md:
 #   1. No interactive prompts.
 #   2. Consume stdin.
 #   3. Graceful on missing deps.

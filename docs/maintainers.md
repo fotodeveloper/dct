@@ -9,9 +9,9 @@ this page covers what must happen *before code becomes public*.
 Any identifier that ships in the repo — tests, docs, skill examples, README,
 docstrings, CLI help text — is visible to every user of the tool. Never commit
 author-specific data: real slugs from other private projects, personal brand
-names, home-directory paths (`/Users/<name>`, `/home/<name>`,
-`C:\Users\<name>`), or version strings tied to a private project's release
-cadence.
+names, home-directory paths (anything under `/Users`, `/home` or
+`C:\Users`), assistant session or artifact links, or version strings tied to
+a private project's release cadence.
 
 Write with anonymous placeholders from the first keystroke:
 
@@ -19,7 +19,7 @@ Write with anonymous placeholders from the first keystroke:
 |---|---|---|
 | Slug | `proj-a`, `proj-b`, `mono`, `sub`, `myproj` | real slugs from other projects |
 | Display name | `Project A`, `My Project`, `Example` | "SuperTool Pro", brand names |
-| Path | `/tmp/proj-a`, `tmp_path` fixture | `/Users/<name>/dev/...` |
+| Path | `/tmp/proj-a`, `tmp_path` fixture | a path inside your home directory |
 | Version | `1.0`, `1.1`, `0.1.0` (generic semver) | real private-project versions |
 | Rename fixtures | `old-slug` → `new-slug`, name = `example.io` (keeps dot coverage) | ex-names with real brand |
 
@@ -31,16 +31,23 @@ Write with anonymous placeholders from the first keystroke:
    touched files before staging:
 
    ```bash
-   rg -l '<private-slug-1>|<private-slug-2>|/Users/|/home/|C:\\\\Users|claude\.ai/code' \
-      -- tests skills README.md CLAUDE.md dct/
+   rg -n '<private-slug-1>|<private-slug-2>|/Use[r]s/|/hom[e]/|C:\\\\Users|claude\.ai/code' \
+      -- tests README.md AGENTS.md CONTRIBUTING.md docs dct/
    # commit messages are history too — session/artifact URLs must never land:
    git log --all --grep='claude\.ai/code' --oneline
    ```
 
    Swap the `<private-slug-*>` placeholders for your own private project
    slugs — the list is your registered projects (`list_projects`) minus the
-   current one. Empty output = clean. Any hit = swap to placeholder or
-   justify below.
+   current one. The targets are the shipped surfaces: `AGENTS.md` is the
+   project's only instruction file (there is no project `CLAUDE.md`), and
+   `dct/` covers the packaged Claude and Codex integration assets. The
+   bracketed letters keep the command from matching its own text, and the
+   docs name the forbidden forms without a matching example, so no hit is
+   the check describing itself. Every hit = swap to a neutral placeholder (`/tmp/proj-a`,
+   `/path/to/…`) or justify it below. Empty output only means this regex
+   found nothing — it is no proof that nothing private leaked (a slug you
+   did not list, a name in a fixture).
 3. Pre-release block (future): `/release` Step 0 runs the audit automatically
    and refuses to stamp if it finds leaks.
 

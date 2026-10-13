@@ -6,7 +6,7 @@ Fills the concrete gaps the per-column migration tests leave open:
   changelog_entries.branch / worktree / branch_source and the `releases`
   table) heals on the first bootstrap, keeps its data, and the second and
   third bootstraps issue no DDL, no DML touching those columns / that table
-  and print nothing (CLAUDE.md three-bootstrap invariant);
+  and print nothing (AGENTS.md three-bootstrap invariant);
 - two processes bootstrapping the same old database at the same instant both
   succeed (the column / table ends up there exactly once);
 - PostgreSQL only: `SET LOCAL lock_timeout` runs BEFORE the ALTER inside the

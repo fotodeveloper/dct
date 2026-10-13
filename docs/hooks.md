@@ -281,7 +281,11 @@ pre-commit) and must never hang or block the host operation:
 4. **Exit codes carry meaning** — `0` = pass-through, `2` = block with a
    structured reason; other codes avoided.
 5. **Strip message content before flag inspection** — commit-message text must
-   not produce false flag matches.
+   not produce false flag matches (strip `-m "message"` content before
+   inspecting commit flags).
 
-Contributor-facing details and code examples live in the repo `CLAUDE.md`
-("Hook conventions").
+Reference implementation: `dct/hooks/check-changelog.sh`. Logic shared by
+several hooks lives in a sourced `dct/hooks/*.lib.sh` (never wired; installed
+beside the hooks — `HOOK_LIBS` in `dct/integrations/claude.py`), while each
+hook keeps its own failure policy; commands a hook prints for pasting quote
+every interpolated argument with `printf %q`.

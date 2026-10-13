@@ -6,7 +6,7 @@
 # never waits. Handles brand-new plans (ULID injection on first save) and
 # re-sync of already-tracked plans.
 #
-# Follows the five hook rules from dct CLAUDE.md:
+# Follows the five hook rules from dct docs/hooks.md:
 #   1. No interactive prompts (non-interactive only).
 #   2. Consume stdin (Claude Code hooks supply JSON there).
 #   3. Graceful when deps missing (command -v dct / jq).

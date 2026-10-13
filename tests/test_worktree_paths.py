@@ -17,8 +17,8 @@ from dct.core.projects import create_project
 
 
 @pytest.mark.parametrize("raw,stored", [
-    ("C:\\Users\\dev\\proj", "C:\\Users\\dev\\proj"),
-    ("C:/Users/dev/proj/", "C:\\Users\\dev\\proj"),
+    ("C:\\Work\\dev\\proj", "C:\\Work\\dev\\proj"),
+    ("C:/Work/dev/proj/", "C:\\Work\\dev\\proj"),
     ("c:\\work\\.\\wt\\..\\proj\\", "c:\\work\\proj"),
     ("D:\\", "D:\\"),
     ("\\\\server\\share\\proj", "\\\\server\\share\\proj"),
@@ -42,16 +42,16 @@ def test_relative_or_ambiguous_paths_are_refused(bad):
 
 
 def test_normalization_is_idempotent():
-    for raw in ("C:/Users/dev/proj/", "\\\\srv\\share\\x\\", "/tmp//wt/"):
+    for raw in ("C:/Work/dev/proj/", "\\\\srv\\share\\x\\", "/tmp//wt/"):
         once = normalize_worktree(raw)
         assert normalize_worktree(once) == once
 
 
 def test_windows_path_round_trips_through_store_and_filter(engine):
     create_project(engine, slug="proj-a", name="A")
-    eid = add_entry(engine, "proj-a", "added", "x", worktree="C:/Users/dev/proj/")["id"]
-    add_entry(engine, "proj-a", "added", "y", worktree="C:\\Users\\dev\\other")
-    assert [e["id"] for e in list_entries(engine, "proj-a", worktree="C:\\Users\\dev\\proj")] == [eid]
+    eid = add_entry(engine, "proj-a", "added", "x", worktree="C:/Work/dev/proj/")["id"]
+    add_entry(engine, "proj-a", "added", "y", worktree="C:\\Work\\dev\\other")
+    assert [e["id"] for e in list_entries(engine, "proj-a", worktree="C:\\Work\\dev\\proj")] == [eid]
 
 
 def test_no_filesystem_access(monkeypatch):
