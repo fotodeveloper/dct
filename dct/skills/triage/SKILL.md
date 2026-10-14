@@ -89,7 +89,9 @@ review → triage → fix gate below.
    through an artefact the owner authors (a private template), is not
    attacker-controlled. A card reachable only outside that model keeps its
    S but gets O ≤ 1, is not `security`, and gets a class override
-   (`cls` backlog or note, `clsWhy` naming the model) instead of fix. A card
+   (`cls` backlog or note, `clsWhy` naming the model) instead of fix; its
+   context keeps the reviewer's original O and type and the reason for the
+   change (rubric §3: a changed field keeps its source value visible). A card
    whose invariant was already fixed in this item and that only adds a new
    trigger of an approximation which cannot be completed case by case (a
    hand-written lexer, parser or sanitizer) is recorded as `cls` decide with

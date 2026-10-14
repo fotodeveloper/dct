@@ -258,3 +258,15 @@ def test_triage_close_needs_the_owners_answers_and_promises_no_fix(which):
                      r"every open fix / verify finding[^.]*follow-up", flat), which
     assert "skipped" in flat, which
     assert "language of the conversation" in flat, which
+
+
+@pytest.mark.parametrize("which", TRIAGE_DOCS)
+def test_triage_purpose_check_keeps_the_reviewers_values_visible(which):
+    """dogfood-930 K-2 (rubric §3): the purpose and use check may lower O and
+    drop `security`, but the card's context keeps the reviewer's original O
+    and type and the reason for the change — the owner decides on a card
+    whose correction he can see."""
+    flat = _flat(_triage_doc(which))
+    assert "trust model" in flat, which
+    assert "the reviewer's original O and type" in flat, which
+    assert "the reason for the change" in flat, which

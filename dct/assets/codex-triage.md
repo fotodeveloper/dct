@@ -31,11 +31,12 @@ as display text) and `reviewers` (lowercase tokens such as `codex`,
 card against the tool's purpose and trust model: an input the owner's own
 process writes, or a surface reached only through an artefact the owner authors,
 is not attacker-controlled — such a card keeps its S, gets O ≤ 1, is not
-`security` and gets a class override (`cls` backlog or note with `clsWhy`); a new
-trigger of an invariant already fixed in this item, in an approximation that
-cannot be completed case by case, is recorded as `cls` decide ("class
-recurrence: structural change or backlog"), never another fix round. Name every
-finding whose `first_seen_id` is not null as recurring.
+`security` and gets a class override (`cls` backlog or note with `clsWhy`), and
+its context keeps the reviewer's original O and type and the reason for the
+change; a new trigger of an invariant already fixed in this item, in an
+approximation that cannot be completed case by case, is recorded as `cls`
+decide ("class recurrence: structural change or backlog"), never another fix
+round. Name every finding whose `first_seen_id` is not null as recurring.
 
 Page: create the directory, then run `dct triage page <code> --project <slug>
 --out <path>` (`--template <path>` unless `[triage] template` is configured).
