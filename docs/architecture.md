@@ -148,8 +148,31 @@ dct/workflows/triage.py  — [one impl] Triage findings ledger (#909): cycles,
                            recurrence by normalised fingerprint, reviewer
                            precision, CARDS / CLOSED export for the triage
                            page; classify() is the one port of the template's
-                           class rule; writers of an open cycle serialise on
-                           its row (db.lock_cycle_row)
+                           class rule; suggestion_digest() is the one hash of
+                           a cycle's cards + proposals (export's
+                           SUGGESTED.digest, checked by accept_suggestions
+                           under the cycle lock); parse_decision_batch() the
+                           one parser of the page's decision text; writers of
+                           an open cycle serialise on its row
+                           (db.lock_cycle_row)
+dct/workflows/triage_page.py — Triage page builder (#930, no DB):
+                           build_triage_page(export, template_html, ...)
+                           fills the three constants (CARDS / CLOSED /
+                           SUGGESTED, via page_constants_json) and the
+                           metadata placeholders of the ORIGINAL template
+                           once — inserted ledger text is never re-scanned.
+                           Metadata has two escaping contexts: HTML outside
+                           <script> (HTML-escaped) and a quoted JS string
+                           literal inside it (JS string escapes, read back
+                           verbatim); any other script position — code, a
+                           comment, a regex or template literal — is
+                           REFUSED, never substituted. STORAGE_KEY =
+                           `triage-<project slug>-<code slug>-c<cycle id>-v1`
+                           (the immutable id last, so the key is injective;
+                           drafts kept under the earlier key order are not
+                           migrated — ledger decisions and proposals are
+                           unaffected). Used by `dct triage page`; dct ships
+                           no template
 dct/workflows/release/   — Release workflow (K-72): proof layer, read-only for
                            index, refs, work tree and database (the plan may
                            write unreferenced git objects to build the future
@@ -232,10 +255,11 @@ SQLAlchemy Core tables (not the ORM) with a `deleted_at` column for soft deletes
 
 **Triage findings ledger** (#909, `dct/workflows/triage.py`):
 - `triage_cycles` — one review round: project_id, code (e.g. `rev-877-r2`, UNIQUE per project among live rows), topic, scope (what was reviewed), base_commit, rubric_version (default 2), artifact_url, created_by, opened_at, closed_at (NULL = open), closed_source / closed_notes (the CLOSED block's source and notes).
-- `findings` — cycle_id, seq (the K-n number, UNIQUE per cycle among live rows), fingerprint + fingerprint_norm (the recurrence identity, normalisation v1 below), title; the rubric v2 fields under full names: impact (S, 0-3), reachability (O, `0`-`3` \| `?`), evidence (E, 0-3), fix_cost (K, S \| M \| L), origin (diff \| pre \| latent), finding_type — all six NOT NULL (rubric §1, K-4); suggested_decision / suggested_opt / suggested_note / suggested_by / suggested_at (an agent's proposal — the template's SUGGESTED — never a decision); the template flags conflict / violation (default true) / dispute / open_design; area (where), reviewer (the CARD's `src`: `codex`, `panel:security`, … — not `source`, which is the provenance column), context; class_rec (classify()) / class_override / class_reason; decision (NULL = undecided) / decision_opt / decision_note (the owner's comment verbatim) / decided_at / decided_by (who decided) / decision_source (where the owner's words are recorded) — the last three NULL while undecided and written together (K-5 / decision_actor_type / decision_actor_client / decision_session_id / decision_actor_source (the LAST decision's writer, read from the provenance context in the same UPDATE as decided_at, refreshed as a set on every overwrite and NULL before a decision — an audit record, never backfilled, not authentication; the row's creation provenance stays untouched); an audit record distinct from the provenance columns, not authentication); item_id (promoted to), first_seen_id (self-FK: the earliest live finding of the project with the same fingerprint_norm; NULL = first). Indexed on cycle_id and fingerprint_norm. fingerprint_norm uses normalisation v1 (NFC + lower + whitespace collapse + fixed-point trailing punctuation strip, `triage.normalize_fingerprint`); the ledger shipped with it, so no reconciliation of earlier norms exists.
+- `findings` — cycle_id, seq (the K-n number, UNIQUE per cycle among live rows), fingerprint + fingerprint_norm (the recurrence identity, normalisation v1 below), title; the rubric v2 fields under full names: impact (S, 0-3), reachability (O, `0`-`3` \| `?`), evidence (E, 0-3), fix_cost (K, S \| M \| L), origin (diff \| pre \| latent), finding_type — all six NOT NULL (rubric §1, K-4); suggested_decision / suggested_opt / suggested_note / suggested_by / suggested_at (an agent's proposal — the template's SUGGESTED — never a decision); the template flags conflict / violation (default true) / dispute / open_design; area (where), reviewer (the CARD's `src`: `codex`, `panel:security`, … — not `source`, which is the provenance column), context; class_rec (classify()) / class_override / class_reason; decision (NULL = undecided) / decision_opt / decision_note (the owner's comment verbatim) / decided_at / decided_by (who decided) / decision_source (where the owner's words are recorded) — the last three NULL while undecided and written together (K-5 / decision_actor_type / decision_actor_client / decision_session_id / decision_actor_source (the LAST decision's writer, read from the provenance context in the same UPDATE as decided_at, refreshed as a set on every overwrite and NULL before a decision — an audit record, never backfilled, not authentication; the row's creation provenance stays untouched); an audit record distinct from the provenance columns, not authentication); decision_text_origin (TEXT, NULL — #930 K-40: the "Punkt wyjścia:" line of the pasted decision text that wrote this decision, verbatim; written with the decision stamp, reset to NULL by a later decision without one; it proves the form was seeded from proposals, not who wrote the note); item_id (promoted to), first_seen_id (self-FK: the earliest live finding of the project with the same fingerprint_norm; NULL = first). Indexed on cycle_id and fingerprint_norm. fingerprint_norm uses normalisation v1 (NFC + lower + whitespace collapse + fixed-point trailing punctuation strip, `triage.normalize_fingerprint`); the ledger shipped with it, so no reconciliation of earlier norms exists.
 - `finding_options` — finding_id, key (UNIQUE per finding among live rows), text, why, is_root, is_recommended (at most one per finding, checked in code).
+- `finding_reviewers` (#930, migration 015) — finding_id (FK findings, NOT NULL), reviewer (VARCHAR(50), a canonical token `^[a-z0-9][a-z0-9:._-]*$`, lowercased on write and refused otherwise — never guessed from the free-text `src`); UNIQUE (finding_id, reviewer) among live rows. The reviewer identity behind `reviewer_precision` (a finding with two reviewers counts for both; one without rows counts under `(unattributed)`) and the `reviewer` filter of `list_findings`; the CARD's `reviewers` list. No backfill: findings recorded before #930 stay unattributed.
 
-Value domains (rubric enums, decisions, classes) are validated by the workflow, not by CHECK constraints; every VARCHAR goes through `ensure_fits`. The three tables carry the provenance columns and are in `INDEX_HEALED_TABLES`.
+Value domains (rubric enums, decisions, classes) are validated by the workflow, not by CHECK constraints; every VARCHAR goes through `ensure_fits`. The four tables carry the provenance columns and are in `INDEX_HEALED_TABLES`.
 
 `items.tags` (the old JSON-array-in-TEXT column) is **deprecated and frozen**:
 nothing writes it any more, `_backfill_item_tags` is its only sanctioned reader,
@@ -258,6 +282,7 @@ Full DDL lives in:
 - `migrations/012_release_preview.sql`
 - `migrations/013_commit_trailer_preferences.sql`
 - `migrations/014_triage_findings.sql`
+- `migrations/015_finding_reviewers.sql` (also `findings.decision_text_origin`, healed at runtime through `TRIAGE_LEDGER_COLUMNS`)
 
 At runtime, the engine creates every MISSING table with all its indexes (`_create_missing_tables` — race-safe against a concurrent bootstrap: a duplicate table / index / relation error rolls the attempt back, the whole schema of those tables is re-checked and finished, at most `SCHEMA_CREATE_ATTEMPTS` tries, any other error propagates; tables that already exist are left to the explicit blocks below — except the release-ledger and triage-ledger tables (`INDEX_HEALED_TABLES`, K-93 A2 / #909), whose missing required indexes every bootstrap completes, warning once instead of failing when existing rows violate a unique index) plus an idempotent `_apply_schema_updates()` that:
 - adds later columns in place (e.g. `item_checkpoints.kind` for gate checkpoints; new columns go through the duplicate-safe `_add_column_if_missing` — `ADD COLUMN IF NOT EXISTS` under a 5 s `lock_timeout` on PostgreSQL, a re-checked "duplicate column" error on SQLite),
@@ -367,6 +392,12 @@ refresh_poll_ms = 2000   # SSE change-token poll interval
 # Passive PyPI update check (#356). When false, disables BOTH the background
 # version probe and the CLI/MCP nudge. Offline-safe and non-blocking regardless.
 check = true
+
+[triage]
+# The triage page template used by `dct triage page` (#930) when no
+# --template is given. dct ships no template; without either the command
+# refuses and names both ways.
+template = "/path/to/triage-template.html"
 ```
 
 **Environment overrides**: `DCT_DATABASE_URL` overrides `[database].url`;
