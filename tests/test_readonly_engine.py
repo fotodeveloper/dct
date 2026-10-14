@@ -1,7 +1,8 @@
 """K-84: the read-only commands never change the database.
 
 `dct release plan`, `dct clog candidates`, `dct release status` /
-`dct clog release-status` and the `dct release reconstruct` preview open the
+`dct clog release-status`, the `dct release reconstruct` preview and
+`dct triage export` / `dct triage page` (#930) open the
 database through ONE genuinely read-only engine path (db.get_readonly_engine +
 db.check_schema_ready): no database file or directory is created, no table or
 index, no journal-mode change, no row. A missing or older schema is a clear
@@ -21,6 +22,7 @@ from pathlib import Path
 
 import pytest
 import sqlalchemy as sa
+from test_triage_page import SKELETON
 
 from dct import paths
 from dct.core.projects import create_project
@@ -32,6 +34,7 @@ from dct.db import (
     get_engine,
     get_readonly_engine,
 )
+from dct.workflows.triage import open_triage, record_findings
 
 pytestmark = pytest.mark.slow
 
@@ -47,10 +50,16 @@ READ_ONLY_COMMANDS = [
     ["release", "takeover", "--project", "proj-a", "--version", "1.0.0", "--no-push"],
     ["release", "version-files", "--project", "proj-a"],
     ["release", "version-files", "--project", "proj-a", "--none"],
+    # #930: the triage export and the page build (template written by _cli).
+    ["triage", "export", "rev-1", "--project", "proj-a"],
+    ["triage", "page", "rev-1", "--project", "proj-a", "--template", "triage-template.html",
+     "--out", "rev-1.html"],
 ]
 
 
 def _cli(db_path: Path, args: list[str], cwd: Path) -> subprocess.CompletedProcess:
+    if args[:2] == ["triage", "page"]:  # the page needs a template to reach the database
+        (cwd / "triage-template.html").write_text(SKELETON, encoding="utf-8")
     env = {**os.environ, "DCT_DATABASE_URL": f"sqlite:///{db_path}"}
     return subprocess.run(
         [sys.executable, "-m", "dct.cli", *args],
@@ -136,6 +145,28 @@ def test_current_schema_reads_and_changes_nothing(tmp_path, args, shown):
     out = _cli(db_path, args, tmp_path)
     assert out.returncode == 0, out.stdout + out.stderr
     assert shown in out.stdout
+    assert _state(db_path) == before
+
+
+def test_triage_page_builds_from_a_current_schema_and_changes_nothing(tmp_path):
+    """#930: `dct triage page` reads the cycle through the read-only engine —
+    the page is written, the database stays byte-identical."""
+    db_path = tmp_path / "triage.db"
+    _rollback_journal_db(db_path)
+    eng = get_engine(f"sqlite:///{db_path}")
+    cycle_id = open_triage(eng, "proj-a", "rev-1", "review", "me")["cycle_id"]
+    record_findings(eng, cycle_id, [{
+        "title": "T", "fp": "fp", "src": "codex", "S": 1, "O": 1, "E": 1, "K": "S",
+        "origin": "diff", "type": "correctness"}])
+    eng.dispose()
+    with sqlite3.connect(db_path) as conn:
+        assert conn.execute("PRAGMA journal_mode=DELETE").fetchone()[0] == "delete"
+    conn.close()
+    before = _state(db_path)
+    out = _cli(db_path, READ_ONLY_COMMANDS[-1], tmp_path)
+    assert out.returncode == 0, out.stdout + out.stderr
+    assert "1 cards, closed=no, suggested=none" in out.stdout
+    assert "const CARDS = [" in (tmp_path / "rev-1.html").read_text(encoding="utf-8")
     assert _state(db_path) == before
 
 

@@ -93,7 +93,10 @@ _INSTRUCTIONS = (
         "  record_findings (JSON array of findings; one bad finding = nothing written) →\n"
         "  suggest_findings (an agent's proposals) / decide_findings (the owner's answers,\n"
         "  verbatim) → close_triage. export_triage = the triage page's CARDS / CLOSED /\n"
-        "  SUGGESTED; list_findings, finding_history, reviewer_precision read the ledger.\n\n"
+        "  SUGGESTED; list_findings, finding_history, reviewer_precision read the ledger.\n"
+        "  The owner's pasted page text → decide_findings_from_text; \"accept the proposals\"\n"
+        "  → accept_suggestions (with the SUGGESTED.digest of the PUBLISHED page, never\n"
+        "  a fresh one); the published page's link → update_triage.\n\n"
         "TOOL-CALL HYGIENE: pass every argument as its own top-level parameter — never\n"
         "nest one prose field in another. Free-text tools reject literal tool-call markup;\n"
         "a rejection means re-send with the fields split out."
@@ -3239,7 +3242,8 @@ def ingest_plan_file(
 
 # ── Triage findings ledger (#909) ─────────────────────────────────────────────
 # Thin MCP layer over dct/workflows/triage.py — ONE implementation shared with
-# the CLI (`dct triage export`); validation, atomicity and the open-cycle gate
+# the CLI (`dct triage export / page / decide / accept / close`); validation,
+# atomicity and the open-cycle gate
 # live there. Deferred by design (no _ALWAYS_LOAD_META): used in review
 # sessions only.
 
@@ -3383,9 +3387,13 @@ def record_findings(
       CARD carries them · cls|class_override fix|verify|quick|decide|backlog|
       reject|note + clsWhy|class_reason (required with an override) ·
       opts|options: array of {k|key, t|text, why, root|is_root,
-      rec|is_recommended} (at most one rec).
+      rec|is_recommended} (at most one rec) · reviewers: optional non-empty
+      array of canonical reviewer tokens ([a-z0-9][a-z0-9:._-]*, lowercased,
+      no duplicates; e.g. ["codex", "panel:security"]) — who reported it,
+      counted by reviewer_precision; `src` stays the free-text display value.
     Example: [{"title": "...", "fp": "...", "src": "codex", "S": 2, "O": 1,
     "E": 2, "K": "S", "origin": "diff", "type": "correctness",
+    "reviewers": ["codex"],
     "opts": [{"k": "a", "t": "...", "rec": true, "root": true}]}]
     A re-recorded CARD is a NEW finding; decisions are never imported.
 
@@ -3411,7 +3419,8 @@ def record_findings(
         cycle's slug). {"error": "..."} — and NOTHING written — on any invalid
         finding: an unknown key (named in the message), a field under both
         spellings, a bad enum or level, a missing required field, two
-        recommended options, a duplicate option key, a seq outside
+        recommended options, a duplicate option key, an empty, invalid or
+        duplicate reviewer token, a seq outside
         1..2147483647, a duplicate or already-taken seq, an auto seq past
         2147483647, an over-long value or normalised fingerprint, tool-call
         markup; or a missing / closed / other project's cycle, both or
@@ -3608,6 +3617,210 @@ def close_triage(
 
 
 @mcp.tool(structured_output=False)
+def decide_findings_from_text(
+    text: str,
+    decided_by: str,
+    decision_source: str,
+    cycle_id: int = 0,
+    cycle: str = "",
+    project: str = "",
+) -> dict:
+    """Record the OWNER's decisions pasted as the triage page's generated text — atomically.
+
+    Pass `text` VERBATIM as the owner pasted it (the page's "Tekst do
+    wklejenia"); never compose or edit it — an agent's proposals go to
+    suggest_findings. Grammar: an optional header line "Triage …:" and an
+    optional "Punkt wyjścia: …" line (the page was seeded from proposals)
+    precede the cards; every other non-blank line is one card:
+      K-<n>: <decision>[ · wariant (<k>)][ [annotation]…][ · uwagi: <note>]
+    <decision> = the page label (Fix teraz | Zweryfikuj | Backlog → dct |
+    Odrzuć / zaakceptuj stan | Odnotuj | Do dyskusji; → -> — – / are
+    interchangeable separators) or fix | verify | backlog | reject | note |
+    discuss, case-insensitive. `wariant (k)` must be an option key of that
+    card; bracketed annotations are ignored; the note = everything after the
+    first " · uwagi:" (one leading space dropped), verbatim, one line.
+    K-01 = K-1. Skip rule: a card line "— (brak decyzji)" with an EMPTY
+    note is a card the owner did not address — skipped, its stored state
+    unchanged, listed in `skipped` (its K-n and wariant are still
+    validated); "— (brak decyzji)" WITH a note refuses the whole text. The
+    "Punkt wyjścia" line, when present, is stored verbatim with every
+    decision this text writes (findings.decision_text_origin; a later
+    decision without one resets it) — it proves the form was seeded from
+    proposals, not who wrote each note. The text is parsed BEFORE anything
+    is written, then written in ONE transaction exactly like
+    decide_findings (stamps, provenance, refusals). Only the cards the text
+    decides change; the others keep their stored state.
+
+    Args:
+        text: The owner's pasted decision text (required, verbatim).
+        decided_by: Required — the PERSON who decided (e.g. "owner"), not
+            the client writing it; ≤ 200 chars.
+        decision_source: Required — where the owner's words are recorded
+            (e.g. "chat 2026-10-14 14:30"); ≤ 200 chars.
+        cycle_id: The cycle's global id (from open_triage); 0 = not given.
+        cycle: The cycle's code instead (e.g. "rev-877-r2"); a code is unique
+            only within a project, so it needs `project`, and it is never
+            read as an id. Give cycle_id OR cycle — both or neither is an
+            error.
+        project: Optional slug (REQUIRED with `cycle`). When given, the cycle
+            must belong to it — checked in the write's own transaction; a
+            mismatch is an error with nothing written. Never auto-detected
+            from CWD: empty = cycle_id alone decides.
+
+    Returns: {cycle_id, project, decided: n, undecided: [seq…], parsed: n,
+        skipped: ["K-n"…]} — undecided = the live findings still without a
+        decision after the write; skipped = the "— (brak decyzji)" lines left
+        untouched (a text of only such lines decides 0 and writes nothing).
+        {"error": "..."} — nothing written — on a parse error (named
+        by its 1-based line: an empty or header-only text, a line that is not
+        a card, "— (brak decyzji)" with a note or an unknown decision label, a K-n that
+        is not a card of the cycle or addressed twice, a wariant that is not
+        an option of that card), any decide_findings refusal (reject / note
+        on a finding promoted to an open item, an empty / over-long
+        decided_by or decision_source), tool-call markup, or a missing /
+        closed / other project's cycle, both or neither of cycle_id / cycle,
+        a code without project.
+    """
+    if (err := _reject_toolcall_markup(
+        text=text, decided_by=decided_by, decision_source=decision_source,
+        cycle=cycle, project=project,
+    )):
+        return err
+    from dct.workflows.triage import decide_findings_from_text as _decide_text
+
+    try:
+        target, slug = _triage_cycle_target(cycle_id, cycle, project)
+        out = _decide_text(_get_engine(), target, text, decided_by=decided_by,
+                           decision_source=decision_source, project=project or None)
+        return {"cycle_id": target, "project": slug, **out}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@mcp.tool(structured_output=False)
+def accept_suggestions(
+    expected_by: str,
+    expected_digest: str,
+    decided_by: str,
+    decision_source: str,
+    cycle_id: int = 0,
+    cycle: str = "",
+    project: str = "",
+    overwrite: bool = False,
+) -> dict:
+    """The OWNER accepts an agent's proposals (the page's SUGGESTED) as final decisions — atomically.
+
+    Call ONLY when the owner said so ("przyjmij propozycje jako ostateczne").
+    Every live finding carrying a suggestion gets decision = the suggested
+    dec / opt and note = "[zaakceptowana propozycja <by>] " + the suggested
+    note (<by> = that finding's proposer). Bound to the proposals the owner
+    saw: refused when any proposal is by someone other than `expected_by`,
+    and when the cycle's cards or proposals differ from the page he saw
+    (`expected_digest` ≠ the digest recomputed under the cycle lock — a
+    revision by the same author counts). Findings without a suggestion are
+    left untouched. One transaction under the cycle lock, written exactly
+    like decide_findings (stamps, provenance, refusals).
+
+    Args:
+        expected_by: Required — the proposer the owner saw on the page
+            (SUGGESTED.by, e.g. "Codex").
+        expected_digest: Required — SUGGESTED.digest of the export the
+            PUBLISHED page was built from (kept when that page was built);
+            never a digest read just now, which would accept proposals the
+            owner has not seen.
+        decided_by: Required — the PERSON who accepted (e.g. "owner");
+            ≤ 200 chars.
+        decision_source: Required — where the owner's acceptance is recorded
+            (e.g. "chat 2026-10-14 14:30"); ≤ 200 chars.
+        cycle_id: The cycle's global id (from open_triage); 0 = not given.
+        cycle: The cycle's code instead (e.g. "rev-877-r2"); a code is unique
+            only within a project, so it needs `project`, and it is never
+            read as an id. Give cycle_id OR cycle — both or neither is an
+            error.
+        project: Optional slug (REQUIRED with `cycle`). When given, the cycle
+            must belong to it — checked in the write's own transaction; a
+            mismatch is an error with nothing written. Never auto-detected
+            from CWD: empty = cycle_id alone decides.
+        overwrite: Default false = refused when a proposed finding already
+            has a decision; true = replace those decisions with the proposals.
+
+    Returns: {cycle_id, project, decided: n, undecided: [seq…],
+        without_suggestion: ["K-n"…], already_decided: ["K-n"…]} — undecided
+        = the post-write state; already_decided = the decisions replaced
+        (only with overwrite=true). {"error": "..."} — nothing written — when
+        no finding has a suggestion, a proposal is not by expected_by, the
+        digest differs (cards or proposals changed since the page was
+        built), a proposed finding is already decided without overwrite, any
+        decide_findings refusal (reject / note on a finding promoted to an
+        open item), an empty / over-long expected_by, an empty
+        expected_digest, an empty / over-long decided_by or decision_source,
+        tool-call markup, or a missing / closed / other
+        project's cycle, both or neither of cycle_id / cycle, a code without
+        project.
+    """
+    if (err := _reject_toolcall_markup(
+        expected_by=expected_by, expected_digest=expected_digest, decided_by=decided_by,
+        decision_source=decision_source, cycle=cycle, project=project,
+    )):
+        return err
+    from dct.workflows.triage import accept_suggestions as _accept
+
+    try:
+        target, slug = _triage_cycle_target(cycle_id, cycle, project)
+        out = _accept(_get_engine(), target, expected_by=expected_by,
+                      expected_digest=expected_digest, decided_by=decided_by,
+                      decision_source=decision_source, overwrite=overwrite,
+                      project=project or None)
+        return {"cycle_id": target, "project": slug, **out}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@mcp.tool(structured_output=False)
+def update_triage(
+    artifact_url: str = "",
+    cycle_id: int = 0,
+    cycle: str = "",
+    project: str = "",
+) -> dict:
+    """Update an OPEN triage cycle's page link (artifact_url) — e.g. after the page's first publish.
+
+    Args:
+        artifact_url: The triage page's URL (≤ 500 chars, refused never
+            truncated). "" (default) = not given — nothing to update is an
+            error; "__clear__" = clear the stored link (null).
+        cycle_id: The cycle's global id (from open_triage); 0 = not given.
+        cycle: The cycle's code instead (e.g. "rev-877-r2"); a code is unique
+            only within a project, so it needs `project`, and it is never
+            read as an id. Give cycle_id OR cycle — both or neither is an
+            error.
+        project: Optional slug (REQUIRED with `cycle`). When given, the cycle
+            must belong to it — checked in the write's own transaction; a
+            mismatch is an error with nothing written. Never auto-detected
+            from CWD: empty = cycle_id alone decides.
+
+    Returns: {cycle_id, project, code, artifact_url} (post-state; null when
+        cleared). {"error": "..."} — nothing written — on nothing to update
+        (artifact_url ""), an over-long URL, tool-call markup, or a missing /
+        closed / other project's cycle, both or neither of cycle_id / cycle,
+        a code without project.
+    """
+    if (err := _reject_toolcall_markup(artifact_url=artifact_url, cycle=cycle, project=project)):
+        return err
+    from dct.workflows.triage import OMITTED
+    from dct.workflows.triage import update_triage as _update
+
+    url = OMITTED if artifact_url == "" else (None if artifact_url == CLEAR else artifact_url)
+    try:
+        target, slug = _triage_cycle_target(cycle_id, cycle, project)
+        out = _update(_get_engine(), target, artifact_url=url, project=project or None)
+        return {"cycle_id": out["cycle_id"], "project": slug, "code": out["code"],
+                "artifact_url": out["artifact_url"]}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@mcp.tool(structured_output=False)
 def list_findings(
     project: str = "",
     cycle: str = "",
@@ -3617,6 +3830,7 @@ def list_findings(
     cls: str = "",
     decision: str = "",
     source: str = "",
+    reviewer: str = "",
     limit: int = 50,
 ) -> dict:
     """List a project's live review findings in compact {cols, rows} form.
@@ -3639,12 +3853,15 @@ def list_findings(
         cls: Effective class — fix | verify | quick | decide | backlog |
             reject | note.
         decision: fix | verify | backlog | reject | note | discuss.
-        source: The reviewer, exactly as recorded (e.g. "codex").
+        source: The free-text `src`, exactly as recorded (e.g. "codex").
+        reviewer: A canonical reviewer token (e.g. "panel:security"; matched
+            lowercased) — findings recorded with it in `reviewers`.
         limit: Max rows (default 50); 0 = no limit.
 
     Returns: {"cols": [...], "rows": [[...]]}. {"error": "..."} on both
         cycle and cycle_id, an unknown cycle or one of another project, an
-        invalid cls / decision, a negative limit, or an unresolvable project.
+        invalid cls / decision / reviewer token, a negative limit, or an
+        unresolvable project.
     """
     from dct.workflows.triage import list_findings as _list
 
@@ -3657,7 +3874,8 @@ def list_findings(
             _get_engine(), project_slug,
             cycle=cycle_id if cycle_id else (cycle or None),
             fingerprint=fingerprint or None, file=file or None, cls=cls or None,
-            decision=decision or None, source=source or None, limit=limit,
+            decision=decision or None, source=source or None,
+            reviewer=reviewer or None, limit=limit,
         )
     except Exception as e:
         return {"error": str(e)}
@@ -3690,9 +3908,12 @@ def finding_history(fingerprint: str, project: str = "") -> dict:
 
 @mcp.tool(structured_output=False)
 def reviewer_precision(project: str = "", since: str = "") -> dict:
-    """Decided findings counted per reviewer and decision — how often each source is right.
+    """Decided findings counted per reviewer token and decision — how often each reviewer is right.
 
-    Undecided findings are not counted.
+    Grouped by the canonical tokens recorded in a finding's `reviewers`: a
+    finding with two reviewers counts once for each (so the sum of n can
+    exceed the decided findings); a decided finding without tokens counts
+    under "(unattributed)", never dropped. Undecided findings are not counted.
 
     Args:
         project: Slug. Empty = auto-detect from CWD.
@@ -3701,7 +3922,8 @@ def reviewer_precision(project: str = "", since: str = "") -> dict:
             "last_release" | "all" | "<N>h" | ISO date/datetime. Empty
             (default) = all time.
 
-    Returns: {"cols": ["source", "decision", "n"], "rows": [[...]]}.
+    Returns: {"cols": ["reviewer", "decision", "n"], "rows": [[...]]},
+        sorted by reviewer, then decision.
         {"error": "..."} on an invalid `since` or an unresolvable project.
     """
     from dct.workflows.triage import reviewer_precision as _precision
@@ -3716,14 +3938,14 @@ def reviewer_precision(project: str = "", since: str = "") -> dict:
 
 @mcp.tool(structured_output=False)
 def export_triage(cycle_id: int = 0, cycle: str = "", project: str = "") -> dict:
-    """Export a triage cycle as the triage page's constants (read-only).
+    """Export a triage cycle as a semantic dict of the triage page's constants (read-only).
 
-    Field names are EXACTLY the page template's, so the values paste into
-    a copy of the template (the page build stays the caller's job; the CLI
-    twin is `dct triage export`). The texts are returned as recorded,
-    unescaped: embed them in a page only through an HTML-safe serializer
-    (`dct triage export` prints them that way), never as raw JSON in a
-    <script>.
+    Field names are EXACTLY the page template's. The canonical page build
+    is the CLI `dct triage page <code> --project <slug> --out <file>`: it
+    builds the whole page from this same export (never assemble or edit a
+    page by hand). This tool returns data, not a page: the texts are as
+    recorded, unescaped — never paste them as raw JSON into a <script>.
+    The CLI twin of this tool is `dct triage export`.
 
     Args:
         cycle_id: The cycle's global id (from open_triage); 0 = not given.
@@ -3739,10 +3961,13 @@ def export_triage(cycle_id: int = 0, cycle: str = "", project: str = "") -> dict
         topic, scope, base_commit, rubric_version, artifact_url, created_by,
         opened_at, closed_at}; cards = CARDS by seq — {id "K-n", title, area,
         src, S, O, E, K, origin, type, fp, ctx [..], opts [{k, rec, root, t,
-        why}]} plus conflict / violation / dispute / openDesign when set and
-        cls + clsWhy for an override; closed = CLOSED {date, source, rubric,
+        why}]} plus conflict / violation / dispute / openDesign when set,
+        cls + clsWhy for an override and reviewers [token…] when recorded; closed = CLOSED {date, source, rubric,
         notes, answers} once closed, else null; suggested = SUGGESTED {by,
-        date, answers} when any finding carries a suggestion, else null.
+        date, answers, digest} when any finding carries a suggestion, else
+        null — digest = the hash of the cycle's cards and proposals that
+        accept_suggestions(expected_digest=…) checks; keep the one of the
+        export the published page was built from.
         {"error": "..."} on a missing or other project's cycle, both or
         neither of cycle_id / cycle, a code without project.
     """

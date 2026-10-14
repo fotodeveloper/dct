@@ -1,4 +1,4 @@
-"""MCP-layer contract tests for the triage findings ledger tools (#909).
+"""MCP-layer contract tests for the triage findings ledger tools (#909, #930).
 
 dct/workflows/triage.py is covered by tests/test_triage_ledger.py; what is
 tested HERE is the thin MCP marshalling layer in dct/mcp/server.py — what the
@@ -10,7 +10,7 @@ calling model drives:
       top-level field),
   (d) the slim acks — every write names its target: cycle_id / finding_id
       and the project slug, read from the cycle, never from the CWD (K-11),
-  (e) the ten tools are registered, deferred (no alwaysLoad) and named in the
+  (e) the thirteen tools are registered, deferred (no alwaysLoad) and named in the
       server instructions' TRIAGE LEDGER paragraph without typos,
   (f) the cycle given as cycle_id OR its code with project, one shape for
       every cycle-taking tool (K-13), and the decision's audit fields (K-5).
@@ -33,6 +33,8 @@ TRIAGE_TOOLS = {
     "open_triage", "record_findings", "decide_findings", "suggest_findings",
     "close_triage", "list_findings", "finding_history", "reviewer_precision",
     "export_triage", "promote_finding_to_item",
+    # #930
+    "decide_findings_from_text", "accept_suggestions", "update_triage",
 }
 
 
@@ -74,7 +76,7 @@ def _wire_tools(srv):
     return {t.name: t for t in asyncio.run(srv.mcp.list_tools())}
 
 
-def test_all_ten_tools_are_registered_and_deferred(srv):
+def test_all_triage_tools_are_registered_and_deferred(srv):
     tools = _wire_tools(srv)
     assert TRIAGE_TOOLS <= set(tools)
     for name in TRIAGE_TOOLS:
@@ -100,7 +102,8 @@ def test_instructions_paragraph_names_only_real_triage_tools(srv):
     assert named, paragraph
     assert named <= TRIAGE_TOOLS, sorted(named - TRIAGE_TOOLS)
     assert {"open_triage", "record_findings", "decide_findings", "suggest_findings",
-            "close_triage", "export_triage"} <= named
+            "close_triage", "export_triage", "decide_findings_from_text",
+            "accept_suggestions", "update_triage"} <= named
 
 
 # ── open_triage ──────────────────────────────────────────────────────────────
@@ -288,12 +291,37 @@ def test_finding_history_spans_cycles_chronologically(srv):
 
 def test_reviewer_precision_counts_only_decided_findings(srv):
     cycle_id = _open(srv)
-    srv.record_findings(cycle_id=cycle_id, findings=[finding(), finding(fp="b"), finding(fp="c", src="panel")])
-    srv.decide_findings(cycle_id=cycle_id, **OWNER, decisions={"K-1": {"dec": "fix"}, "K-2": {"dec": "reject"}})
+    srv.record_findings(cycle_id=cycle_id, findings=[
+        finding(reviewers=["codex", "Panel:Security"]), finding(fp="b", reviewers=["codex"]),
+        finding(fp="c", src="panel", reviewers=["panel:security"]), finding(fp="d")])
+    srv.decide_findings(cycle_id=cycle_id, **OWNER, decisions={
+        "K-1": {"dec": "fix"}, "K-2": {"dec": "reject"}, "K-4": {"dec": "note"}})
     out = srv.reviewer_precision(project="test")
-    assert out["cols"] == ["source", "decision", "n"]
-    assert sorted(map(tuple, out["rows"])) == [("codex", "fix", 1), ("codex", "reject", 1)]
+    assert out["cols"] == ["reviewer", "decision", "n"]
+    # K-1 counts for both of its reviewers; K-3 is undecided; K-4 has no token.
+    assert out["rows"] == [["(unattributed)", "note", 1], ["codex", "fix", 1],
+                           ["codex", "reject", 1], ["panel:security", "fix", 1]]
     assert set(srv.reviewer_precision(project="test", since="yesterday-ish")) == {"error"}
+
+
+def test_list_findings_filters_by_a_reviewer_token(srv):
+    cycle_id = _open(srv)
+    srv.record_findings(cycle_id=cycle_id, findings=[
+        finding(reviewers=["codex", "panel:security"]), finding(fp="b", reviewers=["codex"]),
+        finding(fp="c")])
+    seqs = [r["seq"] for r in _rows(srv.list_findings(project="test", reviewer="PANEL:Security"))]
+    assert seqs == [1]
+    assert len(srv.list_findings(project="test", reviewer="codex")["rows"]) == 2
+    assert set(srv.list_findings(project="test", reviewer="not a token!")) == {"error"}
+
+
+def test_record_findings_refuses_an_invalid_reviewer_token_and_writes_nothing(srv):
+    cycle_id = _open(srv)
+    for bad in ([], ["codex", "codex"], ["has space"], ["-lead"]):
+        out = srv.record_findings(cycle_id=cycle_id, findings=[finding(), finding(
+            fp="b", reviewers=bad)])
+        assert set(out) == {"error"}, bad
+    assert srv.list_findings(project="test")["rows"] == []
 
 
 def test_export_missing_cycle_is_an_error(srv):
@@ -405,9 +433,16 @@ def test_suggestions_carry_no_decision_provenance(srv):
 # ── cycle by id or code, expected project (K-13 / K-11) ──────────────────────
 
 
-def _writes(srv, target: dict):
+def _digest(srv, cycle_id):
+    """SUGGESTED.digest of the cycle's export now — the page the owner saw."""
+    return srv.export_triage(cycle_id=cycle_id)["suggested"]["digest"]
+
+
+def _writes(srv, target: dict, digest=None):
     """One call of every cycle-taking tool against `target` (cycle_id / cycle
-    / project kwargs) — each must accept or refuse it the same way."""
+    / project kwargs) — each must accept or refuse it the same way. `digest`
+    () → the expected_digest accept passes, read when it is called."""
+    digest = digest or (lambda: _digest(srv, srv.export_triage(**target)["cycle"]["id"]))
     return {
         "record": lambda: srv.record_findings(findings=[finding(fp="via target")], **target),
         "decide": lambda: srv.decide_findings(decisions={"K-1": {"dec": "note"}}, **OWNER, **target),
@@ -415,13 +450,19 @@ def _writes(srv, target: dict):
                                                 **target),
         "close": lambda: srv.close_triage(source="chat", **target),
         "export": lambda: srv.export_triage(**target),
+        "decide_text": lambda: srv.decide_findings_from_text(text="K-1: Odnotuj", **OWNER,
+                                                             **target),
+        "accept": lambda: srv.accept_suggestions(expected_by="Codex", overwrite=True,
+                                                 expected_digest=digest(), **OWNER, **target),
+        "update": lambda: srv.update_triage(artifact_url="https://example.com/t", **target),
     }
 
 
 def _ledger_state(srv, cycle_id):
     """Everything a refused call must leave untouched."""
     out = srv.export_triage(cycle_id=cycle_id)
-    return out["cards"], out["closed"], out["suggested"], _rows(srv.list_findings(project="test"))
+    return (out["cycle"], out["cards"], out["closed"], out["suggested"],
+            _rows(srv.list_findings(project="test")))
 
 
 @pytest.mark.parametrize("target", [
@@ -436,17 +477,20 @@ def _ledger_state(srv, cycle_id):
     {"cycle": "1", "project": "test"},             # a numeric code is a code, not id #1
 ], ids=["both", "neither", "code-no-project", "unknown-code", "id-other-project",
         "code-other-project", "negative-id", "id-past-int", "digit-code"])
-@pytest.mark.parametrize("tool", ["record", "decide", "suggest", "close", "export"])
+@pytest.mark.parametrize("tool", ["record", "decide", "suggest", "close", "export",
+                                  "decide_text", "accept", "update"])
 def test_every_cycle_tool_refuses_a_bad_target_and_writes_nothing(srv, target, tool):
     create_project(srv._get_engine(), slug="other", name="Other", path="/tmp/other")
     _open(srv, "rev-x", project="other")
     cycle_id = _open(srv, "rev-1")
     assert cycle_id == 2  # cycle #1 exists (in 'other'): "1" must not reach it
     srv.record_findings(cycle_id=cycle_id, findings=[finding()])
+    srv.suggest_findings(cycle_id=cycle_id, by="Codex", suggestions={"K-1": {"dec": "note"}})
     before = _ledger_state(srv, cycle_id)
     target = {k: (cycle_id if v == "ID" else v) for k, v in target.items()}
+    seen = before[3]["digest"]  # the real cycle's digest: only the target is wrong
 
-    out = _writes(srv, target)[tool]()
+    out = _writes(srv, target, digest=lambda: seen)[tool]()
     assert set(out) == {"error"}, out
     assert _ledger_state(srv, cycle_id) == before
 
@@ -462,7 +506,7 @@ def test_every_cycle_tool_accepts_an_id_or_a_code_and_acks_the_target(srv, targe
     target = {k: (cycle_id if v == "ID" else v) for k, v in target.items()}
     calls = _writes(srv, target)
 
-    for name in ("record", "suggest", "decide", "close"):
+    for name in ("record", "suggest", "decide", "decide_text", "accept", "update", "close"):
         ack = calls[name]()
         assert "error" not in ack, (name, ack)
         assert (ack["cycle_id"], ack["project"]) == (cycle_id, "test"), name
@@ -561,3 +605,205 @@ def test_promote_unconfirmed_on_a_fix_finding_is_refused(srv):
     out = srv.promote_finding_to_item(fid, unconfirmed=True, checked_conditions="x",
                                       reopen_condition="y")
     assert set(out) == {"error"} and "verify" in out["error"]
+
+
+# ── #930: decide_findings_from_text / accept_suggestions / update_triage ─────
+
+
+def _two_findings(srv):
+    cycle_id = _open(srv)
+    srv.record_findings(cycle_id=cycle_id, findings=[finding(), finding(fp="fp two", title="Two")])
+    return cycle_id
+
+
+PAGE_TEXT = (
+    "Triage review of X (test) — decyzje ownera (2026-10-14 10:00), rubric v2:\n"
+    "Punkt wyjścia: propozycje Codex (2026-10-14)\n"
+    "K-1: Fix teraz · wariant (b) [inna niż klasa Decide] · uwagi: OK · ale [później] uwagi: x\n"
+)
+
+
+def test_decide_from_text_records_the_named_cards_verbatim(srv):
+    cycle_id = _two_findings(srv)
+    out = srv.decide_findings_from_text(text=PAGE_TEXT, cycle="rev-1", project="test", **OWNER)
+    assert out == {"cycle_id": cycle_id, "project": "test", "decided": 1, "undecided": [2],
+                   "parsed": 1, "skipped": []}
+    row = _rows(srv.list_findings(project="test"))[0]
+    assert (row["decision"], row["decision_opt"]) == ("fix", "b")
+    fid = row["id"]
+    stored = _finding_row(srv, fid)
+    assert stored["decision_note"] == "OK · ale [później] uwagi: x"
+    assert (stored["decided_by"], stored["decision_source"]) == (
+        "owner", "owner paste 2026-10-13")
+    # K-40: the prefill line is kept verbatim in its own field, not in the note.
+    assert stored["decision_text_origin"] == "Punkt wyjścia: propozycje Codex (2026-10-14)"
+
+
+def test_decide_from_text_skips_cards_left_without_a_decision(srv):
+    """K-31: a "— (brak decyzji)" line with no note is not addressed — its
+    stored decision stays and the ack lists it; a text of only such lines
+    decides nothing."""
+    cycle_id = _two_findings(srv)
+    srv.decide_findings(cycle_id=cycle_id, **OWNER, decisions={"K-2": {"dec": "backlog"}})
+    out = srv.decide_findings_from_text(
+        text="K-1: Odnotuj\nK-2: — (brak decyzji)", cycle_id=cycle_id, **OWNER)
+    assert (out["decided"], out["skipped"], out["undecided"]) == (1, ["K-2"], [])
+    assert [r["decision"] for r in _rows(srv.list_findings(project="test"))] == [
+        "note", "backlog"]
+
+    before = _ledger_state(srv, cycle_id)
+    only = srv.decide_findings_from_text(text="K-1: — (brak decyzji)\nK-2: — (brak decyzji)",
+                                         cycle_id=cycle_id, **OWNER)
+    assert (only["decided"], only["parsed"], only["skipped"]) == (0, 0, ["K-1", "K-2"])
+    assert _ledger_state(srv, cycle_id) == before
+
+
+def test_decide_from_text_keeps_earlier_decisions_of_cards_it_omits(srv):
+    cycle_id = _two_findings(srv)
+    srv.decide_findings(cycle_id=cycle_id, **OWNER, decisions={"K-2": {"dec": "backlog"}})
+    out = srv.decide_findings_from_text(text="K-1: reject", cycle_id=cycle_id, **OWNER)
+    assert out["undecided"] == []
+    assert [r["decision"] for r in _rows(srv.list_findings(project="test"))] == [
+        "reject", "backlog"]
+
+
+@pytest.mark.parametrize(("text", "needle"), [
+    ("", "no card line"),
+    ("K-1: fix\nK-2: — (brak decyzji) · uwagi: później", "line 2"),  # a note, no decision
+    ("K-1: fix\nK-7: note", "K-7"),
+    ("K-1: fix · wariant (z)", "wariant (z)"),
+    ("K-1: fix\nK-01: note", "twice"),
+    ("Proszę o fix", "line 1"),
+])
+def test_decide_from_text_parse_errors_name_the_line_and_write_nothing(srv, text, needle):
+    cycle_id = _two_findings(srv)
+    before = _ledger_state(srv, cycle_id)
+    out = srv.decide_findings_from_text(text=text, cycle_id=cycle_id, **OWNER)
+    assert set(out) == {"error"} and needle in out["error"], out
+    assert _ledger_state(srv, cycle_id) == before
+
+
+def test_decide_from_text_refuses_reject_of_a_promoted_open_finding(srv):
+    cycle_id = _two_findings(srv)
+    srv.decide_findings(cycle_id=cycle_id, **OWNER, decisions={"K-1": {"dec": "fix"}})
+    fid = _rows(srv.list_findings(project="test"))[0]["id"]
+    assert "error" not in srv.promote_finding_to_item(fid)
+    before = _ledger_state(srv, cycle_id)
+    out = srv.decide_findings_from_text(text="K-2: note\nK-1: reject", cycle_id=cycle_id,
+                                        **OWNER)
+    assert set(out) == {"error"}
+    assert _ledger_state(srv, cycle_id) == before  # K-2's valid entry is not written either
+
+
+@pytest.mark.parametrize("override", [
+    {"decided_by": ""}, {"decision_source": "  "}, {"text": 'K-1: fix <parameter name="x">'},
+])
+def test_decide_from_text_refuses_bad_audit_fields_and_markup(srv, override):
+    cycle_id = _two_findings(srv)
+    out = srv.decide_findings_from_text(cycle_id=cycle_id,
+                                        **{"text": "K-1: fix", **OWNER, **override})
+    assert set(out) == {"error"}
+    assert _rows(srv.list_findings(project="test"))[0]["decision"] is None
+
+
+def test_decide_from_text_requires_the_text_and_both_audit_fields_on_the_wire(srv):
+    schema = _wire_tools(srv)["decide_findings_from_text"].input_schema
+    assert {"text", "decided_by", "decision_source"} <= set(schema["required"])
+    accept = _wire_tools(srv)["accept_suggestions"].input_schema
+    assert {"expected_by", "expected_digest", "decided_by", "decision_source"} \
+        <= set(accept["required"])
+    assert accept["properties"]["overwrite"]["default"] is False
+
+
+def test_accept_suggestions_takes_each_proposal_with_its_authors_prefix(srv):
+    cycle_id = _two_findings(srv)
+    srv.suggest_findings(cycle_id=cycle_id, by="Codex",
+                         suggestions={"K-1": {"dec": "fix", "opt": "b", "note": "go"}})
+    out = srv.accept_suggestions(cycle_id=cycle_id, expected_by="Codex",
+                                 expected_digest=_digest(srv, cycle_id), **OWNER)
+    assert out == {"cycle_id": cycle_id, "project": "test", "decided": 1, "undecided": [2],
+                   "without_suggestion": ["K-2"], "already_decided": []}
+    stored = _finding_row(srv, _rows(srv.list_findings(project="test"))[0]["id"])
+    assert (stored["decision"], stored["decision_opt"], stored["decision_note"]) == (
+        "fix", "b", "[zaakceptowana propozycja Codex] go")
+    assert (stored["decided_by"], stored["decision_source"]) == ("owner", "owner paste 2026-10-13")
+
+
+@pytest.mark.parametrize("setup", ["none", "other-author", "mixed-authors", "decided",
+                                   "revised-same-author", "card-added", "empty-digest"])
+def test_accept_suggestions_refusals_write_nothing(srv, setup):
+    cycle_id = _two_findings(srv)
+    if setup in ("other-author", "mixed-authors"):
+        srv.suggest_findings(cycle_id=cycle_id, by="panel", suggestions={"K-2": {"dec": "note"}})
+    if setup not in ("none", "other-author"):
+        srv.suggest_findings(cycle_id=cycle_id, by="Codex", suggestions={"K-1": {"dec": "fix"}})
+    if setup == "decided":
+        srv.decide_findings(cycle_id=cycle_id, **OWNER, decisions={"K-1": {"dec": "backlog"}})
+    exported = srv.export_triage(cycle_id=cycle_id)["suggested"]
+    seen = exported["digest"] if exported else "0" * 64
+    # K-32: what changed after the owner's page was built.
+    if setup == "revised-same-author":
+        srv.suggest_findings(cycle_id=cycle_id, by="Codex",
+                             suggestions={"K-1": {"dec": "fix", "note": "revised"}})
+    if setup == "card-added":
+        srv.record_findings(cycle_id=cycle_id, findings=[finding(fp="late fp", title="Late")])
+    if setup == "empty-digest":
+        seen = ""
+    before = _ledger_state(srv, cycle_id)
+    out = srv.accept_suggestions(cycle_id=cycle_id, expected_by="Codex",
+                                 expected_digest=seen, **OWNER)
+    assert set(out) == {"error"}, out
+    if setup in ("revised-same-author", "card-added"):
+        assert "digest" in out["error"]
+    assert _ledger_state(srv, cycle_id) == before
+
+
+def test_accept_suggestions_with_overwrite_replaces_and_reports_the_decision(srv):
+    cycle_id = _two_findings(srv)
+    srv.suggest_findings(cycle_id=cycle_id, by="Codex", suggestions={"K-1": {"dec": "fix"}})
+    srv.decide_findings(cycle_id=cycle_id, **OWNER, decisions={"K-1": {"dec": "backlog"}})
+    out = srv.accept_suggestions(cycle_id=cycle_id, expected_by="Codex", overwrite=True,
+                                 expected_digest=_digest(srv, cycle_id), **OWNER)
+    assert out["already_decided"] == ["K-1"]
+    stored = _finding_row(srv, _rows(srv.list_findings(project="test"))[0]["id"])
+    assert (stored["decision"], stored["decision_note"]) == (
+        "fix", "[zaakceptowana propozycja Codex]")
+
+
+def test_update_triage_sets_and_clears_the_page_link(srv):
+    cycle_id = _open(srv)
+    url = "https://example.com/artifact/abc"
+    assert srv.update_triage(artifact_url=url, cycle="rev-1", project="test") == {
+        "cycle_id": cycle_id, "project": "test", "code": "rev-1", "artifact_url": url}
+    assert srv.export_triage(cycle_id=cycle_id)["cycle"]["artifact_url"] == url
+    cleared = srv.update_triage(artifact_url="__clear__", cycle_id=cycle_id)
+    assert cleared["artifact_url"] is None
+    assert srv.export_triage(cycle_id=cycle_id)["cycle"]["artifact_url"] is None
+
+
+@pytest.mark.parametrize("url", ["", "x" * 501, 'u <parameter name="cycle">2'],
+                         ids=["omitted", "too-long", "markup"])
+def test_update_triage_refusals_write_nothing(srv, url):
+    cycle_id = _open(srv)
+    srv.update_triage(artifact_url="https://example.com/kept", cycle_id=cycle_id)
+    out = srv.update_triage(artifact_url=url, cycle_id=cycle_id)
+    assert set(out) == {"error"}
+    assert srv.export_triage(cycle_id=cycle_id)["cycle"]["artifact_url"] == \
+        "https://example.com/kept"
+
+
+def test_the_new_writes_refuse_a_closed_cycle(srv):
+    cycle_id = _two_findings(srv)
+    srv.suggest_findings(cycle_id=cycle_id, by="Codex", suggestions={"K-1": {"dec": "fix"}})
+    srv.decide_findings(cycle_id=cycle_id, **OWNER,
+                        decisions={"K-1": {"dec": "fix"}, "K-2": {"dec": "note"}})
+    srv.close_triage(cycle_id=cycle_id, source="chat")
+    before = _ledger_state(srv, cycle_id)
+    for out in (
+        srv.decide_findings_from_text(text="K-1: reject", cycle_id=cycle_id, **OWNER),
+        srv.accept_suggestions(cycle_id=cycle_id, expected_by="Codex", overwrite=True,
+                               expected_digest=_digest(srv, cycle_id), **OWNER),
+        srv.update_triage(artifact_url="https://example.com/late", cycle_id=cycle_id),
+    ):
+        assert set(out) == {"error"} and "closed" in out["error"], out
+    assert _ledger_state(srv, cycle_id) == before

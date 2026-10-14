@@ -9,6 +9,7 @@ loaded — never a wall-clock number, which would depend on the machine.
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 
@@ -39,13 +40,20 @@ print("\nPROBE " + json.dumps({"code": code, "loaded": [m for m in heavy if m in
 '''
 
 
-def probe(*argv: str) -> dict:
+def _probe(argv, env=None) -> tuple[dict, str]:
+    """(the PROBE result, the command's stderr) of `dct <argv>`; `env`
+    entries are added to the inherited environment."""
     out = subprocess.run([sys.executable, "-c", PROBE, json.dumps(HEAVY), json.dumps(argv)],
                          cwd=REPO_ROOT, capture_output=True, text=True, timeout=120,
-                         stdin=subprocess.DEVNULL, check=False)
+                         stdin=subprocess.DEVNULL, check=False,
+                         env={**os.environ, **(env or {})})
     assert out.returncode == 0, out.stderr
     line = [part for part in out.stdout.splitlines() if part.startswith("PROBE ")][-1]
-    return json.loads(line[len("PROBE "):])
+    return json.loads(line[len("PROBE "):]), out.stderr
+
+
+def probe(*argv: str) -> dict:
+    return _probe(argv)[0]
 
 
 @pytest.mark.parametrize("argv", [
@@ -78,3 +86,19 @@ def test_the_parser_vocabularies_match_their_core_definitions():
 
     assert cli.TERMINAL_STATUSES == TERMINAL_STATUSES
     assert cli.RELEASE_FLOW == RELEASE_FLOW
+
+
+@pytest.mark.parametrize(("out_name", "refusal"), [
+    ("page.html", "no triage page template"),   # neither --template nor [triage] template
+    ("", "--out is empty"),                     # K-41: refused before anything is read
+], ids=["missing-template", "empty-out"])
+def test_triage_page_refusals_need_no_database(tmp_path, out_name, refusal):
+    """`dct triage page` refuses a missing template and an empty --out before
+    it opens the database (#930 K-41): exit 1, a readable reason, no database
+    layer loaded, nothing written."""
+    out = str(tmp_path / out_name) if out_name else ""
+    result, stderr = _probe(("triage", "page", "rev-1", "--project", "proj-a", "--out", out),
+                            env={"DCT_CONFIG_PATH": str(tmp_path / "absent.toml")})
+    assert result == {"code": 1, "loaded": []}
+    assert refusal in stderr
+    assert list(tmp_path.iterdir()) == []

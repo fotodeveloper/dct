@@ -35,6 +35,9 @@ CARD_REQUIRED = {"id", "title", "area", "src", "S", "O", "E", "K", "origin", "ty
 # "Optional §4 flags: conflict (rule 1), violation:false (rule 3), dispute
 # (rule 4), openDesign (rule 7). Coordinator override: cls + clsWhy".
 CARD_OPTIONAL = {"conflict", "violation", "dispute", "openDesign", "cls", "clsWhy"}
+# Not a template key: dct's own (#930 §2a) — the canonical reviewer tokens,
+# exported only when recorded; the template ignores unknown keys.
+CARD_DCT_EXTRA = {"reviewers"}
 # "opts: k = letter, rec = recommended variant, root = removes the cause" + t, why.
 OPTION_KEYS = {"k", "rec", "root", "t", "why"}
 # CLOSED: "{ date, source, rubric, notes: [...], answers: { 'K-1': { dec, opt, note } } }"
@@ -42,6 +45,9 @@ CLOSED_KEYS = {"date", "source", "rubric", "notes", "answers"}
 ANSWER_KEYS = {"dec", "opt", "note"}
 # SUGGESTED: "{ by, date, answers: { 'K-1': { dec, opt, note } } }"
 SUGGESTED_KEYS = {"by", "date", "answers"}
+# Not a template key: dct's own (#930 K-32) — the hash of the cards and
+# proposals the page shows, which accept_suggestions(expected_digest=…) checks.
+SUGGESTED_DCT_EXTRA = {"digest"}
 DECISIONS = {"fix", "verify", "backlog", "reject", "note", "discuss"}
 
 
@@ -127,9 +133,34 @@ def test_closed_and_suggested_have_the_template_shape(engine, cycle):
     assert closed["rubric"] == 2 and len(closed["date"]) == 10
 
     sugg = out["suggested"]
-    assert set(sugg) == SUGGESTED_KEYS
+    assert set(sugg) == SUGGESTED_KEYS | SUGGESTED_DCT_EXTRA
     assert sugg["by"] == "Codex" and set(sugg["answers"]) == {"K-1"}
     assert set(sugg["answers"]["K-1"]) == ANSWER_KEYS
+
+
+def test_the_digest_names_exactly_the_cards_and_proposals_shown(engine, cycle):
+    """K-32: SUGGESTED.digest is a sha256 hex, the same for two exports of an
+    unchanged cycle and different after anything the owner would read
+    changes — a revision by the SAME author, a new card, an edited option."""
+    record_findings(engine, cycle, [card_input()])
+    suggest_findings(engine, cycle, "Codex", {"K-1": {"dec": "fix", "opt": "a", "note": "v1"}})
+    first = export_triage(engine, cycle)["suggested"]["digest"]
+    assert len(first) == 64 and int(first, 16) >= 0
+    assert export_triage(engine, cycle)["suggested"]["digest"] == first  # deterministic
+
+    seen = {first}
+    suggest_findings(engine, cycle, "Codex", {"K-1": {"dec": "fix", "opt": "a", "note": "v2"}})
+    revised = export_triage(engine, cycle)["suggested"]["digest"]
+    assert revised not in seen
+    seen.add(revised)
+    record_findings(engine, cycle, [card_input(fp="late", title="Late card")])
+    assert export_triage(engine, cycle)["suggested"]["digest"] not in seen
+
+    # Another cycle with the same cards and proposals is another page.
+    other = open_triage(engine, "proj-a", "rev-2", "review", "claude-code")["cycle_id"]
+    record_findings(engine, other, [card_input()])
+    suggest_findings(engine, other, "Codex", {"K-1": {"dec": "fix", "opt": "a", "note": "v1"}})
+    assert export_triage(engine, other)["suggested"]["digest"] != first
 
 
 def test_the_whole_export_is_json_native(engine, cycle):
@@ -173,6 +204,24 @@ def test_exported_cards_record_back_as_they_are(engine, cycle):
         card_input(fp="fp 2", title="Two", O="?", flags={"violation": False, "dispute": True}),
     ])
     first = export_triage(engine, cycle)["cards"]
+
+    other = open_triage(engine, "proj-a", "rev-2", "re-run", "claude-code")["cycle_id"]
+    record_findings(engine, other, first)
+    assert export_triage(engine, other)["cards"] == first
+
+
+def test_reviewer_tokens_ride_along_only_when_recorded_and_record_back(engine, cycle):
+    """#930 §2a: a card gains `reviewers` (lowercased, recorded order) only
+    when the finding has tokens — a plain card keeps exactly the template
+    keys — and the exported card records back unchanged (K-13 round trip)."""
+    record_findings(engine, cycle, [
+        card_input(reviewers=["Codex", "panel:security"]),
+        card_input(fp="fp 2", title="Two"),
+    ])
+    first = export_triage(engine, cycle)["cards"]
+    assert set(first[0]) == CARD_REQUIRED | CARD_DCT_EXTRA
+    assert first[0]["reviewers"] == ["codex", "panel:security"]
+    assert set(first[1]) == CARD_REQUIRED
 
     other = open_triage(engine, "proj-a", "rev-2", "re-run", "claude-code")["cycle_id"]
     record_findings(engine, other, first)

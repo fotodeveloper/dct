@@ -4,6 +4,7 @@ import argparse
 import atexit
 import contextlib
 import os
+import re
 import shlex
 import signal
 import socket
@@ -2339,7 +2340,7 @@ def cmd_config_get(args):
 
     Supports: database.url, dct_root, plans.<field>, classification.<field>,
     integrations.claude.<field>, mirror.<field> (compat view), web.<field>,
-    update.<field>.
+    update.<field>, triage.<field>.
     Prints the value (or empty string for unset). Exit 1 on unknown key.
     """
     from dct.config import load_config
@@ -2376,6 +2377,8 @@ def cmd_config_get(args):
     value = getattr(obj, field_name)
     if isinstance(value, bool):
         print(str(value).lower())
+    elif value is None:
+        print()  # unset (e.g. triage.template) — the docstring's empty string
     else:
         print(value)
 
@@ -2601,6 +2604,33 @@ def cmd_tag_merge(args):
 
 # ── Triage findings ledger (#909) ───────────────────────────────────────────
 
+# Every triage command addresses its cycle the same way (#930 §8): the
+# positional code within --project (else the CWD's project), or --cycle-id
+# (checked against --project only when that is given). A code is never re-read
+# as an id; the workflow's one resolver (resolve_cycle) decides.
+
+
+def _require_one_triage_selector(args) -> None:
+    """Exactly one of the positional code / --cycle-id, else exit 1 — before
+    any database or file is touched."""
+    if (args.cycle is None) == (args.cycle_id is None):
+        print("✗ Error: give the cycle's code OR --cycle-id, not both or neither",
+              file=sys.stderr)
+        sys.exit(1)
+
+
+def _triage_cycle_ref(args, engine) -> tuple:
+    """(cycle, project) for a dct.workflows.triage call: (id, --project or
+    None) or (code, --project or the CWD's project — exit 1 when undetected)."""
+    if args.cycle_id is not None:
+        return args.cycle_id, args.project
+    return args.cycle, args.project or _detect_project(engine)
+
+
+def _triage_undecided(seqs) -> str:
+    return ", ".join(f"K-{s}" for s in seqs) or "none"
+
+
 def cmd_triage_export(args):
     """`dct triage export (<cycle-code> | --cycle-id N)` — the triage page's
     constants (read-only).
@@ -2615,24 +2645,18 @@ def cmd_triage_export(args):
     CARDS, ready to replace the template's slots, serialised by
     page_constants_json — safe inside an inline <script> whatever the texts
     hold (K-1). --json: the whole export {cycle, cards, closed, suggested}
-    as plain JSON with the texts as recorded. The page build itself
-    (template copy + constants) stays the caller's job.
+    as plain JSON with the texts as recorded. `dct triage page` builds the
+    whole page from the same export.
     """
     import json
 
     from dct.workflows.triage import export_triage, page_constants_json
 
-    if (args.cycle is None) == (args.cycle_id is None):
-        print("✗ Error: give the cycle's code OR --cycle-id, not both or neither",
-              file=sys.stderr)
-        sys.exit(1)
+    _require_one_triage_selector(args)
     engine = _get_readonly_engine()
     try:
-        if args.cycle_id is not None:
-            out = export_triage(engine, args.cycle_id, project=args.project)
-        else:
-            out = export_triage(engine, args.cycle,
-                                project=args.project or _detect_project(engine))
+        cycle, project = _triage_cycle_ref(args, engine)
+        out = export_triage(engine, cycle, project=project)
     except Exception as e:
         print(f"✗ Error: {e}", file=sys.stderr)
         sys.exit(1)
@@ -2643,6 +2667,226 @@ def cmd_triage_export(args):
     print(f"  const CLOSED = {page_constants_json(out['closed'])};")
     print(f"  const SUGGESTED = {page_constants_json(out['suggested'])};")
     print(f"  const CARDS = {page_constants_json(out['cards'])};")
+
+
+# Safe file-name component of a cycle code (#930 Q2): anything outside
+# [A-Za-z0-9._-] becomes '-', leading dots are dropped (no hidden or '..' name).
+_UNSAFE_FILENAME_CHARS = re.compile(r"[^A-Za-z0-9._-]")
+
+
+def _triage_page_filename(code: str) -> str:
+    """`<safe code>.html` — the file name `dct triage page` uses when --out
+    names a directory."""
+    stem = _UNSAFE_FILENAME_CHARS.sub("-", code).lstrip(".")
+    return f"{stem or 'triage'}.html"
+
+
+def _triage_template_path(args) -> Path:
+    """--template, else [triage] template of dct.toml (both ~-expanded), else
+    a refusal naming both ways — dct ships no template."""
+    raw = args.template
+    if raw is None:
+        raw = load_config().triage.template
+    if not raw:
+        raise ValueError(
+            "no triage page template — pass --template <path> or set it once with "
+            "[triage] template = \"<path>\" in dct.toml (dct ships no template)")
+    return Path(raw).expanduser()
+
+
+def _triage_page_target(out_arg: str, code: str, template: Path, force: bool) -> Path:
+    """The file `dct triage page` writes. A directory → `<dir>/<safe code>.html`.
+    Refused: a missing parent directory (never created), the template itself
+    (also through a symlink), an existing path (a symlink too, even a
+    dangling one) without --force, a directory at the target."""
+    out = Path(out_arg).expanduser()
+    if out.is_dir():
+        out = out / _triage_page_filename(code)
+    if not out.parent.is_dir():
+        raise ValueError(f"{out.parent}: no such directory — create it first (--out is "
+                         "never given missing parents)")
+    if out.resolve() == template.resolve():
+        raise ValueError(f"{out}: --out is the template itself — refusing to overwrite it")
+    if out.is_dir():
+        raise ValueError(f"{out}: is a directory")
+    if os.path.lexists(out) and not force:
+        raise ValueError(f"{out} already exists — pass --force to replace it (a published "
+                         "or closed page must never be overwritten by accident)")
+    return out
+
+
+def _write_new_file(out: Path, text: str, force: bool) -> None:
+    """Write `text` (UTF-8, bytes as built) to `out`. Without force the file
+    is created exclusively (a file appearing meanwhile is not overwritten);
+    with force a sibling temp file replaces `out` atomically — a failure
+    (the write, or the chmod below) leaves any existing file as it was. A
+    symlink at `out` is replaced by the file, never written through.
+
+    Permissions (K-36): a new file — with or without force — is created
+    with mode 0666 minus the process umask, as `open()` does (the umask is
+    applied by the kernel, never read or changed here). With force onto an
+    existing REGULAR file, the replacement keeps that file's rwx bits
+    (0600 stays 0600); special bits (setuid / setgid / sticky) are not
+    carried over, and a symlink's target is never consulted — the link is
+    replaced by a file under the creation policy."""
+    import secrets
+    import stat
+
+    data = text.encode("utf-8")
+    if not force:
+        try:
+            with open(out, "xb") as stream:
+                stream.write(data)
+        except FileExistsError:
+            raise ValueError(f"{out} already exists — pass --force to replace it") from None
+        except BaseException:
+            out.unlink(missing_ok=True)
+            raise
+        return
+    try:
+        current = os.lstat(out)
+    except FileNotFoundError:
+        current = None
+    keep_mode = (stat.S_IMODE(current.st_mode) & 0o777
+                 if current is not None and stat.S_ISREG(current.st_mode) else None)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
+    for _attempt in range(100):
+        name = out.parent / f".{out.name}.dct-{secrets.token_hex(6)}"
+        try:
+            fd = os.open(name, flags, 0o666)
+            break
+        except FileExistsError:
+            continue
+    else:
+        raise ValueError(f"{out.parent}: no free temporary file name for the page")
+    try:
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(data)
+        if keep_mode is not None:
+            os.chmod(name, keep_mode)
+        os.replace(name, out)
+    finally:
+        name.unlink(missing_ok=True)
+
+
+def cmd_triage_page(args):
+    """`dct triage page (<code> | --cycle-id N) --out <file>` — build a
+    cycle's triage page from its export (#930 §3; read-only on the database).
+
+    The template comes from --template, else [triage] template in dct.toml
+    (dct ships none). The page is built in memory by build_triage_page
+    (dct/workflows/triage_page.py) from export_triage only; nothing is written
+    unless the build succeeds, and an existing --out is replaced only with
+    --force (atomically). --out naming a directory writes
+    `<dir>/<safe code>.html`; an empty --out is refused before anything is
+    read. Prints `<out>: <n> cards, closed=<yes|no>, suggested=<by>,
+    digest=<hex>` (or `suggested=none`) — the digest of the very export the
+    page holds.
+    """
+    _require_one_triage_selector(args)
+    if not args.out.strip():
+        print("✗ Error: --out is empty — name the page file (or an existing directory)",
+              file=sys.stderr)
+        sys.exit(1)
+    try:
+        template_path = _triage_template_path(args)
+        template_text = template_path.read_text(encoding="utf-8")
+    except Exception as e:
+        print(f"✗ Error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    from dct.workflows.triage import export_triage
+    from dct.workflows.triage_page import build_triage_page
+
+    engine = _get_readonly_engine()
+    try:
+        cycle, project = _triage_cycle_ref(args, engine)
+        export = export_triage(engine, cycle, project=project)
+        out = _triage_page_target(args.out, export["cycle"]["code"], template_path, args.force)
+        page = build_triage_page(export, template_text, topic=args.topic,
+                                 context=args.context, lede=args.lede)
+        _write_new_file(out, page, args.force)
+    except Exception as e:
+        print(f"✗ Error: {e}", file=sys.stderr)
+        sys.exit(1)
+    # The digest of THIS build's export (K-32): the one the owner will see on
+    # the published page, to be passed to `dct triage accept --expected-digest`.
+    suggested = (f"{export['suggested']['by']}, digest={export['suggested']['digest']}"
+                 if export["suggested"] else "none")
+    print(f"{out}: {len(export['cards'])} cards, "
+          f"closed={'yes' if export['closed'] else 'no'}, suggested={suggested}")
+
+
+def cmd_triage_decide(args):
+    """`dct triage decide (<code> | --cycle-id N) --from-text <file|->` — the
+    OWNER's pasted decision text (the page's "Tekst do wklejenia") recorded
+    through decide_findings_from_text: parsed first (a parse error writes
+    nothing), then one transaction; only the cards the text decides change.
+    A card line left "— (brak decyzji)" with no note is skipped (K-31) and
+    listed; a "Punkt wyjścia" line is stored as the decisions' text origin
+    (K-40)."""
+    from dct.workflows.triage import decide_findings_from_text
+
+    _require_one_triage_selector(args)
+    engine = _get_engine()
+    try:
+        text = _read_text_arg(None, args.from_text)
+        cycle, project = _triage_cycle_ref(args, engine)
+        out = decide_findings_from_text(engine, cycle, text, decided_by=args.decided_by,
+                                        decision_source=args.source, project=project)
+    except Exception as e:
+        print(f"✗ Error: {e}", file=sys.stderr)
+        sys.exit(1)
+    print(f"✓ Parsed {out['parsed']}, decided {out['decided']} — "
+          f"undecided: {_triage_undecided(out['undecided'])}")
+    if out["skipped"]:
+        print(f"  skipped (no decision on the page, unchanged): {', '.join(out['skipped'])}")
+
+
+def cmd_triage_accept(args):
+    """`dct triage accept (<code> | --cycle-id N) --expected-by <who>
+    --expected-digest <hex>` — the OWNER accepts the proposals they saw as
+    final (accept_suggestions). The digest is SUGGESTED.digest of the export
+    the published page was built from (K-32) — never one read just now: a
+    proposal changed since then (even by the same author) refuses the whole
+    acceptance, nothing written."""
+    from dct.workflows.triage import accept_suggestions
+
+    _require_one_triage_selector(args)
+    engine = _get_engine()
+    try:
+        cycle, project = _triage_cycle_ref(args, engine)
+        out = accept_suggestions(engine, cycle, expected_by=args.expected_by,
+                                 expected_digest=args.expected_digest,
+                                 decided_by=args.decided_by, decision_source=args.source,
+                                 overwrite=args.overwrite, project=project)
+    except Exception as e:
+        print(f"✗ Error: {e}", file=sys.stderr)
+        sys.exit(1)
+    print(f"✓ Accepted {out['decided']} proposal(s) by {args.expected_by} — "
+          f"undecided: {_triage_undecided(out['undecided'])}")
+    if out["without_suggestion"]:
+        print(f"  without a proposal (untouched): {', '.join(out['without_suggestion'])}")
+    if out["already_decided"]:
+        print(f"  replaced earlier decisions: {', '.join(out['already_decided'])}")
+
+
+def cmd_triage_close(args):
+    """`dct triage close (<code> | --cycle-id N) --source <where> [--note …]…`
+    — close_triage; refused while a finding is undecided."""
+    from dct.workflows.triage import close_triage
+
+    _require_one_triage_selector(args)
+    engine = _get_engine()
+    try:
+        cycle, project = _triage_cycle_ref(args, engine)
+        out = close_triage(engine, cycle, source=args.source, notes=args.note or None,
+                           project=project)
+    except Exception as e:
+        print(f"✗ Error: {e}", file=sys.stderr)
+        sys.exit(1)
+    print(f"✓ Closed triage cycle #{out['cycle_id']} — {len(out['closed']['answers'])} "
+          f"answer(s), source: {out['closed']['source']}")
 
 
 # ── MCP server (stdio) ───────────────────────────────────────────────────────
@@ -3858,24 +4102,79 @@ def build_parser() -> argparse.ArgumentParser:
     p_tag_merge.add_argument("from_name", metavar="from")
     p_tag_merge.add_argument("into_name", metavar="into")
 
-    # triage findings ledger (#909) — export only; writes go through MCP
+    # triage findings ledger (#909, #930) — record / suggest / promote go
+    # through MCP; the page build and the owner's decisions also run here
     p_triage = sub.add_parser("triage", help="Triage findings ledger (review findings)")
     p_triage_sub = p_triage.add_subparsers(dest="triage_command")
+
+    def _triage_cycle_args(p):
+        p.add_argument("cycle", nargs="?",
+                       help="Cycle code within the project (never read as an id)")
+        p.add_argument("--cycle-id", type=int, metavar="N",
+                       help="The cycle's global id instead of its code")
+        p.add_argument("--project",
+                       help="Project slug (default for a code: auto-detect from CWD; "
+                            "with --cycle-id: checked when given)")
 
     p_tr_export = p_triage_sub.add_parser(
         "export",
         help="Print a cycle's triage-page constants CLOSED / SUGGESTED / CARDS (read-only)",
     )
-    p_tr_export.add_argument("cycle", nargs="?",
-                             help="Cycle code within the project (never read as an id)")
-    p_tr_export.add_argument("--cycle-id", type=int, metavar="N",
-                             help="The cycle's global id instead of its code")
-    p_tr_export.add_argument("--project",
-                             help="Project slug (default for a code: auto-detect from CWD; "
-                                  "with --cycle-id: checked when given)")
+    _triage_cycle_args(p_tr_export)
     p_tr_export.add_argument("--json", action="store_true",
                              help="Print the whole export {cycle, cards, closed, suggested} "
                                   "as JSON instead of the constant declarations")
+
+    p_tr_page = p_triage_sub.add_parser(
+        "page", help="Build a cycle's triage page from its export (read-only on the database)")
+    _triage_cycle_args(p_tr_page)
+    p_tr_page.add_argument("--out", required=True, metavar="FILE",
+                           help="The page file to write (its directory must exist; a "
+                                "directory = <dir>/<safe code>.html)")
+    p_tr_page.add_argument("--template", metavar="PATH",
+                           help="Page template (default: [triage] template in dct.toml)")
+    p_tr_page.add_argument("--topic", help="Page title (default: the cycle's topic)")
+    p_tr_page.add_argument("--context",
+                           help="Eyebrow text (default: the cycle's scope, else its code)")
+    p_tr_page.add_argument("--lede", help="Lede text (default: card count, rubric, cycle "
+                                          "and the legend)")
+    p_tr_page.add_argument("--force", action="store_true",
+                           help="Replace an existing --out file")
+
+    p_tr_decide = p_triage_sub.add_parser(
+        "decide", help="Record the owner's pasted decision text (the page's generated text)")
+    _triage_cycle_args(p_tr_decide)
+    p_tr_decide.add_argument("--from-text", required=True, metavar="FILE",
+                             help="File with the owner's decision text ('-' = stdin)")
+    p_tr_decide.add_argument("--decided-by", required=True,
+                             help="The PERSON who decided (e.g. owner)")
+    p_tr_decide.add_argument("--source", required=True,
+                             help="Where the owner's words are recorded (e.g. 'chat 2026-10-14')")
+
+    p_tr_accept = p_triage_sub.add_parser(
+        "accept", help="The owner accepts the agent's proposals as final decisions")
+    _triage_cycle_args(p_tr_accept)
+    p_tr_accept.add_argument("--expected-by", required=True,
+                             help="Who made the proposals the owner saw (refused when any "
+                                  "proposal is by someone else)")
+    p_tr_accept.add_argument("--expected-digest", required=True, metavar="HEX",
+                             help="SUGGESTED.digest of the export the published page was "
+                                  "built from (refused when the cards or proposals changed "
+                                  "since)")
+    p_tr_accept.add_argument("--decided-by", required=True,
+                             help="The PERSON who accepted (e.g. owner)")
+    p_tr_accept.add_argument("--source", required=True,
+                             help="Where the owner's acceptance is recorded")
+    p_tr_accept.add_argument("--overwrite", action="store_true",
+                             help="Replace decisions already recorded on proposed cards")
+
+    p_tr_close = p_triage_sub.add_parser(
+        "close", help="Close a cycle with the owner's recorded answers")
+    _triage_cycle_args(p_tr_close)
+    p_tr_close.add_argument("--source", required=True,
+                            help="Where the owner's answers are recorded")
+    p_tr_close.add_argument("--note", action="append", metavar="TEXT",
+                            help="A paragraph of the closed panel (repeatable)")
 
     # pickup (session-start op — snapshot + handoff consume, #413)
     p_pickup = sub.add_parser(
@@ -4101,6 +4400,10 @@ TAGS_COMMAND_MAP = {
 
 TRIAGE_COMMAND_MAP = {
     "export": cmd_triage_export,
+    "page": cmd_triage_page,
+    "decide": cmd_triage_decide,
+    "accept": cmd_triage_accept,
+    "close": cmd_triage_close,
 }
 
 

@@ -1,6 +1,6 @@
 # dct — MCP Tools Reference
 
-Complete catalogue of the **70 MCP tools** the dct server exposes to Claude Code, grouped by domain. ← back to the [README](../README.md).
+Complete catalogue of the **73 MCP tools** the dct server exposes to Claude Code, grouped by domain. ← back to the [README](../README.md).
 
 The dct MCP server is registered at **user scope** (`~/.claude.json`), so every tool below is callable from any Claude Code session as `mcp__dct__<name>`. Most list/create tools accept an empty `project=""` and auto-detect the project from the session's working directory (longest-prefix match); pass `project=<slug>` to override.
 
@@ -182,10 +182,11 @@ whitespace, lowercase) and unknown names auto-register on first use; a name too
 Item-side tag writes stay on the item tools: `create_item(tags=[...])`,
 `update_item(tags=[...])` (full replace), `list_items(tag=...)`.
 
-## Triage (10)
+## Triage (13)
 
-The findings ledger of review triage (#909) — ONE implementation in
-`dct/workflows/triage.py` shared with the CLI (`dct triage export`). A triage
+The findings ledger of review triage (#909, #930) — ONE implementation in
+`dct/workflows/triage.py` shared with the CLI (`dct triage export / page /
+decide / accept / close`) and the `/triage` skill. A triage
 **cycle** (one review round of a project, unique live `code`) owns its
 **findings**; a finding carries the rubric v2 fields (short template keys
 `S` / `O` / `E` / `K` / `type` or full names `impact` / `reachability` /
@@ -200,7 +201,8 @@ name. Record / decide / suggest need an OPEN cycle and serialise with the close
 on the cycle row. All triage tools are deferred.
 
 **Addressing a cycle** — every tool that takes one (`record_findings`,
-`decide_findings`, `suggest_findings`, `close_triage`, `export_triage`,
+`decide_findings`, `decide_findings_from_text`, `accept_suggestions`,
+`suggest_findings`, `close_triage`, `update_triage`, `export_triage`,
 `list_findings`) takes `cycle_id` (the global id) OR `cycle` (its code, unique
 only within a project, so it needs `project`); both or neither is an error, and
 a numeric code is never read as an id. An optional `project` on the cycle
@@ -219,14 +221,17 @@ not an authorisation boundary.
 | Tool | Purpose |
 |---|---|
 | `open_triage` | Open a cycle (`code`, `topic`, `created_by`; optional `scope`, `base_commit`, `artifact_url`, `rubric_version` = 2, range 1..32767). A duplicate live code in the project is refused. |
-| `record_findings` | Record a JSON array of findings in an open cycle, atomically — the reviewer §2 shape or an exported CARD as it is (`id` 'K-n' → seq, flags at the top level; a NEW finding, decisions never imported). `seq` (1..2147483647) defaults to the next free one. `src` / `source` is the reviewer (stored as `findings.reviewer`). Refused as a whole on an unknown key, a field under both spellings, a bad enum, a missing `title` / `fp` / `src` / S / O / E / K / `origin` / `type`, two recommended options, a duplicate option key or seq, an exhausted auto seq, a fingerprint whose normal form outgrows 500 chars. |
+| `record_findings` | Record a JSON array of findings in an open cycle, atomically — the reviewer §2 shape or an exported CARD as it is (`id` 'K-n' → seq, flags at the top level; a NEW finding, decisions never imported). `seq` (1..2147483647) defaults to the next free one. `src` / `source` is the reviewer as free text (stored as `findings.reviewer`); optional `reviewers` = a non-empty list of canonical reviewer tokens (`[a-z0-9][a-z0-9:._-]*`, lowercased, no duplicates) that `reviewer_precision` counts. Refused as a whole on an unknown key, a field under both spellings, a bad enum, a missing `title` / `fp` / `src` / S / O / E / K / `origin` / `type`, two recommended options, a duplicate option key or seq, an exhausted auto seq, a fingerprint whose normal form outgrows 500 chars. |
 | `suggest_findings` | An agent's proposals (the page's `SUGGESTED`) as a JSON object keyed by `K-n`: `{dec, opt, note}`; never touches the decision. |
 | `decide_findings` | The owner's decisions (the page's `CLOSED.answers`) as a JSON object keyed by `K-n`: `dec` fix / verify / backlog / reject / note / discuss, `opt` an option key of that finding, `note` verbatim. `decided_by` (the person who decided) and `decision_source` (where the owner's words are recorded, e.g. `owner paste 2026-10-13`) are required — an audit record, not authentication; an agent writes here only from the owner's own text, its proposals go to `suggest_findings`. Overwrites while the cycle is open (all three stamps refreshed, together with the writing client's provenance `decision_actor_type` / `decision_actor_client` / `decision_session_id` / `decision_actor_source`, reset as a set on every overwrite); `reject` / `note` are refused while the promoted item is open; returns the still-undecided seqs. |
+| `decide_findings_from_text` | The owner's pasted page text ("Tekst do wklejenia") verbatim: an optional `Triage …:` header and `Punkt wyjścia:` line, then one `K-<n>: <label>[ · wariant (<k>)][ [annotation]…][ · uwagi: <note>]` line per card — the page's Polish labels or `fix` / `verify` / `backlog` / `reject` / `note` / `discuss`. Parsed before anything is written (an error names the line), then written in one transaction like `decide_findings`; only the decided cards change. A `— (brak decyzji)` line with an empty note is skipped (state unchanged, listed in `skipped`); with a note it refuses the whole text. The `Punkt wyjścia:` line is stored verbatim as `decision_text_origin` of every finding the text decides (the form was seeded from proposals — not who wrote each note; a later decision without one resets it). Returns `decide_findings`' ack plus `parsed` and `skipped`. |
+| `accept_suggestions` | The owner accepts the proposals as final: every finding with a suggestion gets its `dec` / `opt` and the note `[zaakceptowana propozycja <by>] <note>`. `expected_by` (the proposer the owner saw) and `expected_digest` (`SUGGESTED.digest` of the export the PUBLISHED page was built from — never a fresh one) are required — refused when any proposal is by someone else, when the digest recomputed under the cycle lock differs (a card or proposal changed since, the same author's revision included), when none exists, or when a proposed finding is already decided unless `overwrite=true`. Findings without a proposal stay untouched (`without_suggestion`). |
+| `update_triage` | Set the open cycle's page link `artifact_url` after the first publish (`"__clear__"` clears it; `""` = nothing to update, an error). |
 | `close_triage` | Close the cycle with `source` (where the answers are recorded) and optional `notes`; refused while a finding is undecided (`discuss` counts as decided). Returns the `CLOSED` constant. |
-| `export_triage` | The page's constants with the template's field names: `cards` (CARDS), `closed` (CLOSED or null), `suggested` (SUGGESTED or null) plus the cycle header. Texts come back as recorded — embed them in a page only through an HTML-safe serializer (`dct triage export` prints them that way). |
-| `list_findings` | A project's live findings as `{cols, rows}` (`id, cycle_code, seq, S, O, E, K, origin, type, class, decision, decision_opt, item_id, first_seen_id, source, title`); filters `cycle` / `cycle_id` (an unknown cycle is an error), `fingerprint`, `file` (substring of the area; ASCII case-insensitive, `%` / `_` literal), `cls`, `decision`, `source`, `limit`. |
+| `export_triage` | A semantic dict of the page's constants with the template's field names: `cards` (CARDS), `closed` (CLOSED or null), `suggested` (SUGGESTED or null — with dct's own `digest`, the hash `accept_suggestions` checks) plus the cycle header. Data, not a page: the canonical page build is `dct triage page`, from this same export. Texts come back as recorded, unescaped. |
+| `list_findings` | A project's live findings as `{cols, rows}` (`id, cycle_code, seq, S, O, E, K, origin, type, class, decision, decision_opt, item_id, first_seen_id, source, title`); filters `cycle` / `cycle_id` (an unknown cycle is an error), `fingerprint`, `file` (substring of the area; ASCII case-insensitive, `%` / `_` literal), `cls`, `decision`, `source` (the free-text `src`), `reviewer` (a canonical token), `limit`. |
 | `finding_history` | Every occurrence of a fingerprint across the project's cycles, chronologically — the recurrence / regression view. |
-| `reviewer_precision` | Decided findings counted per reviewer and decision (`source, decision, n`); optional `since` filters the cohort of findings RECORDED since the anchor (`created_at`, not the decision time). |
+| `reviewer_precision` | Decided findings counted per reviewer token and decision (`reviewer, decision, n`) — a finding with two tokens counts for both, one without tokens under `(unattributed)`; optional `since` filters the cohort of findings RECORDED since the anchor (`created_at`, not the decision time). |
 | `promote_finding_to_item` | Create an item from a finding decided fix / verify / backlog and back-link it, in one transaction; undecided, discuss, reject, note and an already promoted finding are refused. Priority = the rubric outcome unless given. Tags from the dictionary: `security` for a security finding, `unreproduced` only with `unconfirmed=true` on a verify finding plus `checked_conditions` and `reopen_condition` (both go into the description). |
 
 The CLI prints the constants for a page build: `dct triage export (<cycle-code> | --cycle-id N) [--project <slug>] [--json]`
@@ -236,6 +241,26 @@ CWD's project; `--cycle-id` checks `--project` only when given). Without
 through `page_constants_json` — `<`, `>`, `&`, U+2028 and U+2029 as `\uXXXX`
 escapes, so no finding text can close the page's `<script>`; `--json` prints
 the whole export with the texts as recorded.
+
+The page itself is built by `dct triage page (<cycle-code> | --cycle-id N)
+[--project <slug>] [--template <path>] --out <file> [--topic …] [--context …]
+[--lede …] [--force]` (read-only on the database; no MCP tool — a whole HTML
+page is not an MCP payload). It prints `<out>: <n> cards, closed=<yes|no>,
+suggested=<by>, digest=<hex>` (or `suggested=none`): the digest of the very
+export the page holds, the one `accept` later expects. An empty `--out` is
+refused before anything is read. The template comes from `--template`, else
+`[triage] template` in `dct.toml` (dct ships none); an existing `--out` is
+replaced only with `--force` (atomically — a failed build leaves it as it was;
+the replacement keeps the old regular file's rwx bits, special bits dropped,
+while a new file or a replaced symlink gets the umask's default as without
+`--force`),
+a missing parent directory and the template itself are refused, and a
+directory as `--out` writes `<dir>/<safe code>.html` (`[A-Za-z0-9._-]`).
+The owner's answers can also be recorded from a shell: `dct triage decide …
+--from-text <file|-> --decided-by <who> --source <where>`, `dct triage accept
+… --expected-by <proposer> --expected-digest <hex> --decided-by <who> --source
+<where> [--overwrite]`,
+`dct triage close … --source <where> [--note <text>]…`.
 
 ---
 
@@ -270,6 +295,9 @@ Write ops return a minimal ack, not the full record. `get_item` / `get_handoff` 
 | `open_triage` | `{cycle_id, code, project}` |
 | `record_findings` | `{cycle_id, project, recorded: [{seq, finding_id, first_seen_id}]}` |
 | `decide_findings` / `suggest_findings` | `{cycle_id, project, decided, undecided: [seq…]}` / `{cycle_id, project, suggested}` |
+| `decide_findings_from_text` | `{cycle_id, project, decided, undecided: [seq…], parsed, skipped: ["K-n"…]}` |
+| `accept_suggestions` | `{cycle_id, project, decided, undecided: [seq…], without_suggestion: ["K-n"…], already_decided: ["K-n"…]}` |
+| `update_triage` | `{cycle_id, project, code, artifact_url}` |
 | `close_triage` | `{cycle_id, project, closed_at, closed}` — `closed` = the page's `CLOSED` constant |
 | `promote_finding_to_item` | `{id, project, item_type, priority, status, title, short_title, tags, finding_id}` |
 | `add_tag` | `{id, name, created}` (`created` is `false` when an existing tag was reused) |
@@ -279,4 +307,4 @@ Write ops return a minimal ack, not the full record. `get_item` / `get_handoff` 
 
 ---
 
-**Total: 70 tools.** This list is generated from `dct/mcp/server.py`; if it drifts, `dct server` prints the live set.
+**Total: 73 tools.** This list is generated from `dct/mcp/server.py`; if it drifts, `dct server` prints the live set.
