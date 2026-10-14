@@ -81,17 +81,31 @@ review → triage → fix gate below.
    2026-10-14T14:30Z`); `scope` what was reviewed (diff range, files);
    `base_commit` the cycle's fixed base commit. REMEMBER the returned
    `cycle_id`.
-2. `mcp__dct__record_findings(findings=<CARDS>, cycle_id=<id>)` — ONE call
+2. **Purpose and use check** before recording (the class is a recommendation
+   and the rubric's threat model is an input to it, not a constant): for every
+   card say in its context who supplies the trigger input and whether the
+   surface lies within the tool's purpose and trust model — an internal tool
+   whose inputs the owner's own process writes, or a surface reached only
+   through an artefact the owner authors (a private template), is not
+   attacker-controlled. A card reachable only outside that model keeps its
+   S but gets O ≤ 1, is not `security`, and gets a class override
+   (`cls` backlog or note, `clsWhy` naming the model) instead of fix. A card
+   whose invariant was already fixed in this item and that only adds a new
+   trigger of an approximation which cannot be completed case by case (a
+   hand-written lexer, parser or sanitizer) is recorded as `cls` decide with
+   `clsWhy` "class recurrence: structural change or backlog" — never another
+   fix round; the summary says so.
+3. `mcp__dct__record_findings(findings=<CARDS>, cycle_id=<id>)` — ONE call
    with the whole array (atomic: one invalid finding = nothing written). Each
    finding carries `src` — the reviewer(s) as free display text (`codex`,
    `panel:security + codex`) — AND `reviewers`, the list of canonical
    reviewer tokens (lowercase, `^[a-z0-9][a-z0-9:._-]*$`, no duplicates, e.g.
    `["codex", "panel:security"]`). The coordinator knows who reported what:
    always pass `reviewers`; never derive them by guessing from `src`.
-3. The ack's `recorded[]` lists `{seq, finding_id, first_seen_id}`: every
+4. The ack's `recorded[]` lists `{seq, finding_id, first_seen_id}`: every
    finding with a non-null `first_seen_id` is a RECURRING fingerprint —
    name it in the summary (K-n and the finding it recurs from).
-4. Continue with **page** in the same turn.
+5. Continue with **page** in the same turn.
 
 ## Mode: page
 
