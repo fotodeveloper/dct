@@ -1087,5 +1087,44 @@ committed.
 6. An unambiguous instruction resolves without a confirmation question: `mcp__dct__resolve_item(id, status, resolution)` at once.
 7. Acknowledge in one line per item, ending with how to reopen it: `✓ #<id> → <status> · to reopen: /track-update #<id> reopen` (plus how many `task` checkpoints stay open, if any). A wrong resolve is corrected by reopening the item: `/track-update #<id> reopen` (`update_item(id, status="open")`).
 
+## `/triage` fallback
+
+The ledger is the single source of a triage: every page version is derived from `export_triage` by `dct triage page` — never hand-edited, never rebuilt from anything else, and a page file another agent edited is never published. The MCP triage tools are deferred (load them first). MCP writes take `cycle_id`, or `cycle` (the code) with an explicit `project` (never auto-detected); the CLI resolves a `<code>` from the working directory unless `--project` is given, and `--cycle-id N` needs no project. One mode per request, from the user's words: record the consolidated findings → open, then page; build / publish the page → page; an agent's proposals → prefill; the owner's pasted decision text or "accept the proposals as final" → close.
+
+Inspect first, in every mode: `export_triage(cycle=<code>, project=<slug>)`. No cycle → only open creates it. An open cycle without cards (a failed record) is reused. An open cycle with cards is never recorded again (a re-recorded card is a NEW finding). A closed cycle (`closed` not null) is never decided, accepted or closed again: only the page build, the publication and the closure note are retried, reported as "ledger closed; publication pending" until done.
+
+**Open** (only after every parallel review of the diff has finished and the findings are consolidated by fingerprint):
+
+1. `open_triage(code, topic, created_by, project, scope, base_commit)` — `created_by` the client's truthful identity and the UTC time. Remember `cycle_id`.
+2. `record_findings(findings=<CARDS>, cycle_id=<id>)` — ONE call, the whole array (atomic). Each finding carries `src` (the reviewers as display text) and `reviewers` (canonical lowercase tokens, e.g. `["codex", "panel:security"]`; never guessed from `src`).
+3. Name every `recorded[]` entry with a non-null `first_seen_id` as a recurring fingerprint. Continue with page.
+
+**Page:**
+
+1. Path: `.context/artifacts/triage-<safe code>/<safe code>.html` when the project has `.context/artifacts/`, else the session scratchpad; `<safe code>` = the code with characters outside `[A-Za-z0-9._-]` replaced by `-`. Create the directory first.
+2. `dct triage page <code> --project <slug> --out <path> [--template <path>]` — the canonical page build (`export_triage` returns data, not a page); the template comes from `--template`, else `[triage] template` in `dct.toml`, else a refusal naming both (dct ships no template). Read-only on the database; prints `<out>: <n> cards, closed=<yes|no>, suggested=<by>, digest=<hex>` (or `suggested=none`). `--force` only to rebuild the same cycle onto its own path. A host that refuses the CLI → give the user the exact command.
+3. Publish with the host's artifact tool where it has one (a description in the language of the conversation, its first word included: "Open — …" / "Otwarty — …"); otherwise return the local path and the command. A republish keeps the same URL.
+4. After the first publication: `update_triage(artifact_url=<url>, cycle_id=<id>)` (open cycles only).
+5. Report the status, the link and the count per class (`list_findings(project=<slug>, cycle_id=<id>, limit=0)`) — never a second set of cards.
+
+**Prefill:**
+
+1. Read the agent's proposals (a file or its chat answer) in the SUGGESTED shape `{by, date, answers}`; from a page file it edited, read only its `SUGGESTED` constant.
+2. `suggest_findings(by=<SUGGESTED.by>, suggestions=<SUGGESTED.answers>, cycle_id=<id>)` — the `answers` object, not the envelope. A proposal never touches a decision. An agent in an interactive MCP session writes this call itself (then skip it: `export_triage` already shows `suggested.by` = the agent); a non-interactive agent (`codex exec`, a background subagent) cannot call MCP tools, so it hands over a `suggested.json` in the SUGGESTED shape and the coordinator makes this call with `by` = the agent's name.
+3. Rebuild with `--force` onto the same path; republish to the same URL with a description saying the page carries proposals, not decisions. Record the `digest=<hex>` that build printed and name it in the report: it identifies the proposals on the published page (its `SUGGESTED.digest`); only the digest of the page actually published counts.
+
+**Close:**
+
+1. Pasted decision text → `decide_findings_from_text(text=<verbatim>, decided_by="owner", decision_source="chat <YYYY-MM-DD>", cycle_id=<id>)`. A parse error names the line and the key and writes nothing: report it, ask the owner for the corrected line, never repair his text. A card line "— (brak decyzji)" without a note is not addressed: it keeps its stored state and is listed in the ack's `skipped` — report those cards. A "Punkt wyjścia" line is stored with the decisions as their text origin (the form was seeded from proposals; it says nothing about who wrote each note).
+2. Acceptance of the proposals → `accept_suggestions(decided_by="owner", decision_source="chat <YYYY-MM-DD>", expected_by=<the SUGGESTED.by the owner saw>, expected_digest=<the digest recorded for the published page>, cycle_id=<id>)`. The digest is the one recorded at prefill (or the `SUGGESTED.digest` of the published page itself) — never a fresh one from `export_triage` or a new build; without it, rebuild, republish and let the owner look again. Refused when a proposal's author differs from `expected_by`, when the digest differs (cards or proposals changed since that page, even by the same author), or when an addressed card already has a decision (`overwrite=true` only on the owner's explicit word). `without_suggestion` cards need his own text; with acceptance plus his own changes, accept first, then decide his text.
+   CLI twins: `dct triage decide <code> --project <slug> --from-text <file> --decided-by owner --source "chat <YYYY-MM-DD>"` (`--from-text -` = stdin), `dct triage accept <code> --project <slug> --decided-by owner --source "chat <YYYY-MM-DD>" --expected-by <by> --expected-digest <hex>`, `dct triage close <code> --project <slug> --source "chat <YYYY-MM-DD>" --note "<paragraph>"` (`--note` repeatable).
+3. Only addressed cards change; `undecided` in the ack is the real state. While it is not empty, report the outstanding K-n (the skipped ones included) and stop — the next paste continues.
+4. Close only after the owner's recorded text or acceptance and with `undecided` empty — never on proposals alone. A `discuss` card counts as decided for the ledger but stays open in substance; a closed triage records decisions, it does not mean any fix is done. `close_triage(source="chat <YYYY-MM-DD>", notes=[…], cycle_id=<id>)` — notes say what the answers do NOT approve (commit, push, release) and, after an acceptance, quote the owner's acceptance verbatim plus a sentence that the per-card notes are accepted proposal text; a note may quote the "Punkt wyjścia" origin.
+5. Rebuild with `--force`; republish to the same URL with a description starting with "Closed" and the date, in the language of the conversation ("Closed <YYYY-MM-DD>" / "Zamknięty <YYYY-MM-DD>").
+6. `list_findings(project=<slug>, cycle_id=<the closing cycle's id>, decision="backlog", limit=0)` — only this cycle's backlog — → the findings without `item_id` (a linked one is skipped); ask ONE question whose "Promote to dct" option carries the list as its preview; on yes, `promote_finding_to_item(finding_id, project=<slug>)` per finding. Deciding and closing never create items; note and reject never do.
+7. A closure note on the reviewed item when one is known (`add_note`); report which K-n approve fixes, one explicit follow-up for every open fix / verify finding (the fix to implement, or the check to run and its reopen condition), the discuss and skipped cards, and that commit / push / release are not approved.
+
+Consent: decisions come only from the owner's own text; an agent's proposals never become decisions without the owner's acceptance; note and reject never create items.
+
 These prose descriptions are the authoritative behavior. Skill files in
 `dct/skills/` are shortcuts. If they diverge — fix the skill, not this doc.

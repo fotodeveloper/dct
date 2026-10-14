@@ -19,7 +19,7 @@ from dct.integrations.base import (
 )
 
 ASSETS = Path(__file__).resolve().parent.parent / "assets"
-SKILLS = ("pickup", "handoff", "track", "clog")
+SKILLS = ("pickup", "handoff", "track", "clog", "triage")
 START = "<!-- dct-codex:start -->"
 END = "<!-- dct-codex:end -->"
 MCP_START = "# dct-codex:mcp:start"

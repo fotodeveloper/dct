@@ -221,3 +221,141 @@ def test_doctor_reports_instruction_override_read_errors(adapter, kind):
         override.write_bytes(b'\xff')
     rows = {row['check']: row for row in adapter.doctor()}
     assert rows['instructions_shadowed']['status'] == 'error'
+
+
+def test_every_codex_skill_asset_carries_the_managed_marker():
+    for name in codex.SKILLS:
+        text = (codex.ASSETS / f'codex-{name}.md').read_text()
+        front, _, body = text.partition('\n---\n')
+        assert front.startswith('---\nname: ' + name + '\n'), name
+        assert body.lstrip().startswith('<!-- dct-managed-codex-skill -->'), name
+
+
+def test_triage_asset_is_client_neutral_and_keeps_consent():
+    """#930: the Codex /triage asset gives commands without a host's shell
+    prefix and keeps the decision and publication rules of the skill."""
+    text = (codex.ASSETS / 'codex-triage.md').read_text()
+    flat = ' '.join(text.split())
+    assert '! dct' not in text and '`!' not in text
+    for rule in ("decisions come only from the owner's own text",
+                 "an agent's proposals never become decisions without the owner's acceptance",
+                 "note and reject never create items",
+                 "No answer approves a commit, push or release",
+                 "never hand-edit a page",
+                 "otherwise return the local path and the exact command"):
+        assert rule in flat, rule
+    assert 'suggestions=<answers>' in flat and 'not the envelope' in flat
+
+
+def test_triage_is_installed_and_a_user_owned_triage_is_kept(adapter):
+    assert 'triage' in adapter.install_skills()['installed']
+    adapter.uninstall()
+    user = adapter.skills_path / 'triage'
+    user.mkdir(parents=True)
+    (user / 'SKILL.md').write_text('my own triage')
+    result = adapter.install_skills()
+    assert 'triage' in result['skipped'] and 'triage' not in result['installed']
+    adapter.uninstall()
+    assert (user / 'SKILL.md').read_text() == 'my own triage'
+
+
+def _asset_backlog_call():
+    """The keyword arguments of the Codex /triage asset's backlog listing at
+    close, as the asset spells them (placeholders kept)."""
+    import re
+
+    flat = ' '.join((codex.ASSETS / 'codex-triage.md').read_text().split())
+    calls = [m.group(1) for m in re.finditer(r'\blist_findings\(([^()]*)\)', flat)
+             if 'decision="backlog"' in m.group(1)]
+    assert len(calls) == 1, calls
+    return dict(arg.strip().split('=', 1) for arg in calls[0].split(','))
+
+
+def test_triage_asset_promotes_only_the_closing_cycles_unlinked_backlog(srv):
+    """K-35: the asset's backlog call, run as written against two cycles —
+    each with backlog findings, one of the closing cycle's already linked to
+    an item — yields exactly the closing cycle's unlinked finding once the
+    asset's skip rule (an `item_id` is set) is applied."""
+    import ast
+
+    def card(fp):
+        return {'title': fp, 'fp': fp, 'S': 1, 'O': 1, 'E': 1, 'K': 'S', 'origin': 'pre',
+                'type': 'robustness', 'src': 'codex', 'opts': []}
+
+    owner = {'decided_by': 'owner', 'decision_source': 'chat'}
+    earlier = srv.open_triage(code='rev-1', topic='t', created_by='me', project='test')['cycle_id']
+    srv.record_findings(cycle_id=earlier, findings=[card('old backlog')])
+    srv.decide_findings(cycle_id=earlier, decisions={'K-1': {'dec': 'backlog'}}, **owner)
+    closing = srv.open_triage(code='rev-2', topic='t', created_by='me', project='test')['cycle_id']
+    srv.record_findings(cycle_id=closing, findings=[card('linked'), card('fresh'), card('fix')])
+    srv.decide_findings(cycle_id=closing, **owner, decisions={
+        'K-1': {'dec': 'backlog'}, 'K-2': {'dec': 'backlog'}, 'K-3': {'dec': 'fix'}})
+    rows = srv.list_findings(project='test', cycle_id=closing, limit=0)
+    linked = next(r for r in rows['rows'] if r[rows['cols'].index('seq')] == 1)
+    assert 'error' not in srv.promote_finding_to_item(linked[rows['cols'].index('id')])
+
+    placeholders = {'<slug>': 'test', '<closing cycle>': closing}
+    kwargs = {k: placeholders[v] if v in placeholders else ast.literal_eval(v)
+              for k, v in _asset_backlog_call().items()}
+    assert set(kwargs) == {'project', 'cycle_id', 'decision', 'limit'}
+    out = srv.list_findings(**kwargs)
+    found = [dict(zip(out['cols'], r, strict=True)) for r in out['rows']]
+    assert {(f['cycle_code'], f['title']) for f in found} == {('rev-2', 'linked'),
+                                                             ('rev-2', 'fresh')}
+    to_promote = [f['title'] for f in found if f['item_id'] is None]
+    assert to_promote == ['fresh']
+
+
+# --- K-37: the docs' skill lists and counts mirror the real registries -------
+
+_REPO = Path(__file__).resolve().parent.parent
+_NUMBER_WORDS = {3: 'three', 4: 'four', 5: 'five', 6: 'six', 7: 'seven', 8: 'eight'}
+
+
+def _claude_skills() -> set[str]:
+    """What the Claude installer links: every packaged dir with a SKILL.md."""
+    from dct.assets import skills_dir
+
+    return {p.parent.name for p in skills_dir().glob('*/SKILL.md')}
+
+
+def _backticked(sentence: str) -> set[str]:
+    import re
+
+    return set(re.findall(r'`([a-z-]+)`', sentence))
+
+
+def _sentence(text: str, start: str) -> str:
+    flat = ' '.join(text.split())
+    at = flat.index(start)
+    return flat[at:flat.index('.', at)]
+
+
+def test_readme_counts_and_lists_the_packaged_skills():
+    readme = (_REPO / 'README.md').read_text(encoding='utf-8')
+    flat = ' '.join(readme.split())
+    claude, n_codex = _claude_skills(), _NUMBER_WORDS[len(codex.SKILLS)]
+    assert f'with {len(claude)} slash-command skills' in flat
+    assert f'The {len(claude)} Claude Code skills, 4 Claude hooks and {n_codex} ' \
+           'development-version Codex skills' in flat
+    assert f'{n_codex} Codex workflows in development builds' in flat
+    assert f'The {n_codex} explicit workflows are supported' in flat
+    table = readme[readme.index('### Skills'):readme.index('## Global Hooks')]
+    import re
+    assert set(re.findall(r'^\| `/([a-z-]+)` \|', table, re.MULTILINE)) == claude
+    assert _backticked(_sentence(readme, 'Codex currently packages')) == set(codex.SKILLS)
+    assert _backticked(_sentence(readme, 'The adapter installs MCP configuration')) \
+        == set(codex.SKILLS)
+
+
+def test_integration_guide_and_managed_instructions_list_the_codex_skills():
+    guide = (_REPO / 'docs' / 'integrations.md').read_text(encoding='utf-8')
+    n_codex = _NUMBER_WORDS[len(codex.SKILLS)]
+    assert _backticked(_sentence(guide, f'The {n_codex} explicit skills')) == set(codex.SKILLS)
+    assert _backticked(_sentence(guide, 'installs `pickup`')) == set(codex.SKILLS)
+    row = next(line for line in guide.splitlines() if line.startswith('| Managed workflow'))
+    supported = row.split('Supported:')[1].split('|')[0]
+    assert {s.strip() for s in supported.split(',')} == set(codex.SKILLS)
+    assert f'collection of {len(_claude_skills())}' in row
+    agents = (codex.ASSETS / 'codex-agents.md').read_text(encoding='utf-8')
+    assert _backticked(_sentence(agents, 'The `pickup`')) == set(codex.SKILLS)

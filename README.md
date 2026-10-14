@@ -5,9 +5,9 @@
 [![CI](https://github.com/fotodeveloper/dct/actions/workflows/ci.yml/badge.svg)](https://github.com/fotodeveloper/dct/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://github.com/fotodeveloper/dct/blob/main/LICENSE)
 
-dct makes your work state queryable: what is open, which checkpoints block completion, what was decided, and where the next session should resume. One user-scoped database connects issues, todos, changelog entries, plans, sprints, decisions, and session handoffs across your projects. Assistants and scripts retrieve that state through 70 MCP tools or the CLI instead of reconstructing it from a conversation.
+dct makes your work state queryable: what is open, which checkpoints block completion, what was decided, and where the next session should resume. One user-scoped database connects issues, todos, changelog entries, plans, sprints, decisions, and session handoffs across your projects. Assistants and scripts retrieve that state through 73 MCP tools or the CLI instead of reconstructing it from a conversation.
 
-[Claude Code](https://claude.com/claude-code) has the established integration, with 13 slash-command skills and 4 automation hooks. This development checkout also includes Codex workflow skills and experimental native hooks; availability and limits differ by client. See the [capability matrix](https://github.com/fotodeveloper/dct/blob/main/docs/integrations.md#capability-matrix).
+[Claude Code](https://claude.com/claude-code) has the established integration, with 14 slash-command skills and 4 automation hooks. This development checkout also includes Codex workflow skills and experimental native hooks; availability and limits differ by client. See the [capability matrix](https://github.com/fotodeveloper/dct/blob/main/docs/integrations.md#capability-matrix).
 
 Part of the **dc tools** family ([dctools.dev](https://dctools.dev)) — *deterministic context* for AI-assisted development.
 
@@ -49,7 +49,7 @@ Handoff: "Frontmatter crash is fixed; release when CI is green."
 Proposed first action: /release
 ```
 
-No forms, no context switch. Handoff and pickup workflows are packaged as skills for Claude Code and, in the unreleased integration, Codex; other MCP clients can use the `handoff_work` and `pickup_work` tools directly. The example uses Claude Code skills, including `/release`; Codex currently packages `pickup`, `handoff`, `track`, and `clog`. The tracking, session, and release workflows are described below.
+No forms, no context switch. Handoff and pickup workflows are packaged as skills for Claude Code and, in the unreleased integration, Codex; other MCP clients can use the `handoff_work` and `pickup_work` tools directly. The example uses Claude Code skills, including `/release`; Codex currently packages `pickup`, `handoff`, `track`, `clog`, and `triage`. The tracking, session, and release workflows are described below.
 
 ## Installation
 
@@ -118,9 +118,9 @@ dct doctor --client codex --json
 ```
 
 Reconnect/start a fresh Codex session. The adapter installs MCP configuration,
-`pickup`, `handoff`, `track` and `clog` skills, and managed `AGENTS.md`
+`pickup`, `handoff`, `track`, `clog` and `triage` skills, and managed `AGENTS.md`
 instructions. It preserves existing configuration and reports conflicting
-files. The four explicit workflows are supported in this development checkout.
+files. The five explicit workflows are supported in this development checkout.
 
 Native hooks are **experimental**: changelog checks, stop reminders and
 apply-patch autoscan require the supported host events, runtime dependencies,
@@ -142,7 +142,7 @@ structured work state, not token savings. See the [acceptance evidence](https://
 
 ### Other MCP clients: manual setup
 
-The 13 Claude Code skills, 4 Claude hooks and four development-version Codex skills are host integrations. The 70 MCP tools and CLI provide the common tracking surface. Other clients use **generic MCP support with manual setup**; no client-specific skills, hook parity or acceptance test is implied. Register `dct server` as a stdio server using the configuration format required by your client. A common JSON shape is:
+The 14 Claude Code skills, 4 Claude hooks and five development-version Codex skills are host integrations. The 73 MCP tools and CLI provide the common tracking surface. Other clients use **generic MCP support with manual setup**; no client-specific skills, hook parity or acceptance test is implied. Register `dct server` as a stdio server using the configuration format required by your client. A common JSON shape is:
 
 ```json
 { "mcpServers": { "dct": { "command": "dct", "args": ["server"] } } }
@@ -269,9 +269,9 @@ and promotion to items/sprints: **[docs/plans.md](https://github.com/fotodevelop
 - **Decision records** — ADRs, sprint amendments, inline plan decisions with multi-anchor linkage
 - **Plan classification** — deterministic heading rules; optional command enrichment (development builds default to rules, while PyPI 1.5.0 uses the legacy Claude command setting)
 - **Passive autoscan hook** — Claude Code PostToolUse hook re-scans plan-like files in background on every edit
-- **MCP server** — 70 tools over stdio via the official MCP SDK 2.x; client configuration and supported workflow features vary
+- **MCP server** — 73 tools over stdio via the official MCP SDK 2.x; client configuration and supported workflow features vary
 - **CLI** — fast `dct` command for hooks and scripts
-- **Skills** — Claude Code slash commands (`/track`, `/clog`, `/dct-import`, `/plan-status`, …); four Codex workflows in development builds
+- **Skills** — Claude Code slash commands (`/track`, `/clog`, `/triage`, `/dct-import`, `/plan-status`, …); five Codex workflows in development builds
 - **Soft deletes** — ledger pattern, nothing is ever hard-deleted
 - **DB portable** — SQLite (zero setup) or PostgreSQL
 
@@ -359,7 +359,7 @@ dct config path                       # Show resolved config/data locations
 
 ## MCP Tools
 
-dct ships **70 MCP tools**. Zero-arg calls auto-detect the project from the session's working directory; pass `project=<slug>` to override. Write ops return a minimal ack (id + a few post-state fields); fetch full context with `get_item(id)` / `get_handoff(id)`. In Claude Code the tools register at user scope (callable as `mcp__dct__<name>`), with thirteen daily drivers always loaded and the rest fetched on demand; other clients control tool discovery and loading according to their own MCP implementation. Whatever the client, start with `create_item`, `list_items`, `pickup_work`, and `handoff_work`:
+dct ships **73 MCP tools**. Zero-arg calls auto-detect the project from the session's working directory; pass `project=<slug>` to override. Write ops return a minimal ack (id + a few post-state fields); fetch full context with `get_item(id)` / `get_handoff(id)`. In Claude Code the tools register at user scope (callable as `mcp__dct__<name>`), with thirteen daily drivers always loaded and the rest fetched on demand; other clients control tool discovery and loading according to their own MCP implementation. Whatever the client, start with `create_item`, `list_items`, `pickup_work`, and `handoff_work`:
 
 | Tool | Purpose |
 |---|---|
@@ -413,6 +413,7 @@ Claude Code has the established packaged integration. `dct init` installs the re
 | `/dct-init` | Bootstrap dct + register the current project (interactive) |
 | `/plan-status` | Cross-plan progress dashboard |
 | `/plan-resolve-uncertain` | Batch classify uncertain plan sections via haiku |
+| `/triage` | Review findings through the triage ledger — record the consolidated findings, build and publish the page from the ledger, take an agent's proposals, close with the owner's answers (development builds; not in PyPI 1.5.0) |
 
 ## Global Hooks
 

@@ -71,8 +71,8 @@ separate change.
 ## Codex: supported explicit workflows in development builds
 
 The adapter configures `dct server` in `$CODEX_HOME/config.toml` (default
-`~/.codex/config.toml`), installs `pickup`, `handoff`, `track` and `clog` in
-`~/.agents/skills`, and maintains a bounded block in `$CODEX_HOME/AGENTS.md`.
+`~/.codex/config.toml`), installs `pickup`, `handoff`, `track`, `clog` and
+`triage` in `~/.agents/skills`, and maintains a bounded block in `$CODEX_HOME/AGENTS.md`.
 It sets `DCT_ACTOR_CLIENT=codex` and `DCT_ACTOR_TYPE=agent`. A session identifier
 must come from the host; the installer never invents or persists one globally.
 
@@ -88,8 +88,10 @@ A nonempty `AGENTS.override.md` takes precedence over `AGENTS.md`; doctor
 reports this as an error. Merge needed override instructions manually before
 removing or emptying the override. Repair does not modify that user-owned file.
 
-The four explicit skills (`pickup`, `handoff`, `track`, `clog`) are the supported
-Codex workflow surface in this checkout. Their session-resumption behavior has
+The five explicit skills (`pickup`, `handoff`, `track`, `clog`, `triage`) are the
+supported Codex workflow surface in this checkout. `triage` runs review findings
+through the triage ledger: record them, build the page with `dct triage page`,
+record an agent's proposals, and close with the owner's answers. Their session-resumption behavior has
 [separate acceptance evidence](codex-acceptance.md).
 
 ### Experimental native hooks
@@ -163,7 +165,7 @@ manual protocol integration, without a claim of client-specific acceptance.
 |---|---|---|---|
 | Shared tracking/session MCP tools | Available | Available | Manual stdio registration; host-dependent discovery |
 | Integration installer | `init`; new `integrate` commands in development | `integrate install/repair` | Manual |
-| Managed workflow skills | Existing collection | Supported: pickup, handoff, track, clog | Supply client-specific instructions manually |
+| Managed workflow skills | Existing collection of 14, including triage | Supported: pickup, handoff, track, clog, triage | Supply client-specific instructions manually |
 | Changelog checks / stop reminders | Claude hooks | Experimental native hooks; review/trust and dependencies required | No packaged adapter |
 | Plan-file autoscan | Claude edit/write events | Experimental `apply_patch` events; shell edits need explicit rescan | CLI rescan or MCP `ingest_plan_file` |
 | Native plan mirroring | Claude TaskCreate/TodoWrite | Experimental and conditional on actual `update_plan` events | No packaged mirror |

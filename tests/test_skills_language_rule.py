@@ -39,7 +39,9 @@ def _flat(text: str) -> str:
 
 
 def test_every_skill_is_checked():
-    assert len(SKILLS) >= 13, SKILLS
+    assert len(SKILLS) >= 14, SKILLS
+    # #930: discovery, not a list, brings a new skill under the rule.
+    assert "triage" in SKILLS and "triage" in codex.SKILLS
 
 
 @pytest.mark.parametrize("name", SKILLS)

@@ -1,7 +1,7 @@
 ## DCT work tracking
 
 Use the connected DCT MCP server for project tracking and durable session context.
-The `pickup`, `handoff`, `track`, and `clog` skills describe these workflows.
+The `pickup`, `handoff`, `track`, `clog`, and `triage` skills describe these workflows.
 Resolve projects from the working directory, preserve returned integer IDs, and
 inspect existing work before creating duplicates. Prefer `pickup_work` and
 `handoff_work` over sequences of individual session operations. Read handoffs

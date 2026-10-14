@@ -37,7 +37,7 @@ SCREEN_RULE = (
 
 # Skills whose dialog asks for a consent on content the owner must read.
 CONSENT_SKILLS = ("commit", "handoff", "pickup", "release", "dct-init", "dct-import",
-                  "plan-resolve-uncertain")
+                  "plan-resolve-uncertain", "triage")
 
 # Each consent screen is pinned to the option it belongs to.
 SCREEN_OPTIONS = {
@@ -47,6 +47,7 @@ SCREEN_OPTIONS = {
     "release": r'"Release" \(in each of its forms\) carries the screen of the shown variant',
     "dct-import": r'the preview of "Import all as listed"',
     "dct-init": r'"Register" \(recommended\) — its preview',
+    "triage": r'"Promote to dct" \(recommended\) — its preview: the screen',
 }
 
 # Phrases of the retired print-then-ask pattern.
