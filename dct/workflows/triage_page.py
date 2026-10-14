@@ -32,14 +32,18 @@ Contracts (spec #930 §2, §8 K-3 / K-4 / K-5, rev 4 K-33 / K-34 / K-39):
   `<`, `>`, `&`, `$`, backtick, control characters and — a second layer,
   K-42 — `/`, `[` and `]`; `\\` doubled), so the string reads back
   exactly and cannot close the script or reshape a regex.
-- Regex or division (K-42 / K-43): the scan tells a regex literal from a
-  division by the code token before the `/` — a `)` closing an if / while
-  / for / with head is followed by a statement (regex), a `)` closing a
-  call or a grouped expression by an operator (division, likewise after an
-  identifier, number, literal, `]` or a postfix `++` / `--` that follows
-  an operand on the same line); a `/` it cannot classify (after `}`, which
-  ends a block or an object literal) is refused naming its line, never
-  guessed.
+- Regex or division (K-42 / K-43 / K-46 / K-47): the scan tells a regex
+  literal from a division by the code token before the `/` — a `)`
+  closing an if / while / for / with head is followed by a statement
+  (regex), a `)` closing a call or a grouped expression by an operator
+  (division, likewise after an identifier, number, literal, `]` or a
+  postfix `++` / `--` that follows an operand on the same line); a `/` it cannot classify (after `}`, which
+  ends a block or an object literal, or — K-46 — after `of`, `await` or
+  `yield`, keywords in some positions and identifiers in others, directly
+  or through a `++` / `--` after one) is refused naming its line, never
+  guessed. A template literal holding an unescaped `${` substitution is
+  refused naming its line (K-47): the scan does not follow the code inside
+  it; a plain template literal and an escaped `\\${` are kept.
 - K-33: in that JS string context — the template's generate() header line
   "Triage {{TEMAT}} ({{projekt}}) — decyzje ownera (…)" — every run of
   whitespace, line separators included (\\n, \\r, U+2028, U+2029,
@@ -96,25 +100,32 @@ _SCRIPT_OPEN = re.compile(r"<script\b[^>]*>", re.IGNORECASE)
 _SCRIPT_CLOSE = re.compile(r"</script", re.IGNORECASE)
 _DECLARATION = re.compile(r"(?<![A-Za-z0-9_$])const\s+(CARDS|CLOSED|SUGGESTED)\s*=")
 _IDENT_CHAR = re.compile(r"[A-Za-z0-9_$]")
-# How _mask_js classifies a `/` that opens no comment (K-39 / K-42 / K-43),
-# by the code token before it: after one of these punctuators, at the start
-# of the script, after one of these keywords (not a property name: no `.`
-# before it) or after the `)` that closes a control-clause head
-# (_CONTROL_HEADS — a statement follows it) it starts a regex literal;
-# after an identifier, a number, a literal, `]`, a postfix `++` / `--` or
-# the `)` of a call or grouped expression it is division; after `}` (a
-# block or an object literal — the scanner cannot tell) or any other
-# punctuator the template is refused naming the line.
+# How _mask_js classifies a `/` that opens no comment (K-39 / K-42 / K-43 /
+# K-46), by the code token before it: after one of these punctuators, at
+# the start of the script, after one of these reserved words (not a
+# property name: no `.` before it) or after the `)` that closes a
+# control-clause head (_CONTROL_HEADS — a statement follows it) it starts a
+# regex literal; after an identifier, a number, a literal, `]`, a postfix
+# `++` / `--` or the `)` of a call or grouped expression it is division.
+# After `}` (a block or an object literal), any other punctuator, or one of
+# _KEYWORD_OR_IDENTIFIER — a keyword in some positions (`for (x of /re/…)`,
+# `await /re/`, `yield /re/`), a plain identifier in others (`of / 2`), so
+# directly or through a `++` / `--` after it (`of++ / 2`) — the scanner
+# cannot tell, and the template is refused naming the line, never guessed.
 _REGEX_AFTER_CHARS = set("(,=:[!&|?{;+-*%<>~^")
 _REGEX_AFTER_WORDS = {
-    "return", "typeof", "case", "do", "else", "in", "of", "new", "delete",
-    "void", "throw", "instanceof", "yield", "await",
+    "return", "typeof", "case", "do", "else", "in", "new", "delete",
+    "void", "throw", "instanceof",
 }
+_KEYWORD_OR_IDENTIFIER = {"of", "await", "yield"}
 _CONTROL_HEADS = {"if", "while", "for", "with"}
 _LINE_TERMINATORS = set("\n\r\u2028\u2029")
 # _mask_js stands these in for every character of a literal (K-39): a
 # single- / double-quoted string — the one place a placeholder may sit in a
-# script — versus a template or regex literal, where one is refused.
+# script — versus a template or regex literal, where one is refused. A
+# template literal with an unescaped `${` substitution is refused whole
+# (K-47): the scanner does not follow the code inside it, where a backtick
+# would end the literal early.
 _MASK = "\x00"
 _MASK_OTHER = "\x01"
 # Escaped as \uXXXX in a script string: quotes, `<` `>` `&` (cannot close
@@ -203,15 +214,19 @@ def _mask_js(src: str, where: str, first_line: int = 1) -> str:
     _MASK, of a template or regex literal by _MASK_OTHER, and every comment
     character by a space (newlines kept) — same length, so positions carry
     over; only code stays readable. A `/` is classified by the token before
-    it (see _REGEX_AFTER_CHARS); one the scanner cannot classify, or an
-    unbalanced `)`, is refused with ValueError naming its line (`src` starts
-    at template line `first_line`)."""
+    it (see _REGEX_AFTER_CHARS); one the scanner cannot classify, a
+    template literal with an unescaped `${` substitution, or an unbalanced
+    `)`, is refused with ValueError naming its line (`src` starts at
+    template line `first_line`)."""
     out = list(src)
     n = len(src)
     i = 0
     # The last code token: "start", "word" (identifier, keyword or number),
-    # "literal", "postfix" (a postfix ++ / --), ")" or a punctuator char.
+    # "literal", "postfix" (a postfix ++ / --), "unclassified" (a ++ / --
+    # after a _KEYWORD_OR_IDENTIFIER word, see `after`), ")" or a
+    # punctuator char.
     prev = "start"
+    after = ""  # the source text of the "unclassified" token
     word = ""  # the word when prev == "word"
     word_is_property = False  # that word follows a `.` (a property name)
     word_before = ""  # the word token right before that word, if any
@@ -219,8 +234,14 @@ def _mask_js(src: str, where: str, first_line: int = 1) -> str:
     parens: list[bool] = []  # per open `(`: does it open a control-clause head?
     line_break = False  # a line terminator since prev (comments included)
 
-    def line() -> int:
-        return first_line + src.count("\n", 0, i)
+    def line(at: int | None = None) -> int:
+        return first_line + src.count("\n", 0, i if at is None else at)
+
+    def unclassifiable(token: str) -> ValueError:
+        return ValueError(
+            f"{where}: line {line()}: cannot tell whether the '/' after {token!r} starts "
+            "a regex literal or divides — rewrite that line (e.g. parenthesize the "
+            "expression or move the regex into a variable)")
 
     def mask(a: int, b: int, char: str) -> None:
         for k in range(a, b):
@@ -231,6 +252,8 @@ def _mask_js(src: str, where: str, first_line: int = 1) -> str:
         if prev == "start":
             return True
         if prev == "word":
+            if word in _KEYWORD_OR_IDENTIFIER and not word_is_property:
+                raise unclassifiable(word)
             return word in _REGEX_AFTER_WORDS and not word_is_property
         if prev in ("literal", "postfix", "]"):
             return False
@@ -238,10 +261,7 @@ def _mask_js(src: str, where: str, first_line: int = 1) -> str:
             return control_close
         if prev in _REGEX_AFTER_CHARS:
             return True
-        raise ValueError(
-            f"{where}: line {line()}: cannot tell whether the '/' after {prev!r} starts "
-            "a regex literal or divides — rewrite that line (e.g. parenthesize the "
-            "expression or move the regex into a variable)")
+        raise unclassifiable(after if prev == "unclassified" else prev)
 
     while i < n:
         ch = src[i]
@@ -276,6 +296,12 @@ def _mask_js(src: str, where: str, first_line: int = 1) -> str:
                 if c == "\\":
                     j += 2
                     continue
+                if ch == "`" and c == "$" and src.startswith("{", j + 1):
+                    raise ValueError(
+                        f"{where}: line {line(j)}: a template literal holds a '${{' "
+                        "substitution — the scan does not follow the code inside it; "
+                        "build that text by string concatenation (an escaped '\\${' "
+                        "is plain text)")
                 if c == "\n" and ch != "`":
                     raise ValueError(f"{where}: a {ch} literal is never closed on its line")
                 if ch == "/" and c == "[":
@@ -310,7 +336,14 @@ def _mask_js(src: str, where: str, first_line: int = 1) -> str:
             # K-43: `++` / `--` right after an operand (an identifier — not
             # a keyword —, a `)` closing an expression or a `]`), with no
             # line terminator before it, is postfix: a `/` after it divides.
-            # Otherwise it is prefix and the operand follows.
+            # Otherwise it is prefix and the operand follows. After a
+            # _KEYWORD_OR_IDENTIFIER word on the same line it is either
+            # (K-46): a `/` after it is refused.
+            if (prev == "word" and word in _KEYWORD_OR_IDENTIFIER and not word_is_property
+                    and not line_break):
+                prev, after = "unclassified", word + src[i:i + 2]
+                i += 2
+                continue
             operand = (
                 (prev == "word" and (word_is_property or word not in _REGEX_AFTER_WORDS))
                 or (prev == ")" and not control_close) or prev == "]")

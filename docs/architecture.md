@@ -174,9 +174,15 @@ dct/workflows/triage_page.py — Triage page builder (#930, no DB):
                            regex; a `)` of a call or grouping, an
                            identifier, number, literal, `]` or a postfix
                            `++` / `--` (after an operand, same line) →
-                           division; a `/` it cannot classify (after `}`) →
-                           the template is refused naming the line, never
-                           guessed. STORAGE_KEY =
+                           division; a `/` it cannot classify (after `}`,
+                           or after `of` / `await` / `yield` — keyword or
+                           identifier — directly or through a `++` / `--`,
+                           K-46) → the template is refused naming the line,
+                           never guessed. A template literal with an
+                           unescaped `${` (K-47) is refused naming the line
+                           — the scan does not follow the code inside it;
+                           plain ones and an escaped `\${` are kept.
+                           STORAGE_KEY =
                            `triage-<project slug>-<code slug>-c<cycle id>-v1`
                            (the immutable id last, so the key is injective;
                            drafts kept under the earlier key order are not

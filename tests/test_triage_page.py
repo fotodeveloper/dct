@@ -241,7 +241,7 @@ def test_a_template_outside_the_contract_is_refused(template, match):
     (SKELETON.replace("'use strict';", "'use strict'; const t = `{{TEMAT}}`;", 1),
      "sits in a regex or template literal"),
     (SKELETON.replace("'use strict';", "'use strict'; const t = `${1} {{PROJEKT}}`;", 1),
-     "sits in a regex or template literal"),
+     r"line 13: a template literal holds a '\$\{' substitution"),
     (SKELETON.replace("'use strict';", "'use strict'; // {{TEMAT}}", 1),
      "sits in script code or a comment"),
     (SKELETON.replace("'use strict';", "'use strict'; /* {{DATA}} */", 1),
@@ -302,6 +302,82 @@ def test_division_after_a_call_or_a_grouping_still_builds(code):
 def test_a_slash_the_scan_cannot_classify_is_refused_naming_its_line(code, line):
     with pytest.raises(ValueError, match=rf"line {line}: cannot tell whether the '/'"):
         build_triage_page(_export(), _with(code))
+
+
+# K-46: `of`, `await` and `yield` are keywords in some positions and plain
+# identifiers in others, so a `/` after one may start a regex or divide. The
+# reviewer's probe: `of / 2; var s = "/` was read as a regex, the `"` after
+# it opened a "string" around `{{TEMAT}}` — which sits in code — and the
+# topic `globalThis.PWNED=1` ran.
+OF_PROBE = _with('var of = 4; var z = of / 2; var s = "/"; foo({{TEMAT}}); // "')
+
+
+@pytest.mark.parametrize("topic", ["globalThis.PWNED=1", "innocent"])
+def test_a_slash_after_of_is_refused_for_any_topic(topic):
+    with pytest.raises(ValueError, match=r"line 13: cannot tell whether the '/' after 'of'"):
+        build_triage_page(_export(), OF_PROBE, topic=topic)
+
+
+@pytest.mark.parametrize(("code", "after"), [
+    ("var z = await / 2;", "await"),
+    ("var z = yield / 2;", "yield"),
+    ("for (const x of /re/.source) f(x);", "of"),  # the keyword: refused all the same
+    ("var of = 4; var z = of++ / 2;", r"of\+\+"),  # through the postfix path
+    ("var z = await-- / 2;", "await--"),
+    ("var z = yield /* c */ ++ / 2;", r"yield\+\+"),
+])
+def test_a_slash_after_a_word_that_may_be_an_identifier_is_refused(code, after):
+    with pytest.raises(ValueError, match=rf"line 13: cannot tell whether the '/' after '{after}'"):
+        build_triage_page(_export(), _with(code + " const D = '{{TEMAT}}';"))
+
+
+@pytest.mark.parametrize("code", [
+    # Division: read as a regex, `/ 2; const s = '/` would end the literal
+    # and `{{TEMAT}}` would sit in code.
+    "const q = o.of / 2; const s = '/'; const D = '{{TEMAT}}';",
+    "const q = o.await++ / 2; const s = '/'; const D = '{{TEMAT}}';",
+    # A regex: read as division, `'/; const D = '` would be the string.
+    "function f() { return /'/; } const D = '{{TEMAT}}';",
+    "const t = typeof /'/; const D = '{{TEMAT}}';",
+    "of\n++/'/.lastIndex; const D = '{{TEMAT}}';",  # ASI: `of; ++/'/…`
+])
+def test_a_property_named_of_divides_and_real_keywords_still_start_a_regex(code):
+    page = build_triage_page(_export(), _with(code), topic="a/b")
+    assert "a\\u002fb" in page
+
+
+# K-47: the scan does not follow the code of a `${…}` substitution — the
+# reviewer's probe: the backtick inside `${"`"}` ended the literal early,
+# `{{TEMAT}}` became a "string" and the topic `globalThis.PWNED=1` ran.
+TEMPLATE_PROBE = _with('const t = `${"`"}`; foo({{TEMAT}}); // "')
+
+
+@pytest.mark.parametrize("topic", ["globalThis.PWNED=1", "innocent"])
+def test_a_template_literal_with_a_substitution_is_refused_for_any_topic(topic):
+    with pytest.raises(ValueError, match=r"line 13: a template literal holds a '\$\{' substitution"):
+        build_triage_page(_export(), TEMPLATE_PROBE, topic=topic)
+
+
+@pytest.mark.parametrize(("code", "line"), [
+    ("const t = `${x}`;", 13),
+    ("const t = `a\n b ${x}`;", 14),
+    ("const t = `\\\\${x}`;", 13),  # `\\${`: the backslash is escaped, `${` is not
+    ("const t = `\\${a} ${b}`;", 13),  # the second one is real
+])
+def test_an_unescaped_substitution_is_refused_naming_its_line(code, line):
+    with pytest.raises(ValueError, match=rf"line {line}: a template literal holds a '\$\{{' substitution"):
+        build_triage_page(_export(), _with(code + " const D = '{{TEMAT}}';"))
+
+
+@pytest.mark.parametrize("code", [
+    "const t = `'`;",  # a plain template literal: its quote is no string
+    "const t = `a\n'b' $ {x} $`;",
+    "const t = `\\${'`;",  # `\${` is plain text
+    "const t = `$\\{'`;",
+])
+def test_a_template_literal_without_a_substitution_still_builds(code):
+    page = build_triage_page(_export(), _with(code + " const D = '{{TEMAT}}';"), topic="a/b")
+    assert "a\\u002fb" in page
 
 
 def test_an_unbalanced_closing_paren_is_refused_naming_its_line():
