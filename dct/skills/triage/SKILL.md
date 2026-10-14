@@ -191,11 +191,12 @@ An agent (Codex, a consultant) proposed answers for an OPEN cycle.
    decision_source="chat <YYYY-MM-DD>", expected_by=<the SUGGESTED.by of the
    page he saw>, expected_digest=<the digest recorded when that page was
    built and published>, cycle_id=<id>)`. The digest is the one saved in
-   **prefill** (or read from the `SUGGESTED` constant of the published page
-   itself: its local file as published, or a read of its URL) — NEVER a
-   fresh one from `export_triage` or a new build, which
-   would accept proposals he has not seen. No saved digest → do not accept:
-   rebuild, republish and let him look again. It refuses when a proposal's
+   **prefill** (the `digest=` line of the `dct triage page` build that was
+   published, or the `SUGGESTED.digest` of that local file exactly as
+   published in this session) — NEVER a fresh one from `export_triage` or a
+   new build, and never a read of the page's current URL as the only proof:
+   both can carry proposals he has not seen. No saved digest → do not
+   accept: rebuild, republish and let him look again. It refuses when a proposal's
    author differs from `expected_by` or the digest differs (cards or
    proposals changed after he saw them, even by the same author — rebuild,
    republish, record the new digest and let him look again) and when an
@@ -231,8 +232,8 @@ An agent (Codex, a consultant) proposed answers for an OPEN cycle.
    NOT approve (a commit, a push, a release) and, after an acceptance, the
    owner's words of acceptance quoted verbatim plus one sentence that the
    per-card notes are the accepted proposal text, not his words. When the
-   pasted text carried a "Punkt wyjścia" line, a note may quote it as the
-   form's origin.
+   pasted text carried a "Punkt wyjścia" line, it is stored with the decision
+   and comes back as `CLOSED.answers[K-n].origin`; a note may quote it too.
 5. Rebuild onto the same path with `--force` and republish to the same URL
    with a description starting with the word "Closed" and the date, in the
    language of the conversation ("Closed <YYYY-MM-DD>" in English,

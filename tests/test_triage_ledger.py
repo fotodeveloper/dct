@@ -2193,6 +2193,41 @@ class TestDecisionTextOrigin:
         assert _decided(eng, 1)[4] == PREFILL
 
 
+class TestClosedOrigin:
+    """K-45: CLOSED.answers[K-n].origin = the stored decision_text_origin,
+    verbatim, built by the ONE _closed_payload close_triage and export_triage
+    share; the key is ABSENT (never null / "") for a decision without one,
+    and `note` stays the decision note alone."""
+
+    def test_the_origin_rides_from_the_pasted_text_through_close_into_the_export(
+        self, triaged,
+    ):
+        eng, cycle_id = triaged
+        suggest_findings(eng, cycle_id, "Codex", {"K-2": {"dec": "note", "note": "proposal"}})
+        text = page_text(card_line("K-1", "Fix teraz", opt="a", note="Tak — (a)."),
+                         card_line("K-2", NO_DECISION), prefill=True)
+        decide_findings_from_text(eng, cycle_id, text, **OWNER)
+        accept(eng, cycle_id, expected_digest=_seen_digest(eng, cycle_id))
+
+        closed = close_triage(eng, cycle_id, source="chat")["closed"]
+        assert closed["answers"]["K-1"] == {"dec": "fix", "opt": "a", "note": "Tak — (a).",
+                                            "origin": PREFILL}
+        assert closed["answers"]["K-2"] == {
+            "dec": "note", "opt": "", "note": "[zaakceptowana propozycja Codex] proposal"}
+        assert export_triage(eng, cycle_id)["closed"] == closed
+
+    def test_a_decision_rewritten_without_the_prefill_line_carries_no_origin(
+        self, triaged,
+    ):
+        eng, cycle_id = triaged
+        decide_findings_from_text(eng, cycle_id, page_text("K-1: fix", prefill=True), **OWNER)
+        decide_findings_from_text(eng, cycle_id, page_text("K-1: verify", "K-2: note"), **OWNER)
+        close_triage(eng, cycle_id, source="chat")
+        answers = export_triage(eng, cycle_id)["closed"]["answers"]
+        assert all("origin" not in a for a in answers.values())
+        assert answers["K-1"]["dec"] == "verify"
+
+
 # ── #930 §8: accepting an agent's proposals ──────────────────────────────────
 
 

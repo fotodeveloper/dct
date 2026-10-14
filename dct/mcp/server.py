@@ -3595,7 +3595,9 @@ def close_triage(
 
     Returns: {cycle_id, project, closed_at, closed} — closed = the CLOSED
         constant {date, source, rubric, notes, answers: {"K-n": {dec, opt,
-        note}}}. {"error": "..."} — nothing written — on undecided findings
+        note[, origin]}}} — `origin` (the pasted text's "Punkt wyjścia" line,
+        stored as decision_text_origin) is present only when the decision
+        came from a prefilled paste. {"error": "..."} — nothing written — on undecided findings
         (listed as K-n), an empty or over-long source, tool-call markup, or a
         missing / already closed / other project's cycle, both or neither of
         cycle_id / cycle, a code without project.
@@ -3963,7 +3965,7 @@ def export_triage(cycle_id: int = 0, cycle: str = "", project: str = "") -> dict
         src, S, O, E, K, origin, type, fp, ctx [..], opts [{k, rec, root, t,
         why}]} plus conflict / violation / dispute / openDesign when set,
         cls + clsWhy for an override and reviewers [token…] when recorded; closed = CLOSED {date, source, rubric,
-        notes, answers} once closed, else null; suggested = SUGGESTED {by,
+        notes, answers {"K-n": {dec, opt, note[, origin]}}} once closed, else null; suggested = SUGGESTED {by,
         date, answers, digest} when any finding carries a suggestion, else
         null — digest = the hash of the cycle's cards and proposals that
         accept_suggestions(expected_digest=…) checks; keep the one of the

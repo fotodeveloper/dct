@@ -29,8 +29,17 @@ Contracts (spec #930 §2, §8 K-3 / K-4 / K-5, rev 4 K-33 / K-34 / K-39):
   code, a comment, a regex literal or a template literal is refused (a
   value there would change the code, e.g. `/{{TEMAT}}/` with "a/b" gives
   `/a/b/`) — and are written as JS string escapes (\\uXXXX for quotes,
-  `<`, `>`, `&`, `$`, backtick and control characters; `\\` doubled), so
-  the string reads back exactly and cannot close the script.
+  `<`, `>`, `&`, `$`, backtick, control characters and — a second layer,
+  K-42 — `/`, `[` and `]`; `\\` doubled), so the string reads back
+  exactly and cannot close the script or reshape a regex.
+- Regex or division (K-42 / K-43): the scan tells a regex literal from a
+  division by the code token before the `/` — a `)` closing an if / while
+  / for / with head is followed by a statement (regex), a `)` closing a
+  call or a grouped expression by an operator (division, likewise after an
+  identifier, number, literal, `]` or a postfix `++` / `--` that follows
+  an operand on the same line); a `/` it cannot classify (after `}`, which
+  ends a block or an object literal) is refused naming its line, never
+  guessed.
 - K-33: in that JS string context — the template's generate() header line
   "Triage {{TEMAT}} ({{projekt}}) — decyzje ownera (…)" — every run of
   whitespace, line separators included (\\n, \\r, U+2028, U+2029,
@@ -87,18 +96,32 @@ _SCRIPT_OPEN = re.compile(r"<script\b[^>]*>", re.IGNORECASE)
 _SCRIPT_CLOSE = re.compile(r"</script", re.IGNORECASE)
 _DECLARATION = re.compile(r"(?<![A-Za-z0-9_$])const\s+(CARDS|CLOSED|SUGGESTED)\s*=")
 _IDENT_CHAR = re.compile(r"[A-Za-z0-9_$]")
-# A `/` after one of these code characters / keywords starts a regex literal.
-_REGEX_AFTER_CHARS = set("(,=:[!&|?{};+-*%<>~^")
+# How _mask_js classifies a `/` that opens no comment (K-39 / K-42 / K-43),
+# by the code token before it: after one of these punctuators, at the start
+# of the script, after one of these keywords (not a property name: no `.`
+# before it) or after the `)` that closes a control-clause head
+# (_CONTROL_HEADS — a statement follows it) it starts a regex literal;
+# after an identifier, a number, a literal, `]`, a postfix `++` / `--` or
+# the `)` of a call or grouped expression it is division; after `}` (a
+# block or an object literal — the scanner cannot tell) or any other
+# punctuator the template is refused naming the line.
+_REGEX_AFTER_CHARS = set("(,=:[!&|?{;+-*%<>~^")
 _REGEX_AFTER_WORDS = {
     "return", "typeof", "case", "do", "else", "in", "of", "new", "delete",
     "void", "throw", "instanceof", "yield", "await",
 }
+_CONTROL_HEADS = {"if", "while", "for", "with"}
+_LINE_TERMINATORS = set("\n\r\u2028\u2029")
 # _mask_js stands these in for every character of a literal (K-39): a
 # single- / double-quoted string — the one place a placeholder may sit in a
 # script — versus a template or regex literal, where one is refused.
 _MASK = "\x00"
 _MASK_OTHER = "\x01"
-_JS_ESCAPED = set("'\"`$<>&  ")
+# Escaped as \uXXXX in a script string: quotes, `<` `>` `&` (cannot close
+# the script), `$` and backtick, and — a second layer behind the context
+# check (K-42) — `/`, `[` and `]`, so a value cannot end or reshape a
+# regex literal even if one were misread as a string.
+_JS_ESCAPED = set("'\"`$<>&/[]  ")
 
 
 def _plural_cards(n: int) -> str:
@@ -175,21 +198,50 @@ def _script_bodies(template: str) -> list[tuple[int, int]]:
         i = closing.end()
 
 
-def _mask_js(src: str, where: str) -> str:
+def _mask_js(src: str, where: str, first_line: int = 1) -> str:
     """`src` with every character of a quoted string literal replaced by
     _MASK, of a template or regex literal by _MASK_OTHER, and every comment
     character by a space (newlines kept) — same length, so positions carry
-    over; only code stays readable."""
+    over; only code stays readable. A `/` is classified by the token before
+    it (see _REGEX_AFTER_CHARS); one the scanner cannot classify, or an
+    unbalanced `)`, is refused with ValueError naming its line (`src` starts
+    at template line `first_line`)."""
     out = list(src)
     n = len(src)
     i = 0
-    last = ""  # last significant code character
-    word = ""  # last identifier / keyword before it
+    # The last code token: "start", "word" (identifier, keyword or number),
+    # "literal", "postfix" (a postfix ++ / --), ")" or a punctuator char.
+    prev = "start"
+    word = ""  # the word when prev == "word"
+    word_is_property = False  # that word follows a `.` (a property name)
+    word_before = ""  # the word token right before that word, if any
+    control_close = False  # the `)` in prev closes a control-clause head
+    parens: list[bool] = []  # per open `(`: does it open a control-clause head?
+    line_break = False  # a line terminator since prev (comments included)
+
+    def line() -> int:
+        return first_line + src.count("\n", 0, i)
 
     def mask(a: int, b: int, char: str) -> None:
         for k in range(a, b):
             if out[k] != "\n":
                 out[k] = char
+
+    def starts_regex() -> bool:
+        if prev == "start":
+            return True
+        if prev == "word":
+            return word in _REGEX_AFTER_WORDS and not word_is_property
+        if prev in ("literal", "postfix", "]"):
+            return False
+        if prev == ")":
+            return control_close
+        if prev in _REGEX_AFTER_CHARS:
+            return True
+        raise ValueError(
+            f"{where}: line {line()}: cannot tell whether the '/' after {prev!r} starts "
+            "a regex literal or divides — rewrite that line (e.g. parenthesize the "
+            "expression or move the regex into a variable)")
 
     while i < n:
         ch = src[i]
@@ -204,11 +256,17 @@ def _mask_js(src: str, where: str) -> str:
             end = src.find("*/", i + 2)
             if end < 0:
                 raise ValueError(f"{where}: a /* comment is never closed")
+            if any(c in _LINE_TERMINATORS for c in src[i + 2:end]):
+                line_break = True
             mask(i, end + 2, " ")
             i = end + 2
             continue
-        if ch in "'\"`" or (ch == "/" and (last == "" or last in _REGEX_AFTER_CHARS
-                                          or (last.isalnum() and word in _REGEX_AFTER_WORDS))):
+        if ch.isspace():
+            if ch in _LINE_TERMINATORS:
+                line_break = True
+            i += 1
+            continue
+        if ch in "'\"`" or (ch == "/" and starts_regex()):
             j = i + 1
             in_class = False
             while True:
@@ -236,14 +294,38 @@ def _mask_js(src: str, where: str) -> str:
             else:
                 mask(i, j + 1, _MASK if ch in "'\"" else _MASK_OTHER)
                 i = j + 1
-            last, word = _MASK, ""
+            prev, line_break = "literal", False
             continue
-        if not ch.isspace():
-            if _IDENT_CHAR.match(ch):
-                word = word + ch if last and _IDENT_CHAR.match(last) else ch
-            else:
-                word = ""
-            last = ch
+        if ch in "_$" or ch.isalnum():
+            j = i
+            while j < n and (src[j] in "_$" or src[j].isalnum()):
+                j += 1
+            word_before = word if prev == "word" else ""
+            word_is_property = prev == "."
+            word = src[i:j]
+            prev, line_break = "word", False
+            i = j
+            continue
+        if ch in "+-" and nxt == ch:
+            # K-43: `++` / `--` right after an operand (an identifier — not
+            # a keyword —, a `)` closing an expression or a `]`), with no
+            # line terminator before it, is postfix: a `/` after it divides.
+            # Otherwise it is prefix and the operand follows.
+            operand = (
+                (prev == "word" and (word_is_property or word not in _REGEX_AFTER_WORDS))
+                or (prev == ")" and not control_close) or prev == "]")
+            prev = "postfix" if operand and not line_break else ch
+            line_break = False
+            i += 2
+            continue
+        if ch == "(":
+            parens.append(prev == "word" and not word_is_property and (
+                word in _CONTROL_HEADS or (word == "await" and word_before == "for")))
+        elif ch == ")":
+            if not parens:
+                raise ValueError(f"{where}: line {line()}: unbalanced ')'")
+            control_close = parens.pop()
+        prev, line_break = ch, False
         i += 1
     return "".join(out)
 
@@ -289,7 +371,8 @@ def _constant_spans(template: str) -> tuple[dict[str, tuple[int, int]], list[tup
     scripts = []
     found: dict[str, list[tuple[int, int]]] = {name: [] for name in CONSTANTS}
     for start, end in _script_bodies(template):
-        masked = _mask_js(template[start:end], "template <script>")
+        masked = _mask_js(template[start:end], "template <script>",
+                          template.count("\n", 0, start) + 1)
         scripts.append((start, end, masked))
         for m in _DECLARATION.finditer(masked):
             name = m.group(1)

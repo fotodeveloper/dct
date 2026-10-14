@@ -252,6 +252,91 @@ def test_an_unknown_or_misplaced_placeholder_is_refused(template, match):
         build_triage_page(_export(), template)
 
 
+# ── regex or division: the token before a `/` (K-42 / K-43) ────────────────
+
+
+def _with(code: str) -> str:
+    return SKELETON.replace("'use strict';", "'use strict'; " + code, 1)
+
+
+# The reviewer's probe (K-42): a `)` closing an `if (…)` head is followed by
+# a statement, so `/x'{{TEMAT}}'/` is a regex — it was read as division
+# and its quotes as a string, and the topic `a/ + alert(1) + /b` closed the
+# regex and ran code.
+PROBE = _with("const ok=(function(){ if (true) /x'{{TEMAT}}'/.test('y'); return 1; })();")
+
+
+@pytest.mark.parametrize("topic", ["a/ + alert(1) + /b", "innocent"])
+def test_a_placeholder_in_a_regex_after_a_control_head_is_refused_for_any_topic(topic):
+    with pytest.raises(ValueError, match="sits in a regex or template literal"):
+        build_triage_page(_export(), PROBE, topic=topic)
+
+
+@pytest.mark.parametrize("head", [
+    "if (x)", "while (x)", "for (;;)", "for (const k of [1])", "with (o)",
+    "for await (const k of g)", "if ((x))", "if (f(x))", "if (x) {} else",
+    "do x(); while (x)",
+])
+def test_every_control_head_is_followed_by_a_regex(head):
+    with pytest.raises(ValueError, match="sits in a regex or template literal"):
+        build_triage_page(_export(), _with(f"{head} /'{{{{TEMAT}}}}'/.test(s);"))
+
+
+@pytest.mark.parametrize("code", [
+    "const q = (4) / 2; const D = '{{TEMAT}}';",
+    "const q = f(1) / g('/') / 2; const D = '{{TEMAT}}';",
+    "const q = o.if(1) / 2; const D = '{{TEMAT}}';",  # a property named `if`
+    "const q = a[0] / 2 / x; const D = '{{TEMAT}}';",
+    "const q = (a) / '{{TEMAT}}' / 2;",  # division: the quotes are a string
+])
+def test_division_after_a_call_or_a_grouping_still_builds(code):
+    page = build_triage_page(_export(), _with(code), topic="a/b")
+    assert "a\\u002fb" in page
+
+
+@pytest.mark.parametrize(("code", "line"), [
+    ("const q = {} / 2;", 13),
+    ("if (x) {}\n/re/.test(s);", 14),
+    ("const q = a./x/;", 13),
+])
+def test_a_slash_the_scan_cannot_classify_is_refused_naming_its_line(code, line):
+    with pytest.raises(ValueError, match=rf"line {line}: cannot tell whether the '/'"):
+        build_triage_page(_export(), _with(code))
+
+
+def test_an_unbalanced_closing_paren_is_refused_naming_its_line():
+    with pytest.raises(ValueError, match=r"line 13: unbalanced '\)'"):
+        build_triage_page(_export(), _with("x()); const D = '{{TEMAT}}';"))
+
+
+# K-43: a postfix ++ / -- (right after an operand, same line) is followed by
+# division; a prefix one (after a line break or an operator) by an operand.
+POSTFIX = [
+    "let i = 6; const q1 = i++ / 2;",
+    "let i = 6; const q1 = i-- / 2;",
+    "let i = 6; const q1 = (i)++ / 2;",
+    "const arr = [6]; const q1 = arr[0]++ / 2;",
+    "let i = 6; const q1 = i /* c */ ++ / 2;",
+]
+
+
+@pytest.mark.parametrize("code", POSTFIX)
+def test_division_after_a_postfix_increment_builds(code):
+    build_triage_page(_export(), _with(code + " const D = '{{TEMAT}}';"))
+
+
+@pytest.mark.parametrize("code", [
+    "let i = 1; const q = i\n++/'{{TEMAT}}'/.lastIndex;",  # ASI: `i; ++/…/`
+    "let i = 1; const q = i /*\n*/ ++/'{{TEMAT}}'/.lastIndex;",  # a comment's line break
+    "const q = 1 + ++/'{{TEMAT}}'/.lastIndex;",  # prefix after an operator
+    "const q = + +/'{{TEMAT}}'/.source.length;",  # two unary operators
+    "let a = 1; const q = a +++/'{{TEMAT}}'/.lastIndex;",  # `a ++ +`, then a regex
+])
+def test_a_prefix_increment_or_unary_operators_are_followed_by_a_regex(code):
+    with pytest.raises(ValueError, match="sits in a regex or template literal"):
+        build_triage_page(_export(), _with(code))
+
+
 def test_placeholders_inside_the_cards_example_are_replaced_with_it():
     """The template's example CARDS hold {{…}} hints; the whole declaration
     is replaced, so they are neither validated nor left in the page."""
@@ -286,7 +371,7 @@ def test_metadata_inside_a_script_string_is_a_js_escape_that_cannot_break_out():
     page = build_triage_page(_export(), SKELETON, topic=TOPIC)
     line = next(ln for ln in _script(page).splitlines() if "decyzje ownera" in ln)
     assert line == (
-        "  return 'Triage Orders \\u003cb\\u003e\\u0026\\u003c/b\\u003e \\u0022quotes\\u0022 "
+        "  return 'Triage Orders \\u003cb\\u003e\\u0026\\u003c\\u002fb\\u003e \\u0022quotes\\u0022 "
         "\\u0027single\\u0027 \\\\ back \\u0024x \\u0060tick\\u0060 line2 (proj-a) "
         "— decyzje ownera (' + stamp + '), rubric v2:';")
 
@@ -679,3 +764,44 @@ def test_placeholders_in_both_string_quotes_keep_the_script_valid_in_node(tmp_pa
     run = subprocess.run([node, str(script)], capture_output=True, text=True, check=False)
     assert run.returncode == 0, run.stderr
     assert json.loads(run.stdout) == " ".join((HOSTILE + " a/b/ `x` " + TOPIC).split())
+
+
+def _run_in_node(tmp_path, page: str, tail: str):
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node not installed")
+    script = tmp_path / "page.js"
+    script.write_text(_script(page) + "\n" + tail + "\n", encoding="utf-8")
+    run = subprocess.run([node, str(script)], capture_output=True, text=True, check=False)
+    assert run.returncode == 0, run.stderr
+    return json.loads(run.stdout)
+
+
+# A topic that would end or reshape a regex if it ever landed in one.
+REGEX_BREAKER = "a/[b]/ + alert(1) + /c] \\/ [x"
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("code", POSTFIX)
+def test_division_after_a_postfix_increment_runs_in_node(tmp_path, code):
+    """K-43: the accepted scripts are what node runs — 6 / 2 — and the
+    string next to them reads back exactly (`/`, `[`, `]` escaped, K-42)."""
+    page = build_triage_page(_export(), _with(code + " const D = '{{TEMAT}}';"),
+                             topic=REGEX_BREAKER)
+    assert _run_in_node(tmp_path, page, "process.stdout.write(JSON.stringify([q1, D]));") == [
+        3, REGEX_BREAKER]
+
+
+@pytest.mark.slow
+def test_division_after_a_call_and_regexes_after_control_heads_run_in_node(tmp_path):
+    """K-42: the scan's classification is node's — a `)` of a call or a
+    grouping divides, a `)` of an if head is followed by a regex — and a
+    string holding `/`, `[`, `]` reads back exactly."""
+    code = ("function f(n) { return n; } let hits = 0;"
+            " const q1 = f(12) / (2) / 2;"
+            " if (true) /x/.test('x') && hits++;"
+            " while (hits < 2) /y/.test('y') && hits++;"
+            " const D = \"{{TEMAT}}\";")
+    page = build_triage_page(_export(), _with(code), topic=REGEX_BREAKER)
+    assert _run_in_node(tmp_path, page, "process.stdout.write(JSON.stringify([q1, hits, D]));") \
+        == [3, 2, REGEX_BREAKER]

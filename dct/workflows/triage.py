@@ -46,8 +46,9 @@ Contracts:
 - Widths: every VARCHAR value goes through ensure_fits (refused, never
   truncated); value domains (rubric enums, decisions, classes) are checked
   here, not by CHECK constraints.
-- Export: CARDS / CLOSED / SUGGESTED use the template's field names exactly;
-  the page itself is built from the export only, by
+- Export: CARDS / CLOSED / SUGGESTED use the template's field names exactly
+  (dct's additions are optional keys, present only when set: CARDS
+  `reviewers`, CLOSED.answers[K-n].`origin`, K-45); the page itself is built from the export only, by
   dct.workflows.triage_page.build_triage_page.
 - Reviewer identity (#930 §2a): `src` stays the free-text display value;
   the canonical reviewer tokens of a finding live in finding_reviewers and
@@ -1329,14 +1330,24 @@ def _decision_rows(rows: list[Mapping]) -> list[dict]:
 
 
 def _closed_payload(cycle: Mapping, rows: list[Mapping]) -> dict:
-    """The template's CLOSED constant from a closed cycle and its findings."""
+    """The template's CLOSED constant from a closed cycle and its findings —
+    the ONE builder close_triage and export_triage share. answers[K-n] =
+    {dec, opt, note} plus `origin` (#930 K-45) = the stored
+    decision_text_origin verbatim — the "Punkt wyjścia" line of the pasted
+    decision text that decided it — ONLY when that is non-NULL: a decision
+    recorded any other way (decide_findings, accept_suggestions) has no
+    `origin` key, never null or "". `note` stays decision_note alone."""
     notes = cycle["closed_notes"]
+    answers = _answers(_decision_rows(rows), "")
+    for r in rows:
+        if r["decision_text_origin"] is not None:
+            answers[f"K-{r['seq']}"]["origin"] = r["decision_text_origin"]
     return {
         "date": cycle["closed_at"].strftime("%Y-%m-%d"),
         "source": cycle["closed_source"],
         "rubric": cycle["rubric_version"],
         "notes": notes.split("\n\n") if notes else [],
-        "answers": _answers(_decision_rows(rows), ""),
+        "answers": answers,
     }
 
 
@@ -1344,8 +1355,10 @@ def close_triage(
     engine: sa.Engine, cycle: int | str, *, source: str, notes=None, project: str | None = None,
 ) -> dict:
     """Close an open cycle with the owner's answers →
-    {cycle_id, closed_at, closed: CLOSED-payload}. `cycle` = id, or code
-    with `project` (resolve_cycle).
+    {cycle_id, closed_at, closed: CLOSED-payload} (answers[K-n] = {dec, opt,
+    note} + `origin` only when decided from a pasted text with a "Punkt
+    wyjścia" line — _closed_payload). `cycle` = id, or code with `project`
+    (resolve_cycle).
 
     Refused while any live finding is undecided (the message lists them); a
     'discuss' decision counts as decided (recorded as open, owner rule
@@ -1821,8 +1834,9 @@ def export_triage(engine: sa.Engine, cycle: int | str, *, project: str | None = 
 
     `cycle` = id, or code with `project` (resolve_cycle). cards = the
     template's CARDS (by seq; `reviewers` — the canonical tokens — next to
-    `src` when the finding has any); closed = its CLOSED when the cycle is closed,
-    else None; suggested = its SUGGESTED {by, digest, date, answers} when any
+    `src` when the finding has any); closed = its CLOSED when the cycle is closed
+    (the payload close_triage returned — answers[K-n] carry `origin` only
+    when set, _closed_payload), else None; suggested = its SUGGESTED {by, digest, date, answers} when any
     finding carries a suggestion (by / date of the latest; digest =
     suggestion_digest of the cards and every proposal with its author —
     the value accept_suggestions(expected_digest=…) takes back), else None. The
