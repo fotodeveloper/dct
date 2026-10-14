@@ -143,6 +143,18 @@ class UpdateConfig:
 
 
 @dataclass
+class TriageConfig:
+    """[triage] section — #930 triage page build.
+
+    template  path of the triage page template (HTML) that `dct triage page`
+              fills from the ledger when no --template is given; None =
+              unset (dct ships no template — the command then refuses,
+              naming both ways). Stored as written; the CLI expands `~`.
+    """
+    template: str | None = None
+
+
+@dataclass
 class Config:
     database_url: str = ""
     # Retired key (ADR #52): still PARSED so old files load, auto-detected
@@ -154,6 +166,7 @@ class Config:
     mirror: MirrorConfig = field(default_factory=MirrorConfig)
     web: WebConfig = field(default_factory=WebConfig)
     update: UpdateConfig = field(default_factory=UpdateConfig)
+    triage: TriageConfig = field(default_factory=TriageConfig)
 
     def __post_init__(self):
         if not self.database_url:
@@ -239,6 +252,14 @@ def load_config(config_path: Path | None = None) -> Config:
     update_section = data.get("update", {})
     update = UpdateConfig(check=bool(update_section.get("check", True)))
 
+    triage_section = data.get("triage", {})
+    if not isinstance(triage_section, dict):
+        raise ValueError("[triage] must be a table")  # noqa: TRY004 — config errors are ValueErrors
+    triage_template = triage_section.get("template")
+    if triage_template is not None and not isinstance(triage_template, str):
+        raise ValueError("triage.template must be a string (a file path)")
+    triage = TriageConfig(template=triage_template or None)
+
     # Env var overrides config file
     env_url = os.environ.get("DCT_DATABASE_URL")
     if env_url:
@@ -248,6 +269,7 @@ def load_config(config_path: Path | None = None) -> Config:
         database_url=database_url, dct_root=dct_root,
         plans=plans, classification=classification,
         integrations=integrations, mirror=mirror, web=web, update=update,
+        triage=triage,
     )
 
 
@@ -286,6 +308,11 @@ def save_config(config: Config, config_path: Path | None = None) -> Path:
 
     lines.append('\n[update]\n')
     lines.append(f'check = {str(config.update.check).lower()}\n')
+
+    # TOML has no null: an unset template writes no [triage] section.
+    if config.triage.template:
+        lines.append('\n[triage]\n')
+        lines.append(f'template = {_toml_str(config.triage.template)}\n')
 
     path.write_text("".join(lines), encoding="utf-8")
     return path

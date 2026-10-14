@@ -26,12 +26,15 @@ from sqlalchemy import event
 from dct.core.limits import ensure_fits
 from dct.core.projects import create_project
 from dct.db import (
+    INDEX_HEALED_TABLES,
     PROVENANCE_COLUMNS,
+    PROVENANCE_TABLES,
     TRIAGE_LEDGER_COLUMNS,
     SchemaNotReady,
     check_schema_ready,
     create_tables,
     finding_options,
+    finding_reviewers,
     findings,
     lock_cycle_row,
     lock_row,
@@ -40,11 +43,12 @@ from dct.db import (
     triage_cycles,
 )
 
-LEDGER = ("triage_cycles", "findings", "finding_options")
+LEDGER = ("triage_cycles", "findings", "finding_options", "finding_reviewers")
 
 _DDL = re.compile(r"^\s*(ALTER|CREATE|DROP)\b", re.IGNORECASE)
 _DML = re.compile(r"^\s*(INSERT|UPDATE|DELETE)\b", re.IGNORECASE)
-_LEDGER_NAMES = re.compile(r"\b(triage_cycles|findings|finding_options)\b", re.IGNORECASE)
+_LEDGER_NAMES = re.compile(
+    r"\b(triage_cycles|findings|finding_options|finding_reviewers)\b", re.IGNORECASE)
 
 # The widths spec #909 §2 names — a frozen copy on purpose: the test proves
 # the schema matches the approved contract, ensure_fits proves it is enforced.
@@ -65,9 +69,11 @@ SPEC_WIDTHS = {
         "decision_session_id": 128, "decision_actor_source": 16,
     },
     "finding_options": {"key": 4},
+    # #930 §2a: a canonical reviewer token.
+    "finding_reviewers": {"reviewer": 50},
 }
 TABLES = {"triage_cycles": triage_cycles, "findings": findings,
-          "finding_options": finding_options}
+          "finding_options": finding_options, "finding_reviewers": finding_reviewers}
 # K-23: the decision writer's provenance, column → the creation-provenance
 # column whose type it mirrors.
 DECISION_WRITER = {
@@ -124,7 +130,7 @@ def _record_all(engine) -> list[str]:
 
 
 def _drop_ledger(engine) -> None:
-    for name in reversed(LEDGER):  # FK order: options → findings → cycles
+    for name in reversed(LEDGER):  # FK order: reviewers → options → findings → cycles
         with engine.begin() as conn:
             conn.execute(sa.text(f"DROP TABLE {name}"))
 
@@ -153,8 +159,11 @@ def test_a_fresh_bootstrap_creates_the_ledger_with_provenance_and_soft_delete(en
     assert set(LEDGER) <= set(inspector.get_table_names())
     for name in LEDGER:
         cols = {c["name"]: c for c in inspector.get_columns(name)}
-        for col in (*PROVENANCE_COLUMNS, "created_at", "updated_at", "deleted_at"):
+        for col in (*PROVENANCE_COLUMNS, "created_at", "deleted_at"):
             assert col in cols, f"{name}.{col}"
+        # #930 §2a: a reviewer row is written once and only soft-deleted —
+        # the spec gives it no updated_at.
+        assert ("updated_at" in cols) is (name != "finding_reviewers"), name
         assert cols["deleted_at"]["nullable"] is True
 
 
@@ -180,6 +189,8 @@ def test_live_uniqueness_indexes_exist_after_bootstrap(engine):
         "triage_cycles": {("ix_triage_cycles_project_code_live", ("project_id", "code"))},
         "findings": {("ix_findings_cycle_seq_live", ("cycle_id", "seq"))},
         "finding_options": {("ix_finding_options_finding_key_live", ("finding_id", "key"))},
+        "finding_reviewers": {
+            ("ix_finding_reviewers_finding_reviewer_live", ("finding_id", "reviewer"))},
     }
     for name, wanted in expected.items():
         unique = {(ix["name"], tuple(ix["column_names"]))
@@ -319,7 +330,7 @@ def test_a_database_without_the_ledger_heals_once_then_stays_quiet(engine, capsy
     create_tables(engine)  # bootstrap 1 — creates the ledger with its indexes
     capsys.readouterr()
     created = [s for s in seen if _DDL.match(s) and _LEDGER_NAMES.search(s)]
-    assert sum(s.upper().startswith("CREATE TABLE") for s in created) == 3
+    assert sum(s.upper().startswith("CREATE TABLE") for s in created) == len(LEDGER)
     check_schema_ready(engine)
     with engine.begin() as conn:  # usable end to end, unique guard included
         _cycle(conn, pid, "rev-1")
@@ -367,7 +378,7 @@ def _recreate_ledger_before_k4_k5(engine) -> None:
             table.to_metadata(old)
     columns = []
     later = {name for name, _ddl in TRIAGE_LEDGER_COLUMNS["findings"]}
-    assert later == {"decided_by", "decision_source", *DECISION_WRITER}
+    assert later == {"decided_by", "decision_source", *DECISION_WRITER, "decision_text_origin"}
     for column in findings.columns:
         if column.name in later:
             continue
@@ -477,7 +488,7 @@ def _recreate_findings_without_the_decision_writer(engine) -> None:
         if table.name != "findings":
             table.to_metadata(old)
     sa.Table("findings", old, *(c._copy() for c in findings.columns
-                                if c.name not in DECISION_WRITER))
+                                if c.name not in (*DECISION_WRITER, "decision_text_origin")))
     old.create_all(engine, tables=[old.tables[name] for name in LEDGER])
 
 
@@ -502,13 +513,53 @@ def test_a_ledger_without_the_decision_writer_gains_it_once_never_backfilled(eng
     assert out.err == "", out.err
     altered = [s for s in seen if s.upper().startswith("ALTER TABLE FINDINGS")]
     assert sorted(re.search(r"ADD COLUMN (?:IF NOT EXISTS )?(\w+)", s).group(1) for s in altered) == sorted(
-        DECISION_WRITER), altered
+        (*DECISION_WRITER, "decision_text_origin")), altered
     assert not [s for s in seen if _DML.match(s) and _LEDGER_NAMES.search(s)]
     check_schema_ready(engine)
     with engine.connect() as conn:
         row = conn.execute(sa.select(findings).where(findings.c.id == fid)).one()
     assert all(getattr(row, c) is None for c in DECISION_WRITER)
     assert (row.actor_client, row.decided_by) == ("codex", "owner")
+
+    _assert_quiet_bootstraps(engine, capsys)
+
+
+def test_a_ledger_without_the_text_origin_gains_it_once_never_backfilled(engine, capsys):
+    """#930 K-40: findings.decision_text_origin (TEXT, nullable) is added by
+    bootstrap 1 on a ledger of the #909 build — its only ALTER; a decision
+    recorded before it keeps NULL (never guessed from decision_source or
+    the note) — and bootstraps 2-3 issue no DDL, write nothing, print
+    nothing."""
+    pid = _project(engine)
+    _drop_ledger(engine)
+    old = sa.MetaData()
+    for table in metadata.sorted_tables:
+        if table.name != "findings":
+            table.to_metadata(old)
+    sa.Table("findings", old, *(c._copy() for c in findings.columns
+                                if c.name != "decision_text_origin"))
+    old.create_all(engine, tables=[old.tables[name] for name in LEDGER])
+    with engine.begin() as conn:
+        fid = _finding(conn, _cycle(conn, pid), decision="fix", decided_at=datetime.now(UTC),
+                       decided_by="owner", decision_source="Punkt wyjścia: propozycje",
+                       decision_note="Punkt wyjścia: x")
+    with pytest.raises(SchemaNotReady, match="findings.decision_text_origin"):
+        check_schema_ready(engine)
+
+    seen = _record_all(engine)
+    create_tables(engine)  # bootstrap 1
+    assert capsys.readouterr().err == ""
+    # (the rebuilt table has no indexes: the index heal adds those — not ours)
+    altered = [s for s in seen if s.upper().startswith("ALTER TABLE FINDINGS")]
+    assert len(altered) == 1 and re.search(
+        r"ADD COLUMN (IF NOT EXISTS )?decision_text_origin TEXT", altered[0],
+        re.IGNORECASE), altered
+    assert not [s for s in seen if _DML.match(s) and _LEDGER_NAMES.search(s)]
+    check_schema_ready(engine)
+    assert _nullable(engine, "decision_text_origin")
+    with engine.connect() as conn:
+        row = conn.execute(sa.select(findings).where(findings.c.id == fid)).one()
+    assert (row.decision_text_origin, row.decision_source) == (None, "Punkt wyjścia: propozycje")
 
     _assert_quiet_bootstraps(engine, capsys)
 
@@ -633,3 +684,83 @@ def test_a_held_row_lock_lets_a_foreign_key_insert_through_but_not_a_second_lock
     finally:
         holder.rollback()
         holder.close()
+
+
+# ── #930 §2a: finding_reviewers ──────────────────────────────────────────────
+
+
+def _reviewer(conn, finding_id, token="codex") -> int:
+    return conn.execute(finding_reviewers.insert().values(
+        finding_id=finding_id, reviewer=token,
+    )).inserted_primary_key[0]
+
+
+def test_the_reviewer_table_is_a_healed_provenance_ledger():
+    assert "finding_reviewers" in PROVENANCE_TABLES
+    assert "finding_reviewers" in INDEX_HEALED_TABLES
+    cols = finding_reviewers.c
+    assert cols.finding_id.nullable is False and cols.reviewer.nullable is False
+    assert {fk.column.table.name for fk in cols.finding_id.foreign_keys} == {"findings"}
+
+
+def test_a_reviewer_token_is_unique_per_finding_among_live_rows(engine):
+    pid = _project(engine)
+    with engine.begin() as conn:
+        cid = _cycle(conn, pid)
+        f1, f2 = _finding(conn, cid, seq=1), _finding(conn, cid, seq=2)
+        first = _reviewer(conn, f1)
+        _reviewer(conn, f1, "panel:security")  # another token of the same finding
+        _reviewer(conn, f2)  # the same token on another finding
+    with pytest.raises(sa.exc.IntegrityError), engine.begin() as conn:
+        _reviewer(conn, f1)
+    with engine.begin() as conn:
+        _soft_delete(conn, finding_reviewers, first)
+        _reviewer(conn, f1)  # the soft-deleted row freed the token
+
+
+def test_a_reviewer_row_needs_a_real_finding(engine):
+    if engine.dialect.name == "sqlite":
+        with engine.connect() as conn:
+            assert conn.exec_driver_sql("PRAGMA foreign_keys").scalar() == 1
+    with pytest.raises(sa.exc.IntegrityError), engine.begin() as conn:
+        _reviewer(conn, 999_999)
+
+
+def test_a_database_without_the_reviewer_table_gains_it_once_then_stays_quiet(engine, capsys):
+    """A database bootstrapped by the #909 build (ledger without
+    finding_reviewers): bootstrap 1 creates exactly that table with its
+    unique index and touches no existing row; bootstraps 2-3 issue no DDL,
+    write nothing and print nothing."""
+    pid = _project(engine)
+    with engine.begin() as conn:
+        fid = _finding(conn, _cycle(conn, pid))
+        conn.execute(sa.text("DROP TABLE finding_reviewers"))
+    with pytest.raises(SchemaNotReady, match="finding_reviewers"):
+        check_schema_ready(engine)
+
+    seen = _record_all(engine)
+    create_tables(engine)  # bootstrap 1
+    out = capsys.readouterr()
+    assert out.err == "", out.err
+    ddl = [s for s in seen if _DDL.match(s) and _LEDGER_NAMES.search(s)]
+    assert [s.split("(")[0].split() for s in ddl if s.upper().startswith("CREATE TABLE")] == [
+        ["CREATE", "TABLE", "finding_reviewers"]]
+    assert any("ix_finding_reviewers_finding_reviewer_live" in s for s in ddl)
+    assert not [s for s in seen if _DML.match(s) and _LEDGER_NAMES.search(s)]
+    check_schema_ready(engine)
+    with engine.begin() as conn:  # usable, unique guard included
+        _reviewer(conn, fid)
+    with pytest.raises(sa.exc.IntegrityError), engine.begin() as conn:
+        _reviewer(conn, fid)
+
+    _assert_quiet_bootstraps(engine, capsys)
+
+
+def test_the_reviewer_table_missing_its_unique_index_is_healed(engine, capsys):
+    with engine.begin() as conn:
+        conn.execute(sa.text("DROP INDEX ix_finding_reviewers_finding_reviewer_live"))
+    create_tables(engine)
+    names = {ix["name"] for ix in sa.inspect(engine).get_indexes("finding_reviewers")}
+    assert "ix_finding_reviewers_finding_reviewer_live" in names
+    capsys.readouterr()
+    _assert_quiet_bootstraps(engine, capsys)

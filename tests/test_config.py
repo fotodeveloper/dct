@@ -325,3 +325,60 @@ def test_classification_rejects_string_argv(tmp_path):
     path.write_text('[classification]\ncommand = "custom --classify"\n')
     with pytest.raises(ValueError, match='array of strings'):
         load_config(path)
+
+
+# ── [triage] template (#930 §8 K-1) ──────────────────────────────────────────
+
+
+def test_triage_template_defaults_to_unset_and_writes_no_section(tmp_path):
+    path = tmp_path / "dct.toml"
+    cfg = Config(database_url="sqlite:///x.db")
+    assert cfg.triage.template is None
+    save_config(cfg, path)
+    assert "[triage]" not in path.read_text()
+    assert load_config(path).triage.template is None
+
+
+@pytest.mark.parametrize("template", [
+    "/tmp/proj-a/triage.html",
+    "~/templates/triage page.html",
+    'C:\\Work\\triage "v2".html',  # backslashes and quotes survive the TOML
+    "/tmp/szablon-żółw.html",
+])
+def test_triage_template_round_trips(tmp_path, template):
+    path = tmp_path / "dct.toml"
+    cfg = Config(database_url="sqlite:///x.db")
+    cfg.triage.template = template
+    save_config(cfg, path)
+    assert tomllib.loads(path.read_text(encoding="utf-8"))["triage"] == {"template": template}
+    loaded = load_config(path)
+    assert loaded.triage.template == template
+    # a rewrite (any other command saving the config) keeps it
+    save_config(loaded, path)
+    assert load_config(path).triage.template == template
+
+
+def test_triage_template_section_comes_last_and_other_sections_survive(tmp_path):
+    path = tmp_path / "dct.toml"
+    cfg = Config(database_url="sqlite:///x.db")
+    cfg.triage.template = "/tmp/t.html"
+    cfg.web.port = 9999
+    save_config(cfg, path)
+    content = path.read_text()
+    assert content.index("[update]") < content.index("[triage]")
+    assert load_config(path).web.port == 9999
+
+
+def test_an_empty_triage_template_reads_as_unset(tmp_path):
+    path = tmp_path / "dct.toml"
+    path.write_text('[triage]\ntemplate = ""\n')
+    assert load_config(path).triage.template is None
+
+
+@pytest.mark.parametrize("body", ['[triage]\ntemplate = 5\n', '[triage]\ntemplate = ["a"]\n',
+                                  'triage = "x"\n'])
+def test_a_malformed_triage_section_is_refused(tmp_path, body):
+    path = tmp_path / "dct.toml"
+    path.write_text(body)
+    with pytest.raises(ValueError, match="triage"):
+        load_config(path)

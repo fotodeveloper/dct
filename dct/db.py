@@ -38,6 +38,7 @@ PROVENANCE_TABLES = (
     "triage_cycles",
     "findings",
     "finding_options",
+    "finding_reviewers",
 )
 
 
@@ -523,6 +524,13 @@ findings = sa.Table(
     sa.Column("decision_actor_client", sa.String(64)),
     sa.Column("decision_session_id", sa.String(128)),
     sa.Column("decision_actor_source", sa.String(16)),
+    # #930 K-40: the "Punkt wyjścia: …" line of the pasted decision text that
+    # produced this decision (the form was seeded from an agent's proposals),
+    # verbatim; written with the decision stamp by decide_findings_from_text,
+    # reset to NULL by every other decision write. It proves the form was
+    # prefilled, not who wrote each note; never folded into decision_note or
+    # decision_source. NULL while undecided; never backfilled.
+    sa.Column("decision_text_origin", sa.Text),
     sa.Column("item_id", sa.Integer, sa.ForeignKey("items.id")),  # promoted to this item
     # Earliest live finding of the same project with an equal
     # fingerprint_norm, set at record time; NULL = this is the first.
@@ -546,6 +554,24 @@ finding_options = sa.Table(
     sa.Column("is_recommended", sa.Boolean, nullable=False, server_default=sa.false()),
     sa.Column("created_at", sa.DateTime, nullable=False, server_default=sa.text("CURRENT_TIMESTAMP")),
     sa.Column("updated_at", sa.DateTime, nullable=False, server_default=sa.text("CURRENT_TIMESTAMP")),
+    sa.Column("deleted_at", sa.DateTime),
+    *_provenance_columns(),
+)
+
+# #930 §2a: who reported a finding, as canonical reviewer tokens ("codex",
+# "panel:security") next to the free-text display value findings.reviewer
+# (the CARD's src). A finding may have several reviewers (one row each); a
+# finding recorded without tokens has none (reviewer_precision counts it as
+# "(unattributed)" — never a token guessed from src). The token shape
+# ^[a-z0-9][a-z0-9:._-]*$ (lowercased on write) is validated in
+# dct/workflows/triage.py; uniqueness per finding among LIVE rows below.
+finding_reviewers = sa.Table(
+    "finding_reviewers",
+    metadata,
+    sa.Column("id", sa.Integer, primary_key=True, autoincrement=True),
+    sa.Column("finding_id", sa.Integer, sa.ForeignKey("findings.id"), nullable=False),
+    sa.Column("reviewer", sa.String(50), nullable=False),
+    sa.Column("created_at", sa.DateTime, nullable=False, server_default=sa.text("CURRENT_TIMESTAMP")),
     sa.Column("deleted_at", sa.DateTime),
     *_provenance_columns(),
 )
@@ -686,6 +712,16 @@ sa.Index(
     unique=True,
     sqlite_where=finding_options.c.deleted_at.is_(None),
     postgresql_where=finding_options.c.deleted_at.is_(None),
+)
+# #930 §2a: one row per (finding, reviewer token) among LIVE rows; its leading
+# column also serves the per-finding lookups (export, the reviewer filter).
+sa.Index(
+    "ix_finding_reviewers_finding_reviewer_live",
+    finding_reviewers.c.finding_id,
+    finding_reviewers.c.reviewer,
+    unique=True,
+    sqlite_where=finding_reviewers.c.deleted_at.is_(None),
+    postgresql_where=finding_reviewers.c.deleted_at.is_(None),
 )
 
 
@@ -1092,12 +1128,14 @@ def _create_missing_tables(engine: sa.Engine) -> None:
 
 # K-93 A2: tables of the release-ledger feature — and, by the same reasoning,
 # of the triage ledger (#909: its live-uniqueness indexes are the last guard
-# of cycle code / finding seq / option key) — whose REQUIRED indexes every
+# of cycle code / finding seq / option key / #930 reviewer token) — whose REQUIRED indexes every
 # bootstrap completes even when the table already exists — SQLite commits
 # CREATE TABLE and CREATE INDEX separately, so a crash in between leaves the
 # table without its unique guard. Tables of older features keep the "no
 # silent retrofit" rule of _create_missing_tables.
-INDEX_HEALED_TABLES = ("releases", "triage_cycles", "findings", "finding_options")
+INDEX_HEALED_TABLES = (
+    "releases", "triage_cycles", "findings", "finding_options", "finding_reviewers",
+)
 
 
 def _heal_required_indexes(engine: sa.Engine, existed: set[str]) -> None:
@@ -1215,9 +1253,9 @@ RELEASE_LEDGER_COLUMNS: dict[str, tuple[tuple[str, str], ...]] = {
 }
 
 
-# #909 K-5: decision-origin columns, and K-23: the decision writer's
-# provenance, added to `findings` after the ledger first reached development
-# databases. Nullable, no backfill (an undecided finding has none; a decision
+# #909 K-5: decision-origin columns, K-23: the decision writer's
+# provenance, and #930 K-40: the decision text's prefill line, added to
+# `findings` after the ledger first reached development databases. Nullable, no backfill (an undecided finding has none; a decision
 # recorded before them stays unattributed — never a guessed author, never
 # copied from the finding's creation provenance). Healed like
 # RELEASE_LEDGER_COLUMNS.
@@ -1229,6 +1267,8 @@ TRIAGE_LEDGER_COLUMNS: dict[str, tuple[tuple[str, str], ...]] = {
         ("decision_actor_client", "VARCHAR(64)"),
         ("decision_session_id", "VARCHAR(128)"),
         ("decision_actor_source", "VARCHAR(16)"),
+        # #930 K-40: the decision text's prefill line (see the column).
+        ("decision_text_origin", "TEXT"),
     ),
 }
 

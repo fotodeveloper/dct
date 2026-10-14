@@ -22,9 +22,13 @@ Contracts:
   item row, skipping the rows it does not lock:
     record_findings          project → cycle
     decide_findings          cycle → item of each promoted finding decided
-                             reject / note (_refuse_open_promotion)
+                             reject / note (_refuse_open_promotion); also
+                             decide_findings_from_text and
+                             accept_suggestions (one shared step,
+                             _decide_locked)
     suggest_findings         cycle
     close_triage             cycle
+    update_triage            cycle
     promote_finding_to_item  cycle → finding (the cycle id is read first,
                              unlocked, to find which cycle to lock)
   Only record_findings locks the project row (first_seen and the seq
@@ -43,13 +47,26 @@ Contracts:
   truncated); value domains (rubric enums, decisions, classes) are checked
   here, not by CHECK constraints.
 - Export: CARDS / CLOSED / SUGGESTED use the template's field names exactly;
-  the page build itself (template copy + constants) is the coordinator's job.
+  the page itself is built from the export only, by
+  dct.workflows.triage_page.build_triage_page.
+- Reviewer identity (#930 §2a): `src` stays the free-text display value;
+  the canonical reviewer tokens of a finding live in finding_reviewers and
+  are never guessed from `src`. reviewer_precision counts per token.
+- Owner decisions arrive as a dict (decide_findings), as the page's pasted
+  decision text (decide_findings_from_text — parse_decision_batch is the one
+  parser of it: skipped "— (brak decyzji)" cards, K-31, and the prefill
+  line stored in decision_text_origin, K-40) or as an acceptance of an
+  agent's proposals (accept_suggestions, bound to the suggestion_digest of
+  the export the owner saw, K-32); all three validate and write through one
+  connection-level step under the cycle lock, and change ONLY the findings
+  they address.
 - JSON: every returned value is JSON-serialisable (datetimes as ISO strings);
   page_constants_json is the one serializer of those values into a page.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import unicodedata
@@ -65,6 +82,7 @@ from dct.core.provenance import get_provenance
 from dct.core.sprint import _json_safe, _parse_since_conn, _to_cols_rows
 from dct.db import (
     finding_options,
+    finding_reviewers,
     findings,
     items,
     lock_cycle_row,
@@ -97,6 +115,7 @@ _FINDING_SPELLINGS: dict[str, tuple[str, ...]] = {
     "class_override": ("cls", "class_override"),
     "class_reason": ("clsWhy", "class_reason"),
     "options": ("opts", "options"),
+    "reviewers": ("reviewers",),
 }
 _OPTION_SPELLINGS: dict[str, tuple[str, ...]] = {
     "key": ("k", "key"),
@@ -144,7 +163,13 @@ FINDING_COLS = [
     "decision", "decision_opt", "item_id", "first_seen_id", "source", "title",
 ]
 HISTORY_COLS = ["id", "cycle_code", "opened_at", "seq", "decision", "decision_opt", "item_id"]
-PRECISION_COLS = ["source", "decision", "n"]
+PRECISION_COLS = ["reviewer", "decision", "n"]
+
+# #930 §2a: a canonical reviewer token (lowercased on write, then matched).
+REVIEWER_TOKEN = re.compile(r"[a-z0-9][a-z0-9:._-]*")
+# reviewer_precision's bucket of decided findings that carry no token — so
+# nothing is silently dropped from the count. Not a valid token (parentheses).
+UNATTRIBUTED = "(unattributed)"
 
 
 def _now() -> datetime:
@@ -344,6 +369,39 @@ def _parse_options(value, where: str) -> list[dict]:
     return options
 
 
+def reviewer_token(value, where: str = "reviewer") -> str:
+    """One canonical reviewer token (#930 §2a): a string, lowercased, then
+    matching ^[a-z0-9][a-z0-9:._-]*$ and at most the column's 50 chars —
+    refused otherwise (never stripped, never truncated)."""
+    if not isinstance(value, str):
+        raise ValueError(f"{where}: a reviewer token must be a string, got {value!r}")  # noqa: TRY004 — every refusal is a ValueError
+    token = value.lower()
+    if REVIEWER_TOKEN.fullmatch(token) is None:
+        raise ValueError(
+            f"{where}: reviewer token {value!r} is not a token — lowercase letters, "
+            "digits and : . _ - , starting with a letter or digit (e.g. 'codex', "
+            "'panel:security')")
+    ensure_fits(finding_reviewers, {"reviewer": token}, {"reviewer": f"{where}: reviewer"})
+    return token
+
+
+def _reviewer_tokens(value, where: str) -> list[str]:
+    """`reviewers` of one finding: absent / None = no tokens; otherwise a
+    non-empty list of tokens (reviewer_token), duplicates (after
+    lowercasing) refused. Input order is kept."""
+    if value is None:
+        return []
+    if not isinstance(value, list) or not value:
+        raise ValueError(f"{where}: reviewers must be a non-empty list of reviewer tokens")
+    tokens: list[str] = []
+    for i, raw in enumerate(value):
+        token = reviewer_token(raw, f"{where}.reviewers[{i}]")
+        if token in tokens:
+            raise ValueError(f"{where}: reviewer {token!r} is listed twice")
+        tokens.append(token)
+    return tokens
+
+
 def _parse_finding(raw, index: int) -> dict:
     """Validate one finding of a batch; returns the column values (seq may be
     None = auto), its options and the card used by classify()."""
@@ -399,7 +457,8 @@ def _parse_finding(raw, index: int) -> dict:
     values["class_reason"] = reason
     values["class_rec"] = rubric.classify(_card_fields(values))
     ensure_fits(findings, values, {k: f"{where}: {k}" for k in values})
-    return {"values": values, "options": _parse_options(f.get("options"), where)}
+    return {"values": values, "options": _parse_options(f.get("options"), where),
+            "reviewers": _reviewer_tokens(f.get("reviewers"), where)}
 
 
 def _card_fields(row: Mapping) -> dict:
@@ -624,8 +683,11 @@ def record_findings(
     Keys per finding (either spelling of a field, never both): seq|id
     (optional — next free; id is the CARD's 'K-<n>'), title, fp|fingerprint,
     S|impact, O|reachability, E|evidence, K|fix_cost, origin,
-    type|finding_type, area, src|source (the reviewer), ctx|context (str or
-    list of paragraphs), flags {conflict, violation, dispute,
+    type|finding_type, area, src|source (the reviewer as free display
+    text, required), reviewers (optional, #930 §2a: a non-empty list of
+    canonical reviewer tokens, lowercased, ^[a-z0-9][a-z0-9:._-]*$, ≤ 50
+    chars, no duplicates — never derived from src; absent = no tokens),
+    ctx|context (str or list of paragraphs), flags {conflict, violation, dispute,
     openDesign|open_design} — or those flags at the top level, as an
     exported CARD carries them — cls|class_override + clsWhy|class_reason,
     opts|options [{k|key, t|text, why, root|is_root, rec|is_recommended}].
@@ -679,13 +741,13 @@ def record_findings(
             if values["seq"] is None:
                 values["seq"] = next_seq
                 next_seq += 1
-            batch.append((values, p["options"]))
+            batch.append((values, p["options"], p["reviewers"]))
         if next_seq - 1 > INT_MAX:
             raise ValueError(
                 f"seq exhausted in cycle {cycle_row['code']}: the next free seq passes "
                 f"{INT_MAX} — nothing recorded (pass explicit seqs)")
         recorded = []
-        for values, options in batch:
+        for values, options, reviewers in batch:
             values["first_seen_id"] = _first_seen_id(
                 conn, project_id, values["fingerprint_norm"])
             finding_id = conn.execute(
@@ -696,6 +758,11 @@ def record_findings(
                 conn.execute(finding_options.insert(), [
                     {"finding_id": finding_id, "created_at": now, "updated_at": now, **o}
                     for o in options
+                ])
+            if reviewers:
+                conn.execute(finding_reviewers.insert(), [
+                    {"finding_id": finding_id, "reviewer": token, "created_at": now}
+                    for token in reviewers
                 ])
             recorded.append({"seq": values["seq"], "finding_id": finding_id,
                              "first_seen_id": values["first_seen_id"]})
@@ -815,34 +882,61 @@ def decide_findings(
     each such reject / note (lock order: module docstring). `undecided`
     lists the live findings still without a decision.
     """
-    where = "decide_findings"
+    stamp = _decision_stamp(decided_by, decision_source, "decide_findings")
+    now = _now()
+    with engine.begin() as conn:
+        cycle_id, _project = _resolve_cycle(conn, project, cycle)
+        _lock_open_cycle(conn, cycle_id)
+        return _decide_locked(conn, cycle_id, decisions, stamp, now)
+
+
+def _decision_stamp(decided_by, decision_source, where: str) -> dict:
+    """The audit columns written with every owner decision: decided_by /
+    decision_source (K-5, required, width-checked), the K-23 writer
+    provenance — all four, every time (an unknown field is written as NULL,
+    so an overwrite never keeps the previous client's value) — and
+    decision_text_origin (K-40), NULL here; decide_findings_from_text puts
+    the text's prefill line into it. Never written by suggest_findings."""
     stamp = {
         "decided_by": _required_text(decided_by, "decided_by", where),
         "decision_source": _required_text(decision_source, "decision_source", where),
     }
     ensure_fits(findings, stamp)
-    # K-23: the writer of this decision — all four, every time (an unknown
-    # field is written as NULL, so an overwrite never keeps the previous
-    # client's value). Never written by suggest_findings.
     writer = get_provenance()
     stamp.update(
         decision_actor_type=writer.actor_type,
         decision_actor_client=writer.actor_client,
         decision_session_id=writer.session_id,
         decision_actor_source=writer.source,
+        # K-40: only decide_findings_from_text sets it (the text's prefill
+        # line); every other decision write resets it, so it always
+        # describes the write that produced the current decision.
+        decision_text_origin=None,
     )
-    now = _now()
-    with engine.begin() as conn:
-        cycle_id, _project = _resolve_cycle(conn, project, cycle)
-        _lock_open_cycle(conn, cycle_id)
-        resolved = _resolve_answers(conn, cycle_id, decisions, "decisions")
-        for row, dec, _opt, _note in resolved:
-            _refuse_open_promotion(conn, row, dec)
-        for row, dec, opt, note in resolved:
-            conn.execute(findings.update().where(findings.c.id == row["id"]).values(
-                decision=dec, decision_opt=opt, decision_note=note,
-                decided_at=now, updated_at=now, **stamp))
-        return {"decided": len(resolved), "undecided": _undecided(conn, cycle_id)}
+    return stamp
+
+
+def _decide_locked(
+    conn: sa.Connection, cycle_id: int, decisions, stamp: dict, now: datetime,
+) -> dict:
+    """The ONE connection-level decision step (decide_findings,
+    decide_findings_from_text, accept_suggestions): the caller holds the
+    cycle row lock of an open cycle (_lock_open_cycle) in this transaction.
+    Reads the live findings and options, validates EVERY entry
+    (_resolve_answers, then _refuse_open_promotion — which locks the item of
+    each promoted reject / note: lock order cycle → item) before the first
+    write, so one bad entry writes nothing; then writes each addressed
+    finding's decision with `stamp` (_decision_stamp). Findings not
+    addressed keep their stored state. → {decided: n, undecided: [seq…]}
+    with `undecided` read after the writes."""
+    resolved = _resolve_answers(conn, cycle_id, decisions, "decisions")
+    for row, dec, _opt, _note in resolved:
+        _refuse_open_promotion(conn, row, dec)
+    for row, dec, opt, note in resolved:
+        conn.execute(findings.update().where(findings.c.id == row["id"]).values(
+            decision=dec, decision_opt=opt, decision_note=note,
+            decided_at=now, updated_at=now, **stamp))
+    return {"decided": len(resolved), "undecided": _undecided(conn, cycle_id)}
 
 
 def suggest_findings(
@@ -871,6 +965,348 @@ def suggest_findings(
                 suggested_decision=dec, suggested_opt=opt, suggested_note=note,
                 suggested_by=by, suggested_at=now, updated_at=now))
     return {"suggested": len(resolved)}
+
+
+# ── decision text / acceptance / cycle update (#930) ─────────────────────────
+
+# The decision labels of the triage page — the template's DECISIONS, in
+# Polish because the page emits them — and the English decision tokens,
+# each → its rubric decision. Matched case-insensitively after
+# _label_key(); the page's "— (brak decyzji)" marks an undecided card.
+DECISION_LABELS: dict[str, str] = {
+    "Fix teraz": "fix",
+    "Zweryfikuj": "verify",
+    "Backlog → dct": "backlog",
+    "Odrzuć / zaakceptuj stan": "reject",
+    "Odnotuj": "note",
+    "Do dyskusji": "discuss",
+    **{token: token for token in rubric.DECISIONS},
+}
+NO_DECISION_LABEL = "— (brak decyzji)"
+# The page's header line ("Triage <topic> (<project>) — decyzje ownera
+# (<stamp>), rubric v<n>:") and its optional prefill line ("Punkt wyjścia:
+# propozycje <by> …"), both skipped before the first card line.
+_TEXT_HEADER = re.compile(r"Triage\b.*:")
+_TEXT_PREFILL = "Punkt wyjścia:"
+_TEXT_CARD = re.compile(r"[Kk]-([0-9]+)\s*:\s*(.*)")
+_TEXT_NOTE = " · uwagi:"
+_TEXT_SEGMENT = " · "
+_TEXT_VARIANT = re.compile(r"wariant \(([^()]*)\)", re.IGNORECASE)
+_TEXT_ANNOTATION = re.compile(r"\s*\[[^\]]*\]")
+# Separators a label may be written with: → / -> / — / – / "/" are one.
+_LABEL_SEPARATOR = re.compile(r"\s*(?:→|->|—|–|/)\s*")
+# The note prefix of an accepted proposal (the template's closing rule).
+ACCEPTED_PREFIX = "[zaakceptowana propozycja {by}]"
+
+
+def _label_key(label: str) -> str:
+    return " | ".join(
+        " ".join(part.split()).casefold() for part in _LABEL_SEPARATOR.split(label.strip()))
+
+
+_LABEL_KEYS = {_label_key(label): dec for label, dec in DECISION_LABELS.items()}
+
+
+def parse_decision_batch(text: str, *, cards: list[dict]) -> dict:
+    """Parse the page's generated decision text ("Tekst do wklejenia") →
+    {"decisions": {"K-<n>": {dec, opt, note}}, "skipped": ["K-<n>"…],
+    "prefill_line": str | None} — a pure function, the one parser of that
+    text (decide_findings_from_text, the CLI and MCP adapters;
+    parse_decision_text returns only its decisions).
+
+    Grammar (frozen, #930 §8), line by line (\\n, \\r\\n, \\r or any other
+    str.splitlines boundary; trailing whitespace of a line ignored; blank
+    lines skipped):
+    - before the first card line, a header line `Triage … :` and a line
+      starting `Punkt wyjścia:` are skipped (each at most once); the
+      latter is returned verbatim (stripped) as `prefill_line` (K-40: it
+      proves the form was seeded from proposals, not who wrote each note),
+      None without one;
+    - every other non-blank line is a card line
+      `K-<n>: <label>[ · wariant (<k>)][ [annotation]…][ · uwagi: <note>]`.
+      K-<n> is canonicalised (K-01 = K-1) and must name a card of `cards`
+      (the export's CARDS: `id`, `opts[].k`); a card addressed twice is
+      refused. <label> is one of DECISION_LABELS — the page's Polish labels
+      or the English tokens fix / verify / backlog / reject / note /
+      discuss — case-insensitive, with → / -> / — / – / "/" interchangeable
+      as separators and whitespace collapsed. `wariant (<k>)` (optional)
+      must be an option key of that card. Bracketed annotations before the
+      note are ignored. The note is everything after the FIRST ` · uwagi:`
+      with one leading space dropped — brackets, `·` and a repeated
+      `uwagi:` inside it kept verbatim; an empty note is None.
+    - K-31: a card line whose label is "— (brak decyzji)" (the page's
+      undecided card) with an empty note is NOT addressed: listed in
+      `skipped` (in text order), absent from `decisions` — the card keeps
+      its stored state. Its key, duplicates and `wariant (<k>)` are still
+      validated. The same line WITH a non-empty note refuses the whole
+      text (the owner wrote a comment without choosing a decision).
+    Any other non-blank line, a malformed card line, an unknown K-<n> or
+    option, or a text without a card line (empty, header only) →
+    ValueError naming the 1-based line. A text of skipped lines only is
+    valid: decisions = {}. A card not mentioned is in neither list."""
+    if not isinstance(text, str):
+        raise ValueError(f"decision text must be a string, got {type(text).__name__}")  # noqa: TRY004 — every refusal is a ValueError
+    options: dict[int, list[str]] = {}
+    for card in cards:
+        m = _SEQ_KEY.fullmatch(str(card.get("id", "")))
+        if m is None:
+            raise ValueError(f"cards: card id {card.get('id')!r} is not 'K-<n>'")
+        options[int(m.group(1))] = [o["k"] for o in card.get("opts") or []]
+    decisions: dict[str, dict] = {}
+    skipped: list[str] = []
+    prefill_line: str | None = None
+    header_seen = prefill_seen = False
+    for number, raw in enumerate(text.splitlines(), start=1):
+        line = raw.rstrip()
+        stripped = line.lstrip()
+        if not stripped:
+            continue
+        where = f"line {number}"
+        card = _TEXT_CARD.fullmatch(stripped)
+        first = not decisions and not skipped
+        if card is None:
+            if first and not header_seen and not prefill_seen \
+                    and _TEXT_HEADER.fullmatch(stripped):
+                header_seen = True
+                continue
+            if first and not prefill_seen and stripped.startswith(_TEXT_PREFILL):
+                prefill_seen = True
+                prefill_line = stripped
+                continue
+            raise ValueError(
+                f"{where}: not a decision line — expected 'K-<n>: <decision>"
+                f"[ · wariant (<k>)][ · uwagi: <note>]', got {stripped!r}")
+        seq = int(card.group(1))
+        key = f"K-{seq}"
+        where = f"{where} ({key})"
+        if seq not in options:
+            raise ValueError(f"{where}: no card {key} in this cycle")
+        if key in decisions or key in skipped:
+            raise ValueError(f"{where}: {key} is addressed twice")
+        rest = card.group(2)
+        note = None
+        at = rest.find(_TEXT_NOTE)
+        if at >= 0:
+            note = rest[at + len(_TEXT_NOTE):].removeprefix(" ") or None
+            rest = rest[:at]
+        segments = _TEXT_ANNOTATION.sub("", rest).strip().split(_TEXT_SEGMENT)
+        label = segments[0].strip()
+        undecided = _label_key(label) == _label_key(NO_DECISION_LABEL)
+        dec = None if undecided else _LABEL_KEYS.get(_label_key(label))
+        if dec is None and not undecided:
+            raise ValueError(
+                f"{where}: unknown decision {label!r} (accepted: "
+                + ", ".join(DECISION_LABELS) + ")")
+        opt = None
+        for segment in segments[1:]:
+            variant = _TEXT_VARIANT.fullmatch(segment.strip())
+            if variant is None or opt is not None:
+                raise ValueError(
+                    f"{where}: unexpected part {segment.strip()!r} — after the decision "
+                    "only ' · wariant (<k>)', [annotations] and ' · uwagi: <note>'")
+            opt = variant.group(1)
+            if opt not in options[seq]:
+                raise ValueError(
+                    f"{where}: wariant ({opt}) is not an option of {key}"
+                    + (f" (options: {', '.join(options[seq])})" if options[seq]
+                       else " (it has no options)"))
+        if undecided:
+            if note is not None:
+                raise ValueError(
+                    f"{where}: {key} has a note but no decision ('{NO_DECISION_LABEL}') "
+                    "— choose a decision for it or remove the note; nothing was recorded")
+            skipped.append(key)
+            continue
+        decisions[key] = {"dec": dec, "opt": opt, "note": note}
+    if not decisions and not skipped:
+        raise ValueError("decision text has no card line ('K-<n>: <decision> …')")
+    return {"decisions": decisions, "skipped": skipped, "prefill_line": prefill_line}
+
+
+def parse_decision_text(text: str, *, cards: list[dict]) -> dict[str, dict]:
+    """The decisions of parse_decision_batch only → {"K-<n>": {dec, opt,
+    note}} (skipped "— (brak decyzji)" lines and the prefill line are
+    dropped; an all-skipped text gives {})."""
+    return parse_decision_batch(text, cards=cards)["decisions"]
+
+
+def _parse_cards(conn: sa.Connection, cycle_id: int) -> list[dict]:
+    """The cycle's live cards as parse_decision_text needs them (id, opts.k)."""
+    rows = _live_findings(conn, cycle_id)
+    options = _live_options(conn, [r["id"] for r in rows])
+    return [{"id": f"K-{r['seq']}", "opts": [{"k": o["key"]} for o in options[r["id"]]]}
+            for r in rows]
+
+
+def decide_findings_from_text(
+    engine: sa.Engine,
+    cycle: int | str,
+    text: str,
+    *,
+    decided_by: str,
+    decision_source: str,
+    project: str | None = None,
+) -> dict:
+    """Record the OWNER's decisions pasted as the page's decision text →
+    {decided: n, undecided: [seq…], parsed: n, skipped: ['K-<n>'…]}.
+
+    `cycle` = id, or code with `project` (resolve_cycle). The text is parsed
+    (parse_decision_batch, against the cycle's live cards read first)
+    BEFORE the write transaction — a parse error writes and locks nothing;
+    the entries are then validated again and written in ONE transaction
+    under the cycle lock through the step decide_findings uses
+    (_decide_locked: same stamp, provenance, K-2 refusal and atomicity —
+    the first invalid entry refuses the whole batch). Only the findings the
+    text decides are changed: a "— (brak decyzji)" line without a note is
+    skipped (K-31, listed in `skipped`, its stored decision kept); a text of
+    skipped lines only still locks and checks the open cycle, then writes
+    nothing (decided 0). The text's "Punkt wyjścia:" line, when present, is
+    stored verbatim in decision_text_origin of every finding it decides
+    (K-40 — never in decision_note / decision_source; a later decision
+    without it resets the field to NULL). `undecided` is the post-write
+    state. Locks: as decide_findings."""
+    stamp = _decision_stamp(decided_by, decision_source, "decide_findings_from_text")
+    with engine.connect() as conn:
+        cycle_id, _project = _resolve_cycle(conn, project, cycle)
+        cards = _parse_cards(conn, cycle_id)
+    batch = parse_decision_batch(text, cards=cards)
+    decisions = batch["decisions"]
+    stamp["decision_text_origin"] = batch["prefill_line"]
+    now = _now()
+    with engine.begin() as conn:
+        _lock_open_cycle(conn, cycle_id)
+        if decisions:
+            out = _decide_locked(conn, cycle_id, decisions, stamp, now)
+        else:
+            out = {"decided": 0, "undecided": _undecided(conn, cycle_id)}
+    return {**out, "parsed": len(decisions), "skipped": batch["skipped"]}
+
+
+def accept_suggestions(
+    engine: sa.Engine,
+    cycle: int | str,
+    *,
+    expected_by: str,
+    decided_by: str,
+    decision_source: str,
+    expected_digest: str | None = None,
+    overwrite: bool = False,
+    project: str | None = None,
+) -> dict:
+    """The OWNER accepts the agent's proposals as final → {decided: n,
+    undecided: [seq…], without_suggestion: ['K-<n>'…], already_decided:
+    ['K-<n>'…]}.
+
+    `cycle` = id, or code with `project` (resolve_cycle). Every live finding
+    carrying a suggestion is addressed: decision = suggested_decision, opt =
+    suggested_opt, note = "[zaakceptowana propozycja <by>] " + the suggested
+    note (just the bracketed prefix when the proposal has no note), <by>
+    being THAT finding's suggested_by. Bound to the proposals the owner saw:
+    refused when any addressed finding's suggested_by differs from
+    `expected_by` (required), and — K-32 — when `expected_digest` (the
+    SUGGESTED.digest of the export the owner saw; None skips the check in
+    this workflow, the MCP / CLI / skill adapters always pass it) differs
+    from suggestion_digest recomputed from the rows read under the cycle
+    lock: a proposal revised (even by the same author), added or withdrawn,
+    or a card recorded or changed since that export refuses the whole
+    acceptance. Refused when no finding has a suggestion, and
+    when an addressed finding already has a decision unless `overwrite`
+    (then it is replaced and still listed in already_decided). Findings
+    without a suggestion are left untouched (without_suggestion). One
+    transaction under the cycle lock; suggestions are read after the lock
+    and written through the decide_findings step (_decide_locked: stamp,
+    provenance, K-2 refusal, atomicity). Locks: as decide_findings."""
+    where = "accept_suggestions"
+    expected_by = _required_text(expected_by, "expected_by", where)
+    if not isinstance(overwrite, bool):
+        raise ValueError(f"{where}: overwrite must be true or false, got {overwrite!r}")  # noqa: TRY004 — every refusal is a ValueError
+    if expected_digest is not None:
+        expected_digest = _required_text(expected_digest, "expected_digest", where)
+    stamp = _decision_stamp(decided_by, decision_source, where)
+    now = _now()
+    with engine.begin() as conn:
+        cycle_id, _project = _resolve_cycle(conn, project, cycle)
+        cycle_row = _lock_open_cycle(conn, cycle_id)
+        rows = _live_findings(conn, cycle_id)
+        addressed = [r for r in rows if r["suggested_decision"] is not None]
+        if not addressed:
+            raise ValueError(
+                f"{where}: no finding of triage cycle {cycle_row['code']} has a suggestion "
+                "— nothing to accept")
+        foreign = [r for r in addressed if r["suggested_by"] != expected_by]
+        if foreign:
+            raise ValueError(
+                f"{where}: the proposals are not all by {expected_by!r} — "
+                + ", ".join(f"K-{r['seq']} by {r['suggested_by']!r}" for r in foreign)
+                + " (nothing accepted; show the owner the current proposals first)")
+        if expected_digest is not None:
+            options = _live_options(conn, [r["id"] for r in rows])
+            current = _rows_digest(cycle_id, rows, options)
+            if current != expected_digest:
+                raise ValueError(
+                    f"{where}: the proposals or cards of triage cycle {cycle_row['code']} "
+                    f"changed since the export the owner saw (digest {expected_digest!r}, "
+                    f"now {current!r}) — nothing accepted; rebuild the page from the "
+                    "current export and show it to the owner first")
+        already = [f"K-{r['seq']}" for r in addressed if r["decision"] is not None]
+        if already and not overwrite:
+            raise ValueError(
+                f"{where}: {', '.join(already)} already decided — nothing accepted "
+                "(overwrite=true replaces those decisions with the proposals)")
+        decisions = {}
+        for r in addressed:
+            prefix = ACCEPTED_PREFIX.format(by=r["suggested_by"])
+            note = r["suggested_note"]
+            decisions[f"K-{r['seq']}"] = {
+                "dec": r["suggested_decision"], "opt": r["suggested_opt"],
+                "note": f"{prefix} {note}" if note else prefix,
+            }
+        out = _decide_locked(conn, cycle_id, decisions, stamp, now)
+    return {
+        **out,
+        "without_suggestion": [f"K-{r['seq']}" for r in rows
+                               if r["suggested_decision"] is None],
+        "already_decided": already,
+    }
+
+
+class _Omitted:
+    """The type of OMITTED — an argument the caller did not pass."""
+
+    def __repr__(self) -> str:
+        return "OMITTED"
+
+
+# update_triage: a field passed as OMITTED is left unchanged; None clears it.
+OMITTED = _Omitted()
+
+
+def update_triage(
+    engine: sa.Engine,
+    cycle: int | str,
+    *,
+    artifact_url: str | None | _Omitted = OMITTED,
+    project: str | None = None,
+) -> dict:
+    """Update an OPEN cycle's page link → {cycle_id, code, artifact_url}.
+
+    `cycle` = id, or code with `project` (resolve_cycle). `artifact_url`:
+    OMITTED (the default) = unchanged, None = cleared, a non-empty string =
+    set (≤ 500 chars, refused never truncated). Nothing to change (OMITTED)
+    is refused; so is a closed or missing cycle. Locks: the cycle row."""
+    where = "update_triage"
+    if artifact_url is OMITTED:
+        raise ValueError(f"{where}: nothing to update — pass artifact_url (None clears it)")
+    if artifact_url is not None:
+        artifact_url = _required_text(artifact_url, "artifact_url", where)
+        ensure_fits(triage_cycles, {"artifact_url": artifact_url})
+    now = _now()
+    with engine.begin() as conn:
+        cycle_id, _project = _resolve_cycle(conn, project, cycle)
+        cycle_row = _lock_open_cycle(conn, cycle_id)
+        conn.execute(triage_cycles.update().where(triage_cycles.c.id == cycle_id).values(
+            artifact_url=artifact_url, updated_at=now))
+    return {"cycle_id": cycle_id, "code": cycle_row["code"], "artifact_url": artifact_url}
 
 
 # ── close ────────────────────────────────────────────────────────────────────
@@ -1153,6 +1589,7 @@ def list_findings(
     cls: str | None = None,
     decision: str | None = None,
     source: str | None = None,
+    reviewer: str | None = None,
     limit: int = 50,
 ) -> dict:
     """The project's live findings as a brief {cols, rows} table (FINDING_COLS),
@@ -1162,13 +1599,17 @@ def list_findings(
     substring of area, case-insensitive for ASCII letters only — other
     characters match exactly, the same on SQLite and PostgreSQL; % and _
     are literal), cls (effective class: override or derived), decision,
-    source (reviewer). limit 0 = no limit."""
+    source (the free-text src, exact), reviewer (#930 §2a: findings
+    carrying this canonical reviewer token — lowercased and validated like a
+    recorded token, an invalid one refused). limit 0 = no limit."""
     if cls is not None:
         _enum(cls, rubric.CLASS_ORDER, "cls", "list_findings")
     if decision is not None:
         _enum(decision, rubric.DECISIONS, "decision", "list_findings")
     if not isinstance(limit, int) or isinstance(limit, bool) or limit < 0:
         raise ValueError("list_findings: limit must be a non-negative integer")
+    if reviewer is not None:
+        reviewer = reviewer_token(reviewer, "list_findings")
     with engine.connect() as conn:
         q = _project_findings_query(_project_id(conn, project))
         if cycle is not None:
@@ -1184,6 +1625,12 @@ def list_findings(
             q = q.where(findings.c.decision == decision)
         if source is not None:
             q = q.where(findings.c.reviewer == source)
+        if reviewer is not None:
+            q = q.where(sa.exists().where(
+                finding_reviewers.c.finding_id == findings.c.id,
+                finding_reviewers.c.reviewer == reviewer,
+                finding_reviewers.c.deleted_at.is_(None),
+            ))
         q = q.order_by(triage_cycles.c.id.desc(), findings.c.seq)
         if limit:
             q = q.limit(limit)
@@ -1208,45 +1655,135 @@ def finding_history(engine: sa.Engine, project: str, fingerprint: str) -> dict:
 
 
 def reviewer_precision(engine: sa.Engine, project: str, *, since: str | None = None) -> dict:
-    """Decided findings counted per reviewer and decision →
-    {cols: [source, decision, n], rows}. `since` limits the count to the
-    cohort of findings RECORDED since an anchor — findings.created_at, not
-    decided_at (the snapshot vocabulary: last_release | all | <N>h | ISO
-    date); None = all time. Undecided findings are not counted."""
+    """Decided findings counted per reviewer token and decision →
+    {cols: [reviewer, decision, n], rows} (#930 §2a). A finding with two
+    reviewer tokens counts once for each; a decided finding without tokens
+    counts under UNATTRIBUTED ("(unattributed)"), so nothing is silently
+    dropped — the sum of n can therefore exceed the decided findings.
+    `since` limits the count to the cohort of findings RECORDED since an
+    anchor — findings.created_at, not decided_at (the snapshot vocabulary:
+    last_release | all | <N>h | ISO date); None = all time. Undecided
+    findings are not counted."""
     with engine.connect() as conn:
         project_id = _project_id(conn, project)
         anchor = None
         if since is not None:
             anchor, _label = _parse_since_conn(conn, project_id, since)
+        # Grouped on the raw token (NULL = no reviewer row) and named in
+        # Python: a bound literal in a coalesce() would be two different
+        # parameters in SELECT and GROUP BY on PostgreSQL; the sort is done
+        # here too, so NULL ordering does not differ between backends.
         q = (
-            sa.select(findings.c.reviewer, findings.c.decision, sa.func.count().label("n"))
-            .select_from(findings.join(triage_cycles, triage_cycles.c.id == findings.c.cycle_id))
+            sa.select(finding_reviewers.c.reviewer, findings.c.decision,
+                      sa.func.count().label("n"))
+            .select_from(
+                findings.join(triage_cycles, triage_cycles.c.id == findings.c.cycle_id)
+                .outerjoin(finding_reviewers, sa.and_(
+                    finding_reviewers.c.finding_id == findings.c.id,
+                    finding_reviewers.c.deleted_at.is_(None))))
             .where(
                 triage_cycles.c.project_id == project_id,
                 triage_cycles.c.deleted_at.is_(None),
                 findings.c.deleted_at.is_(None),
                 findings.c.decision.is_not(None),
             )
-            .group_by(findings.c.reviewer, findings.c.decision)
-            .order_by(findings.c.reviewer, findings.c.decision)
+            .group_by(finding_reviewers.c.reviewer, findings.c.decision)
         )
         if anchor is not None:
             q = q.where(findings.c.created_at >= anchor)
-        rows = [{"source": r.reviewer, "decision": r.decision, "n": r.n}
-                for r in conn.execute(q)]
+        rows = sorted(
+            ({"reviewer": r.reviewer or UNATTRIBUTED, "decision": r.decision, "n": r.n}
+             for r in conn.execute(q)),
+            key=lambda r: (r["reviewer"], r["decision"]))
     return _to_cols_rows(rows, PRECISION_COLS)
+
+
+# ── suggestion digest (#930 K-32) ────────────────────────────────────────────
+
+# The card fields a proposal is judged against: what the owner reads on the
+# page next to it. Options: key, text, why, recommended, root.
+_DIGEST_CARD_FIELDS = ("id", "title", "fp", "S", "O", "E", "K", "origin", "type")
+
+
+def suggestion_digest(cycle_id: int, cards: list[dict], suggested_answers: dict) -> str:
+    """The canonical hash of the proposals a reader saw → sha256 hex — the
+    ONE implementation shared by export_triage (SUGGESTED.digest) and
+    accept_suggestions(expected_digest=…) (K-32).
+
+    Input: the cycle id; the cycle's CARDS in page order (export_triage's
+    cards — id, title, fp, S / O / E / K / origin / type and every option's
+    k / t / why / rec / root count; other keys are ignored); and per card
+    with a proposal {"K-<n>": {dec, opt, note, by}} (opt / note None and ""
+    alike; by = THAT card's proposer). Canonical JSON (sorted keys, no
+    whitespace, UTF-8) of all three, so any change to a proposal, its
+    author, a card's rubric fields or wording, an option, or the card set
+    itself yields another digest — a revision by the same author included."""
+    payload = {
+        "v": 1,
+        "cycle": int(cycle_id),
+        "cards": [
+            {**{f: c.get(f) for f in _DIGEST_CARD_FIELDS},
+             "opts": [{"k": o.get("k"), "t": o.get("t"), "why": o.get("why") or "",
+                       "rec": bool(o.get("rec")), "root": bool(o.get("root"))}
+                      for o in c.get("opts") or []]}
+            for c in cards
+        ],
+        "answers": {
+            str(key): {"dec": a.get("dec"), "opt": a.get("opt") or "",
+                       "note": a.get("note") or "", "by": a.get("by")}
+            for key, a in suggested_answers.items()
+        },
+    }
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _digest_answers(rows: list[Mapping]) -> dict:
+    """suggestion_digest's per-card proposals of the findings rows."""
+    return {
+        f"K-{r['seq']}": {"dec": r["suggested_decision"], "opt": r["suggested_opt"],
+                          "note": r["suggested_note"], "by": r["suggested_by"]}
+        for r in rows if r["suggested_decision"] is not None
+    }
+
+
+def _rows_digest(cycle_id: int, rows: list[Mapping], options: dict[int, list[dict]]) -> str:
+    """suggestion_digest of a cycle's live findings rows (by seq) and their
+    options — what export_triage publishes and accept_suggestions recomputes."""
+    return suggestion_digest(
+        cycle_id, [_card(r, options[r["id"]], []) for r in rows], _digest_answers(rows))
 
 
 # ── export ───────────────────────────────────────────────────────────────────
 
 
-def _card(row: Mapping, options: list[dict]) -> dict:
-    """One template CARD — field names exactly as the template's CARDS."""
+def _live_reviewers(conn: sa.Connection, finding_ids: list[int]) -> dict[int, list[str]]:
+    """The live reviewer tokens per finding, in recorded order."""
+    out: dict[int, list[str]] = {fid: [] for fid in finding_ids}
+    if not finding_ids:
+        return out
+    rows = conn.execute(
+        sa.select(finding_reviewers.c.finding_id, finding_reviewers.c.reviewer).where(
+            finding_reviewers.c.finding_id.in_(finding_ids),
+            finding_reviewers.c.deleted_at.is_(None),
+        ).order_by(finding_reviewers.c.finding_id, finding_reviewers.c.id)
+    )
+    for r in rows:
+        out[r.finding_id].append(r.reviewer)
+    return out
+
+
+def _card(row: Mapping, options: list[dict], reviewers: list[str]) -> dict:
+    """One template CARD — field names exactly as the template's CARDS, plus
+    `reviewers` (#930 §2a, the canonical tokens) when the finding has any;
+    like the optional flags it is absent otherwise, so an exported CARD
+    records back unchanged (record_findings refuses an empty list)."""
     card = {
         "id": f"K-{row['seq']}",
         "title": row["title"],
         "area": row["area"] or "",
         "src": row["reviewer"],
+        **({"reviewers": list(reviewers)} if reviewers else {}),
         **{k: v for k, v in _card_fields(row).items()
            if k in ("S", "O", "E", "K", "origin", "type")},
         "fp": row["fingerprint"],
@@ -1263,13 +1800,14 @@ def _card(row: Mapping, options: list[dict]) -> dict:
     return card
 
 
-def _suggested_payload(rows: list[Mapping]) -> dict | None:
+def _suggested_payload(rows: list[Mapping], digest: str) -> dict | None:
     with_suggestion = [r for r in rows if r["suggested_decision"] is not None]
     if not with_suggestion:
         return None
     latest = max(with_suggestion, key=lambda r: (r["suggested_at"], r["id"]))
     return {
         "by": latest["suggested_by"],
+        "digest": digest,
         "date": latest["suggested_at"].strftime("%Y-%m-%d"),
         "answers": _answers(
             [{"seq": r["seq"], "suggested_decision": r["suggested_decision"],
@@ -1282,9 +1820,12 @@ def export_triage(engine: sa.Engine, cycle: int | str, *, project: str | None = 
     """The page constants of a cycle → {cycle, cards, closed, suggested}.
 
     `cycle` = id, or code with `project` (resolve_cycle). cards = the
-    template's CARDS (by seq); closed = its CLOSED when the cycle is closed,
-    else None; suggested = its SUGGESTED {by, date, answers} when any
-    finding carries a suggestion (by / date of the latest), else None. The
+    template's CARDS (by seq; `reviewers` — the canonical tokens — next to
+    `src` when the finding has any); closed = its CLOSED when the cycle is closed,
+    else None; suggested = its SUGGESTED {by, digest, date, answers} when any
+    finding carries a suggestion (by / date of the latest; digest =
+    suggestion_digest of the cards and every proposal with its author —
+    the value accept_suggestions(expected_digest=…) takes back), else None. The
     values are the stored texts, unescaped; embed them in a page only
     through page_constants_json (K-1).
     """
@@ -1296,6 +1837,7 @@ def export_triage(engine: sa.Engine, cycle: int | str, *, project: str | None = 
         ).scalar_one()
         rows = _live_findings(conn, cycle_id)
         options = _live_options(conn, [r["id"] for r in rows])
+        reviewers = _live_reviewers(conn, [r["id"] for r in rows])
     cycle_out = {
         "id": cycle["id"], "project": slug, "code": cycle["code"], "topic": cycle["topic"],
         "scope": cycle["scope"], "base_commit": cycle["base_commit"],
@@ -1305,7 +1847,7 @@ def export_triage(engine: sa.Engine, cycle: int | str, *, project: str | None = 
     }
     return {
         "cycle": _json_safe(cycle_out),
-        "cards": [_card(r, options[r["id"]]) for r in rows],
+        "cards": [_card(r, options[r["id"]], reviewers[r["id"]]) for r in rows],
         "closed": _closed_payload(cycle, rows) if cycle["closed_at"] is not None else None,
-        "suggested": _suggested_payload(rows),
+        "suggested": _suggested_payload(rows, _rows_digest(cycle_id, rows, options)),
     }

@@ -21,6 +21,19 @@ Contract under test (spec #909 §3, owner decisions §8):
 - lock order project → cycle → finding → item; the races are proven with
   conftest.hold_row_and_race (pid-precise on PostgreSQL, K-16).
 - the export uses the template's CARDS / CLOSED / SUGGESTED names exactly.
+- #930: reviewer tokens (§2a) — validated, lowercased, never guessed from
+  src, exported next to src, filtered on, and counted per token by
+  reviewer_precision with an "(unattributed)" bucket; the page's decision
+  text (frozen grammar, §8) parsed purely and decided atomically through
+  the decide_findings step; acceptance of an agent's proposals bound to
+  their author (expected_by) and to undecided findings unless overwrite;
+  update_triage of an open cycle's page link (omitted ≠ cleared).
+- #930 rev 4: a "— (brak decyzji)" line without a note is skipped (K-31,
+  stored state kept, listed), with a note it refuses the batch; the
+  acceptance is bound to suggestion_digest of the export the owner saw,
+  compared under the cycle lock (K-32); the text's prefill line is stored
+  in decision_text_origin of the findings it decides and reset by every
+  other decision write (K-40).
 Expectations come from the spec and the rubric, not from reading the code.
 """
 
@@ -40,6 +53,7 @@ from dct.core.items import create_item, create_item_conn, get_item, resolve_item
 from dct.core.projects import create_project, delete_project
 from dct.db import (
     finding_options,
+    finding_reviewers,
     findings,
     items,
     lock_cycle_row,
@@ -49,19 +63,26 @@ from dct.db import (
 )
 from dct.workflows import triage as triage_module
 from dct.workflows.triage import (
+    OMITTED,
+    accept_suggestions,
     close_triage,
     decide_findings,
+    decide_findings_from_text,
     export_triage,
     finding_history,
     list_findings,
     normalize_fingerprint,
     open_triage,
     page_constants_json,
+    parse_decision_batch,
+    parse_decision_text,
     promote_finding_to_item,
     record_findings,
     resolve_cycle,
     reviewer_precision,
     suggest_findings,
+    suggestion_digest,
+    update_triage,
 )
 
 # ── helpers ──────────────────────────────────────────────────────────────────
@@ -866,8 +887,12 @@ class TestReads:
         _recorded(engine, other, finding())
         decide(engine, other, {"K-1": {"dec": "reject"}})
         out = reviewer_precision(engine, "proj-a")
-        assert out["cols"] == ["source", "decision", "n"]
-        assert sorted(map(tuple, out["rows"])) == [("codex", "fix", 2), ("panel:perf", "reject", 1)]
+        # #930 §2a: counted per reviewer TOKEN; these findings were recorded
+        # without tokens, so they land in the unattributed bucket — never a
+        # token guessed from their src ("codex", "panel:perf").
+        assert out["cols"] == ["reviewer", "decision", "n"]
+        assert sorted(map(tuple, out["rows"])) == [
+            ("(unattributed)", "fix", 2), ("(unattributed)", "reject", 1)]
         assert reviewer_precision(engine, "proj-a", since="all") == out
         assert reviewer_precision(engine, "proj-a", since="2999-01-01")["rows"] == []
 
@@ -1658,3 +1683,864 @@ class TestForeignKeyLocks:
         assert not isinstance(recorded, Exception), recorded
         assert recorded["recorded"][0]["first_seen_id"] == 1
         assert _row(eng, 1)["decision"] == "reject"
+
+
+# ── #930 §2a: reviewer tokens ────────────────────────────────────────────────
+
+
+def _tokens(eng, finding_id):
+    with eng.connect() as conn:
+        return list(conn.execute(
+            sa.select(finding_reviewers.c.reviewer).where(
+                finding_reviewers.c.finding_id == finding_id,
+                finding_reviewers.c.deleted_at.is_(None),
+            ).order_by(finding_reviewers.c.id)).scalars())
+
+
+def _retire_tokens(eng, finding_id):
+    with eng.begin() as conn:
+        conn.execute(finding_reviewers.update().where(
+            finding_reviewers.c.finding_id == finding_id).values(deleted_at=datetime.now(UTC)))
+
+
+class TestReviewerTokens:
+    def test_tokens_are_lowercased_kept_in_order_and_exported_next_to_src(self, engine):
+        cycle_id = _setup(engine)
+        fid = _recorded(engine, cycle_id, finding(
+            src="Codex + security panel", reviewers=["Codex", "panel:Security", "a.b_c-1"],
+        ))[0]["finding_id"]
+        assert _tokens(engine, fid) == ["codex", "panel:security", "a.b_c-1"]
+        card = export_triage(engine, cycle_id)["cards"][0]
+        assert card["src"] == "Codex + security panel"  # the display text, unchanged
+        assert card["reviewers"] == ["codex", "panel:security", "a.b_c-1"]
+        assert list(card).index("reviewers") == list(card).index("src") + 1
+
+    def test_a_finding_without_tokens_has_none_and_none_is_guessed_from_src(self, engine):
+        cycle_id = _setup(engine)
+        fid = _recorded(engine, cycle_id, finding(src="codex"))[0]["finding_id"]
+        assert _tokens(engine, fid) == []
+        assert "reviewers" not in export_triage(engine, cycle_id)["cards"][0]
+        assert list_findings(engine, "proj-a", reviewer="codex")["rows"] == []
+
+    def test_a_token_of_exactly_fifty_chars_fits(self, engine):
+        cycle_id = _setup(engine)
+        fid = _recorded(engine, cycle_id, finding(reviewers=["x" * 50]))[0]["finding_id"]
+        assert _tokens(engine, fid) == ["x" * 50]
+
+    @pytest.mark.parametrize(("reviewers", "match"), [
+        ([], "non-empty list"),
+        ("codex", "non-empty list"),
+        ({"codex": 1}, "non-empty list"),
+        ([""], "not a token"),
+        ([" codex"], "not a token"),  # never stripped
+        (["codex "], "not a token"),
+        (["-codex"], "not a token"),
+        ([":x"], "not a token"),
+        (["two words"], "not a token"),
+        (["zespół"], "not a token"),  # non-ASCII
+        (["codex/x"], "not a token"),
+        ([7], "must be a string"),
+        ([None], "must be a string"),
+        (["codex", "CODEX"], "listed twice"),  # a duplicate after lowercasing
+        (["x" * 51], "reviewer too long: 51 chars, max 50"),
+    ])
+    def test_a_bad_token_refuses_the_whole_batch(self, engine, reviewers, match):
+        cycle_id = _setup(engine)
+        with pytest.raises(ValueError, match=match):
+            record_findings(engine, cycle_id, [
+                finding(fp="fine", reviewers=["codex"]), finding(reviewers=reviewers)])
+        assert _count(engine, findings) == 0
+        assert _count(engine, finding_reviewers) == 0
+
+    def test_src_stays_required_next_to_tokens(self, engine):
+        cycle_id = _setup(engine)
+        raw = finding(reviewers=["codex"])
+        del raw["src"]
+        with pytest.raises(ValueError, match="src"):
+            record_findings(engine, cycle_id, [raw])
+        assert _count(engine, finding_reviewers) == 0
+
+    def test_exported_cards_with_tokens_record_back_unchanged(self, engine):
+        """Bidirectional: the CARD (with and without `reviewers`) is accepted
+        by record_findings as is and exports identically."""
+        cycle_id = _setup(engine)
+        _recorded(engine, cycle_id, finding(reviewers=["codex", "panel:perf"]),
+                  finding(fp="second", opts=[]))
+        cards = export_triage(engine, cycle_id)["cards"]
+        copy = open_triage(engine, "proj-a", "rev-copy", "copy", "me")["cycle_id"]
+        record_findings(engine, copy, cards)
+        assert export_triage(engine, copy)["cards"] == cards
+
+    def test_the_reviewer_filter_matches_live_tokens_case_insensitively(self, engine):
+        cycle_id = _setup(engine)
+        r = _recorded(engine, cycle_id,
+                      finding(reviewers=["codex", "panel:perf"]),
+                      finding(fp="b", reviewers=["panel:perf"]),
+                      finding(fp="c"))
+        seq = list_findings(engine, "proj-a")["cols"].index("seq")
+
+        def seqs(token):
+            return sorted(row[seq] for row in list_findings(engine, "proj-a", reviewer=token)["rows"])
+
+        assert seqs("CODEX") == [1]
+        assert seqs("panel:perf") == [1, 2]
+        _retire_tokens(engine, r[1]["finding_id"])
+        assert seqs("panel:perf") == [1]  # a soft-deleted token no longer matches
+
+    @pytest.mark.parametrize("token", ["", "two words", "(unattributed)", 5])
+    def test_the_reviewer_filter_refuses_a_non_token(self, engine, token):
+        _setup(engine)
+        with pytest.raises(ValueError, match="list_findings"):
+            list_findings(engine, "proj-a", reviewer=token)
+
+
+class TestReviewerPrecision:
+    def test_a_two_reviewer_finding_counts_for_both_and_untokened_ones_are_unattributed(
+        self, engine,
+    ):
+        cycle_id = _setup(engine)
+        _recorded(engine, cycle_id,
+                  finding(reviewers=["codex", "panel:security"]),   # K-1 fix
+                  finding(fp="b", reviewers=["codex"]),             # K-2 reject
+                  finding(fp="c"),                                  # K-3 fix, no token
+                  finding(fp="d", reviewers=["panel:security"]))    # K-4 undecided
+        decide(engine, cycle_id, {"K-1": {"dec": "fix"}, "K-2": {"dec": "reject"},
+                                  "K-3": {"dec": "fix"}})
+        other = _setup(engine, slug="proj-b")
+        _recorded(engine, other, finding(reviewers=["codex"]))
+        decide(engine, other, {"K-1": {"dec": "fix"}})
+
+        out = reviewer_precision(engine, "proj-a")
+        assert out["cols"] == ["reviewer", "decision", "n"]
+        assert out["rows"] == [
+            ["(unattributed)", "fix", 1],
+            ["codex", "fix", 1],
+            ["codex", "reject", 1],
+            ["panel:security", "fix", 1],
+        ]
+        json.dumps(out)
+
+    def test_a_soft_deleted_token_drops_out_and_a_tokenless_finding_is_unattributed(
+        self, engine,
+    ):
+        cycle_id = _setup(engine)
+        r = _recorded(engine, cycle_id, finding(reviewers=["codex"]),
+                      finding(fp="b", reviewers=["codex", "panel:x"]))
+        decide(engine, cycle_id, {"K-1": {"dec": "note"}, "K-2": {"dec": "note"}})
+        _retire_tokens(engine, r[0]["finding_id"])
+        assert reviewer_precision(engine, "proj-a")["rows"] == [
+            ["(unattributed)", "note", 1], ["codex", "note", 1], ["panel:x", "note", 1]]
+
+    def test_since_bounds_the_recorded_cohort(self, engine):
+        cycle_id = _setup(engine)
+        _recorded(engine, cycle_id, finding(reviewers=["codex"]))
+        decide(engine, cycle_id, {"K-1": {"dec": "fix"}})
+        assert reviewer_precision(engine, "proj-a", since="all")["rows"] == [["codex", "fix", 1]]
+        assert reviewer_precision(engine, "proj-a", since="2999-01-01")["rows"] == []
+
+
+# ── #930 §8: the page's decision text ────────────────────────────────────────
+
+# The producer is the template's generate(); these helpers emit its lines
+# exactly ("<id>: <label>[ · wariant (<k>)[ [inny niż rekomendacja]]]
+# [ [inna niż klasa <X>]][ · uwagi: <note>]", header, optional prefill
+# line), so the parser is tested against what the page writes.
+HEADER = "Triage review of X (proj-a) — decyzje ownera (2026-10-14 09:30), rubric v2:"
+PREFILL = ("Punkt wyjścia: propozycje Codex z 2026-10-14 — wstępnie wypełnione, "
+           "to nie są decyzje; poniżej stan formularza.")
+
+
+def card_line(key, label, *, opt=None, rec=True, cls_label=None, note=None):
+    line = f"{key}: {label}"
+    if opt:
+        line += f" · wariant ({opt})" + ("" if rec else " [inny niż rekomendacja]")
+    if cls_label:
+        line += f" [inna niż klasa {cls_label}]"
+    if note:
+        line += " · uwagi: " + " ".join(note.split())
+    return line
+
+
+def page_text(*lines, prefill=False):
+    return "\n".join([HEADER, *([PREFILL] if prefill else []), *lines])
+
+
+CARDS_AB = [  # K-1 with options a / b, K-2 without options, K-10 with a
+    {"id": "K-1", "opts": [{"k": "a"}, {"k": "b"}]},
+    {"id": "K-2", "opts": []},
+    {"id": "K-10", "opts": [{"k": "a"}]},
+]
+
+
+class TestParseDecisionText:
+    @pytest.mark.parametrize(("label", "dec"), [
+        ("Fix teraz", "fix"), ("Zweryfikuj", "verify"), ("Backlog → dct", "backlog"),
+        ("Odrzuć / zaakceptuj stan", "reject"), ("Odnotuj", "note"), ("Do dyskusji", "discuss"),
+        ("fix", "fix"), ("verify", "verify"), ("backlog", "backlog"), ("reject", "reject"),
+        ("note", "note"), ("discuss", "discuss"),
+        ("FIX TERAZ", "fix"), ("backlog -> dct", "backlog"), ("Backlog — dct", "backlog"),
+        ("Backlog→dct", "backlog"), ("odrzuć — zaakceptuj   stan", "reject"),
+        ("Do  dyskusji", "discuss"), ("VERIFY", "verify"),
+    ])
+    def test_every_label_and_token_maps_to_its_decision(self, label, dec):
+        assert parse_decision_text(page_text(card_line("K-2", label)), cards=CARDS_AB) == {
+            "K-2": {"dec": dec, "opt": None, "note": None}}
+
+    def test_a_full_page_text_parses_with_variants_annotations_and_notes(self):
+        text = page_text(
+            card_line("K-1", "Fix teraz", opt="b", rec=False, cls_label="Verify",
+                      note="Tak, ale [ważne] · tylko wariant (b) · uwagi: drugie"),
+            card_line("K-2", "Do dyskusji", cls_label="Fix now"),
+            card_line("K-10", "Backlog → dct", opt="a"),
+            prefill=True,
+        )
+        assert parse_decision_text(text, cards=CARDS_AB) == {
+            "K-1": {"dec": "fix", "opt": "b",
+                    "note": "Tak, ale [ważne] · tylko wariant (b) · uwagi: drugie"},
+            "K-2": {"dec": "discuss", "opt": None, "note": None},
+            "K-10": {"dec": "backlog", "opt": "a", "note": None},
+        }
+
+    def test_the_note_drops_exactly_one_leading_space_and_trailing_whitespace(self):
+        text = "K-2: Odnotuj · uwagi:   wcięte  \t"
+        assert parse_decision_text(text, cards=CARDS_AB)["K-2"]["note"] == "  wcięte"
+
+    @pytest.mark.parametrize("tail", [" · uwagi:", " · uwagi: ", " · uwagi:   "])
+    def test_an_empty_note_is_none(self, tail):
+        assert parse_decision_text("K-2: note" + tail, cards=CARDS_AB)["K-2"]["note"] is None
+
+    @pytest.mark.parametrize("newline", ["\r\n", "\r", "\n"])
+    def test_line_endings_and_blank_lines_do_not_matter(self, newline):
+        text = newline.join(["", HEADER, "", "K-1: fix · wariant (a)", "   ", "K-2: note", ""])
+        assert set(parse_decision_text(text, cards=CARDS_AB)) == {"K-1", "K-2"}
+
+    def test_leading_zeros_name_the_same_card(self):
+        assert parse_decision_text("K-01: fix\nK-010: note", cards=CARDS_AB) == {
+            "K-1": {"dec": "fix", "opt": None, "note": None},
+            "K-10": {"dec": "note", "opt": None, "note": None}}
+
+    def test_a_card_not_mentioned_is_not_in_the_result(self):
+        assert list(parse_decision_text(page_text("K-2: note"), cards=CARDS_AB)) == ["K-2"]
+
+    @pytest.mark.parametrize(("text", "match"), [
+        (page_text("K-1: fix", "K-01: note"), r"line 3 \(K-1\): K-1 is addressed twice"),
+        (page_text("K-3: fix"), r"line 2 \(K-3\): no card K-3"),
+        (page_text("K-0: fix"), r"line 2 \(K-0\): no card K-0"),
+        # K-31: an undecided card line is skipped only without a note, and
+        # its key / variant / duplicates are still validated
+        (page_text("K-1: — (brak decyzji) · uwagi: tak, ale"),
+         r"line 2 \(K-1\): K-1 has a note but no decision"),
+        (page_text("K-2: fix", "K-1: — (brak decyzji) · wariant (a) · uwagi: x"),
+         r"line 3 \(K-1\): K-1 has a note but no decision"),
+        (page_text("K-1: — (brak decyzji) · wariant (z)"),
+         r"line 2 \(K-1\): wariant \(z\) is not an option"),
+        (page_text("K-9: — (brak decyzji)"), r"line 2 \(K-9\): no card K-9"),
+        (page_text("K-1: — (brak decyzji)", "K-1: fix"), r"line 3 \(K-1\): K-1 is addressed twice"),
+        (page_text("K-1: fix", "K-01: — (brak decyzji)"), r"line 3 \(K-1\): K-1 is addressed twice"),
+        (page_text("K-1: — (brak decyzji)", "K-1: — (brak decyzji)"), "K-1 is addressed twice"),
+        (page_text("K-1: — (brak decyzji) · tak"), "unexpected part 'tak'"),
+        (page_text("K-1: approve"), r"line 2 \(K-1\): unknown decision 'approve'"),
+        (page_text("K-1: Odrzuć"), r"line 2 \(K-1\): unknown decision 'Odrzuć'"),
+        (page_text("K-1:"), r"line 2 \(K-1\): unknown decision ''"),
+        (page_text("K-1: fix · wariant (z)"), r"line 2 \(K-1\): wariant \(z\) is not an option"),
+        (page_text("K-2: fix · wariant (a)"), "it has no options"),
+        (page_text("K-1: fix · wariant (a) · wariant (b)"), "unexpected part 'wariant \\(b\\)'"),
+        (page_text("K-1: fix · tak"), "unexpected part 'tak'"),
+        (page_text("K-1: fix", "Dziękuję!"), "line 3: not a decision line"),
+        (page_text("K-1: fix", HEADER), "line 3: not a decision line"),  # header after a card
+        (page_text("K-1: fix", PREFILL), "line 3: not a decision line"),
+        (f"{HEADER}\n{HEADER}\nK-1: fix", "line 2: not a decision line"),
+        (f"{PREFILL}\n{PREFILL}\nK-1: fix", "line 2: not a decision line"),
+        ("K1: fix", "line 1: not a decision line"),
+        ("K-: fix", "line 1: not a decision line"),
+        ("K-1 fix", "line 1: not a decision line"),
+        ("- K-1: fix", "line 1: not a decision line"),
+        ("Q-1: fix", "line 1: not a decision line"),
+        ("", "no card line"),
+        ("  \n\n", "no card line"),
+        (HEADER, "no card line"),
+        (page_text(prefill=True), "no card line"),
+    ])
+    def test_malformed_text_is_refused_naming_the_line(self, text, match):
+        with pytest.raises(ValueError, match=match):
+            parse_decision_text(text, cards=CARDS_AB)
+
+    def test_a_non_string_is_refused(self):
+        with pytest.raises(ValueError, match="must be a string"):
+            parse_decision_text(None, cards=CARDS_AB)
+
+
+class TestDecideFromText:
+    def test_the_text_decides_only_what_it_names_and_reports_the_post_write_state(
+        self, triaged,
+    ):
+        eng, cycle_id = triaged
+        decide(eng, cycle_id, {"K-2": {"dec": "backlog", "note": "earlier"}})
+        out = decide_findings_from_text(
+            eng, cycle_id, page_text(card_line("K-1", "Fix teraz", opt="a", note="ok")),
+            **OWNER)
+        assert out == {"decided": 1, "undecided": [], "parsed": 1, "skipped": []}
+        k1, k2 = _row(eng, 1), _row(eng, 2)
+        assert (k1["decision"], k1["decision_opt"], k1["decision_note"]) == ("fix", "a", "ok")
+        assert (k1["decided_by"], k1["decision_source"]) == (
+            OWNER["decided_by"], OWNER["decision_source"])
+        assert (k2["decision"], k2["decision_note"]) == ("backlog", "earlier")
+
+    def test_undecided_lists_the_findings_still_open_after_a_partial_text(self, triaged):
+        eng, _cycle_id = triaged
+        out = decide_findings_from_text(eng, "rev-1", "K-2: note", project="proj-a", **OWNER)
+        assert out == {"decided": 1, "undecided": [1], "parsed": 1, "skipped": []}
+
+    def test_a_valid_line_then_an_invalid_one_writes_nothing(self, triaged):
+        eng, cycle_id = triaged
+        with pytest.raises(ValueError, match="line 3"):
+            decide_findings_from_text(
+                eng, cycle_id, page_text("K-1: fix · wariant (a)", "K-2: fix · wariant (q)"),
+                **OWNER)
+        assert _row(eng, 1)["decision"] is None
+
+    def test_a_refusal_at_write_time_writes_nothing(self, triaged):
+        """K-2 through the shared step: reject on a finding promoted to an
+        open item is refused after the parse, and the valid K-2 line before
+        it is not written either."""
+        eng, cycle_id = triaged
+        decide(eng, cycle_id, {"K-1": {"dec": "fix"}})
+        item_id = promote_finding_to_item(eng, 1)["id"]
+        with pytest.raises(ValueError, match=f"close item #{item_id} first"):
+            decide_findings_from_text(eng, cycle_id, "K-2: note\nK-1: reject", **OWNER)
+        assert _row(eng, 2)["decision"] is None
+        assert _row(eng, 1)["decision"] == "fix"
+
+    def test_a_closed_cycle_is_refused(self, triaged):
+        eng, cycle_id = triaged
+        decide(eng, cycle_id, {"K-1": {"dec": "fix"}, "K-2": {"dec": "note"}})
+        close_triage(eng, cycle_id, source="chat")
+        with pytest.raises(ValueError, match="is closed"):
+            decide_findings_from_text(eng, cycle_id, "K-1: reject", **OWNER)
+        assert _row(eng, 1)["decision"] == "fix"
+
+    def test_a_cycle_of_another_project_is_refused(self, triaged):
+        eng, cycle_id = triaged
+        create_project(eng, "proj-b", "B")
+        with pytest.raises(ValueError, match="does not belong to project 'proj-b'"):
+            decide_findings_from_text(eng, cycle_id, "K-1: fix", project="proj-b", **OWNER)
+        assert _row(eng, 1)["decision"] is None
+
+    @pytest.mark.parametrize("field", ["decided_by", "decision_source"])
+    def test_the_stamp_is_required(self, triaged, field):
+        eng, cycle_id = triaged
+        with pytest.raises(ValueError, match=f"{field} is required"):
+            decide_findings_from_text(eng, cycle_id, "K-1: fix", **{**OWNER, field: " "})
+
+    def test_the_writer_provenance_is_replaced_by_the_text_decision(self, triaged):
+        eng, cycle_id = triaged
+        provenance.set_provenance(provenance.Provenance(
+            actor_type="agent", actor_client="codex", session_id="s-1", source="mcp"))
+        try:
+            decide(eng, cycle_id, {"K-1": {"dec": "fix"}})
+            provenance.set_provenance(provenance.Provenance(actor_client="claude-code",
+                                                           source="cli"))
+            decide_findings_from_text(eng, cycle_id, "K-1: note", **OWNER)
+        finally:
+            provenance.set_provenance(provenance.Provenance())
+        row = _row(eng, 1)
+        assert (row["decision_actor_type"], row["decision_actor_client"],
+                row["decision_session_id"], row["decision_actor_source"]) == (
+            None, "claude-code", None, "cli")
+
+
+# ── #930 K-31 / K-40: skipped cards and the prefill line ────────────────────
+
+NO_DECISION = "— (brak decyzji)"
+
+
+class TestParseDecisionBatch:
+    def test_a_card_without_decision_or_note_is_skipped_not_decided(self):
+        text = page_text(card_line("K-1", "Fix teraz", opt="a"), card_line("K-2", NO_DECISION),
+                         card_line("K-10", NO_DECISION, opt="a", rec=False))
+        assert parse_decision_batch(text, cards=CARDS_AB) == {
+            "decisions": {"K-1": {"dec": "fix", "opt": "a", "note": None}},
+            "skipped": ["K-2", "K-10"],
+            "prefill_line": None,
+        }
+
+    def test_a_text_of_skipped_lines_only_has_no_decisions(self):
+        text = page_text(card_line("K-2", NO_DECISION), card_line("K-1", NO_DECISION))
+        assert parse_decision_batch(text, cards=CARDS_AB) == {
+            "decisions": {}, "skipped": ["K-2", "K-1"], "prefill_line": None}
+        assert parse_decision_text(text, cards=CARDS_AB) == {}
+
+    @pytest.mark.parametrize("text", ["", "   \n", HEADER, page_text(prefill=True)])
+    def test_a_text_without_any_card_line_is_still_refused(self, text):
+        with pytest.raises(ValueError, match="no card line"):
+            parse_decision_batch(text, cards=CARDS_AB)
+
+    def test_the_prefill_line_is_returned_verbatim(self):
+        text = page_text(card_line("K-2", "Odnotuj"), prefill=True)
+        assert parse_decision_batch(text, cards=CARDS_AB)["prefill_line"] == PREFILL
+        indented = text.replace(PREFILL, f"  {PREFILL}  \t")
+        assert parse_decision_batch(indented, cards=CARDS_AB)["prefill_line"] == PREFILL
+
+    def test_parse_decision_text_is_the_decisions_of_the_batch(self):
+        text = page_text(card_line("K-1", "fix", note="tak"), card_line("K-2", NO_DECISION),
+                         prefill=True)
+        assert parse_decision_text(text, cards=CARDS_AB) == parse_decision_batch(
+            text, cards=CARDS_AB)["decisions"]
+
+
+def _decided(eng, finding_id):
+    r = _row(eng, finding_id)
+    return (r["decision"], r["decision_opt"], r["decision_note"], r["decision_source"],
+            r["decision_text_origin"])
+
+
+class TestDecideFromTextBatch:
+    def test_a_skipped_card_keeps_its_earlier_decision_and_is_listed(self, triaged):
+        eng, cycle_id = triaged
+        decide(eng, cycle_id, {"K-2": {"dec": "backlog", "note": "earlier"}})
+        text = page_text(card_line("K-1", "Zweryfikuj", opt="b", rec=False),
+                         card_line("K-2", NO_DECISION))
+        out = decide_findings_from_text(eng, cycle_id, text, **OWNER)
+        assert out == {"decided": 1, "undecided": [], "parsed": 1, "skipped": ["K-2"]}
+        assert _decided(eng, 2)[:3] == ("backlog", None, "earlier")
+        assert _decided(eng, 1)[:2] == ("verify", "b")
+
+    def test_skipped_lines_only_write_nothing_and_report_the_state(self, triaged):
+        eng, cycle_id = triaged
+        decide(eng, cycle_id, {"K-1": {"dec": "fix"}})
+        before = (_row(eng, 1), _row(eng, 2))
+        text = page_text(card_line("K-1", NO_DECISION), card_line("K-2", NO_DECISION),
+                         prefill=True)
+        out = decide_findings_from_text(eng, cycle_id, text, decided_by="someone else",
+                                        decision_source="other")
+        assert out == {"decided": 0, "undecided": [2], "parsed": 0, "skipped": ["K-1", "K-2"]}
+        assert (_row(eng, 1), _row(eng, 2)) == before
+
+    def test_skipped_lines_only_still_refuse_a_closed_cycle(self, triaged):
+        eng, cycle_id = triaged
+        decide(eng, cycle_id, {"K-1": {"dec": "fix"}, "K-2": {"dec": "note"}})
+        close_triage(eng, cycle_id, source="chat")
+        with pytest.raises(ValueError, match="is closed"):
+            decide_findings_from_text(eng, cycle_id, card_line("K-1", NO_DECISION), **OWNER)
+
+    def test_a_note_without_a_decision_refuses_the_whole_batch(self, triaged):
+        eng, cycle_id = triaged
+        text = page_text(card_line("K-1", "Fix teraz", opt="a"),
+                         card_line("K-2", NO_DECISION, note="nie wiem jeszcze"))
+        with pytest.raises(ValueError, match=r"line 3 \(K-2\): K-2 has a note but no decision"):
+            decide_findings_from_text(eng, cycle_id, text, **OWNER)
+        assert _row(eng, 1)["decision"] is None and _row(eng, 2)["decision"] is None
+
+    @pytest.mark.parametrize("text", ["", HEADER])
+    def test_an_empty_text_is_refused(self, triaged, text):
+        eng, cycle_id = triaged
+        with pytest.raises(ValueError, match="no card line"):
+            decide_findings_from_text(eng, cycle_id, text, **OWNER)
+
+
+class TestDecisionTextOrigin:
+    """K-40: the "Punkt wyjścia" line is stored verbatim in
+    decision_text_origin of every finding the text decides — never in the
+    note or the source — and every later decision without it resets it."""
+
+    def test_a_prefilled_text_marks_only_the_findings_it_decides(self, triaged):
+        """Partial batch: K-1 accepted as proposed, K-2 skipped."""
+        eng, cycle_id = triaged
+        text = page_text(card_line("K-1", "Fix teraz", opt="a", note="jak proponowano"),
+                         card_line("K-2", NO_DECISION), prefill=True)
+        decide_findings_from_text(eng, cycle_id, text, **OWNER)
+        assert _decided(eng, 1) == ("fix", "a", "jak proponowano",
+                                    OWNER["decision_source"], PREFILL)
+        assert _decided(eng, 2) == (None, None, None, None, None)
+
+    def test_accepted_and_edited_notes_alike_carry_the_origin_and_stay_verbatim(self, triaged):
+        """Mixed accept / edit: the line proves the form was seeded, not who
+        wrote each note — both notes are stored exactly as pasted."""
+        eng, cycle_id = triaged
+        suggest_findings(eng, cycle_id, "Codex", {"K-1": {"dec": "fix", "opt": "a",
+                                                           "note": "propozycja"},
+                                                  "K-2": {"dec": "note"}})
+        edited = "Nie — [ważne] · uwagi: zostaw (b)"
+        text = page_text(card_line("K-1", "Fix teraz", opt="a", note="propozycja"),
+                         card_line("K-2", "Odrzuć / zaakceptuj stan", note=edited),
+                         prefill=True)
+        decide_findings_from_text(eng, cycle_id, text, **OWNER)
+        assert _decided(eng, 1) == ("fix", "a", "propozycja", OWNER["decision_source"], PREFILL)
+        assert _decided(eng, 2) == ("reject", None, edited, OWNER["decision_source"], PREFILL)
+
+    def test_a_text_without_the_prefill_line_resets_the_origin(self, triaged):
+        eng, cycle_id = triaged
+        decide_findings_from_text(eng, cycle_id, page_text("K-1: fix", prefill=True), **OWNER)
+        assert _decided(eng, 1)[4] == PREFILL
+        decide_findings_from_text(eng, cycle_id, page_text("K-1: note"), **OWNER)
+        assert _decided(eng, 1)[:2] == ("note", None) and _decided(eng, 1)[4] is None
+
+    @pytest.mark.parametrize("writer", ["decide", "accept"])
+    def test_every_other_decision_write_resets_the_origin(self, triaged, writer):
+        eng, cycle_id = triaged
+        decide_findings_from_text(eng, cycle_id, page_text("K-1: fix", prefill=True), **OWNER)
+        if writer == "decide":
+            decide(eng, cycle_id, {"K-1": {"dec": "verify"}})
+        else:
+            suggest_findings(eng, cycle_id, "Codex", {"K-1": {"dec": "backlog"}})
+            accept(eng, cycle_id, overwrite=True)
+        assert _decided(eng, 1)[4] is None
+
+    def test_suggest_never_touches_the_origin(self, triaged):
+        eng, cycle_id = triaged
+        decide_findings_from_text(eng, cycle_id, page_text("K-1: fix", prefill=True), **OWNER)
+        suggest_findings(eng, cycle_id, "Codex", {"K-1": {"dec": "reject"}})
+        assert _decided(eng, 1)[4] == PREFILL
+
+
+# ── #930 §8: accepting an agent's proposals ──────────────────────────────────
+
+
+def accept(eng, cycle, **kw):
+    return accept_suggestions(eng, cycle, **{"expected_by": "Codex", **OWNER, **kw})
+
+
+class TestAcceptSuggestions:
+    def test_each_proposal_becomes_the_decision_with_the_prefixed_note(self, triaged):
+        eng, cycle_id = triaged
+        suggest_findings(eng, cycle_id, "Codex", {
+            "K-1": {"dec": "fix", "opt": "b", "note": "bo [b] · prościej"},
+            "K-2": {"dec": "backlog"},  # no note
+        })
+        out = accept(eng, cycle_id)
+        assert out == {"decided": 2, "undecided": [], "without_suggestion": [],
+                       "already_decided": []}
+        k1, k2 = _row(eng, 1), _row(eng, 2)
+        assert (k1["decision"], k1["decision_opt"], k1["decision_note"]) == (
+            "fix", "b", "[zaakceptowana propozycja Codex] bo [b] · prościej")
+        assert (k2["decision"], k2["decision_opt"], k2["decision_note"]) == (
+            "backlog", None, "[zaakceptowana propozycja Codex]")
+        assert (k1["decided_by"], k1["decision_source"]) == (
+            OWNER["decided_by"], OWNER["decision_source"])
+        # the proposal itself stays recorded as a proposal
+        assert (k1["suggested_decision"], k1["suggested_by"]) == ("fix", "Codex")
+
+    def test_findings_without_a_proposal_are_left_untouched_and_listed(self, triaged):
+        eng, cycle_id = triaged
+        suggest_findings(eng, cycle_id, "Codex", {"K-2": {"dec": "note"}})
+        out = accept(eng, "rev-1", project="proj-a")
+        assert out == {"decided": 1, "undecided": [1], "without_suggestion": ["K-1"],
+                       "already_decided": []}
+        assert _row(eng, 1)["decision"] is None
+
+    def test_no_proposal_at_all_is_refused(self, triaged):
+        eng, cycle_id = triaged
+        with pytest.raises(ValueError, match="nothing to accept"):
+            accept(eng, cycle_id)
+
+    def test_proposals_of_another_author_are_refused_whole(self, triaged):
+        """Mixed authors: the owner saw Codex's proposals; one by another
+        agent refuses the whole acceptance."""
+        eng, cycle_id = triaged
+        suggest_findings(eng, cycle_id, "Codex", {"K-1": {"dec": "fix"}})
+        suggest_findings(eng, cycle_id, "other-agent", {"K-2": {"dec": "note"}})
+        with pytest.raises(ValueError, match="K-2 by 'other-agent'"):
+            accept(eng, cycle_id)
+        assert _row(eng, 1)["decision"] is None and _row(eng, 2)["decision"] is None
+
+    def test_the_author_comparison_is_exact(self, triaged):
+        eng, cycle_id = triaged
+        suggest_findings(eng, cycle_id, "Codex", {"K-1": {"dec": "fix"}})
+        with pytest.raises(ValueError, match="not all by 'codex'"):
+            accept(eng, cycle_id, expected_by="codex")
+
+    def test_an_existing_decision_refuses_unless_overwrite(self, triaged):
+        eng, cycle_id = triaged
+        decide(eng, cycle_id, {"K-1": {"dec": "reject", "note": "owner said no"}})
+        suggest_findings(eng, cycle_id, "Codex", {"K-1": {"dec": "fix"}, "K-2": {"dec": "note"}})
+        with pytest.raises(ValueError, match="K-1 already decided"):
+            accept(eng, cycle_id)
+        assert _row(eng, 1)["decision_note"] == "owner said no"
+        assert _row(eng, 2)["decision"] is None
+        out = accept(eng, cycle_id, overwrite=True)
+        assert out["already_decided"] == ["K-1"] and out["decided"] == 2
+        assert _row(eng, 1)["decision"] == "fix"
+
+    def test_a_promoted_finding_keeps_the_k2_refusal(self, triaged):
+        eng, cycle_id = triaged
+        decide(eng, cycle_id, {"K-1": {"dec": "fix"}})
+        item_id = promote_finding_to_item(eng, 1)["id"]
+        suggest_findings(eng, cycle_id, "Codex", {"K-1": {"dec": "reject"}, "K-2": {"dec": "note"}})
+        with pytest.raises(ValueError, match=f"close item #{item_id} first"):
+            accept(eng, cycle_id, overwrite=True)
+        assert _row(eng, 2)["decision"] is None
+
+    def test_a_closed_cycle_is_refused(self, triaged):
+        eng, cycle_id = triaged
+        suggest_findings(eng, cycle_id, "Codex", {"K-1": {"dec": "fix"}})
+        decide(eng, cycle_id, {"K-1": {"dec": "fix"}, "K-2": {"dec": "note"}})
+        close_triage(eng, cycle_id, source="chat")
+        with pytest.raises(ValueError, match="is closed"):
+            accept(eng, cycle_id, overwrite=True)
+
+    @pytest.mark.parametrize(("kw", "match"), [
+        ({"expected_by": ""}, "expected_by is required"),
+        ({"expected_by": None}, "expected_by is required"),
+        ({"decided_by": ""}, "decided_by is required"),
+        ({"decision_source": None}, "decision_source is required"),
+        ({"overwrite": "yes"}, "overwrite must be true or false"),
+    ])
+    def test_bad_arguments_are_refused(self, triaged, kw, match):
+        eng, cycle_id = triaged
+        suggest_findings(eng, cycle_id, "Codex", {"K-1": {"dec": "fix"}})
+        with pytest.raises(ValueError, match=match):
+            accept(eng, cycle_id, **kw)
+        assert _row(eng, 1)["decision"] is None
+
+
+# ── #930 K-32: acceptance bound to the digest of what the owner saw ──────────
+
+DIGEST_CARDS = [
+    {"id": "K-1", "title": "T", "fp": "fp", "S": 2, "O": "?", "E": 1, "K": "S",
+     "origin": "diff", "type": "correctness", "src": "codex", "ctx": ["c"],
+     "opts": [{"k": "a", "t": "do a", "why": "", "rec": True, "root": True},
+              {"k": "b", "t": "do b", "why": "w", "rec": False, "root": False}]},
+    {"id": "K-2", "title": "U", "fp": "fp2", "S": 1, "O": 1, "E": 0, "K": "M",
+     "origin": "pre", "type": "opinion", "src": "panel", "ctx": [], "opts": []},
+]
+DIGEST_ANSWERS = {"K-1": {"dec": "fix", "opt": "a", "note": "n", "by": "Codex"}}
+
+
+def _variant(path, value):
+    cards = json.loads(json.dumps(DIGEST_CARDS))
+    answers = json.loads(json.dumps(DIGEST_ANSWERS))
+    target = {"cards": cards, "answers": answers}
+    *head, last = path
+    node = target
+    for step in head:
+        node = node[step]
+    node[last] = value
+    return cards, answers
+
+
+class TestSuggestionDigest:
+    BASE = suggestion_digest(7, DIGEST_CARDS, DIGEST_ANSWERS)
+
+    def test_it_is_a_sha256_hex_and_deterministic(self):
+        assert re.fullmatch(r"[0-9a-f]{64}", self.BASE)
+        assert suggestion_digest(7, DIGEST_CARDS, dict(DIGEST_ANSWERS)) == self.BASE
+
+    @pytest.mark.parametrize(("path", "value"), [
+        (("answers", "K-1", "note"), "n2"),            # same author, revised note
+        (("answers", "K-1", "dec"), "verify"),
+        (("answers", "K-1", "opt"), "b"),
+        (("answers", "K-1", "by"), "codex"),           # another author
+        (("answers", "K-2"), {"dec": "note", "opt": "", "note": "", "by": "Codex"}),
+        (("cards", 0, "title"), "T2"),
+        (("cards", 0, "fp"), "fp-x"),
+        (("cards", 0, "S"), 3),
+        (("cards", 0, "O"), 2),
+        (("cards", 1, "type"), "spec"),
+        (("cards", 0, "opts", 0, "t"), "do a better"),
+        (("cards", 0, "opts", 1, "why"), "other"),
+        (("cards", 0, "opts", 0, "rec"), False),
+        (("cards", 0, "opts", 0, "root"), False),
+    ])
+    def test_every_part_the_owner_reads_changes_it(self, path, value):
+        assert suggestion_digest(7, *_variant(path, value)) != self.BASE
+
+    def test_the_cycle_and_the_card_set_and_order_change_it(self):
+        assert suggestion_digest(8, DIGEST_CARDS, DIGEST_ANSWERS) != self.BASE
+        assert suggestion_digest(7, DIGEST_CARDS[:1], DIGEST_ANSWERS) != self.BASE
+        assert suggestion_digest(7, DIGEST_CARDS[::-1], DIGEST_ANSWERS) != self.BASE
+
+    def test_none_and_empty_mean_the_same_and_display_only_keys_do_not_count(self):
+        cards, answers = _variant(("cards", 0, "ctx"), ["other context"])
+        cards[0]["reviewers"] = ["codex"]
+        cards[1]["src"] = "someone else"
+        assert suggestion_digest(7, cards, answers) == self.BASE
+        empty = {"K-1": {"dec": "fix", "opt": "", "note": "", "by": "Codex"}}
+        none = {"K-1": {"dec": "fix", "opt": None, "note": None, "by": "Codex"}}
+        assert suggestion_digest(7, DIGEST_CARDS, empty) == suggestion_digest(
+            7, DIGEST_CARDS, none)
+
+
+def _seen_digest(eng, cycle_id):
+    """The SUGGESTED.digest of the export the owner saw."""
+    return export_triage(eng, cycle_id)["suggested"]["digest"]
+
+
+class TestAcceptDigest:
+    def test_the_export_digest_is_the_shared_function_of_its_cards_and_proposals(
+        self, triaged,
+    ):
+        eng, cycle_id = triaged
+        suggest_findings(eng, cycle_id, "Codex", {"K-1": {"dec": "fix", "opt": "b"}})
+        suggest_findings(eng, cycle_id, "Other", {"K-2": {"dec": "note", "note": "x"}})
+        export = export_triage(eng, cycle_id)
+        assert export["suggested"]["digest"] == suggestion_digest(cycle_id, export["cards"], {
+            "K-1": {"dec": "fix", "opt": "b", "note": None, "by": "Codex"},
+            "K-2": {"dec": "note", "opt": None, "note": "x", "by": "Other"},
+        })
+
+    def test_the_digest_seen_accepts(self, triaged):
+        eng, cycle_id = triaged
+        suggest_findings(eng, cycle_id, "Codex", {"K-1": {"dec": "fix", "opt": "a"}})
+        out = accept(eng, cycle_id, expected_digest=_seen_digest(eng, cycle_id))
+        assert out["decided"] == 1 and _row(eng, 1)["decision"] == "fix"
+
+    def test_a_revision_by_the_same_author_refuses_the_old_digest(self, triaged):
+        """expected_by alone cannot tell the revision apart: same author."""
+        eng, cycle_id = triaged
+        suggest_findings(eng, cycle_id, "Codex", {"K-1": {"dec": "fix", "note": "v1"}})
+        seen = _seen_digest(eng, cycle_id)
+        suggest_findings(eng, cycle_id, "Codex", {"K-1": {"dec": "reject", "note": "v2"}})
+        with pytest.raises(ValueError, match="changed since the export the owner saw"):
+            accept(eng, cycle_id, expected_digest=seen)
+        assert _row(eng, 1)["decision"] is None
+        accept(eng, cycle_id, expected_digest=_seen_digest(eng, cycle_id))
+        assert _row(eng, 1)["decision"] == "reject"
+
+    def test_a_card_recorded_after_the_export_refuses_the_old_digest(self, triaged):
+        eng, cycle_id = triaged
+        suggest_findings(eng, cycle_id, "Codex", {"K-1": {"dec": "fix"}})
+        seen = _seen_digest(eng, cycle_id)
+        _recorded(eng, cycle_id, finding(fp="third"))
+        with pytest.raises(ValueError, match="changed since the export"):
+            accept(eng, cycle_id, expected_digest=seen)
+        assert _row(eng, 1)["decision"] is None
+
+    def test_expected_by_stays_an_additional_check(self, triaged):
+        eng, cycle_id = triaged
+        suggest_findings(eng, cycle_id, "Codex", {"K-1": {"dec": "fix"}})
+        with pytest.raises(ValueError, match="not all by 'Other'"):
+            accept(eng, cycle_id, expected_by="Other", expected_digest=_seen_digest(eng, cycle_id))
+
+    @pytest.mark.parametrize("bad", ["", "  ", 5])
+    def test_a_blank_digest_is_refused_not_skipped(self, triaged, bad):
+        eng, cycle_id = triaged
+        suggest_findings(eng, cycle_id, "Codex", {"K-1": {"dec": "fix"}})
+        with pytest.raises(ValueError, match="expected_digest is required"):
+            accept(eng, cycle_id, expected_digest=bad)
+        assert _row(eng, 1)["decision"] is None
+
+
+# ── #930 Q1: the page link of an open cycle ──────────────────────────────────
+
+
+class TestUpdateTriage:
+    URL = "https://example.com/artifact/abc"
+
+    def test_set_then_clear_the_link(self, triaged):
+        eng, cycle_id = triaged
+        assert update_triage(eng, cycle_id, artifact_url=self.URL) == {
+            "cycle_id": cycle_id, "code": "rev-1", "artifact_url": self.URL}
+        assert export_triage(eng, cycle_id)["cycle"]["artifact_url"] == self.URL
+        update_triage(eng, "rev-1", project="proj-a", artifact_url=None)
+        assert export_triage(eng, cycle_id)["cycle"]["artifact_url"] is None
+
+    def test_omitted_is_not_cleared_but_refused(self, triaged):
+        eng, cycle_id = triaged
+        update_triage(eng, cycle_id, artifact_url=self.URL)
+        for call in (lambda: update_triage(eng, cycle_id),
+                     lambda: update_triage(eng, cycle_id, artifact_url=OMITTED)):
+            with pytest.raises(ValueError, match="nothing to update"):
+                call()
+        assert export_triage(eng, cycle_id)["cycle"]["artifact_url"] == self.URL
+
+    @pytest.mark.parametrize(("url", "match"), [
+        ("", "artifact_url is required"), ("  ", "artifact_url is required"),
+        (5, "artifact_url is required"),
+        ("x" * 501, "artifact_url too long: 501 chars, max 500"),
+    ])
+    def test_a_bad_link_is_refused(self, triaged, url, match):
+        eng, cycle_id = triaged
+        with pytest.raises(ValueError, match=match):
+            update_triage(eng, cycle_id, artifact_url=url)
+
+    def test_a_link_of_exactly_the_width_fits(self, triaged):
+        eng, cycle_id = triaged
+        assert update_triage(eng, cycle_id, artifact_url="x" * 500)["artifact_url"] == "x" * 500
+
+    def test_a_closed_or_foreign_cycle_is_refused(self, triaged):
+        eng, cycle_id = triaged
+        create_project(eng, "proj-b", "B")
+        with pytest.raises(ValueError, match="does not belong"):
+            update_triage(eng, cycle_id, project="proj-b", artifact_url=self.URL)
+        decide(eng, cycle_id, {"K-1": {"dec": "fix"}, "K-2": {"dec": "note"}})
+        close_triage(eng, cycle_id, source="chat")
+        with pytest.raises(ValueError, match="is closed"):
+            update_triage(eng, cycle_id, artifact_url=self.URL)
+        assert export_triage(eng, cycle_id)["cycle"]["artifact_url"] is None
+
+
+# ── #930: the new writers under the open-cycle contract ──────────────────────
+
+
+class TestNewWritersRace:
+    @pytest.mark.parametrize("writer", ["decide_text", "accept", "update"])
+    def test_a_close_committed_while_the_writer_waits_refuses_it(
+        self, concurrent_engine, lock_probe, writer,
+    ):
+        eng = concurrent_engine
+        cycle_id = _setup(eng)
+        _recorded(eng, cycle_id, finding())
+        suggest_findings(eng, cycle_id, "Codex", {"K-1": {"dec": "fix"}})
+        decide(eng, cycle_id, {"K-1": {"dec": "note"}})
+        competitor = {
+            "decide_text": lambda: decide_findings_from_text(eng, cycle_id, "K-1: fix", **OWNER),
+            "accept": lambda: accept(eng, cycle_id, overwrite=True),
+            "update": lambda: update_triage(eng, cycle_id, artifact_url="https://x/y"),
+        }[writer]
+
+        outcome = _hold_and_race(eng, lock_probe, cycle_id, competitor, _close_directly(cycle_id))
+
+        assert isinstance(outcome, ValueError), outcome
+        assert "is closed" in str(outcome)
+        row = _row(eng, 1)
+        assert row["decision"] == "note"
+        assert export_triage(eng, cycle_id)["cycle"]["artifact_url"] is None
+
+    def test_a_proposal_changed_while_the_acceptance_waits_refuses_it(
+        self, concurrent_engine, lock_probe,
+    ):
+        """Acceptance is bound to the proposals the owner saw: a proposal by
+        another author committed while accept_suggestions waits for the
+        cycle lock is read after the lock and refuses the acceptance."""
+        eng = concurrent_engine
+        cycle_id = _setup(eng)
+        _recorded(eng, cycle_id, finding(), finding(fp="second"))
+        suggest_findings(eng, cycle_id, "Codex", {"K-1": {"dec": "fix"}})
+
+        def late_proposal(conn):
+            conn.execute(findings.update().where(
+                findings.c.cycle_id == cycle_id, findings.c.seq == 2).values(
+                suggested_decision="reject", suggested_by="other-agent",
+                suggested_at=datetime.now(UTC)))
+
+        outcome = _hold_and_race(eng, lock_probe, cycle_id, lambda: accept(eng, cycle_id),
+                                 late_proposal)
+
+        assert isinstance(outcome, ValueError), outcome
+        assert "K-2 by 'other-agent'" in str(outcome)
+        assert _row(eng, 1)["decision"] is None
+
+    def test_a_same_author_revision_while_the_acceptance_waits_refuses_its_digest(
+        self, concurrent_engine, lock_probe,
+    ):
+        """K-32: the digest is compared under the cycle lock, in the write
+        transaction — a revision by the SAME author (invisible to
+        expected_by) committed while accept_suggestions waits refuses it."""
+        eng = concurrent_engine
+        cycle_id = _setup(eng)
+        _recorded(eng, cycle_id, finding())
+        suggest_findings(eng, cycle_id, "Codex", {"K-1": {"dec": "fix", "note": "v1"}})
+        seen = _seen_digest(eng, cycle_id)
+
+        def revision(conn):
+            conn.execute(findings.update().where(
+                findings.c.cycle_id == cycle_id, findings.c.seq == 1).values(
+                suggested_decision="reject", suggested_note="v2",
+                suggested_at=datetime.now(UTC)))
+
+        outcome = _hold_and_race(eng, lock_probe, cycle_id,
+                                 lambda: accept(eng, cycle_id, expected_digest=seen), revision)
+
+        assert isinstance(outcome, ValueError), outcome
+        assert "changed since the export the owner saw" in str(outcome)
+        assert _row(eng, 1)["decision"] is None
