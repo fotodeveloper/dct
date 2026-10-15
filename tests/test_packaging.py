@@ -8,7 +8,7 @@ silently installed zero skills/hooks, and `dct web` died on missing templates.
 The contract locked here: every asset the installer or the web viewer needs
 lives INSIDE the `dct` package and is declared for both wheel (package-data)
 and sdist (MANIFEST.in) builds, and the installable skill list is derived from
-the directory — never a hardcoded list that can drift.
+the canonical manifest — never a hardcoded list that can drift.
 """
 
 import tomllib
@@ -47,7 +47,7 @@ def test_every_packaged_hook_lib_is_installed():
 
 
 def test_skill_discovery_matches_directory_contents():
-    """The skill list comes from the filesystem — no hardcoded-list drift.
+    """The skill list agrees with the manifest and packaged outputs.
 
     The pre-fix hardcoded SKILL_NAMES silently omitted plan-status and
     plan-resolve-uncertain, so `dct init` never installed them.
@@ -56,7 +56,10 @@ def test_skill_discovery_matches_directory_contents():
     on_disk = sorted(
         p.name for p in SKILLS_DIR.iterdir() if (p / "SKILL.md").is_file()
     )
+    from dct.skill_render import skill_names
+
     assert discovered == on_disk
+    assert tuple(discovered) == skill_names()
     assert "plan-status" in discovered
     assert "plan-resolve-uncertain" in discovered
     assert len(discovered) >= 13
@@ -74,7 +77,7 @@ def test_every_skill_directory_has_a_skill_md():
 def _asset_files() -> list[Path]:
     """Every non-Python file the package must ship, relative to dct/."""
     wanted = []
-    for sub in ("skills", "hooks", "assets", "web/templates", "web/static"):
+    for sub in ("skills", "skill_sources", "hooks", "assets", "web/templates", "web/static"):
         for p in (PKG_ROOT / sub).rglob("*"):
             if p.is_file() and "__pycache__" not in p.parts and p.name != ".DS_Store" \
                     and p.suffix != ".py":  # modules ship as code, not package data
@@ -97,5 +100,5 @@ def test_manifest_grafts_every_asset_dir():
     must graft each asset directory, or the sdist — and any wheel built from
     it — ships without them even when package-data is correct."""
     manifest = (REPO_ROOT / "MANIFEST.in").read_text()
-    for sub in ("dct/skills", "dct/hooks", "dct/assets", "dct/web/templates", "dct/web/static"):
+    for sub in ("dct/skills", "dct/skill_sources", "dct/hooks", "dct/assets", "dct/web/templates", "dct/web/static"):
         assert f"graft {sub}" in manifest, f"MANIFEST.in missing: graft {sub}"

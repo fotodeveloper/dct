@@ -18,6 +18,7 @@ def test_copied_skill_refresh_preserves_user_directory(tmp_path, monkeypatch):
     (target / 'custom').mkdir(parents=True)
     (target / 'custom' / 'SKILL.md').write_text('user')
     monkeypatch.setattr(claude, 'SKILLS_DIR', source)
+    monkeypatch.setattr(claude, 'discover_skills', lambda: sorted(p.name for p in source.iterdir() if p.is_dir()))
     monkeypatch.setattr(claude, 'CLAUDE_SKILLS_DIR', target)
 
     def unavailable(*args, **kwargs):
@@ -69,6 +70,7 @@ def test_managed_copy_modification_is_preserved(tmp_path, monkeypatch):
     assert is_managed_copy(target / 'pickup')
     skill.write_text('user customization')
     monkeypatch.setattr(claude, 'SKILLS_DIR', source)
+    monkeypatch.setattr(claude, 'discover_skills', lambda: sorted(p.name for p in source.iterdir() if p.is_dir()))
     monkeypatch.setattr(claude, 'CLAUDE_SKILLS_DIR', target)
     claude.install_skills()
     assert skill.read_text() == 'user customization'
@@ -113,6 +115,7 @@ def test_uninstall_removes_only_owned_assets(tmp_path, monkeypatch):
     config = tmp_path / 'claude.json'
     config.write_text('{"mcpServers":{"dct":{"command":"custom"}}}')
     monkeypatch.setattr(claude, 'SKILLS_DIR', source)
+    monkeypatch.setattr(claude, 'discover_skills', lambda: sorted(p.name for p in source.iterdir() if p.is_dir()))
     monkeypatch.setattr(claude, 'CLAUDE_SKILLS_DIR', installed)
     monkeypatch.setattr(claude, 'CLAUDE_HOOKS_DIR', tmp_path / 'hooks')
     monkeypatch.setattr(claude, 'CLAUDE_MD', tmp_path / 'CLAUDE.md')

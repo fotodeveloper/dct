@@ -184,9 +184,9 @@ def test_ingest_threads_classification_config(tmp_path, monkeypatch, engine):
                       model=None, timeout_seconds=None, **kw):
         captured["model"] = model
         captured["timeout_seconds"] = timeout_seconds
-        return "prose"
+        return classify.ClassificationResult("prose", "command", "command")
 
-    monkeypatch.setattr(ingest_mod.classify_mod, "classify_uncertain", fake_classify)
+    monkeypatch.setattr(ingest_mod.classify_mod, "classify_result", fake_classify)
 
     cfg = Config(database_url="sqlite:///x.db")
     cfg.classification.model = "threaded-model"
@@ -211,8 +211,8 @@ def test_provider_disabled_skips_classifier(tmp_path, monkeypatch, engine):
 
     called = []
     monkeypatch.setattr(
-        ingest_mod.classify_mod, "classify_uncertain",
-        lambda *a, **k: called.append(1) or "prose",
+        ingest_mod.classify_mod, "classify_result",
+        lambda *a, **k: called.append(1) or classify.ClassificationResult("prose", "rules", "rules"),
     )
     cfg = Config(database_url="sqlite:///x.db")
     cfg.classification.provider = "disabled"
@@ -288,3 +288,16 @@ def test_ingest_executes_explicit_custom_command(tmp_path, monkeypatch, engine):
     assert report['uncertain_remaining'] == 0
     assert len(commands) == 1
     assert commands[0][:2] == ['custom-classifier', '--label']
+
+
+@pytest.mark.parametrize('command, expected_model', [
+    (['claude', '--print', '--model', 'explicit-model'], 'explicit-model'),
+    (['claude', '--print', '--model=inline-model'], 'inline-model'),
+    (['custom-classifier', '--model', 'unknown-to-dct'], None),
+])
+def test_typed_result_records_only_known_actual_model(monkeypatch, command, expected_model):
+    """A custom command's argument cannot be assumed to identify a model."""
+    monkeypatch.setattr(classify.shutil, 'which', lambda cmd: cmd)
+    monkeypatch.setattr(classify.subprocess, 'run', lambda *a, **kw: _FakeResult(stdout='prose'))
+    result = classify.classify_result('Unfamiliar topic', provider='command', command=command)
+    assert (result.section_type, result.source, result.provider, result.model) == ('prose', 'command', 'command', expected_model)

@@ -1,0 +1,126 @@
+version = 1
+
+[hosts.claude]
+display_name = "claude"
+capabilities = ["question-preview", "task-mirror"]
+
+[hosts.codex]
+display_name = "codex"
+capabilities = ["visible-consent-fallback", "deferred-tools"]
+
+[hosts.fallback]
+display_name = "fallback"
+capabilities = ["visible-consent-fallback"]
+
+[[skills]]
+name = "clog"
+short_description = "Record completed work in the changelog"
+description = "[dct] Add a changelog entry to the dct database. Use when: \"clog\", \"changelog\", \"log this change\", or right after finishing any change (\"just fixed/added X\") — in any language."
+explicit_only = false
+body = "workflows/clog.md"
+entry_tool = "add_changelog"
+
+[[skills]]
+name = "commit"
+short_description = "Prepare and commit explicitly approved work"
+description = "[dct] Commit explicitly requested work after exact staged-files/message/changelog consent."
+explicit_only = false
+body = "workflows/commit.md"
+entry_tool = "dct clog candidates"
+
+[[skills]]
+name = "dct-import"
+short_description = "Import approved plans and historical tracking data"
+description = "[dct] Explicit import of approved markdown tracking files, plan anchors and historical changelog rows."
+explicit_only = true
+body = "workflows/dct-import.md"
+entry_tool = "ingest_plan_file / import_released_changelog"
+
+[[skills]]
+name = "dct-init"
+short_description = "Set up this client and register the current project"
+description = "[dct] Explicit setup: diagnose/repair the current client integration and register this project."
+explicit_only = true
+body = "workflows/dct-init.md"
+entry_tool = "dct doctor"
+
+[[skills]]
+name = "handoff"
+short_description = "Prepare a reviewed handoff for the next session"
+description = "[dct] End-of-session workflow — flag next-sprint items and leave a handoff prompt. Use when: \"handoff\", \"end session\", \"wrap up\" — in any language."
+explicit_only = false
+body = "workflows/handoff.md"
+entry_tool = "handoff_work"
+
+[[skills]]
+name = "pickup"
+short_description = "Resume work or inspect the current session state"
+description = "[dct] Start-of-session workflow — read last handoff, show current sprint, propose first action. Use when: \"pickup\", \"resume\", \"where were we\", \"what’s next\", \"back to work\" — in any language."
+explicit_only = false
+body = "workflows/pickup.md"
+entry_tool = "pickup_work"
+
+[[skills]]
+name = "plan-resolve-uncertain"
+short_description = "Resolve uncertain plan section classifications"
+description = "[dct] Explicitly classify indexed uncertain plan sections with configured rules/command or manual choices."
+explicit_only = true
+body = "workflows/plan-resolve-uncertain.md"
+entry_tool = "set_plan_section_type / resolve_uncertain_sections"
+
+[[skills]]
+name = "plan-status"
+short_description = "Inspect progress across indexed project plans"
+description = "[dct] Cross-plan progress dashboard — per-plan done/total checkpoints, uncertain sections, last scan. Use when: \"plan status\", \"plan progress\", \"how far along is the plan\", \"what’s left in the plans\", or the user asks about overall progress of planned work — in any language."
+explicit_only = false
+body = "workflows/plan-status.md"
+entry_tool = "list_plans / get_plan"
+
+[[skills]]
+name = "release"
+short_description = "Preview and execute an explicitly approved release"
+description = "[dct] Release a version with ONE question — dct first checks everything the release will do (the commit of uncommitted changes, the entries, the changelog section, the version files, the push), the owner sees one screen and answers once, then the local `dct release` workflow commits, stamps, tags and pushes, each verified. Use when: \"release\", \"bump version\", \"ship it\" — in any language."
+explicit_only = false
+body = "workflows/release.md"
+entry_tool = "dct release plan"
+
+[[skills]]
+name = "track"
+short_description = "Create an issue, task, feature, idea or improvement"
+description = "[dct] Create a tracked item (issue / todo / feature / idea / improvement). Use when: \"track this\", \"add issue/todo/feature\", \"bug\", \"idea\", \"refactor\" — in any language. Type mapping lives in the create_item tool description."
+explicit_only = false
+body = "workflows/track.md"
+entry_tool = "create_item"
+
+[[skills]]
+name = "track-list"
+short_description = "Find and list tracked work across projects"
+description = "[dct] List and search tracked items across projects, priority-grouped, with file hotspots. Use when: \"list issues\", \"what’s open\", \"backlog\", \"show todos\" — in any language."
+explicit_only = false
+body = "workflows/track-list.md"
+entry_tool = "list_items"
+
+[[skills]]
+name = "track-resolve"
+short_description = "Close tracked work after its required gates pass"
+description = "[dct] Resolve or close a tracked item. Use when: \"resolve issue\", \"close item\", \"done with #42\", \"wont fix\" — in any language."
+explicit_only = false
+body = "workflows/track-resolve.md"
+entry_tool = "resolve_item"
+
+[[skills]]
+name = "track-update"
+short_description = "Update tracked work, fields and sprint membership"
+description = "[dct] Update a tracked item — status, priority, fields, sprint membership. Use when: \"update item #N\", \"change priority\", \"start working on #N\", \"wip\", \"add/remove from sprint\" — in any language."
+explicit_only = false
+body = "workflows/track-update.md"
+entry_tool = "update_item"
+
+[[skills]]
+name = "triage"
+short_description = "Record findings, prepare proposals and close triage"
+description = "[dct] Run a review's findings through the dct triage ledger: record consolidated findings, build and publish the triage page from the ledger, take an agent's prefill as proposals, and close with the owner's answers. Use when: \"record the findings\", \"build/publish the triage page\", \"Codex filled in the proposals\", \"redeploy the triage\", the owner pastes the page's decision text, or \"accept the proposals as final\" — in any language."
+explicit_only = false
+body = "workflows/triage.md"
+entry_tool = "open_triage"
+

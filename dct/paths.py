@@ -43,6 +43,11 @@ def config_dir() -> Path:
     return _xdg("XDG_CONFIG_HOME", ".config")
 
 
+def dct_reference_path() -> Path:
+    """Canonical integration reference, independent of the database config file."""
+    return config_dir() / "dct-reference.md"
+
+
 def data_dir() -> Path:
     if _IS_WINDOWS:
         return Path(_windows_dirs().user_data_dir)

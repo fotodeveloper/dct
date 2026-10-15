@@ -214,7 +214,25 @@ def _print_table(headers: list[str], rows: list[list[str]], max_widths: dict[int
 
 # ── Init ──────────────────────────────────────────────────────────────────────
 
+def _require_init_terminal():
+    if not sys.stdin.isatty():
+        print("dct init needs an interactive terminal. Run `dct init` in your own terminal.",
+              file=sys.stderr)
+        sys.exit(1)
+
+
+def _print_reference_install_result(result: dict) -> None:
+    """Show both independently handled reference assets, or a single result."""
+    steps = [result["canonical"], result["legacy"]] if "legacy" in result else [result]
+    for step in steps:
+        mark = "⚠" if step["status"] == "preserved" else "✓"
+        print(f"  {mark} {step['message']}")
+        if step.get("remedy"):
+            print(f"    → {step['remedy']}")
+
+
 def cmd_init(args):
+    _require_init_terminal()
     print("=== dct — Deterministic Context Tracker — setup ===\n")
 
     # Database
@@ -304,10 +322,7 @@ def cmd_init(args):
     # The dct reference read on demand (K-36) — an installed asset like the
     # skills, independent of the CLAUDE.md consent below.
     reference = install_reference(config)
-    mark = "⚠" if reference["status"] == "preserved" else "✓"
-    print(f"  {mark} {reference['message']}")
-    if reference.get("remedy"):
-        print(f"    → {reference['remedy']}")
+    _print_reference_install_result(reference)
 
     # Wire hooks into ~/.claude/settings.json (idempotent; consent-gated).
     # args.wire_hooks: True (--wire-hooks) / False (--no-wire-hooks) / None (ask
@@ -338,7 +353,7 @@ def cmd_init(args):
         print("  ⚠ Hooks not wired — run `dct hooks wire` later (see docs/hooks.md).")
 
     # Attach the CLAUDE.md pointer (idempotent; consent-gated — a short block
-    # naming ~/.claude/dct-reference.md, so the assistant knows dct exists and
+    # naming the canonical shared reference, so the assistant knows dct exists and
     # where to read when to reach for it; plain "track this" works reliably).
     # args.attach_snippet: True (--attach-snippet) / False (--no-attach-snippet)
     # / None (ask on a tty, skip when non-interactive).
@@ -347,7 +362,7 @@ def cmd_init(args):
         if sys.stdin.isatty():
             answer = input(
                 "Add a short dct pointer to ~/.claude/CLAUDE.md "
-                "(it names ~/.claude/dct-reference.md, read on demand)? [Y/n]: "
+                f"(it names {paths.dct_reference_path()}, read on demand)? [Y/n]: "
             ).strip().lower()
             attach = answer != "n"
         else:
@@ -359,14 +374,19 @@ def cmd_init(args):
         except ValueError as e:
             print(f"  ⚠ CLAUDE.md pointer skipped: {e}")
         else:
-            verb = {
-                "added": "added to",
-                "refreshed": "refreshed in",
-                "unchanged": "already present in",
-            }[result["status"]]
-            print(f"  ✓ dct pointer {verb} {result['path']}")
-            if result["backup"]:
-                print(f"    (backup: {result['backup']})")
+            if result["status"] == "preserved":
+                print(f"  ⚠ CLAUDE.md pointer not updated: {result['message']}")
+                if result.get("remedy"):
+                    print(f"    → {result['remedy']}")
+            else:
+                verb = {
+                    "added": "added to",
+                    "refreshed": "refreshed in",
+                    "unchanged": "already present in",
+                }[result["status"]]
+                print(f"  ✓ dct pointer {verb} {result['path']}")
+                if result.get("backup"):
+                    print(f"    (backup: {result['backup']})")
     else:
         print(
             "  ⚠ CLAUDE.md pointer not attached — re-run with --attach-snippet, or "
@@ -718,6 +738,69 @@ def _changelog_setting(project: dict) -> str:
 
 
 # ── Plan rescan (v0.2.0) ─────────────────────────────────────────────────────
+
+def _plan_classification_command(args, *, batch: bool):
+    """Resolve a CLI ULID alias; the semantic core rechecks the project on write."""
+    import json
+
+    from dct.core.ids import is_valid_ulid
+    from dct.core.plans.classification import (
+        resolve_uncertain_sections,
+        set_plan_section_type,
+    )
+    from dct.core.plans.crud import get_plan_by_ulid, get_plan_section_by_ulid
+
+    try:
+        alias = args.plan_ulid if batch else args.section_ulid
+        if not is_valid_ulid(alias):
+            raise ValueError("Expected an explicit plan/section ULID, not an integer id")
+        if not args.project or not args.project.strip():
+            raise ValueError("--project must name the expected project")
+        engine = _get_engine()
+        row = (get_plan_by_ulid if batch else get_plan_section_by_ulid)(engine, alias)
+        if row is None:
+            raise ValueError("Plan/section ULID not found")
+        if batch:
+            ack = resolve_uncertain_sections(engine, args.project, row["id"])
+        else:
+            ack = set_plan_section_type(engine, args.project, row["id"], args.section_type)
+        if args.json:
+            print(json.dumps(ack, default=_json_default))
+        else:
+            print(ack)
+    except Exception as exc:
+        print(f"✗ Error: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+
+def cmd_plan_set_section_type(args):
+    _plan_classification_command(args, batch=False)
+
+
+def cmd_plan_resolve_uncertain(args):
+    _plan_classification_command(args, batch=True)
+
+
+def cmd_clog_import_released(args):
+    import json
+
+    from dct.workflows.changelog_import import import_history, parse_released_at
+
+    try:
+        stated_time = parse_released_at(args.released_at)
+        ack = import_history(_get_engine(), args.project, args.category, args.entry,
+            args.version, stated_time, component=args.component,
+            source_file=args.source_file, source_lines=args.source_lines,
+            related_item_id=args.related_item)
+        if args.json:
+            print(json.dumps(ack, default=_json_default))
+        else:
+            print(f"✓ Imported history #{ack['id']} [{ack['version']}] — "
+                  f"{ack['released_at']} ({ack['released_at_source']})")
+    except Exception as exc:
+        print(f"✗ Error: {exc}", file=sys.stderr)
+        sys.exit(1)
+
 
 def cmd_plan_rescan(args):
     """Re-scan a plan markdown file — hook entrypoint and manual CLI.
@@ -1164,8 +1247,8 @@ def cmd_pickup(args):
 
     from dct.workflows.session import parse_sections, pickup_work
 
-    engine = _get_engine()
     consume = {"auto": None, "always": True, "never": False}[args.consume]
+    engine = _get_readonly_engine() if consume is False else _get_engine()
     # consumed_by is REQUIRED by pickup_work whenever consumption is possible;
     # default it (and echo it) rather than let the op fail on a missing identity.
     identity = args.consumed_by or (None if consume is False else _default_identity())
@@ -3258,6 +3341,8 @@ def _print_integration_result(result: dict, as_json: bool) -> None:
                 print(f"  {details['message']}")
             for path in details.get("preserved", []):
                 print(f"  preserved: {path}")
+            for path in details.get("retained", []):
+                print(f"  retained: {path}")
         else:
             print(f"{result['client']}: {'ready' if result.get('ok') else 'attention required'}")
     for row in result.get("checks", []):
@@ -3334,7 +3419,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_init.add_argument(
         "--attach-snippet", dest="attach_snippet", action="store_true", default=None,
-        help="Append the short dct pointer (names ~/.claude/dct-reference.md) "
+        help="Append the short dct pointer (names the canonical shared reference) "
              "to ~/.claude/CLAUDE.md without prompting",
     )
     p_init.add_argument(
@@ -3499,7 +3584,17 @@ def build_parser() -> argparse.ArgumentParser:
     p_plan_rescan.add_argument("--quiet", "-q", action="store_true",
                                help="Suppress all output on stdout/stderr")
     p_plan_rescan.add_argument("--resolve-uncertain", action="store_true",
-                               help="Call claude --print for any uncertain sections")
+                               help="Resolve uncertain sections with configured rules/command (disabled remains unresolved)")
+
+    p_plan_type = p_plan_sub.add_parser("set-section-type", help="Apply/revoke a manual section type")
+    p_plan_type.add_argument("section_ulid", help="Explicit section ULID (integer ids are MCP-only)")
+    p_plan_type.add_argument("section_type")
+    p_plan_type.add_argument("--project", required=True, help="Expected project slug")
+    p_plan_type.add_argument("--json", action="store_true")
+    p_plan_uncertain = p_plan_sub.add_parser("resolve-uncertain", help="Resolve indexed uncertainty with configured rules/command")
+    p_plan_uncertain.add_argument("plan_ulid", help="Explicit plan ULID")
+    p_plan_uncertain.add_argument("--project", required=True, help="Expected project slug")
+    p_plan_uncertain.add_argument("--json", action="store_true")
 
     # add (item)
     p_add = sub.add_parser("add", help="Create a tracked item")
@@ -3586,6 +3681,18 @@ def build_parser() -> argparse.ArgumentParser:
         "--branch", help="Branch the change was made on (default: detected in CWD)")
     p_clog_add.add_argument(
         "--worktree", help="Checkout toplevel of the change (default: detected in CWD)")
+
+    p_clog_import = p_clog_sub.add_parser("import-released", help="Import one historical row without creating a release")
+    p_clog_import.add_argument("project")
+    p_clog_import.add_argument("category", choices=["added", "changed", "fixed", "removed"])
+    p_clog_import.add_argument("entry")
+    p_clog_import.add_argument("--version", required=True)
+    p_clog_import.add_argument("--released-at", default="", help="ISO date or timestamp with offset; omitted means import time")
+    p_clog_import.add_argument("--component", default="")
+    p_clog_import.add_argument("--source-file", default="")
+    p_clog_import.add_argument("--source-lines", default="")
+    p_clog_import.add_argument("--related-item", type=int, default=0)
+    p_clog_import.add_argument("--json", action="store_true")
 
     def _add_branch_filters(p):
         p.add_argument(
@@ -4333,10 +4440,13 @@ PROJECT_COMMAND_MAP = {
 }
 
 PLAN_COMMAND_MAP = {
+    "set-section-type": cmd_plan_set_section_type,
+    "resolve-uncertain": cmd_plan_resolve_uncertain,
     "rescan": cmd_plan_rescan,
 }
 
 CLOG_COMMAND_MAP = {
+    "import-released": cmd_clog_import_released,
     "add": cmd_clog_add,
     "list": cmd_clog_list,
     "count": cmd_clog_count,
@@ -4504,6 +4614,8 @@ def main():
         parser.print_help()
         sys.exit(0)
 
+    if args.command == "init":
+        _require_init_terminal()
     _maybe_nudge(args)
 
     if args.command == "project":

@@ -39,8 +39,8 @@ def refresh_integrations() -> list[dict]:
     the implementation used by the Claude adapter.
 
     Each result: ``{"client", "ok", "removed", "checks", "remedies"}`` plus
-    ``"error"`` (the failing checks' messages) when not ok, and for Claude
-    ``"reference"`` (the ``install_reference`` result, K-66). ``remedies``
+    ``"error"`` (the failing checks' messages) when not ok, and for each client
+    ``"reference"`` (the shared reference installation result). ``remedies``
     lists, per failing check, its own remedy when the check carries one
     (a foreign reference must be moved aside first — a repair would only
     preserve it again), otherwise the client's ``dct integrate repair``.
@@ -65,6 +65,9 @@ def refresh_integrations() -> list[dict]:
             else:
                 from dct.integrations.codex import START
                 adapter.install_skills()
+                install_reference = getattr(adapter, "install_reference", None)
+                if callable(install_reference):
+                    extra["reference"] = install_reference()
                 removed = []
                 if adapter.instructions_path.is_file() and START in adapter.instructions_path.read_text(encoding="utf-8"):
                     adapter.install_instructions()
@@ -73,7 +76,7 @@ def refresh_integrations() -> list[dict]:
                     refresh_hooks()
             # Upgrade refreshes opted-in assets, not the complete integration.
             # Missing instruction blocks or hook wiring are not upgrade failures.
-            asset_names = {"skills", "hook_assets"}
+            asset_names = {"skills", "hook_assets", "reference", "shared_reference"}
             if name == "claude":
                 asset_names.add("reference")
             if name == "codex":

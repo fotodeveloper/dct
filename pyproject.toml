@@ -1,12 +1,17 @@
 [project]
 name = "dctracker"
-description = "Deterministic Context Tracker (dct) — cross-project tracking, changelog, and release tooling for Claude Code."
+description = "Deterministic Context Tracker (dct) — cross-project tracking, changelog, and release tooling for AI coding clients."
 version = "1.5.0"
 requires-python = ">=3.11"
-license = "MIT"
+license = "MIT AND 0BSD"
+license-files = [
+    "LICENSE",
+    "dct/web/static/vendor/LICENSE.htmx.txt",
+    "dct/web/static/vendor/LICENSE.uPlot.txt",
+]
 authors = [{ name = "fotodeveloper", email = "dev@fotodeveloper.com" }]
 readme = "README.md"
-keywords = ["claude-code", "mcp", "tracking", "changelog", "sprints", "developer-tools", "cli"]
+keywords = ["claude-code", "codex", "mcp", "tracking", "changelog", "sprints", "developer-tools", "cli"]
 classifiers = [
     "Development Status :: 5 - Production/Stable",
     "Environment :: Console",
@@ -78,6 +83,9 @@ dct = [
     "skills/**/*.md",
     "hooks/*.sh",
     "assets/*.md",
+    "assets/*.yaml",
+    "skill_sources/*.toml",
+    "skill_sources/**/*.md",
     "assets/*.sh",
     "web/templates/*",
     "web/templates/**/*",

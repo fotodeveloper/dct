@@ -51,6 +51,23 @@ def _reference() -> str:
     return REFERENCE.read_text(encoding="utf-8")
 
 
+def _skill_invocation(body: str, name: str) -> str:
+    """Exact native prefix from the workflow heading, independent of fallback wrappers."""
+    heading = re.search(r"(?m)^# ([/$]?)[a-z][a-z-]*\b", body)
+    assert heading, "missing workflow heading to identify its native invocation"
+    return heading.group(1) + name
+
+
+def _question_interaction(body: str) -> str:
+    """Claude retains its UI; other renderings use the supported readable interaction."""
+    heading = re.search(r"(?m)^# ([/$]?)[a-z][a-z-]*\b", body)
+    assert heading
+    if heading.group(1) == "/":
+        return "AskUserQuestion"
+    assert "AskUserQuestion" not in body
+    return "decision interaction"
+
+
 def _trailer_regex() -> re.Pattern:
     """The strict body-scan regex of the PRODUCTION proof layer — the doc
     must state the very same pattern (asserted in
@@ -83,7 +100,7 @@ def test_dct_import_stops_instead_of_retrying_on_an_outdated_create_ack():
 
 @pytest.mark.parametrize("text", [
     pytest.param(lambda: _skill("track-update"), id="claude-track-update"),
-    pytest.param(lambda: _codex("track"), id="codex-track"),
+    pytest.param(lambda: _codex("track-update"), id="codex-track-update"),
 ])
 def test_update_keeps_the_label_unless_asked_to_change_it(text):
     """K-40: short_title is optional on update — omitting it keeps the label;
@@ -123,12 +140,20 @@ def _in_order(body: str, *markers: str) -> None:
     assert positions == sorted(positions), list(zip(markers, positions))
 
 
+def _workflow_fallback(name: str) -> str:
+    body = _fallbacks()
+    start = body.index(f"## `/{name}` fallback")
+    end = body.find("\n## ", start + 1)
+    section = body[start:end if end >= 0 else len(body)]
+    return re.sub(r"(?m)^#{3}(#+)? ", lambda m: "#" * (len(m.group(1) or "") + 1) + " ", section)
+
+
 def _release_fallback() -> str:
-    return _section(_fallbacks(), "## `/release` fallback", "## `/commit` fallback")
+    return _workflow_fallback("release")
 
 
 def _commit_fallback() -> str:
-    return _section(_fallbacks(), "## `/commit` fallback", "## `/track`")
+    return _workflow_fallback("commit")
 
 
 # ── the workflow's CLI is the contract the dialogs are written against ──────
@@ -170,7 +195,7 @@ DIALOG_DOCS = [
     pytest.param(_release_fallback, id="release-fallback"),
     pytest.param(lambda: _skill("commit"), id="commit-skill"),
     pytest.param(_commit_fallback, id="commit-fallback"),
-    pytest.param(lambda: _section(_reference(), "**Committing**", "**Session end**"),
+    pytest.param(_reference,
                  id="dct-reference"),
 ]
 
@@ -517,7 +542,7 @@ def test_release_dialog_routes_an_unfinished_release_before_the_project_setting(
 
 
 def _reference_releasing() -> str:
-    return _section(_reference(), "**Releasing**", "**Session end**")
+    return _section(_reference(), "## Workflow use without duplication", "## Type triggers")
 
 
 def test_reference_release_paragraph_only_points_to_the_skill_and_the_fallback():
@@ -530,7 +555,8 @@ def test_reference_release_paragraph_only_points_to_the_skill_and_the_fallback()
     elsewhere."""
     body = _reference_releasing()
     flat = " ".join(body.split())
-    assert "/release" in flat and "assistant-fallbacks.md" in flat
+    assert "installed native skill" in flat and "complete workflow" in flat
+    assert "docs/assistant-fallbacks.md" not in flat
     assert not _commands(body), f"the reference still carries release commands: {_commands(body)}"
     for copy in ("--plan-digest", "--proposal-digest", "--consent", "--push-", "--confirm",
                  "executor.", "attest", "takeover", "prepare", "apply"):
@@ -544,8 +570,7 @@ def test_reference_promises_one_screen_only_for_the_typical_case():
     for sentence in re.split(r"(?<=[.!?])\s+", " ".join(_reference_releasing().split())):
         if re.search(r"\b(one|ONE|a single|single) (question|dialog|screen)\b", sentence):
             assert re.search(r"\btypical", sentence), f"an unconditional promise: {sentence}"
-    assert re.search(r"\btypical[^.]{0,60}\bone screen\b",
-                     " ".join(_reference_releasing().split()))
+    assert "a report is not a consent request" in " ".join(_reference_releasing().split()).lower()
 
 
 # ── resume without a second question (K-112) ────────────────────────────────
@@ -985,8 +1010,7 @@ def test_commit_selects_from_the_workflow_candidates_after_staging():
 
 def test_commit_fallback_keeps_the_same_order_and_candidates():
     commit = _commit_fallback()
-    _in_order(commit, "**Stage first.**", "**Then select the trailer**",
-              "**Then commit — WITHOUT another `git add`.**")
+    _in_order(commit, "Step 4: Stage", "Step 5: Select", "Step 6: Commit")
     assert "partially staged" in commit and "ANY change to the index" in commit
     assert "dct clog candidates --json" in commit
 

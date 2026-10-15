@@ -34,45 +34,52 @@ operations bootstrap the database as usual. The existing interactive `dct init` 
 installs Claude Code. `dct integrate install claude` explicitly installs its
 MCP, skills, hooks and managed instructions.
 
-### Claude Code instructions: pointer + reference
+### Shared reference and managed pointers
 
-The Claude Code instructions come in two parts. The full dct reference
-(`dct/assets/dct-reference.md`) is installed as `~/.claude/dct-reference.md` on
-every install path — `dct init` (also with `--no-attach-snippet`),
-`dct integrate install|repair claude` and `dct upgrade` — as a symlink into
-the package, or a marked copy where symlinks are unavailable. The managed
-block in `~/.claude/CLAUDE.md` is only a short pointer naming that file as
-plain text (no `@` import, which would load the whole reference in every
-session); it is attached with consent, and a block still holding the old full
-text is refreshed to the pointer, with content outside the markers untouched.
+Development builds install `dct/assets/dct-reference.md` at the canonical
+`paths.config_dir() / "dct-reference.md"`: on POSIX this is normally
+`~/.config/dctools/dct-reference.md`, honoring `XDG_CONFIG_HOME`; Windows uses
+the existing platform directory policy. `DCT_CONFIG_PATH` selects the database
+configuration file and does not relocate this integration asset. Either client
+installs or refreshes the guide without a database bootstrap. The reference is a
+concise generated catalog with shared operating rules; the complete workflow
+fallback is generated from the same authored contracts.
 
-Ownership of `~/.claude/dct-reference.md` is proven, never guessed. dct's are:
-a symlink into the running package's assets (including the older link to
-`assets/claude-md-snippet.md`), a symlink whose exact target dct recorded when
-it created it (`~/.claude/.dct-managed-links.json`, so the link re-points after
-the package moves to a new virtual environment, a new Python or between an
-editable and a wheel install), and an unchanged marked copy. These are
-re-pointed or refreshed. Anything else (your own file, an edited copy, a link
-dct did not create, also a dangling one or one into another `dct/assets`
-directory) is preserved: install, upgrade, repair and doctor report it as
-"not dct's" with its path and link target. Move or replace that file yourself
-before a repair can install the reference; repairing alone would preserve it
-again. Doctor reports the reference as missing, outdated or not dct's, each
-with its remedy. A missing reference is installed by
-`dct integrate repair claude`, which repairs the whole Claude integration: it
-registers the MCP server (an existing entry is kept), installs skills and hook
-files, wires the hooks into `~/.claude/settings.json`, adds or refreshes the
-pointer block in `~/.claude/CLAUDE.md` and installs the reference. A file or
-link that appears at an install path while dct is creating it is never
-overwritten (reference, skills and hooks alike). Uninstall removes only an
-owned reference. The client-neutral reference location for Codex is a
-separate change.
+The Claude `CLAUDE.md` and Codex `AGENTS.md` blocks are short pointers rendered
+with that actual resolved path. Install, refresh and doctor use the same body
+renderer. After an XDG change, an owned block naming the old path is outdated;
+repair installs the current reference and refreshes the block while preserving
+outside-marker bytes. A foreign canonical reference blocks pointer rewrites,
+so a failed repair does not claim an available guide at the new location.
+Canonical and Claude's legacy alias are handled and reported independently:
+a conflict at the canonical path still permits refreshing a proven-owned old
+alias, while preserving the earlier pointer and the foreign canonical file.
+
+Ownership is proven by the established current-package link contract, an exact
+symlink target recorded beside the file, or an unchanged marked copy. Recorded
+links follow package relocations. Edited copies and foreign links, including
+arbitrary links into another package directory, remain untouched and receive a
+path-specific remedy. Creation is exclusive: a path appearing during install
+is preserved. Repeating current content is a no-op. Doctor reports
+current, missing, outdated and foreign states without writing.
+
+Claude retains and refreshes its proven-owned `~/.claude/dct-reference.md`
+compatibility alias; a Codex-only installation creates no Claude alias. PyPI
+1.5.0 still uses the legacy reference path. Each client's uninstall removes
+only its owned assets, pointer block and any owned client-specific alias. It
+retains the shared canonical reference and reports retention in both plain CLI
+and JSON output. Plain output lists `retained` separately from `preserved`,
+making shared-reference lifetime visible. Both uninstall
+orders preserve the other client's guide. Upgrade touches only detected
+clients and existing instruction blocks, introducing no new hook trust or
+instruction opt-in. Installation has separately reported steps and is retryable;
+it does not promise an all-file transaction.
 
 ## Codex: supported explicit workflows in development builds
 
 The adapter configures `dct server` in `$CODEX_HOME/config.toml` (default
-`~/.codex/config.toml`), installs `pickup`, `handoff`, `track`, `clog` and
-`triage` in `~/.agents/skills`, and maintains a bounded block in `$CODEX_HOME/AGENTS.md`.
+`~/.codex/config.toml`), installs `clog`, `commit`, `dct-import`, `dct-init`, `handoff`, `pickup`, `plan-resolve-uncertain`, `plan-status`, `release`, `track`, `track-list`, `track-resolve`, `track-update`, `triage`
+in `~/.agents/skills`, and maintains a bounded block in `$CODEX_HOME/AGENTS.md`.
 It sets `DCT_ACTOR_CLIENT=codex` and `DCT_ACTOR_TYPE=agent`. A session identifier
 must come from the host; the installer never invents or persists one globally.
 
@@ -88,11 +95,15 @@ A nonempty `AGENTS.override.md` takes precedence over `AGENTS.md`; doctor
 reports this as an error. Merge needed override instructions manually before
 removing or emptying the override. Repair does not modify that user-owned file.
 
-The five explicit skills (`pickup`, `handoff`, `track`, `clog`, `triage`) are the
-supported Codex workflow surface in this checkout. `triage` runs review findings
-through the triage ledger: record them, build the page with `dct triage page`,
-record an agent's proposals, and close with the owner's answers. Their session-resumption behavior has
-[separate acceptance evidence](codex-acceptance.md).
+The 14 packaged skills (`clog`, `commit`, `dct-import`, `dct-init`, `handoff`, `pickup`, `plan-resolve-uncertain`, `plan-status`, `release`, `track`, `track-list`, `track-resolve`, `track-update`, `triage`) are the shared workflow inventory in this checkout.
+Each contains its complete contract, with native `agents/openai.yaml` metadata.
+`dct-init`, `dct-import` and `plan-resolve-uncertain` are explicit-only. Both
+adapters derive their inventory from the canonical manifest; renderer and build
+checks reject stale or missing generated assets. `triage` uses the findings
+ledger, publishes only when the host provides that capability, and preserves
+owner-only decisions. Its proposals and scoped backlog follow the same contract
+in both clients. Session resumption has [separate acceptance evidence](codex-acceptance.md);
+full fresh-client acceptance of the expanded inventory remains a separate gate.
 
 ### Experimental native hooks
 
@@ -157,7 +168,7 @@ upgrades, model calls or network requests.
 ## Capability matrix
 
 This matrix describes the development checkout. **Established** is the existing
-Claude integration; **supported** denotes the packaged explicit Codex workflows;
+Claude integration; **packaged** denotes the shared Codex workflow inventory;
 **experimental** requires the stated native-host conditions; **generic** denotes
 manual protocol integration, without a claim of client-specific acceptance.
 
@@ -165,11 +176,11 @@ manual protocol integration, without a claim of client-specific acceptance.
 |---|---|---|---|
 | Shared tracking/session MCP tools | Available | Available | Manual stdio registration; host-dependent discovery |
 | Integration installer | `init`; new `integrate` commands in development | `integrate install/repair` | Manual |
-| Managed workflow skills | Existing collection of 14, including triage | Supported: pickup, handoff, track, clog, triage | Supply client-specific instructions manually |
+| Managed workflow skills | Existing collection of 14, including triage | Packaged: clog, commit, dct-import, dct-init, handoff, pickup, plan-resolve-uncertain, plan-status, release, track, track-list, track-resolve, track-update, triage | Supply client-specific instructions manually |
 | Changelog checks / stop reminders | Claude hooks | Experimental native hooks; review/trust and dependencies required | No packaged adapter |
 | Plan-file autoscan | Claude edit/write events | Experimental `apply_patch` events; shell edits need explicit rescan | CLI rescan or MCP `ingest_plan_file` |
 | Native plan mirroring | Claude TaskCreate/TodoWrite | Experimental and conditional on actual `update_plan` events | No packaged mirror |
-| Managed instructions | CLAUDE.md pointer + `~/.claude/dct-reference.md` | AGENTS.md; conflicts reported | Manual |
+| Managed instructions | CLAUDE.md pointer + shared reference; owned legacy alias retained | AGENTS.md pointer + shared reference; conflicts reported | Manual |
 | Integration diagnostics | Development `doctor` | Development `doctor`; runtime trust checked separately | Core runtime checks only |
 
 Hook installation and trust are separate from explicit skills. Treat each

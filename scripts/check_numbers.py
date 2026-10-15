@@ -57,13 +57,10 @@ SITE_COUNTS = [
 # that added a test — which would have made this gate cry wolf in CI. What is
 # left changes only when a tool is added or removed, which is exactly the drift
 # worth failing a build over.
-README_PATTERNS = [(r"(\d+) MCP tools", "tools", False)]
+README_PATTERNS = [(r"(\d+) (?:MCP tools|tools over stdio)", "tools", False)]
 
-# The packaged dct reference (installed as ~/.claude/dct-reference.md by
-# `dct init`; before K-36 it was the attached CLAUDE.md snippet) renders the
-# tool count too. It sat outside this gate and
-# silently drifted to "52 total" once (#341/#611) — same exact tier as README.
-SNIPPET_PATTERNS = [(r"\*\*MCP tools\*\* — (\d+) total", "tools", False)]
+# The generated concise reference carries no volatile MCP total. Its catalog
+# is validated by render_skills.py --check against the canonical manifest.
 
 # Per-file contracts: exactly the numbers that page is expected to render.
 SITE_PATTERNS = {
@@ -135,12 +132,13 @@ def derive(repo: Path) -> dict[str, str]:
     import asyncio
 
     from dct.mcp.server import mcp
+    from dct.skill_render import skill_names
 
     return {
         "version": pyproject["project"]["version"],
         "tests": match.group(1),
         "tools": str(len(asyncio.run(mcp.list_tools()))),
-        "skills": str(sum(1 for p in (repo / "dct/skills").iterdir() if p.is_dir())),
+        "skills": str(len(skill_names(repo))),
         # A sourced *.lib.sh (K-48) sits beside the hooks but is not one.
         "hooks": str(sum(1 for p in (repo / "dct/hooks").glob("*.sh")
                          if not p.name.endswith(".lib.sh"))),
@@ -236,7 +234,6 @@ def main() -> int:
 
     targets = [
         (REPO / "README.md", README_PATTERNS),
-        (REPO / "dct/assets/dct-reference.md", SNIPPET_PATTERNS),
     ]
     if args.site:
         targets += [(args.site / rel, pats) for rel, pats in SITE_PATTERNS.items()]

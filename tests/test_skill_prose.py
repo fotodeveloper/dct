@@ -65,8 +65,7 @@ def _triage_fallback() -> str:
         .read_text(encoding="utf-8")
     start = text.index("## `/triage` fallback")
     end = text.find("\n## ", start + 1)
-    end = text.index("These prose descriptions are the authoritative behavior.", start) \
-        if end < 0 else end
+    end = len(text) if end < 0 else end
     return text[start:end]
 
 

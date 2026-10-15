@@ -1,0 +1,340 @@
+# {{host.skill-prefix}}dct-import — Import Existing Tracking Data
+
+## Two import paths (v0.2.0)
+
+Markdown files fall into three buckets; each uses a different tool:
+
+| Bucket       | Files                                                       | Tool                                     |
+| ------------ | ----------------------------------------------------------- | ---------------------------------------- |
+| **Plan-like**| plans, specs, ADRs, roadmaps, retros, backlogs              | `mcp__dct__ingest_plan_file` (v0.2 pipeline) |
+| **Issue-like**| ORCH-N / BUG-N custom-field files, TODOS with inline status | v0.1 items + checkpoints (see Pattern Catalog below) |
+| **Changelog**| CHANGELOG.md, changelog.md, changelog_unreleased.md         | `add_changelog` for unreleased; `import_released_changelog` for history |
+
+The v0.2 pipeline handles ULID injection, `[x]` historical state, and
+optional LLM classification of uncertain sections in one call — you don't
+re-implement Pattern Catalog logic for plan-like files.
+
+## Key principle
+
+The assistant proposes; the user decides through {{host.question-method}}. Never auto-create
+without confirmation. Ambiguous entries are flagged and asked one-by-one.
+
+## Workflow
+
+### Step 1: Detect candidate files
+
+Scan project root (and common subdirs) for typical tracking files. Apply
+the stale-file skip list FIRST (see below) — do not even offer skipped
+paths to the user.
+
+Typical patterns (file name heuristic):
+- **Plan-like** (→ `ingest_plan_file`):
+  - `docs/plans/*.md`, `docs/specs/*.md`, `docs/adr/*.md`, `docs/retros/*.md`
+  - `ROADMAP.md`, `TODOS.md`, `FUTURE.md`, `BACKLOG.md`
+  - `SPRINT*.md`, `PLAN*.md`
+- **Issue-like** (→ v0.1 items path):
+  - `ISSUES.md`, `BUGS.md`, `*issues*.md`, `*orchestrator*.md`
+- **Changelog** (→ `add_changelog`):
+  - `CHANGELOG.md`, `changelog.md`, `changelog_unreleased.md`
+
+### Step 2: Classify each file by format
+
+For each candidate, read the first ~60 lines and classify by content.
+The Pattern Catalog below lists 10 known formats. A file may match multiple
+(e.g. a plan with embedded checkboxes) — pick the dominant one, flag as
+composite in Step 4.
+
+### Step 3: Parse per-format
+
+Apply the mapping rules from the Pattern Catalog. Build a draft table of
+proposed imports BEFORE any DB write.
+
+### Step 4: Present review — {{host.question}} pipeline
+
+First {{host.question}}:
+- question: "Found N files. Which to import?"
+- options: one per file formatted `TODOS.md (304 lines) — checkbox TODOs`,
+  plus `"All detected files"`, `"Pick subset (I'll list)"`, `"Cancel"`.
+- On subset: follow-up multi-select {{host.question}}.
+
+For each selected file, ONE {{host.question}} with the proposed table inside
+it — the preview of "Import all as listed", on "Details" pages when longer
+than 15 lines (Rules: "The screen travels inside the dialog"):
+- question: "Proceed with <file>? (N entries, M ambiguous)"
+- options:
+  - `"Import all as listed"`
+  - `"Resolve ambiguities one-by-one"` — one {{host.question}} per flagged row
+  - `"Edit first"` — free-text {{host.question}}, parse corrections, ask
+    again with the corrected table
+  - `"Skip this file"`
+  - `"Cancel import"`
+
+### Step 5: Execute
+
+Check existing items/history before importing to avoid a known duplicate. Imports are per operation, not a whole-file transaction; retain every acknowledged id and report partial completion. After an ambiguous write response inspect its result before retrying.
+
+**For plan-like files** (v0.2 pipeline):
+- Pass a real boolean: call `mcp__dct__ingest_plan_file(file_path, project, auto_resolve_uncertain=true)` only when the owner approved using the configured `rules` or `command` strategy for that import. For skipping resolution, an unapproved strategy, or a disabled/unavailable provider, call `mcp__dct__ingest_plan_file(file_path, project, auto_resolve_uncertain=false)`. Never pass a strategy name or prose as the boolean. Respect the configuration; do not force a Claude invocation. Show the configured command/provider and unknown cost where applicable before strategy consent.
+- The tool handles ULID injection, DB upsert, first-import `[x]` historical
+  state, and optional LLM classification in one call.
+- This DOES modify the MD file by injecting `<!-- dct:plan/section/cp:<ULID> -->`
+  HTML comments — this is intentional; the anchors are the stable cross-cut
+  between file and DB. Original text / ordering / code blocks are preserved.
+
+For each confirmed issue-like or changelog entry (legacy v0.1 path):
+1. Items: `mcp__dct__create_item(...)` — **REMEMBER the returned `id`** per entry.
+   Pass a `short_title` for every item: a 2-4 word English noun phrase naming
+   what it is about (≤ 50 chars, no item number, no project name), derived
+   from the title — even when the title itself stays in its source language.
+   Every create ack must echo `short_title` (null when none was stored). A
+   missing key means the MCP server's contract is outdated: STOP the import
+   and report an unsupported server contract (restart / upgrade the server).
+   Do NOT retry the create — that item already exists.
+2. Parent + sub-tasks: after creating the parent item, loop
+   `mcp__dct__add_checkpoint(parent_id, text)` for each sub-task —
+   remember each checkpoint id. Mark already-done sub-tasks via
+   `complete_checkpoint(cp_id)` in a second pass.
+3. Changelog entries: `mcp__dct__add_changelog(...)`.
+4. Provenance: `mcp__dct__add_note(item_id, f"Imported from {filename} on {date}")`
+   for every item. This feeds the post-migration audit trail.
+5. For issue-like / changelog: NEVER modify or delete the source markdown file.
+
+### Step 6: Report
+
+Per-file summary: counts by type / priority / done-vs-open. End with
+"X items, Y checkpoints, Z changelog entries imported from N files".
+
+---
+
+## Pattern Catalog
+
+### Format A — TODOS.md (checkbox flat list)
+
+```markdown
+## P1 — Blockers
+- [ ] Fix parser crash on empty files
+- [x] Rotate session tokens  ← already done
+
+## P2 — Important
+- [ ] Add progress bar
+```
+
+Mapping:
+- Section heading `## P1 — ...` → `priority="P1"` for items in that section
+- `- [ ]` / `- [x]` → `status="open"` / `status="resolved"`
+- `✅` or bare `**DONE**` or `STATUS: DONE` at entry end → equivalent to `[x]`
+- Line after dash → `title` (strip bold markers, emoji, leading/trailing whitespace)
+- `item_type` defaults to `todo` unless entry text matches type triggers
+  ("bug", "crash", "error" → issue; "add X" → feature; etc.)
+
+### Format B — Narrative sprint / ROADMAP
+
+```markdown
+## Sprint 3 — January push
+
+Goal: ship the parser rewrite, close the 4 blocker bugs, validate perf.
+
+- Parser rewrite from scratch (new AST, incremental indexing)
+- Memory leak fix in watcher — blocking prod since Jan 4
+- Cross-platform CI matrix
+- Performance baseline vs v0.17
+```
+
+Mapping (**plan-as-parent** strategy):
+- Each `## Sprint N — <title>` or `## Sprint 0.5 — <title>` → ONE parent item:
+  `item_type="feature"`, `title="Sprint N — <title>"`, description includes the Goal line
+- Each bullet under the sprint → `add_checkpoint(parent_id, bullet_text)`
+- Completed sprint (all bullets done, or marked "Done"/"✅ Shipped"):
+  resolve parent + complete all checkpoints
+- Recognize multilingual section markers: `## Sprint`, `## Iteration`,
+  `## Faza`, `## Etap`
+
+### Format C — Custom issue format (ORCH-N, BUG-N)
+
+```markdown
+## ORCH-3 — Scheduler race on concurrent writes
+
+**Where**: cmd/scheduler/dispatch.go:142
+**Problem**: Two workers claim the same job when heartbeat skipped.
+**Fix**: Add advisory lock around SELECT FOR UPDATE SKIP LOCKED.
+**Severity**: P1
+**Status**: open
+```
+
+Mapping:
+- Heading → `title` (strip the ID prefix or capture it as tag — see the tag note below)
+- `**Where**:` → `source_file` (+ `source_lines` if line range present)
+- `**Problem**:` + `**Fix**:` → merged into `description`
+- `**Severity**:` → `priority` (P1/P2/P3)
+- `**Status**:` → `status` (map "open"/"in progress"/"done"/"resolved")
+- `item_type="issue"` (that's what this format represents)
+- Prefix like `ORCH-3` → `tags=["orch"]` (derive bucket tag from prefix)
+
+**Tag note**: tags come from a global, normalized dictionary. A derived bucket
+tag can trip the similarity guard against a name that already exists (`orch` vs
+`orchestrator`) — the create is then REFUSED with a suggestion and the item is
+rolled back. Default to the suggested existing tag; when the new bucket is
+genuinely wanted, call `mcp__dct__add_tag(name=..., force=true)` once, then
+re-run the import batch.
+
+### Format D — Plan-as-parent (1.5k+ line planning doc)
+
+Large planning documents (1.5k-2k+ lines) SHOULD NOT be flattened into
+hundreds of items. Instead:
+
+1. File → ONE parent item: `item_type="feature"`, title from file H1,
+   description = first prose section + link to file path.
+2. Each `##` section → `add_checkpoint(parent_id, section_title)`.
+3. Each checkbox WITHIN those sections → one more `add_checkpoint` (nested
+   via sort_order grouping, e.g. section 1 gets sort 10-19, section 2 gets 20-29).
+4. If file has >7 `##` sections, ask user via {{host.question-method}} whether
+   they prefer "one parent per section" (multiple items) instead.
+
+### Format E — Keep-a-Changelog with [Unreleased]
+
+Standard format:
+```markdown
+## [Unreleased]
+### Added
+- New Python parser support
+
+### Fixed
+- Memory leak in watcher
+```
+
+Mapping:
+- `### Added/Changed/Fixed/Removed` → `category` directly
+- Bullet → `entry`
+- Only import `[Unreleased]` section by default (past versions already released)
+
+### Format F — Keep-a-Changelog WITHOUT [Unreleased]
+
+Some projects have only historical version sections. Ask whether to import the latest version as explicitly unreleased, import the exact historical rows with their stated versions/dates, or skip. A latest-as-unreleased choice uses `add_changelog` and is explicitly shown as such; it is not a discovered historical release.
+
+Before historical writes, read existing history (`list_changelog(project=<slug>, unreleased_only=false)`) and preview exact category, entry, version, stated date (or import-time default), component/source and supported related item per row. Check duplicates against existing rows; this does not establish automatic deduplication or whole-file atomicity. Import only the approved files and rows.
+
+Historical rows use `import_released_changelog(project=<slug>, category=<category>, entry=<text>, version=<original spelling>, released_at=<stated ISO-8601 or "">, component="", source_file="", source_lines="", related_item_id=0)`. Every field is a separate top-level parameter. CLI equivalent: `dct clog import-released <project> <category> <entry> --version <version> [--released-at <ISO-8601>] [--component ...] [--source-file ...] [--source-lines ...] [--related-item N] --json`.
+
+A stated date-only value becomes 00:00:00 UTC on that day; full timestamps require an offset and normalize to UTC. Malformed timestamps write nothing for that row. An absent date uses current import time, reported as `released_at_source="import_time"`, never as a discovered original release date; supplied dates return `released_at_source="stated"`. The ack carries saved id/project/category/version/released_at/source; retain every returned id. Original version spelling is preserved. Versions with release records or above current_version refuse.
+
+Per-row failure leaves earlier successful rows intact: report exact acknowledged ids, failed/unattempted rows and cause. An ambiguous response is inspected before any retry, never blindly imported again. No automatic branch/worktree attribution is made for historical events. Historical import changes neither current_version, unrelated unreleased entries nor release records. Never use add→release stamping, `release_changelog`, advance, tags, commits, reconstruction or compensating deletion for import. Preserve source Markdown for changelog/issue rows.
+
+### Format G — Empty subsections
+
+```markdown
+## [Unreleased]
+### Added
+
+### Fixed
+- Actually something here
+```
+
+Skip empty subsections gracefully — do not create placeholder items. If
+ALL subsections under [Unreleased] are empty, treat the file as "no
+unreleased content" and move on.
+
+### Format H — FUTURE.md / IDEAS.md (prose or loose bullets)
+
+```markdown
+## Maybe someday
+
+Would be cool to support Ruby parsers. The challenge is...
+
+Another idea: plugin system for custom languages.
+```
+
+Mapping:
+- Each H2/bullet → `item_type="idea"`, `priority="future"`
+- Description = the prose underneath (first 500 chars)
+
+### Format I — Conventional-commit style entries
+
+```markdown
+- feat(parser): add Python support
+- fix(watcher): memory leak on large trees
+- refactor(graph): extract schema builder
+```
+
+Mapping (useful when importing from git log turned into markdown):
+- Prefix `feat:` / `feat(scope):` → `category="added"`, `component=<scope>`
+- `fix:` → `category="fixed"`
+- `refactor:` / `chore:` / `perf:` / `style:` → `category="changed"`
+- `revert:` / `remove:` → `category="removed"`
+- Text after `:` → `entry`
+
+### Format J — No-changelog graceful case
+
+If the project has NO changelog file, do NOT error. Report: `"No changelog
+file found — skipping changelog import"` and continue with items only.
+
+---
+
+## Stale-file skip list
+
+Skip these paths during Step 1 detection — do NOT offer them to the user.
+Common sources of already-migrated / archival / generated content:
+
+- `.cursor/plans/`, `.cursor/chats/` — Cursor working files
+- `worktrees/`, `.git/worktrees/` — git worktree dirs
+- `old_modules*`, `old-*`, `*-archive`, `archive/` — manual archives
+- `node_modules/`, `target/`, `dist/`, `build/` — build outputs
+- `.venv/`, `venv/`, `__pycache__/` — Python virtualenvs
+- `.claude/`, `.gstack/` — plugin internals
+- Any file matching `*.bak`, `*.old`, `*~`
+
+User can override ("include archive/old-bugs.md anyway") via explicit path
+in their {{host.skill-prefix}}dct-import invocation.
+
+---
+
+## Edge case handling
+
+### Bilingual / mixed-language titles
+
+Polish, English, mixed — preserve as-is. Do not translate, do not strip
+language markers. Example: `"Parser crashes / Parser się wywala"` stays
+as the title unchanged.
+
+### Composite files (plan + checkboxes + narrative)
+
+When a file clearly mixes formats, pick the dominant one and note the
+mixed nature in the user's review table ("composite: plan-as-parent with
+embedded checkboxes"). Usually "plan-as-parent" wins for 500+ line docs.
+
+### Done-status recognition
+
+A sub-task is DONE when ANY of these hold:
+- `[x]` or `[X]` prefix
+- `✅` marker anywhere in the line
+- Literal `**DONE**`, `STATUS: DONE`, `[DONE]`, `(done)`, `— done`
+- Line struck through with `~~text~~`
+
+### No sprint / no plan / no checkboxes
+
+If the file is pure prose without structure, offer to import as a single
+`item_type="idea"` with the file content as description (truncated to
+~1000 chars with link to full file path).
+
+---
+
+## Rules
+
+{{shared.language}}
+{{shared.consent}}
+- **Plan-like files → `ingest_plan_file`** — v0.2 pipeline owns ULID injection
+  and first-import state semantics. Do not re-implement these inline.
+- **Issue-like / changelog files → v0.1 items / changelog path** — unchanged,
+  uses Pattern Catalog below.
+- **Plan-like ingest DOES modify source files** — it injects HTML-comment
+  ULID anchors. Users should know this (show diff option if they're unsure).
+  Other formats: NEVER modify source files.
+- **Provenance notes are mandatory for v0.1 items** — every legacy-path
+  item gets `add_note("Imported from <file> on <date>")`. Plan-like entries
+  have `plans.source_file` + `plans.imported_at` which serve the same role.
+- **Respect stale-file skip list** — do not even offer those to the user.
+- **One file, one format** — pick dominant; note composites for the user.
+- **Changelog missing is OK** — skip gracefully, never error out.
+- **Ambiguities are NEVER silent** — always flag and ask.
+
+
+{{shared.discovery}}

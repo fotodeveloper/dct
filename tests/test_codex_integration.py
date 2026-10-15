@@ -1,11 +1,13 @@
 """Codex install/repair contracts on isolated user homes."""
 
+import json
 import tomllib
 from pathlib import Path
 
 import pytest
 
 from dct.integrations import codex
+from dct.skill_render import MARKER, load_manifest, skill_names, validate_frontmatter
 
 
 @pytest.fixture
@@ -98,7 +100,7 @@ def test_unknown_and_modified_skills_are_preserved(adapter):
     assert adapter.install_skills()['skipped'] == ['pickup']
     modified = adapter.skills_path / 'handoff' / 'SKILL.md'
     modified.write_text('user revision')
-    assert adapter.install_skills()['skipped'] == ['pickup', 'handoff']
+    assert set(adapter.install_skills()['skipped']) == {'pickup', 'handoff'}
     adapter.uninstall()
     assert (user / 'SKILL.md').read_text() == 'user skill'
     assert modified.read_text() == 'user revision'
@@ -110,6 +112,7 @@ def test_packaged_skill_upgrade_and_repeated_install(adapter, tmp_path, monkeypa
     sources.mkdir()
     for name in codex.SKILLS:
         (sources / f'codex-{name}.md').write_text((codex.ASSETS / f'codex-{name}.md').read_text() + '\nNew version.\n')
+        (sources / f'codex-{name}.yaml').write_bytes((codex.ASSETS / f'codex-{name}.yaml').read_bytes())
     monkeypatch.setattr(codex, 'ASSETS', sources)
     adapter.install_skills()
     assert (adapter.skills_path / 'pickup' / 'SKILL.md').read_text().endswith('New version.\n')
@@ -161,10 +164,10 @@ def test_shipped_workflows_use_client_neutral_tools_and_consent():
     for name in codex.SKILLS:
         text = (codex.ASSETS / f'codex-{name}.md').read_text()
         assert 'AskUserQuestion' not in text
-        assert 'claude-' not in text
-        assert 'name: ' + name in text
+        assert json.loads(text.split('name: ', 1)[1].splitlines()[0]) == name
     assert 'consume="false"' in (codex.ASSETS / 'codex-pickup.md').read_text()
-    assert 'approved text' in (codex.ASSETS / 'codex-handoff.md').read_text()
+    assert 'context_summary' in (codex.ASSETS / 'codex-handoff.md').read_text()
+    assert 'explicit' in (codex.ASSETS / 'codex-handoff.md').read_text()
 
 
 def test_uninstall_ignores_marker_text_inside_multiline_string(adapter):
@@ -223,28 +226,35 @@ def test_doctor_reports_instruction_override_read_errors(adapter, kind):
     assert rows['instructions_shadowed']['status'] == 'error'
 
 
-def test_every_codex_skill_asset_carries_the_managed_marker():
+def test_every_codex_skill_asset_carries_parsed_frontmatter_then_generated_marker():
+    """Native discovery requires frontmatter at byte zero; the marker follows it."""
+    entries = {entry['name']: entry for entry in load_manifest()['skills']}
+    assert tuple(entries) == codex.SKILLS
     for name in codex.SKILLS:
+        entry = entries[name]
         text = (codex.ASSETS / f'codex-{name}.md').read_text()
-        front, _, body = text.partition('\n---\n')
-        assert front.startswith('---\nname: ' + name + '\n'), name
-        assert body.lstrip().startswith('<!-- dct-managed-codex-skill -->'), name
+        validate_frontmatter(text, name=name, description=entry['description'],
+                             explicit_only=entry['explicit_only'], host='codex')
+        _, _, body = text.partition('\n---\n')
+        assert body.lstrip().startswith(f'<!-- {MARKER} -->'), name
+        metadata = (codex.ASSETS / f'codex-{name}.yaml').read_text()
+        assert f'allow_implicit_invocation: {str(not entry["explicit_only"]).lower()}' in metadata
 
 
 def test_triage_asset_is_client_neutral_and_keeps_consent():
     """#930: the Codex /triage asset gives commands without a host's shell
     prefix and keeps the decision and publication rules of the skill."""
     text = (codex.ASSETS / 'codex-triage.md').read_text()
-    flat = ' '.join(text.split())
+    flat = ' '.join(text.split()).lower()
     assert '! dct' not in text and '`!' not in text
     for rule in ("decisions come only from the owner's own text",
-                 "an agent's proposals never become decisions without the owner's acceptance",
+                 "proposals never become decisions without the owner's acceptance",
                  "note and reject never create items",
-                 "No answer approves a commit, push or release",
-                 "never hand-edit a page",
-                 "otherwise return the local path and the exact command"):
+                 "commit, push and release are not approved by these answers",
+                 "never hand-edit its constants",
+                 "return the local artifact and exact next action/command"):
         assert rule in flat, rule
-    assert 'suggestions=<answers>' in flat and 'not the envelope' in flat
+    assert 'suggestions=<suggested.answers>' in flat and 'never the whole `{by, date, answers}` envelope' in flat
 
 
 def test_triage_is_installed_and_a_user_owned_triage_is_kept(adapter):
@@ -265,7 +275,7 @@ def _asset_backlog_call():
     import re
 
     flat = ' '.join((codex.ASSETS / 'codex-triage.md').read_text().split())
-    calls = [m.group(1) for m in re.finditer(r'\blist_findings\(([^()]*)\)', flat)
+    calls = [m.group(1) for m in re.finditer(r'\b(?:mcp__dct__)?list_findings\(([^()]*)\)', flat)
              if 'decision="backlog"' in m.group(1)]
     assert len(calls) == 1, calls
     return dict(arg.strip().split('=', 1) for arg in calls[0].split(','))
@@ -294,7 +304,7 @@ def test_triage_asset_promotes_only_the_closing_cycles_unlinked_backlog(srv):
     linked = next(r for r in rows['rows'] if r[rows['cols'].index('seq')] == 1)
     assert 'error' not in srv.promote_finding_to_item(linked[rows['cols'].index('id')])
 
-    placeholders = {'<slug>': 'test', '<closing cycle>': closing}
+    placeholders = {'<slug>': 'test', '<closing cycle>': closing, "<the closing cycle's id>": closing}
     kwargs = {k: placeholders[v] if v in placeholders else ast.literal_eval(v)
               for k, v in _asset_backlog_call().items()}
     assert set(kwargs) == {'project', 'cycle_id', 'decision', 'limit'}
@@ -309,7 +319,6 @@ def test_triage_asset_promotes_only_the_closing_cycles_unlinked_backlog(srv):
 # --- K-37: the docs' skill lists and counts mirror the real registries -------
 
 _REPO = Path(__file__).resolve().parent.parent
-_NUMBER_WORDS = {3: 'three', 4: 'four', 5: 'five', 6: 'six', 7: 'seven', 8: 'eight'}
 
 
 def _claude_skills() -> set[str]:
@@ -334,28 +343,130 @@ def _sentence(text: str, start: str) -> str:
 def test_readme_counts_and_lists_the_packaged_skills():
     readme = (_REPO / 'README.md').read_text(encoding='utf-8')
     flat = ' '.join(readme.split())
-    claude, n_codex = _claude_skills(), _NUMBER_WORDS[len(codex.SKILLS)]
-    assert f'with {len(claude)} slash-command skills' in flat
-    assert f'The {len(claude)} Claude Code skills, 4 Claude hooks and {n_codex} ' \
-           'development-version Codex skills' in flat
-    assert f'{n_codex} Codex workflows in development builds' in flat
-    assert f'The {n_codex} explicit workflows are supported' in flat
+    claude, count = _claude_skills(), len(skill_names())
+    assert claude == set(skill_names()) == set(codex.SKILLS)
+    assert f'with {count} slash-command skills' in flat
+    assert f'The {count} Claude Code skills, 4 Claude hooks and {count} development-version Codex skills' in flat
+    assert f'{count} Codex workflows in development builds' in flat
+    assert f'The {count} packaged workflows are available' in flat
     table = readme[readme.index('### Skills'):readme.index('## Global Hooks')]
     import re
     assert set(re.findall(r'^\| `/([a-z-]+)` \|', table, re.MULTILINE)) == claude
     assert _backticked(_sentence(readme, 'Codex currently packages')) == set(codex.SKILLS)
-    assert _backticked(_sentence(readme, 'The adapter installs MCP configuration')) \
-        == set(codex.SKILLS)
+    assert _backticked(_sentence(readme, 'The adapter installs MCP configuration')) == set(codex.SKILLS)
 
 
-def test_integration_guide_and_managed_instructions_list_the_codex_skills():
+def test_integration_guide_lists_inventory_and_managed_instructions_use_neutral_reference():
     guide = (_REPO / 'docs' / 'integrations.md').read_text(encoding='utf-8')
-    n_codex = _NUMBER_WORDS[len(codex.SKILLS)]
-    assert _backticked(_sentence(guide, f'The {n_codex} explicit skills')) == set(codex.SKILLS)
-    assert _backticked(_sentence(guide, 'installs `pickup`')) == set(codex.SKILLS)
+    count = len(skill_names())
+    assert _backticked(_sentence(guide, f'The {count} packaged skills')) == set(codex.SKILLS)
     row = next(line for line in guide.splitlines() if line.startswith('| Managed workflow'))
-    supported = row.split('Supported:')[1].split('|')[0]
-    assert {s.strip() for s in supported.split(',')} == set(codex.SKILLS)
+    packaged = row.split('Packaged:')[1].split('|')[0]
+    assert {s.strip() for s in packaged.split(',')} == set(codex.SKILLS)
     assert f'collection of {len(_claude_skills())}' in row
     agents = (codex.ASSETS / 'codex-agents.md').read_text(encoding='utf-8')
-    assert _backticked(_sentence(agents, 'The `pickup`')) == set(codex.SKILLS)
+    assert '{{reference_path}}' in agents
+    assert 'never invent a model or session identifier' in agents
+
+
+@pytest.mark.parametrize('raw', [
+    '# Owner settings\r\nmodel = "example"\r\n',
+    '# Mixed owner bytes\r\nmodel = "example"\n[mcp_servers.other]\r\ncommand = "other"\r\n',
+    '# Owner header\r\n[mcp_servers.dct]\r\ncommand = "custom"\r\nargs = []\r\n[mcp_servers.dct.env]\r\nCUSTOM = "keep"\r\n',
+])
+def test_mcp_edits_preserve_exact_owner_line_endings(adapter, raw):
+    """Installing absent fields and repeat/uninstall must not normalize owner bytes."""
+    adapter.home.mkdir(parents=True)
+    adapter.config_path.write_bytes(raw.encode())
+    adapter.install_mcp()
+    after = adapter.config_path.read_bytes()
+    if '[mcp_servers.dct]' not in raw:
+        assert after.startswith(raw.encode())
+    else:
+        for line in raw.splitlines(keepends=True):
+            assert line.encode() in after
+    assert adapter.install_mcp()['status'] == 'unchanged'
+    assert adapter.config_path.read_bytes() == after
+    adapter.uninstall()
+    remaining = adapter.config_path.read_bytes()
+    if '[mcp_servers.dct]' not in raw:
+        assert remaining.startswith(raw.encode())
+        assert 'dct' not in tomllib.loads(remaining.decode()).get('mcp_servers', {})
+    else:
+        assert remaining == after
+
+
+def test_missing_packaged_metadata_does_not_leave_a_retry_blocking_directory(adapter, tmp_path, monkeypatch):
+    """A source read failure must not create an unowned partial installation."""
+    source = tmp_path / 'source-assets'
+    source.mkdir()
+    (source / 'codex-action.md').write_text('Workflow')
+    monkeypatch.setattr(codex, 'SKILLS', ('action',))
+    monkeypatch.setattr(codex, 'ASSETS', source)
+    with pytest.raises(FileNotFoundError):
+        adapter.install_skills()
+    assert not (adapter.skills_path / 'action').exists()
+    (source / 'codex-action.yaml').write_text('policy:\n  allow_implicit_invocation: false\n')
+    assert adapter.install_skills()['installed'] == ['action']
+    assert (adapter.skills_path / 'action/agents/openai.yaml').read_text().endswith('false\n')
+
+
+def test_edited_native_metadata_makes_the_whole_skill_foreign(adapter, tmp_path, monkeypatch):
+    source = tmp_path / 'source-assets'
+    source.mkdir()
+    for extension, text in [('md', 'Workflow'), ('yaml', 'policy:\n  allow_implicit_invocation: false\n')]:
+        (source / f'codex-action.{extension}').write_text(text)
+    monkeypatch.setattr(codex, 'SKILLS', ('action',))
+    monkeypatch.setattr(codex, 'ASSETS', source)
+    adapter.install_skills()
+    metadata = adapter.skills_path / 'action/agents/openai.yaml'
+    metadata.write_text('Owner metadata')
+    assert adapter.install_skills()['skipped'] == ['action']
+    adapter.uninstall()
+    assert metadata.read_text() == 'Owner metadata'
+
+
+def test_partial_owned_skill_write_can_be_retried_without_claiming_success(adapter, tmp_path, monkeypatch):
+    """A failed second asset is reported and its owned partial directory stays retryable."""
+    source = tmp_path / 'source-assets'
+    source.mkdir()
+    (source / 'codex-action.md').write_text('Workflow')
+    (source / 'codex-action.yaml').write_text('policy:\n  allow_implicit_invocation: false\n')
+    monkeypatch.setattr(codex, 'SKILLS', ('action',))
+    monkeypatch.setattr(codex, 'ASSETS', source)
+    original = codex.atomic_write
+
+    def interrupt(path, text):
+        if path.name == 'openai.yaml':
+            raise OSError('Interrupted metadata write')
+        return original(path, text)
+
+    monkeypatch.setattr(codex, 'atomic_write', interrupt)
+    with pytest.raises(OSError, match='Interrupted'):
+        adapter.install_skills()
+    assert not (adapter.skills_path / 'action/agents/openai.yaml').exists()
+    monkeypatch.setattr(codex, 'atomic_write', original)
+    assert adapter.install_skills()['installed'] == ['action']
+    assert (adapter.skills_path / 'action/agents/openai.yaml').read_bytes() == (source / 'codex-action.yaml').read_bytes()
+
+
+def test_skill_directory_appearing_after_ownership_check_is_preserved(adapter, tmp_path, monkeypatch):
+    source = tmp_path / 'source-assets'
+    source.mkdir()
+    (source / 'codex-action.md').write_text('Workflow')
+    (source / 'codex-action.yaml').write_text('policy:\n  allow_implicit_invocation: false\n')
+    monkeypatch.setattr(codex, 'SKILLS', ('action',))
+    monkeypatch.setattr(codex, 'ASSETS', source)
+    destination = adapter.skills_path / 'action'
+    original = Path.mkdir
+
+    def race(self, *args, **kwargs):
+        if self == destination:
+            original(self)
+            (self / 'SKILL.md').write_text('Appeared owner skill')
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, 'mkdir', race)
+    assert adapter.install_skills()['skipped'] == ['action']
+    assert (destination / 'SKILL.md').read_text() == 'Appeared owner skill'
+    assert not (destination / '.dct-managed-copy.json').exists()

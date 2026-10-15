@@ -9,17 +9,21 @@ import sys
 import tomllib
 from pathlib import Path
 
+from dct import paths
+from dct.integrations import reference
 from dct.integrations.base import (
     ClientIntegration,
+    _line_ending,
     atomic_write,
     is_managed_copy,
     managed_instructions,
     mark_managed_copy,
     read_exact_text,
 )
+from dct.skill_render import skill_names
 
 ASSETS = Path(__file__).resolve().parent.parent / "assets"
-SKILLS = ("pickup", "handoff", "track", "clog", "triage")
+SKILLS = skill_names()
 START = "<!-- dct-codex:start -->"
 END = "<!-- dct-codex:end -->"
 MCP_START = "# dct-codex:mcp:start"
@@ -57,7 +61,7 @@ LEGACY_HOOK_RETIRE_LAYOUTS = {
 
 
 def _read_config(path: Path) -> tuple[str, dict]:
-    raw = path.read_text(encoding="utf-8") if path.exists() else ""
+    raw = read_exact_text(path) if path.exists() else ""
     try:
         return raw, tomllib.loads(raw)
     except tomllib.TOMLDecodeError as exc:
@@ -81,7 +85,8 @@ def _insert_missing(raw: str, path: tuple[str, ...], fields: dict) -> str:
     """
     if not fields:
         return raw
-    assignment = ''.join(f'{key} = {json.dumps(value)}\n' for key, value in fields.items())
+    eol = _line_ending(raw)
+    assignment = ''.join(f'{key} = {json.dumps(value)}{eol}' for key, value in fields.items())
     offset = 0
     for line in raw.splitlines(keepends=True):
         stripped = line.strip()
@@ -96,9 +101,9 @@ def _insert_missing(raw: str, path: tuple[str, ...], fields: dict) -> str:
                 matches = False
             if matches:
                 end = offset + len(line)
-                return raw[:end] + ('\n' if not line.endswith('\n') else '') + assignment + raw[end:]
+                return raw[:end] + (eol if not line.endswith('\n') else '') + assignment + raw[end:]
         offset += len(line)
-    return raw + ('\n\n' if raw else '') + '[' + '.'.join(path) + ']\n' + assignment
+    return raw + (eol + eol if raw else '') + '[' + '.'.join(path) + ']' + eol + assignment
 
 
 def _module_command(action: str) -> str:
@@ -201,7 +206,8 @@ class CodexIntegration(ClientIntegration):
         raw, data = _read_config(self.config_path)
         servers = _table(data, 'mcp_servers')
         if 'dct' not in servers:
-            updated = raw + ('\n\n' if raw else '') + MCP_BLOCK + '\n'
+            eol = _line_ending(raw)
+            updated = raw + (eol + eol if raw else '') + MCP_BLOCK.replace('\n', eol) + eol
         else:
             server = _table(servers, 'dct')
             if 'url' in server:
@@ -227,24 +233,43 @@ class CodexIntegration(ClientIntegration):
             if (destination.exists() or destination.is_symlink()) and not is_managed_copy(destination):
                 skipped.append(name)
                 continue
-            destination.mkdir(parents=True, exist_ok=True)
-            skill = destination / 'SKILL.md'
-            content = (ASSETS / f'codex-{name}.md').read_text(encoding='utf-8')
-            if not skill.exists() or skill.read_text(encoding='utf-8') != content:
-                # Backups live outside the owned skill directory so upgrades do
-                # not change the inventory or advertise duplicate skills.
-                backup = atomic_write(skill, content)
-                if backup:
-                    backup_path = Path(backup)
-                    self.home.mkdir(parents=True, exist_ok=True)
-                    backup_path.replace(self.home / backup_path.name)
-            mark_managed_copy(destination)
+            # Read every source before creating any partial destination.
+            contents = [(relative, source.read_text(encoding="utf-8"))
+                        for relative, source in (("SKILL.md", ASSETS / f"codex-{name}.md"),
+                                                 ("agents/openai.yaml", ASSETS / f"codex-{name}.yaml"))]
+            if not destination.exists():
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                try:
+                    destination.mkdir()
+                except FileExistsError:
+                    skipped.append(name)  # another owner won exclusive creation
+                    continue
+            try:
+                for relative, content in contents:
+                    skill = destination / relative
+                    if not skill.exists() or read_exact_text(skill) != content:
+                        # Backups stay outside the managed skill inventory.
+                        backup = atomic_write(skill, content)
+                        if backup:
+                            backup_path = Path(backup)
+                            self.home.mkdir(parents=True, exist_ok=True)
+                            backup_path.replace(self.home / backup_path.name)
+            finally:
+                # An interrupted owned multi-file refresh stays provably ours,
+                # so a retry can finish it instead of preserving a false conflict.
+                mark_managed_copy(destination)
             installed.append(name)
         return {'installed': installed, 'skipped': skipped, 'path': str(self.skills_path)}
 
+    def install_reference(self) -> dict:
+        return reference.install_reference(client="codex")
+
     def install_instructions(self) -> dict:
-        return managed_instructions(self.instructions_path,
-                                    (ASSETS / 'codex-agents.md').read_text(encoding='utf-8'), START, END)
+        body = reference.instruction_body("codex", template=ASSETS / "codex-agents.md")
+        result = self.install_reference()
+        if result["status"] == "preserved":
+            return result
+        return managed_instructions(self.instructions_path, body, START, END)
 
     def _repair_missing_legacy_hooks(
             self, hooks: dict, desired: dict) -> tuple[list[str], list[str]]:
@@ -463,17 +488,17 @@ class CodexIntegration(ClientIntegration):
             try:
                 destination = self.skills_path / name
                 owned = is_managed_copy(destination)
-                current = owned and (destination / 'SKILL.md').read_text(encoding='utf-8') == (ASSETS / f'codex-{name}.md').read_text(encoding='utf-8')
+                current = owned and all((destination / relative).read_bytes() == source.read_bytes()
+                                        for relative, source in (("SKILL.md", ASSETS / f"codex-{name}.md"), ("agents/openai.yaml", ASSETS / f"codex-{name}.yaml")))
                 add(f'skill:{name}', 'ok' if current else 'error', 'Current DCT skill' if current else 'Missing, outdated or user-owned skill; repair preserves conflicts')
             except (OSError, UnicodeError) as exc:
                 add(f'skill:{name}', 'error', str(exc))
         try:
-            raw = self.instructions_path.read_text(encoding='utf-8') if self.instructions_path.exists() else ''
-            body = (ASSETS / 'codex-agents.md').read_text(encoding='utf-8').strip('\n')
-            valid = raw.count(START) == raw.count(END) == 1 and f'{START}\n{body}\n{END}' in raw
-            add('instructions', 'ok' if valid else 'error', str(self.instructions_path))
-        except (OSError, UnicodeError) as exc:
+            body = reference.instruction_body("codex", template=ASSETS / "codex-agents.md")
+            rows.append(reference.instruction_row(self.instructions_path, body, START, END))
+        except (OSError, UnicodeError, ValueError) as exc:
             add('instructions', 'error', str(exc))
+        rows.append(reference.reference_row(client="codex"))
         try:
             override = self.home / 'AGENTS.override.md'
             shadowed = override.exists() and bool(override.read_text(encoding='utf-8').strip())
@@ -527,14 +552,15 @@ class CodexIntegration(ClientIntegration):
         # Validate config before making any changes to other integration files.
         raw, data = _read_config(self.config_path)
         removed, retained = [], []
-        managed = MCP_BLOCK in raw
+        block = MCP_BLOCK.replace("\n", _line_ending(raw))
+        managed = block in raw
         if managed:
             try:
-                tomllib.loads(raw[:raw.index(MCP_BLOCK)])
+                tomllib.loads(raw[:raw.index(block)])
             except tomllib.TOMLDecodeError:
                 managed = False  # Marker-shaped text inside a multiline string.
         if managed and _table(data, 'mcp_servers', 'dct') == tomllib.loads(MCP_BODY)['mcp_servers']['dct']:
-            updated = raw.replace(MCP_BLOCK, '', 1)
+            updated = raw.replace(block, '', 1)
             tomllib.loads(updated)
             atomic_write(self.config_path, updated)
             removed.append('mcp')
@@ -558,4 +584,7 @@ class CodexIntegration(ClientIntegration):
         hook_removed, hook_retained = self._uninstall_hooks()
         removed.extend(hook_removed)
         retained.extend(hook_retained)
+        canonical = paths.dct_reference_path()
+        if canonical.exists() or canonical.is_symlink():
+            retained.append(str(canonical) + ' (shared reference retained)')
         return {'removed': removed, 'retained': retained}

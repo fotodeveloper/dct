@@ -450,13 +450,14 @@ def srv(engine, monkeypatch):
     """MCP harness: point the server at the fixture engine, seed slug 'test'.
 
     Tools are called directly (the SDK's @mcp.tool() decorator returns the
-    function unchanged) — `server._get_engine` is the only seam that needs
-    patching, so the returned module IS the system under test.
+    function unchanged). Both read/write engine accessors point at this fixture;
+    dedicated file-backed tests prove readonly provisioning/refusal behavior.
     """
     from dct.core.projects import create_project
     from dct.mcp import server as S
 
     monkeypatch.setattr(S, "_get_engine", lambda: engine)
+    monkeypatch.setattr(S, "_get_readonly_engine", lambda: engine)
     create_project(engine, slug="test", name="Test Project", path="/tmp/test")
     return S
 

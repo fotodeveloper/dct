@@ -633,17 +633,38 @@ GATE_REJECT_EXCEPTION = re.compile(
 ASSETS = PACKAGE / "assets"
 
 
+# Match checkpoint rejection actions, not a tool rejecting an invalid request.
+_CHECKPOINT_REJECTION = re.compile(
+    r"reject_checkpoint\b|dct\s+checkpoint\s+reject\b"
+    r"|\breject(?:ing)?\b[^.;\n]{0,80}?\b(?:checkpoints?|gates?|steps?|ones)\b"
+    r"|\b(?:checkpoints?|gates?)\b[^.;\n]{0,40}?\b(?:are|should be|must be)\s+rejected\b",
+    re.IGNORECASE,
+)
+_TASK_REJECTION = re.compile(r"\b(?:task|cc-task)\s+checkpoints?\b", re.IGNORECASE)
+
+
 def _reject_shortcut_offenders(text: str) -> list[str]:
-    """Blocks (a paragraph, a list item, a numbered step) that tell the agent
-    to reject checkpoints for irrelevance / abandoned scope without the gate
-    exception."""
+    """Checkpoint-rejection instructions require the gate exception.
+
+    A request refusal is not a checkpoint mutation. A rejection explicitly
+    restricted to non-gate task checkpoints does not waive a gate either;
+    mixed targets still require the exception.
+    """
     blocks = re.split(r"\n\s*\n|\n(?=\s*(?:[-*] |\d+\. |#))", text)
-    return [
-        _flat(b) for b in blocks
-        if re.search(r"reject", b, re.IGNORECASE)
-        and re.search(r"irrelevant|abandoned|scope|not apply|N/A", b, re.IGNORECASE)
-        and not GATE_REJECT_RESTRICTED.search(_flat(b))
-    ]
+    offenders = []
+    for block in blocks:
+        flat = _flat(block)
+        if (not re.search(r"irrelevant|abandoned|scope|not apply|N/A", flat, re.IGNORECASE)
+                or GATE_REJECT_RESTRICTED.search(flat)):
+            continue
+        for action in _CHECKPOINT_REJECTION.finditer(flat):
+            tail = flat[action.end():].split('.', 1)[0]
+            if (_TASK_REJECTION.search(action.group())
+                    and not re.search(r"\b(?:checkpoints?|gates?|ones)\b", tail, re.IGNORECASE)):
+                continue
+            offenders.append(flat)
+            break
+    return offenders
 
 
 # Any wording that keeps the restriction on a gate counts in the scan; the
@@ -672,3 +693,35 @@ def test_packaged_references_carry_the_same_gate_exception(name):
 @pytest.mark.parametrize("path", sorted(ASSETS.glob("*.md")), ids=lambda p: p.name)
 def test_no_packaged_asset_rejects_checkpoints_without_the_gate_exception(path):
     assert _reject_shortcut_offenders(path.read_text(encoding="utf-8")) == []
+
+
+@pytest.mark.parametrize('text', [
+    'The draft changes scope, and handoff_work rejects an empty replace.',
+    'Complete checkpoints when proven, reject an obsolete task checkpoint on the scoped owner decision, and preserve ledger history.',
+    'The command rejects a request outside its supported scope; checkpoint history is unchanged.',
+])
+def test_rejection_scan_spares_request_refusals_and_explicit_non_gate_tasks(text):
+    """Request refusal and a scoped task decision never authorize rejecting a gate."""
+    assert _reject_shortcut_offenders(text) == []
+
+
+@pytest.mark.parametrize('text', [
+    'Reject irrelevant checkpoints within the agreed scope.',
+    'Use reject_checkpoint for abandoned scope.',
+    'Run dct checkpoint reject <id> when the check does not apply.',
+    'Reject an irrelevant gate so the item can close.',
+    'Complete current checkpoints and reject irrelevant ones within scope.',
+    'Checkpoints should be rejected for abandoned scope.',
+    'Reject obsolete task checkpoints and irrelevant gates within scope.',
+])
+def test_rejection_scan_catches_unauthorized_checkpoint_shortcuts(text):
+    """Narrowing request-refusal detection must preserve the actual gate guard."""
+    assert _reject_shortcut_offenders(text) == [_flat(text)]
+
+
+def test_rejection_scan_notices_removed_gate_exception():
+    """Removing only the gate exception makes a real checkpoint instruction unsafe."""
+    text = "Reject irrelevant checkpoints within scope; a gate only on the user's decision (full gate policy: add_checkpoint)."
+    assert _reject_shortcut_offenders(text) == []
+    mutated = GATE_REJECT_RESTRICTED.sub('', text)
+    assert _reject_shortcut_offenders(mutated) == [_flat(mutated)]

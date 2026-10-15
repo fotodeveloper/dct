@@ -1,0 +1,1 @@
+The approval is one supported decision interaction on the exact draft. The presentation rule below determines eligible UI or complete visible text; never ask acceptance of hidden or truncated content.

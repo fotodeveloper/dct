@@ -1,0 +1,1 @@
+Inspect the current host native skill locations (`.agents/skills` in applicable project/ancestor paths and the configured user skills) for manifest workflow names, and Codex integration diagnostics for shadowing/conflicts. Never edit Claude hooks or permission settings.

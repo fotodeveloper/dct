@@ -26,6 +26,7 @@ import re
 from pathlib import Path
 
 import pytest
+from test_skill_prose_changelog import _codex, _release_fallback, _resume_path
 
 from dct.assets import skills_dir
 from dct.core.changelog import add_entry, list_entries, release_entries
@@ -48,14 +49,13 @@ def _skill_resume() -> str:
 
 
 def _fallback_resume() -> str:
-    body = FALLBACKS.read_text(encoding="utf-8")
-    start = body.index("**Resume path**")
-    return body[start:body.index("**Legacy path**", start)]
+    return _resume_path(_release_fallback())
 
 
 RESUME_DOCS = [
     pytest.param(_skill_resume, id="skill"),
     pytest.param(_fallback_resume, id="fallback"),
+    pytest.param(lambda: _resume_path(_codex("release")), id="codex"),
 ]
 
 

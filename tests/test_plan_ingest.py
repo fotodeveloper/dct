@@ -182,7 +182,7 @@ def _write_fixture(tmp_path, content: str, rel: str = "docs/plans/p.md"):
 
 
 def test_ingest_first_import_creates_plan_sections_checkpoints(engine, proj, tmp_path, monkeypatch):
-    monkeypatch.setattr(classify_mod, "classify_uncertain", lambda *a, **kw: None)
+    monkeypatch.setattr(classify_mod, "classify_result", lambda *a, **kw: classify_mod.ClassificationResult(reason="no_rule"))
 
     path = _write_fixture(tmp_path, "# Plan\n## Sprint 1\n- [ ] A\n- [x] B\n")
     report = ingest_file(engine, path, project_slug="dct", auto_resolve_uncertain=False)
@@ -211,8 +211,8 @@ def test_ingest_does_not_downgrade_resolved_to_uncertain(
     is disabled (or the LLM returned None)."""
     # First: ingest with LLM returning 'reference' (so heading gets resolved).
     monkeypatch.setattr(
-        classify_mod, "classify_uncertain",
-        lambda *a, **kw: "reference",
+        classify_mod, "classify_result",
+        lambda *a, **kw: classify_mod.ClassificationResult("reference", "command", "command"),
     )
     path = _write_fixture(tmp_path, "# Some weird standalone title\n")
     ingest_file(engine, path, project_slug="dct", auto_resolve_uncertain=True)
@@ -226,8 +226,8 @@ def test_ingest_does_not_downgrade_resolved_to_uncertain(
     # will still classify this heading as 'uncertain', but DB must not
     # downgrade the 'reference' classification back to 'uncertain'.
     monkeypatch.setattr(
-        classify_mod, "classify_uncertain",
-        lambda *a, **kw: None,
+        classify_mod, "classify_result",
+        lambda *a, **kw: classify_mod.ClassificationResult(reason="no_rule"),
     )
     # Change file content slightly to force hash mismatch + rescan.
     path.write_text(path.read_text() + "\nSome trailing prose.\n", encoding="utf-8")
@@ -244,7 +244,7 @@ def test_ingest_drops_plan_anchor_missing_warning_after_injection(
     ingest immediately writes the anchor to disk. The report should not
     show the warning after the fix is materialized — otherwise users see
     a warning about a file that visibly has the anchor."""
-    monkeypatch.setattr(classify_mod, "classify_uncertain", lambda *a, **kw: None)
+    monkeypatch.setattr(classify_mod, "classify_result", lambda *a, **kw: classify_mod.ClassificationResult(reason="no_rule"))
 
     path = _write_fixture(tmp_path, "# Plan\n## Sprint 1\n- [ ] Do\n")
     report = ingest_file(engine, path, project_slug="dct", auto_resolve_uncertain=False)
@@ -256,7 +256,7 @@ def test_ingest_drops_plan_anchor_missing_warning_after_injection(
 
 
 def test_ingest_reads_x_state_on_first_import(engine, proj, tmp_path, monkeypatch):
-    monkeypatch.setattr(classify_mod, "classify_uncertain", lambda *a, **kw: None)
+    monkeypatch.setattr(classify_mod, "classify_result", lambda *a, **kw: classify_mod.ClassificationResult(reason="no_rule"))
 
     path = _write_fixture(tmp_path, "## S\n- [ ] pending one\n- [x] done one\n")
     ingest_file(engine, path, project_slug="dct", auto_resolve_uncertain=False)
@@ -270,7 +270,7 @@ def test_ingest_reads_x_state_on_first_import(engine, proj, tmp_path, monkeypatc
 
 
 def test_ingest_re_sync_ignores_x_state(engine, proj, tmp_path, monkeypatch):
-    monkeypatch.setattr(classify_mod, "classify_uncertain", lambda *a, **kw: None)
+    monkeypatch.setattr(classify_mod, "classify_result", lambda *a, **kw: classify_mod.ClassificationResult(reason="no_rule"))
 
     path = _write_fixture(tmp_path, "## S\n- [ ] A\n- [ ] B\n")
     ingest_file(engine, path, project_slug="dct", auto_resolve_uncertain=False)
@@ -306,9 +306,9 @@ def test_ingest_auto_resolve_uncertain_uses_classify(engine, proj, tmp_path, mon
 
     def fake_classify(heading, parent_heading=None, preview="", **kwargs):
         called.append(heading)
-        return "prose"
+        return classify_mod.ClassificationResult("prose", "command", "command")
 
-    monkeypatch.setattr(classify_mod, "classify_uncertain", fake_classify)
+    monkeypatch.setattr(classify_mod, "classify_result", fake_classify)
 
     path = _write_fixture(tmp_path, "# Some weird standalone heading\n")
     report = ingest_file(engine, path, project_slug="dct", auto_resolve_uncertain=True)
@@ -319,7 +319,7 @@ def test_ingest_auto_resolve_uncertain_uses_classify(engine, proj, tmp_path, mon
 
 
 def test_ingest_uncertain_without_classify_stays_uncertain(engine, proj, tmp_path, monkeypatch):
-    monkeypatch.setattr(classify_mod, "classify_uncertain", lambda *a, **kw: None)
+    monkeypatch.setattr(classify_mod, "classify_result", lambda *a, **kw: classify_mod.ClassificationResult(reason="no_rule"))
 
     path = _write_fixture(tmp_path, "# Some weird standalone heading\n")
     report = ingest_file(engine, path, project_slug="dct", auto_resolve_uncertain=False)
@@ -329,7 +329,7 @@ def test_ingest_uncertain_without_classify_stays_uncertain(engine, proj, tmp_pat
 
 
 def test_ingest_uses_title_from_first_h1(engine, proj, tmp_path, monkeypatch):
-    monkeypatch.setattr(classify_mod, "classify_uncertain", lambda *a, **kw: None)
+    monkeypatch.setattr(classify_mod, "classify_result", lambda *a, **kw: classify_mod.ClassificationResult(reason="no_rule"))
 
     path = _write_fixture(tmp_path, "# Real Title\n## Sprint 1\n- [ ] X\n")
     ingest_file(engine, path, project_slug="dct", auto_resolve_uncertain=False)
@@ -340,7 +340,7 @@ def test_ingest_uses_title_from_first_h1(engine, proj, tmp_path, monkeypatch):
 
 
 def test_ingest_falls_back_to_filename_title(engine, proj, tmp_path, monkeypatch):
-    monkeypatch.setattr(classify_mod, "classify_uncertain", lambda *a, **kw: None)
+    monkeypatch.setattr(classify_mod, "classify_result", lambda *a, **kw: classify_mod.ClassificationResult(reason="no_rule"))
 
     path = _write_fixture(tmp_path, "## Sprint 1\n- [ ] X\n", rel="docs/plans/my-plan.md")
     ingest_file(engine, path, project_slug="dct", auto_resolve_uncertain=False)
@@ -351,7 +351,7 @@ def test_ingest_falls_back_to_filename_title(engine, proj, tmp_path, monkeypatch
 
 
 def test_ingest_stamps_imported_at_on_first_import_only(engine, proj, tmp_path, monkeypatch):
-    monkeypatch.setattr(classify_mod, "classify_uncertain", lambda *a, **kw: None)
+    monkeypatch.setattr(classify_mod, "classify_result", lambda *a, **kw: classify_mod.ClassificationResult(reason="no_rule"))
 
     path = _write_fixture(tmp_path, "# Plan\n## A\n- [ ] X\n")
     r1 = ingest_file(engine, path, project_slug="dct", auto_resolve_uncertain=False)

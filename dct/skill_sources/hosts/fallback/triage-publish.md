@@ -1,0 +1,5 @@
+3. When the host refuses the CLI call, give the exact `dct triage page` command to run and continue only from its actual output.
+4. Publish only through a publishing/artifact capability actually available and authorized on this host. Use the same local path and destination for a republish when the publisher supports a stable URL; do not claim URL stability without that capability. Descriptions use the conversation language, including their first word, and say the page collects the owner's answers. The page's storage key comes from the cycle id, preserving viewer drafts on a rebuild.
+5. After the FIRST successful publish, call `update_triage(artifact_url=<actual url>, cycle_id=<id>)` for an open cycle. Do not store a local path as a published URL.
+6. If publication is unavailable, return the local artifact and exact next action/command. Report publication pending; a generic MCP connection does not establish a publisher. For proposals record that local build's digest with its exact artifact; acceptance still needs the exact digest of the artifact the owner actually saw. Never invent a published page or require Claude login.
+

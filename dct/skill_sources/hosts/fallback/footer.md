@@ -1,0 +1,1 @@
+The complete behavior above is generated, not separately authored. Change `dct/skill_sources` and regenerate every target. Missing CLI effect capability is a refusal with its concrete remedy, never a reason to emulate releases through raw ledger writes.

@@ -3,6 +3,7 @@
 import hashlib
 import json
 import os
+import re
 import shutil
 import tempfile
 from abc import ABC, abstractmethod
@@ -213,3 +214,88 @@ def is_managed_copy(path: Path) -> bool:
         return marker.get('owner') == 'dct' and marker.get('files') == _copy_inventory(path)
     except (OSError, ValueError, AttributeError):
         return False
+
+
+def _link_or_copy(src: Path, dst: Path, *, mark_file: bool = False) -> str:
+    """Symlink dst → src; when symlinks are unavailable fall back to a real
+    copy (W5: Windows without Developer Mode / SeCreateSymbolicLinkPrivilege
+    raises WinError 1314). Copies drift until the next `dct upgrade`
+    refreshes them — say so instead of failing the whole init.
+
+    Never overwrites (K-58): the caller checked or cleared ``dst``, but a
+    file, directory or link that appears there before the creation is left
+    untouched — the symlink and the copy are both exclusive creations, never
+    a write through an existing path — and ``"preserved"`` is returned. Any
+    other error of the copy (permissions, I/O) propagates: it is never
+    reported as an installed asset.
+
+    A directory copy carries the content manifest (``mark_managed_copy``);
+    ``mark_file=True`` gives a single Markdown file the same proof inline
+    (``_write_marked_copy``) — hooks stay unmarked, a header would break a
+    script. Returns ``"symlink"``, ``"copy"`` or ``"preserved"``."""
+    try:
+        dst.symlink_to(src)
+    except FileExistsError:
+        return "preserved"
+    except OSError:
+        try:
+            if src.is_dir():
+                # copytree creates dst itself and refuses an existing path
+                shutil.copytree(src, dst)
+                mark_managed_copy(dst)
+            elif mark_file:
+                _write_marked_copy(src, dst)
+            else:
+                _create_exclusive(dst, src.read_bytes(), mode=src.stat().st_mode)
+        except FileExistsError:
+            return "preserved"
+        print(
+            f"  note: symlinks unavailable — copied {src.name} instead "
+            "(copies drift; `dct upgrade` refreshes them)"
+        )
+        return "copy"
+    return "symlink"
+
+
+def _create_exclusive(dst: Path, data: bytes, *, mode: int | None = None) -> None:
+    """Create ``dst`` holding ``data``; raise FileExistsError when anything —
+    a file, a directory, a live or dangling symlink — already sits there
+    (O_EXCL never follows a link). A failed write removes the file this call
+    created, so no truncated copy is left behind as someone's file."""
+    fd = os.open(dst, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0), 0o666)
+    try:
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(data)
+            if mode is not None and hasattr(os, "fchmod"):
+                os.fchmod(stream.fileno(), mode & 0o7777)
+    except BaseException:
+        dst.unlink(missing_ok=True)
+        raise
+
+
+# Single-file counterpart of base.mark_managed_copy / is_managed_copy: the
+# first line records the sha256 of the rest, so only an UNCHANGED copy dct
+# wrote is recognised as dct's (an edited one becomes the user's file).
+_COPY_HEADER = re.compile(r"<!-- dct:managed-copy sha256=([0-9a-f]{64}) [^\n]*-->\n")
+
+
+def _write_marked_copy(src: Path, dst: Path) -> None:
+    body = src.read_bytes()
+    header = (f"<!-- dct:managed-copy sha256={hashlib.sha256(body).hexdigest()} "
+              "(managed by dct init; an edited copy is left alone) -->\n")
+    _create_exclusive(dst, header.encode("utf-8") + body)
+
+
+def _marked_copy_body(path: Path) -> bytes | None:
+    """The copied bytes of an unchanged marked copy; None for anything else."""
+    if path.is_symlink() or not path.is_file():
+        return None
+    try:
+        raw = path.read_bytes()
+    except OSError:
+        return None
+    match = _COPY_HEADER.match(raw.decode("utf-8", errors="replace"))
+    if not match:
+        return None
+    body = raw[len(match.group(0).encode("utf-8")):]
+    return body if hashlib.sha256(body).hexdigest() == match.group(1) else None

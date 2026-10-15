@@ -78,7 +78,10 @@ def test_every_consent_skill_states_the_screen_rule_among_its_rules(name):
 
 def test_the_fallbacks_state_the_screen_rule_before_the_first_workflow():
     flat = _flat(FALLBACKS.read_text(encoding="utf-8"))
-    assert SCREEN_RULE in flat[:flat.find("## `/")]
+    header = flat[:flat.find("## `/")]
+    assert "exact readable proposal before the user's explicit response" in header
+    assert "show the full decision material in visible text" in header
+    assert "Plan-only/optional-question-only permission tool" in header
 
 
 @pytest.mark.parametrize("name", sorted(SCREEN_OPTIONS))

@@ -1,0 +1,1 @@
+A typical release uses one decision interaction carrying the complete screen. Show "Checking proj-a…" while preparing. The owner sees all version/action material and answers explicitly through the host presentation below; when no eligible UI exists, complete visible text plus the owner's explicit reply is the consent route.

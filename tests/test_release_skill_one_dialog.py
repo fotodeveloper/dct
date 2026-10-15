@@ -61,12 +61,15 @@ from test_release_effects import (
     use_cli,
 )
 from test_skill_prose_changelog import (
+    _codex,
     _commands,
     _dct_executes,
     _effects_detail_keys,
     _in_order,
+    _question_interaction,
     _release_fallback,
     _skill,
+    _skill_invocation,
 )
 
 from dct.core.changelog import add_entry, list_entries
@@ -78,6 +81,7 @@ ROOT = Path(__file__).resolve().parent.parent
 RELEASE_DIALOGS = [
     pytest.param(lambda: _skill("release"), id="skill"),
     pytest.param(_release_fallback, id="fallback"),
+    pytest.param(lambda: _codex("release"), id="codex"),
 ]
 
 # ── reading the prose ───────────────────────────────────────────────────────
@@ -256,9 +260,10 @@ def test_1_the_message_file_is_for_a_dirty_tree_and_drafted_by_the_assistant(tex
     assert re.search(r"Changelog: <[^>]+>", plain), "no `Changelog: <ids>` line in the draft"
     assert re.search(r"conventional", plain, re.IGNORECASE)
     assert re.search(r"scratch file", plain, re.IGNORECASE), "the message is not written to a file"
-    assert re.search(r"/commit[^.]{0,160}(question|ask)[^.]{0,80}"
+    commit = re.escape(_skill_invocation(text(), "commit"))
+    assert re.search(rf"{commit}[^.]{{0,160}}(question|ask)[^.]{{0,80}}"
                      r"(not asked|never asked|suppress|skipp)|"
-                     r"(suppress|skip|never ask|not ask)[^.]{0,80}/commit", plain, re.IGNORECASE), \
+                     rf"(suppress|skip|never ask|not ask)[^.]{{0,80}}{commit}", plain, re.IGNORECASE), \
         "the nested /commit questions are not suppressed"
 
 
@@ -287,7 +292,8 @@ def test_1_the_owner_sees_only_a_checking_line_before_the_screen(text):
 @pytest.mark.parametrize("text", RELEASE_DIALOGS)
 def test_2_the_screen_is_one_ask_user_question_with_two_questions(text):
     plain = _plain(_new_release(text()))
-    assert re.search(r"\b(one|single)\b[^.]{0,60}AskUserQuestion[^.]{0,120}"
+    interaction = re.escape(_question_interaction(text()))
+    assert re.search(rf"\b(one|single)\b[^.]{{0,60}}{interaction}[^.]{{0,120}}"
                      r"\btwo questions\b", plain, re.IGNORECASE), \
         "the screen is not described as one AskUserQuestion with two questions"
 
@@ -629,7 +635,7 @@ def test_4_every_other_refusal_is_one_plain_sentence_and_run_release_again(text)
     plain = _plain(text())
     assert "one plain sentence" in plain.lower()
     assert "Technical details" in plain
-    assert "run /release again" in plain, 'the one phrase for coming back is "run /release again"'
+    assert f"run {_skill_invocation(text(), 'release')} again" in plain, 'the one phrase for coming back is "run /release again"'
 
 
 @pytest.mark.parametrize("text", RELEASE_DIALOGS)
@@ -796,7 +802,7 @@ def test_7_the_counts_follow_from_the_one_screen(text):
     assert rows["another"] == {"dialogs": 2, "answers": 2 * screen}
     assert rows["proven_gt4"] == {"dialogs": 2, "answers": screen + 1}
     plain = _plain(text())
-    assert re.search(r"dialog is one AskUserQuestion", plain)
+    assert f"dialog is one {_question_interaction(text())}" in plain
     assert re.search(r"answer is one question", plain)
 
 
@@ -923,7 +929,7 @@ def test_9_a_commit_made_under_a_consent_that_cannot_be_finished_is_named(text):
     assert "pending_consent.checkout_root" in plain
     assert re.search(r'"Your changes are already committed as [0-9a-f]+; the release you '
                      r'approved earlier didn\'t finish, so here it is again\."', plain)
-    assert re.search(r'was started in <checkout_root> — run /release again in that folder', plain)
+    assert f"was started in <checkout_root> — run {_skill_invocation(text(), 'release')} again in that folder" in plain
 
 
 def test_9_pending_consent_is_routed_before_the_changelog_file_in_all_three_documents():
@@ -1083,9 +1089,9 @@ def test_9_every_stop_names_a_true_next_step(text):
     assert "--no-skip-worktree" in row("hidden_index_flags")[1]
     secret = row("secret_like")[1]
     assert "git restore" in secret and "git rm --cached" in secret and "TRACKED" in secret
-    assert "/commit" in row("intent_to_add")[1] and "git rm --cached" in row("intent_to_add")[1]
+    assert _skill_invocation(text(), "commit") in row("intent_to_add")[1] and "git rm --cached" in row("intent_to_add")[1]
     contract = row("message_contract")
-    assert "/commit" in contract[1] and "stop" in contract[2]
+    assert _skill_invocation(text(), "commit") in contract[1] and "stop" in contract[2]
     assert "IN FULL" in row("remote_tag_exists")[2]
 
 
@@ -1198,7 +1204,8 @@ def test_9_a_missing_older_record_is_one_short_sentence(text):
 @pytest.mark.parametrize("text", RELEASE_DIALOGS)
 def test_9_an_old_cli_stop_names_the_upgrade(text):
     plain = _plain(text())
-    assert re.search(r"older than this /release\. Upgrade it with dct upgrade \(or uv tool "
+    release = re.escape(_skill_invocation(text(), "release"))
+    assert re.search(rf"older than this {release}\. Upgrade it with dct upgrade \(or uv tool "
                      r"upgrade dctracker, or pipx upgrade dctracker", plain)
 
 
@@ -1415,7 +1422,7 @@ def test_11_index_only_has_its_own_row_with_a_true_next_step(text):
     row = _first_row(body, "index_only")
     assert _keys(row[0]) == {"index_only"}, f"index_only shares a row: {row[0]}"
     say, then = _plain(row[1]), _plain(row[2])
-    assert "git restore --staged -- <paths>" in say and "run /release again" in say
+    assert "git restore --staged -- <paths>" in say and f"run {_skill_invocation(text(), 'release')} again" in say
     assert re.search(r"\bstop\b", then) and not re.search(r"preview again", then), then
     assert re.search(r"\bnever\b[^.]{0,60}\bunstage", _plain(row[1] + row[2])), \
         "the row does not say the dialog never unstages for the owner"

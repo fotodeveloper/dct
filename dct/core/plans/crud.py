@@ -287,7 +287,22 @@ def add_plan_section(
     section_type_confidence: str = "high",
     source_lines: str | None = None,
     status: str = "pending",
+    classification_result=None,
 ) -> dict:
+    """Create a section, optionally atomically carrying known classification.
+
+    Generic creation keeps unknown provenance. Ingest supplies a typed semantic
+    result; its coherent fields are validated by the same classification writer.
+    Provider execution must finish before this function opens its transaction.
+    """
+    classification_values = {}
+    if classification_result is not None:
+        from dct.core.plans.classification import _values
+        classification_values = _values(classification_result)
+        section_type = classification_values.pop("section_type")
+        section_type_confidence = classification_values.pop("section_type_confidence")
+        needs_llm_review = classification_values.pop("needs_llm_review")
+        classification_values.update(classified_at=datetime.now(UTC), classification_revision=0)
     _validate(section_type, VALID_SECTION_TYPES, "section_type")
     _validate(status, VALID_SECTION_STATUSES, "status")
     if depth < 1 or depth > 6:
@@ -316,6 +331,7 @@ def add_plan_section(
                 status=status,
                 source_lines=source_lines,
                 sprint_id=sprint_id,
+                **classification_values,
             )
             .returning(plan_sections)
         ).first()
@@ -365,6 +381,12 @@ def get_plan_section_by_ulid(engine: sa.Engine, ulid: str) -> dict | None:
 
 
 def update_plan_section(engine: sa.Engine, section_id: int, **kwargs) -> dict | None:
+    if {"section_type", "section_type_confidence", "needs_llm_review",
+        "classification_source", "classification_provider", "classification_model",
+        "classified_at", "classification_revision"}.intersection(kwargs):
+        raise ValueError("Unsupported direct classification update "
+                         "(section_type, section_type_confidence, needs_llm_review); "
+                         "use set_plan_section_type")
     allowed = {
         "heading", "depth", "slug", "sort_order", "section_type",
         "section_type_confidence", "needs_llm_review", "status",
@@ -372,7 +394,7 @@ def update_plan_section(engine: sa.Engine, section_id: int, **kwargs) -> dict | 
     }
     values: dict = {}
     for k, v in kwargs.items():
-        if k not in allowed or v is None:
+        if k not in allowed or (v is None and k != "parent_section_id"):
             continue
         if k == "section_type":
             _validate(v, VALID_SECTION_TYPES, "section_type")

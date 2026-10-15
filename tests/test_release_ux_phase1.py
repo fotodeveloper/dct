@@ -81,8 +81,10 @@ from test_release_effects import (
     resume,
 )
 from test_skill_prose_changelog import (
+    _codex,
     _fallbacks,
     _skill,
+    _workflow_fallback,
 )
 
 from dct.core.changelog import add_entry
@@ -571,14 +573,23 @@ def test_k37_docs_require_a_script_that_changes_only_version_files(text):
     assert _warns_against_wrapping(body), "no warning against wrapping a release/publish command"
 
 
-def test_k37_dct_init_detects_the_registration_before_any_setup_question():
-    body = _init()
-    probe = body.index("mcp__dct__list_projects")
-    for setup in ("permissions.allow", "Probe project-local CC artefacts",
-                  "version-sync script"):
+@pytest.mark.parametrize("text", [
+    pytest.param(_init, id="claude"),
+    pytest.param(lambda: _codex("dct-init"), id="codex"),
+    pytest.param(lambda: _workflow_fallback("dct-init"), id="fallback"),
+])
+def test_k37_dct_init_detects_the_registration_before_any_setup_question(text):
+    body = text()
+    step2 = body.index("Step 2: Probe current project registration")
+    probe = body.index("Call `mcp__dct__list_projects`", step2)
+    for setup in ("Conflicting project artifacts", "version-sync script"):
         assert setup in body, f"precondition: {setup!r} still described"
-        assert probe < body.index(setup), \
+        assert probe < body.index(setup, step2), \
             f"the registration is probed after the setup step {setup!r}"
+    if text is _init:
+        assert "permissions.allow" in body[step2:]
+    else:
+        assert "permissions.allow" not in body
     assert "Project is already registered. What now?" not in body
 
 
@@ -598,9 +609,7 @@ def test_k37_dct_init_drops_the_final_what_next_question():
 
 
 def _resolve_fallback() -> str:
-    text = _fallbacks()
-    start = text.index("## `/track-resolve`")
-    return text[start:text.index("These prose descriptions", start)]
+    return _workflow_fallback("track-resolve")
 
 
 RESOLVE_DIALOGS = [
@@ -1080,16 +1089,23 @@ def test_dct_init_asks_the_commit_lines_once_and_stores_them():
         "a project's own rules (e.g. a session-link ban) do not win over a stored answer"
 
 
-def test_dct_init_never_promises_null_for_a_detected_version():
+@pytest.mark.parametrize("text", [
+    pytest.param(_init, id="claude"),
+    pytest.param(lambda: _codex("dct-init"), id="codex"),
+    pytest.param(lambda: _workflow_fallback("dct-init"), id="fallback"),
+])
+def test_dct_init_never_promises_null_for_a_detected_version(text):
     """`dct project add` stores the detected version when --version is left
     out, so nothing may promise an unset one where a version is detected:
     the registration passes the version the "Register" preview showed, and
     leaves --version out only when none was detected or given."""
-    registration = _init_section("Always pass the version", "Run via Bash")
+    body = _flat(text())
+    at = body.index("Always pass the version")
+    registration = body[at:body.index("Run via", at)]
     assert not re.search(r"\bNULL\b|\bunset\b|\bleave (it )?empty\b", registration,
                          re.IGNORECASE), registration
     assert re.search(r"no version detected or given, leave `--version` out", registration)
-    assert not re.search(r"Leave NULL", _init())
+    assert not re.search(r"Leave NULL", body)
 
 
 def _case2() -> str:

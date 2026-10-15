@@ -2,114 +2,32 @@
 in CP #1235): register the MCP server user-scope, install hook and skill
 symlinks into the host's ~/.claude, wire hooks into settings.json."""
 
-import hashlib
 import json
 import os
-import re
 import shlex
 import shutil
 import subprocess
 from pathlib import Path
 
-from dct import assets
+from dct import assets, paths
 from dct.config import Config
+from dct.integrations import base as integration_base
+from dct.integrations import reference
 from dct.integrations.base import (
     ClientIntegration,
     _copy_inventory,
+    _link_or_copy,
     atomic_write,
     forget_managed_link,
     is_managed_copy,
-    is_recorded_link,
     managed_instructions,
-    mark_managed_copy,
     read_exact_text,
-    record_managed_link,
 )
 
-
-def _link_or_copy(src: Path, dst: Path, *, mark_file: bool = False) -> str:
-    """Symlink dst → src; when symlinks are unavailable fall back to a real
-    copy (W5: Windows without Developer Mode / SeCreateSymbolicLinkPrivilege
-    raises WinError 1314). Copies drift until the next `dct upgrade`
-    refreshes them — say so instead of failing the whole init.
-
-    Never overwrites (K-58): the caller checked or cleared ``dst``, but a
-    file, directory or link that appears there before the creation is left
-    untouched — the symlink and the copy are both exclusive creations, never
-    a write through an existing path — and ``"preserved"`` is returned. Any
-    other error of the copy (permissions, I/O) propagates: it is never
-    reported as an installed asset.
-
-    A directory copy carries the content manifest (``mark_managed_copy``);
-    ``mark_file=True`` gives a single Markdown file the same proof inline
-    (``_write_marked_copy``) — hooks stay unmarked, a header would break a
-    script. Returns ``"symlink"``, ``"copy"`` or ``"preserved"``."""
-    try:
-        dst.symlink_to(src)
-    except FileExistsError:
-        return "preserved"
-    except OSError:
-        try:
-            if src.is_dir():
-                # copytree creates dst itself and refuses an existing path
-                shutil.copytree(src, dst)
-                mark_managed_copy(dst)
-            elif mark_file:
-                _write_marked_copy(src, dst)
-            else:
-                _create_exclusive(dst, src.read_bytes(), mode=src.stat().st_mode)
-        except FileExistsError:
-            return "preserved"
-        print(
-            f"  note: symlinks unavailable — copied {src.name} instead "
-            "(copies drift; `dct upgrade` refreshes them)"
-        )
-        return "copy"
-    return "symlink"
-
-
-def _create_exclusive(dst: Path, data: bytes, *, mode: int | None = None) -> None:
-    """Create ``dst`` holding ``data``; raise FileExistsError when anything —
-    a file, a directory, a live or dangling symlink — already sits there
-    (O_EXCL never follows a link). A failed write removes the file this call
-    created, so no truncated copy is left behind as someone's file."""
-    fd = os.open(dst, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0), 0o666)
-    try:
-        with os.fdopen(fd, "wb") as stream:
-            stream.write(data)
-            if mode is not None and hasattr(os, "fchmod"):
-                os.fchmod(stream.fileno(), mode & 0o7777)
-    except BaseException:
-        dst.unlink(missing_ok=True)
-        raise
-
-
-# Single-file counterpart of base.mark_managed_copy / is_managed_copy: the
-# first line records the sha256 of the rest, so only an UNCHANGED copy dct
-# wrote is recognised as dct's (an edited one becomes the user's file).
-_COPY_HEADER = re.compile(r"<!-- dct:managed-copy sha256=([0-9a-f]{64}) [^\n]*-->\n")
-
-
-def _write_marked_copy(src: Path, dst: Path) -> None:
-    body = src.read_bytes()
-    header = (f"<!-- dct:managed-copy sha256={hashlib.sha256(body).hexdigest()} "
-              "(managed by dct init; an edited copy is left alone) -->\n")
-    _create_exclusive(dst, header.encode("utf-8") + body)
-
-
-def _marked_copy_body(path: Path) -> bytes | None:
-    """The copied bytes of an unchanged marked copy; None for anything else."""
-    if path.is_symlink() or not path.is_file():
-        return None
-    try:
-        raw = path.read_bytes()
-    except OSError:
-        return None
-    match = _COPY_HEADER.match(raw.decode("utf-8", errors="replace"))
-    if not match:
-        return None
-    body = raw[len(match.group(0).encode("utf-8")):]
-    return body if hashlib.sha256(body).hexdigest() == match.group(1) else None
+# Compatibility helpers retained for existing installer callers and tests.
+_marked_copy_body = integration_base._marked_copy_body
+_write_marked_copy = integration_base._write_marked_copy
+_create_exclusive = integration_base._create_exclusive
 
 SKILLS_DIR = assets.skills_dir()
 HOOKS_DIR = assets.hooks_dir()
@@ -148,16 +66,9 @@ HOOK_WIRING = [
 HOOK_LIBS = ["dct-changelog-count.lib.sh"]
 
 def discover_skills() -> list[str]:
-    """Skill directories shipped inside the package (each holds a SKILL.md).
-
-    Derived from the filesystem on every call — dct/skills/ is the single
-    source of truth. Never reintroduce a hardcoded name list: a stale one
-    silently dropped plan-status and plan-resolve-uncertain from every
-    install for two releases.
-    """
-    if not SKILLS_DIR.is_dir():
-        return []
-    return sorted(p.name for p in SKILLS_DIR.iterdir() if (p / "SKILL.md").is_file())
+    """Canonical inventory shared with Codex; missing outputs are diagnostics."""
+    from dct.skill_render import skill_names
+    return list(skill_names())
 
 
 def register_mcp(config: Config) -> tuple[bool, str]:
@@ -435,143 +346,43 @@ def _appeared_note(dst: Path) -> str:
 
 
 def _owned_reference(path: Path) -> bool:
-    """dct's own reference install (K-57: proven, never guessed): a symlink
-    resolving into the RUNNING package's assets dir (also a dangling one —
-    a file an upgrade dropped — and the hand-made link to
-    assets/claude-md-snippet.md, K-76), a symlink whose exact target dct
-    recorded when it created it (``is_recorded_link`` — survives a move of
-    the package: new venv, new Python, editable <-> wheel), or an unchanged
-    marked copy. A dangling link or a path that merely looks like another
-    dct install proves nothing."""
-    if path.is_symlink():
-        target = os.path.realpath(path)
-        source = os.path.realpath(assets.assets_dir())
-        return target.startswith(source + os.sep) or is_recorded_link(path)
-    return _marked_copy_body(path) is not None
+    """Compatibility seam for established reference ownership callers."""
+    return reference.owned_reference(path)
 
 
 def _reference_current(path: Path) -> bool:
-    """The installed reference is the current packaged one (doctor's byte
-    comparison, as for hook files)."""
-    src = assets.dct_reference_path()
-    try:
-        if path.is_symlink():
-            return path.resolve() == src.resolve()
-        return _marked_copy_body(path) == src.read_bytes()
-    except OSError:
-        return False
+    return reference.reference_current(path)
 
 
-# The one description of `dct integrate repair claude` (install_integration
-# over this adapter) — every remedy offering it names its whole scope, since
-# it is run only with the user's consent to all of it (K-73).
-REPAIR_REMEDY = (
-    "`dct integrate repair claude` installs it as part of the full Claude Code "
-    "integration repair: it registers the dct MCP server (an existing entry is "
-    "kept), installs the skills and hook files, wires the hooks into "
-    "~/.claude/settings.json, adds the dct pointer block to ~/.claude/CLAUDE.md "
-    "(refreshes it if present) and installs this reference. Run it only if you "
-    "want all of that."
-)
+REPAIR_REMEDY = reference.repair_remedy("claude")
 
 
 def reference_state(path: Path | None = None) -> dict:
-    """Classify the installed reference (K-66): ``current`` / ``missing`` /
-    ``outdated`` (dct's, but not the running package's reference) /
-    ``foreign`` (not proven dct's — dct never touches it).
-
-    Returns ``{"state", "path", "target" (link target or None), "message",
-    "remedy" (None when current)}``. A ``foreign`` remedy names that specific
-    file (and its link target) and asks the user to move it to an unused name
-    or replace it after keeping what they need, then repair: a repair alone
-    would preserve it again. It never carries a ready-made shell command or
-    a fixed backup name (K-78): a pasted command breaks on spaces or quotes
-    and could overwrite an earlier backup.
-    """
-    path = CLAUDE_REFERENCE if path is None else Path(path)
-    target = os.readlink(path) if path.is_symlink() else None
-    report = {"path": str(path), "target": target}
-    if target is None and not path.exists():
-        return {**report, "state": "missing", "message": f"dct reference missing at {path}",
-                "remedy": REPAIR_REMEDY}
-    if not _owned_reference(path):
-        if target is None:
-            what = "a file dct did not install, or a copy edited since"
-        else:
-            dangling = "" if os.path.exists(path) else "dangling "
-            what = f"a {dangling}link to {target} that dct did not create"
-        subject = str(path) if target is None else f"{path} (the link itself, to {target})"
-        return {**report, "state": "foreign",
-                "message": f"{path} is not dct's ({what}) — dct leaves it untouched",
-                "remedy": f"To use dct's reference, first move {subject} to an unused name, "
-                          f"or replace it once you have kept what you need from it; dct never "
-                          f"moves, replaces or removes it for you. After that, "
-                          + REPAIR_REMEDY}
-    if _reference_current(path):
-        return {**report, "state": "current", "message": f"Packaged dct reference at {path}",
-                "remedy": None}
-    was = f"dct's link to {target}" if target is not None else "dct's copy from an older package"
-    return {**report, "state": "outdated",
-            "message": f"Outdated dct reference at {path} ({was})", "remedy": REPAIR_REMEDY}
+    """Compatibility diagnostic for the owned Claude legacy alias."""
+    return reference.reference_state(CLAUDE_REFERENCE if path is None else path, client="claude", owned=_owned_reference)
 
 
 def reference_row() -> dict:
-    """The doctor row for ``CLAUDE_REFERENCE``: ``reference_state`` plus the
-    shared row keys (``check``, ``status``: ok only when current)."""
     state = reference_state()
-    return {"check": "reference", "status": "ok" if state["state"] == "current" else "error",
-            "state": state["state"], "message": state["message"], "remedy": state["remedy"]}
+    return {"check": "reference", "status": "ok" if state["state"] == "current" else "error", **state}
 
 
 def install_reference(config: Config | None = None) -> dict:
-    """Install ~/.claude/dct-reference.md → the packaged dct reference (K-36).
+    """Install canonical and legacy assets independently; report both results.
 
-    The attached CLAUDE.md block only names this path; the reference itself
-    is read on demand. Installed on every path that installs skills/hooks,
-    independent of the CLAUDE.md attach consent. Ownership is proven, never
-    guessed (``_owned_reference``): an owned link — also one into a previous
-    install location that dct recorded — or an unchanged marked copy is
-    replaced; a user's own file or a foreign symlink is never touched — it is
-    preserved and reported with its cause and remedy (``reference_state``).
-    A symlink dct creates is recorded (``record_managed_link``), so it
-    re-points after the package moves. A file appearing at the path during
-    the install is preserved too (``_link_or_copy``). ``config`` is unused
-    (call-site symmetry with the other install_* helpers).
-
-    Returns ``{"status": "installed" | "refreshed" | "unchanged" |
-    "preserved", "path": str, "mode": "symlink" | "copy" | None,
-    "target": str | None, "message": str, "remedy": str | None}``. Raises
-    ``OSError`` when the file cannot be created (never a false success).
+    Flat fields preserve the legacy result unless canonical is preserved,
+    which remains the blocking primary result. `canonical` and `legacy`
+    always report each step. A canonical conflict never permits a pointer
+    rewrite, but does not suppress refreshing a proven-owned legacy alias.
     """
-    src = assets.dct_reference_path()
-    dst = CLAUDE_REFERENCE
-    state = reference_state(dst)
-    if state["state"] == "foreign":
-        return {"status": "preserved", "path": str(dst), "mode": None, "target": state["target"],
-                "message": state["message"], "remedy": state["remedy"]}
-    if state["state"] == "current":
-        mode = "symlink" if dst.is_symlink() else "copy"
-        if mode == "symlink" and not is_recorded_link(dst):
-            record_managed_link(dst)  # adopt a current link made before records existed
-        return {"status": "unchanged", "path": str(dst), "mode": mode, "target": state["target"],
-                "message": f"dct reference current at {dst}", "remedy": None}
-    present = state["state"] == "outdated"
-    dst.parent.mkdir(parents=True, exist_ok=True)
-    if present:
-        dst.unlink()
-        forget_managed_link(dst)
-    mode = _link_or_copy(src, dst, mark_file=True)
-    if mode == "preserved":
-        now = reference_state(dst)
-        return {"status": "preserved", "path": str(dst), "mode": None, "target": now["target"],
-                "message": f"{dst} appeared while dct was installing the reference — left untouched; "
-                           + now["message"],
-                "remedy": now["remedy"]}
-    if mode == "symlink":
-        record_managed_link(dst)
-    status = "refreshed" if present else "installed"
-    return {"status": status, "path": str(dst), "mode": mode, "target": str(src) if mode == "symlink" else None,
-            "message": f"dct reference {status} at {dst}", "remedy": None}
+    canonical = reference.install_reference(client="claude")
+    # These are independent assets: a foreign canonical path must not strand
+    # a proven-owned old alias. Pointer installation still checks canonical.
+    legacy = reference.install_reference(CLAUDE_REFERENCE, client="claude", create=_link_or_copy, owned=_owned_reference)
+    # Preserve the established flat legacy result, except a canonical conflict
+    # remains the blocking result callers already recognize as preserved.
+    primary = canonical if canonical["status"] == "preserved" else legacy
+    return {**primary, "canonical": canonical, "legacy": legacy}
 
 
 # CLAUDE.md snippet markers — the managed block attach_claude_md_snippet()
@@ -606,7 +417,9 @@ def attach_claude_md_snippet(claude_md_path: Path | None = None) -> dict:
       ``wire_hooks_into_settings``.
 
     Returns ``{"status": "added" | "refreshed" | "unchanged",
-    "backup": str | None, "path": str}``. Raises ``ValueError`` — with nothing
+    "backup": str | None, "path": str}``. A canonical reference conflict
+    returns its ``preserved`` diagnostic with message/remedy and no guaranteed
+    backup field; the pointer is untouched. Raises ``ValueError`` — with nothing
     written — when the packaged snippet is missing or has no ``---``
     separator, or when the target has malformed markers (start without end,
     or a stray end without start).
@@ -615,16 +428,10 @@ def attach_claude_md_snippet(claude_md_path: Path | None = None) -> dict:
         claude_md_path = CLAUDE_MD
     claude_md_path = Path(claude_md_path)
 
-    src = assets.claude_snippet_path()
-    if not src.is_file():
-        raise ValueError(f"packaged snippet missing: {src}")
-    raw_snippet = src.read_text(encoding="utf-8")
-    separator = "\n---\n"
-    if separator not in raw_snippet:
-        raise ValueError(
-            f"{src}: no '---' separator — cannot split off the preamble"
-        )
-    body = raw_snippet.split(separator, 1)[1].strip("\n")
+    body = reference.instruction_body("claude")
+    result = reference.install_reference(client="claude")
+    if result["status"] == "preserved":
+        return result
     return managed_instructions(claude_md_path, body, SNIPPET_START, SNIPPET_END)
 
 
@@ -694,15 +501,11 @@ class ClaudeIntegration(ClientIntegration):
                      "message": "Missing, modified or unowned skills: " + ", ".join(invalid)
                      if invalid else "Packaged skills present"})
         try:
-            body = CLAUDE_MD.read_text(encoding="utf-8")
-        except OSError:
-            body = ""
-        block_valid = body.count(SNIPPET_START) == body.count(SNIPPET_END) == 1
-        if block_valid:
-            block_valid = body.index(SNIPPET_START) < body.index(SNIPPET_END)
-        rows.append({"check": "instructions", "status": "ok" if block_valid else "error",
-                     "message": "DCT managed instruction block" if block_valid else "Missing or malformed DCT instruction block"})
+            rows.append(reference.instruction_row(CLAUDE_MD, reference.instruction_body("claude"), SNIPPET_START, SNIPPET_END))
+        except (OSError, UnicodeError, ValueError) as exc:
+            rows.append({"check": "instructions", "status": "error", "message": str(exc)})
         rows.append(reference_row())
+        rows.append(reference.reference_row(client="claude", check="shared_reference"))
         missing_hooks = []
         for script in [spec["script"] for spec in HOOK_WIRING] + HOOK_LIBS:
             path = CLAUDE_HOOKS_DIR / script
@@ -776,10 +579,12 @@ class ClaudeIntegration(ClientIntegration):
                     atomic_write(CLAUDE_MD, original[:start] + original[end + len(SNIPPET_END):])
                     removed.append(str(CLAUDE_MD) + " (managed block)")
         preserved = []
+        canonical = paths.dct_reference_path()
+        retained = [str(canonical) + " (shared reference retained)"] if canonical.exists() or canonical.is_symlink() else []
         for path in (CLAUDE_JSON, CLAUDE_SETTINGS):
             if path.is_file():
                 preserved.append(str(path))
         return {"status": "partial" if preserved else "ok", "removed": removed,
-                "preserved": preserved,
+                "preserved": preserved, "retained": retained,
                 "message": "MCP entries and hook settings preserved for manual review; remove DCT references before restarting the client"
                 if preserved else "Owned integration assets removed"}

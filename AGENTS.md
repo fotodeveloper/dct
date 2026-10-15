@@ -171,8 +171,11 @@ enforcement: [docs/maintainers.md](docs/maintainers.md).
 
 ## Skill fallbacks
 
-Skills in `dct/skills/` are the preferred way to drive dct, but assistants must
-not couple logic to skill existence. Step-by-step MCP-only equivalents for
-`/release`, `/commit`, `/track`, `/clog`, `/track-resolve` live in
-[docs/assistant-fallbacks.md](docs/assistant-fallbacks.md) — those prose
-descriptions are the authoritative behavior; if a skill diverges, fix the skill.
+The workflow contracts in `dct/skill_sources/` are the single authored source
+for all 14 skills, their Claude Code and Codex adapters, and the complete
+MCP-only workflows in [docs/assistant-fallbacks.md](docs/assistant-fallbacks.md).
+Skills are preferred when available, but assistants must not couple behavior
+to skill existence. Fix a divergent contract in `dct/skill_sources/`, then run
+`python scripts/render_skills.py` to regenerate every target and
+`python scripts/render_skills.py --check` to verify freshness. Never repair
+an individual generated skill, asset or fallback by hand.

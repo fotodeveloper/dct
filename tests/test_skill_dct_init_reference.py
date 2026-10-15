@@ -17,7 +17,7 @@ replaced first — repair alone is not offered as its fix.
 
 K-77 (#917 round 2): the skill never decides ownership itself (a header
 line or a link target proves nothing — an edited copy keeps its header, and
-only dct knows which links it recorded). It reads the `reference` row of
+only dct knows which links it recorded). It reads the canonical `shared_reference` row of
 `dct doctor --client claude --json` — the installer's own classification
 (current / missing / outdated / foreign, with its remedy) — and a valid JSON
 on stdout with exit code 1 still carries that diagnosis.
@@ -30,10 +30,10 @@ import shutil
 
 import pytest
 
-from dct import assets, cli
+from dct import assets, cli, paths
 from dct.assets import skills_dir
 from dct.cli import build_parser
-from dct.integrations import claude
+from dct.integrations import claude, reference
 from dct.integrations import doctor as doctor_mod
 
 
@@ -213,10 +213,13 @@ def test_exit_code_one_with_valid_json_still_carries_the_diagnosis():
 
 @pytest.fixture
 def ref(tmp_path, monkeypatch):
-    path = tmp_path / "home" / ".claude" / "dct-reference.md"
-    path.parent.mkdir(parents=True)
-    monkeypatch.setattr(claude, "CLAUDE_REFERENCE", path)
-    return path
+    directory = tmp_path / "home" / ".config" / "dctools"
+    directory.mkdir(parents=True)
+    monkeypatch.setattr(paths, "config_dir", lambda: directory)
+    legacy = tmp_path / "home" / ".claude" / "dct-reference.md"
+    legacy.parent.mkdir(parents=True)
+    monkeypatch.setattr(claude, "CLAUDE_REFERENCE", legacy)
+    return paths.dct_reference_path()
 
 
 def _fake_package(root):
@@ -289,9 +292,9 @@ def _doctor_json(capsys, monkeypatch) -> tuple[dict, int]:
 
 def _reference_row_as_the_skill_reads_it(result: dict) -> dict:
     """The path the skill names: integrations[] → client "claude" →
-    checks[] → check "reference"."""
+    checks[] → check "shared_reference"."""
     [integration] = [i for i in result["integrations"] if i["client"] == "claude"]
-    [row] = [r for r in integration["checks"] if r["check"] == "reference"]
+    [row] = [r for r in integration["checks"] if r["check"] == "shared_reference"]
     return row
 
 
@@ -300,7 +303,7 @@ def test_the_skill_handles_each_state_the_installer_reports(
         scenario, ref, tmp_path, monkeypatch, capsys):
     setup, expected = SCENARIOS[scenario]
     setup(ref, tmp_path, monkeypatch)
-    row = claude.reference_row()
+    row = reference.reference_row(client="claude", check="shared_reference")
     assert row["state"] == expected, (scenario, row)
 
     result, code = _doctor_json(capsys, monkeypatch)
@@ -326,9 +329,9 @@ def test_the_skill_handles_each_state_the_installer_reports(
 def test_the_skill_names_the_json_path_and_fields_it_reads():
     flat = _flat(_reference_section())
     for word in ("`integrations`", '`"client": "claude"`', "`checks`",
-                 '`"check": "reference"`', "`state`", "`message`", "`remedy`"):
+                 '`"check": "shared_reference"`', "`state`", "`message`", "`remedy`"):
         assert word in flat, f"the skill does not name {word}"
-    row = claude.reference_row()
+    row = reference.reference_row(client="claude", check="shared_reference")
     assert {"check", "state", "message", "remedy"} <= set(row)
 
 
@@ -341,3 +344,20 @@ def test_the_state_rule_guard_notices_a_dropped_state(state):
     rules = [b for b in re.split(r"\n(?=- )", mutated)
              if b.startswith("- ") and re.search(rf"\*\*`{state}`\*\*", b.split("—")[0])]
     assert rules == []
+
+
+def test_canonical_reference_row_wins_when_legacy_alias_is_foreign(tmp_path, monkeypatch, capsys):
+    """The pointer's actual asset and its compatibility alias can disagree."""
+    canonical_dir = tmp_path / 'canonical'
+    monkeypatch.setattr(paths, 'config_dir', lambda: canonical_dir)
+    legacy = tmp_path / 'legacy-reference.md'
+    monkeypatch.setattr(claude, 'CLAUDE_REFERENCE', legacy)
+    legacy.write_text('Owner alias content')
+    reference.install_reference(client='claude')
+    result, _ = _doctor_json(capsys, monkeypatch)
+    shown = _reference_row_as_the_skill_reads_it(result)
+    assert shown['state'] == 'current'
+    [integration] = [row for row in result['integrations'] if row['client'] == 'claude']
+    [alias] = [row for row in integration['checks'] if row['check'] == 'reference']
+    assert alias['state'] == 'foreign'
+    assert legacy.read_text() == 'Owner alias content'

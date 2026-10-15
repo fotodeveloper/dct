@@ -23,41 +23,54 @@ import re
 
 import pytest
 from test_gate_policy import POLICY_CLAUSES, _descriptions
-from test_skill_prose_changelog import _fallbacks, _skill
+from test_skill_prose_changelog import _codex, _skill, _workflow_fallback
 
 
 def _flat(text: str) -> str:
     return " ".join(text.split())
 
 
-def _resolve_skill() -> str:
-    body = _skill("track-resolve")
+def _resolve_closing(body: str) -> str:
+    """Only the pending-gate step, bounded before the resolution step."""
     start = body.index("### Step 2")
     return body[start:body.index("### Step 3", start)]
 
 
+def _resolve_skill() -> str:
+    return _resolve_closing(_skill("track-resolve"))
+
+
 def _resolve_fallback() -> str:
-    text = _fallbacks()
-    start = text.index("## `/track-resolve`")
-    return text[start:text.index("These prose descriptions", start)]
+    return _resolve_closing(_workflow_fallback("track-resolve"))
+
+
+def _update_procedure(body: str) -> str:
+    """The terminal-status route AND the shared gate procedure it points below to.
+
+    Sprint membership is a separate operation and bounds this procedure;
+    later status/rule paragraphs cannot satisfy its evidence requirements.
+    """
+    start = body.index('- "resolved"')
+    return body[start:body.index("\nSprint membership", start)]
 
 
 def _update_closing() -> str:
-    """/track-update's closing rule: the status bullet that routes a
-    terminal transition to the /track-resolve procedure."""
-    body = _skill("track-update")
-    start = body.index('- "resolved"')
-    return body[start:body.index("\n\n", start)]
+    return _update_procedure(_skill("track-update"))
 
 
 TEXTS = {
     "track-resolve-skill": _resolve_skill,
+    "track-resolve-codex": lambda: _resolve_closing(_codex("track-resolve")),
     "track-resolve-fallback": _resolve_fallback,
     "track-update-skill": _update_closing,
+    "track-update-codex": lambda: _update_procedure(_codex("track-update")),
+    "track-update-fallback": lambda: _update_procedure(_workflow_fallback("track-update")),
 }
 
 # What the closing workflows must say (regexes over the flattened text).
 WORKFLOW_CLAUSES = {
+    "no terminal update bypass": re.compile(
+        r"never use `update_item` with a terminal status to bypass it", re.IGNORECASE),
     "taken by its recorded condition": re.compile(
         r"by (?:its|each gate's) recorded condition", re.IGNORECASE),
     "met with current evidence completes without a ritual done": re.compile(
@@ -100,7 +113,7 @@ SCENARIOS = {
     "evidence sufficient": (
         ["close by recorded condition", "technical gate on its evidence",
          "complete only when met"],
-        ["taken by its recorded condition",
+        ["taken by its recorded condition", "no terminal update bypass",
          "met with current evidence completes without a ritual done"],
     ),
     "evidence missing or stale": (
@@ -157,6 +170,7 @@ def test_no_workflow_stops_on_every_pending_gate(text):
 
 # A flip keeps the words but reverses the rule.
 FLIPS = {
+    "no terminal update bypass": (r"Never use `update_item`", "Use `update_item`"),
     "met with current evidence completes without a ritual done":
         (r"without asking for a", "after asking for a"),
     "missing or stale evidence stays pending": (r"stays pending", "is completed"),
@@ -195,3 +209,33 @@ def test_the_policy_guard_notices_a_dropped_extra_clause(name):
     flat = _flat(_descriptions()["add_checkpoint"])
     mutated = POLICY_EXTRA[name].sub("", flat)
     assert mutated != flat and not POLICY_EXTRA[name].search(mutated)
+
+
+@pytest.mark.parametrize('clause', sorted(WORKFLOW_CLAUSES))
+def test_resolve_fallback_extraction_cannot_borrow_clause_from_neighbor_workflow(monkeypatch, clause):
+    """An intact adjacent workflow must not hide a deleted closing requirement."""
+    import test_skill_prose_changelog as prose
+
+    valid = _flat(_resolve_skill())
+    mutated = WORKFLOW_CLAUSES[clause].sub('', valid)
+    body = ('## `/track-resolve` fallback\n\n##### Step 2: Pending gates\n' + mutated
+            + '\n##### Step 3: Determine resolution\nOnly this workflow.\n'
+            + '\n## `/track-update` fallback\n\n' + valid)
+    monkeypatch.setattr(prose, '_fallbacks', lambda: body)
+    extracted = _resolve_fallback()
+    assert clause in _missing(_flat(extracted), [clause])
+    assert 'track-update' not in extracted
+
+
+@pytest.mark.parametrize('clause', sorted(WORKFLOW_CLAUSES))
+def test_update_closing_extraction_follows_shared_procedure_and_excludes_later_steps(monkeypatch, clause):
+    """The routed shared procedure is required; a later copied clause cannot satisfy it."""
+    valid = _flat(_resolve_skill())
+    mutated = WORKFLOW_CLAUSES[clause].sub('', valid)
+    body = ('- "resolved" → follow the shared procedure below before resolve:\n\n' + mutated
+            + '\n\nSprint membership (NOT via update_item):\nKeep sprint history.\n'
+            + '\n## Step 3: Execute\n' + valid)
+    monkeypatch.setattr(__import__(__name__), '_skill', lambda _: body)
+    extracted = _update_closing()
+    assert clause in _missing(_flat(extracted), [clause])
+    assert 'Keep sprint history' not in extracted

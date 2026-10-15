@@ -1,0 +1,1 @@
+- Codex integration status from Step 1; no Claude permissions allowlist exists for this workflow.

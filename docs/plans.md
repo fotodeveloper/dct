@@ -30,7 +30,7 @@ Every indexed element gets a stable Crockford base32 ULID in an HTML comment. Ma
 - [ ] <!-- dct:cp:01HX9Z4KM8QR5S0101 parent=01HX9Z4KA2B3CD0010 --> Add unit tests
 ```
 
-**Properties**: stable across heading rename, reorder, or copy-paste between plans (the parent anchor detects cross-plan copy).
+**Properties**: stable across heading rename and reorder. Before ingest writes anchors or database rows, it validates the plan's project and every existing section/checkpoint anchor's plan ownership. Copying an existing section or checkpoint anchor into another plan is refused with its ULID and owning plan; remove the copied identity to import it as a new element. Existing parent-reference mismatch warnings and missing-parent handling remain unchanged.
 
 ## State semantics
 
@@ -59,13 +59,13 @@ Every indexed element gets a stable Crockford base32 ULID in an HTML comment. Ma
 
 When `/dct-import` or the hook ingests a file:
 
-1. **Parse** (mechanical, code-fence-aware) → sections, checkpoints, existing ULID anchors, warnings.
+1. **Parse and prevalidate** (mechanical, code-fence-aware) → sections, checkpoints, existing ULID anchors, warnings. Refuse foreign/deleted plan, section or checkpoint identities before source-file or database effects.
 2. **Ensure ULIDs** — missing plan/section/checkpoint ULIDs are generated + structurally-derived parents filled.
 3. **Write-back** (atomic, `os.replace` via `<file>.dct-tmp`) — the MD file is mutated to embed new ULID HTML comments; original text / ordering / code blocks preserved. Idempotent: subsequent runs do not re-inject.
 4. **Hash** → `sha256(file)` stored as `plans.source_hash`. Second ingest of an unchanged file is a no-op (hash short-circuit).
 5. **Upsert** plans/sections/checkpoints. On first import reads `[x]` as historical done-state. On rescan, MD brackets are ignored (DB owns state).
 6. **Classify uncertain sections** (when enabled) — apply the configured provider. Local rules are the default; unknown headings remain `uncertain`. An explicitly configured command can enrich them.
-7. **Sticky resolved**: a row previously resolved (via command or manually) is never downgraded back to `uncertain` on a later rescan.
+7. **Manual precedence**: `classification_source="manual"` with a resolved type survives all later rescans, including changed headings and positive automatic inference, until explicitly reset to `uncertain` or another manual type. Heading/order/content still update normally. Automatic results use primary key, observed classification revision and unchanged inference input; stale results never overwrite an owner decision.
 
 ## Rules-first classification
 
@@ -73,9 +73,23 @@ New configurations use `[classification].provider = "rules"`, reusing the parser
 
 To retain optional Claude enrichment, explicitly set `provider = "command"` and `command = ["claude", "--print"]`. Existing configurations with an explicit command/model/timeout or legacy `[plans].classify_*` values continue to select the command provider unless a provider is explicitly specified.
 
-Commands run as argv without a shell, with the classification prompt appended as one argument. Only a Claude executable receives the legacy `--model` option. A custom command receives its configured arguments unchanged plus the prompt. Missing executables, timeouts, errors and ambiguous output leave the section uncertain. Remote provider implementations and persistent classification provenance remain future work.
+Commands run as argv without a shell, with the classification prompt appended as one argument. Only a Claude executable receives the legacy `--model` option. A custom command receives its configured arguments unchanged plus the prompt. Before an ingest with effectively enabled command classification or an explicit batch begins, the known effective Claude model (explicit `--model` / `--model=` overrides the legacy default) is validated against the metadata storage limit. Invalid configuration on those paths runs no command and writes nothing. An explicit false ingest flag or false configuration default still imports structure without validating unused command configuration or invoking a provider; custom-command models remain unknown. A later command failure preserves and reports successful earlier batch sections. Missing executables, timeouts, errors and ambiguous output leave the section uncertain. Remote provider implementations remain future work. Successful classifications record actual rules/command/manual source, provider, known model, UTC classification time and a monotonic revision. Unknown legacy provenance stays null; prompt bodies, credentials and argv are never stored. A rules hit under command configuration is recorded as rules.
 
 `[plans].auto_resolve_uncertain` and the existing CLI/MCP switches still control whether the configured provider is consulted. Enabling resolution does not implicitly enable a network model.
+
+## Explicit resolution of indexed sections
+
+MCP uses integer primary keys: `set_plan_section_type(section_id, section_type, project)` applies a manual type or revokes it with `uncertain`; `resolve_uncertain_sections(plan_id, project)` processes the selected plan's indexed uncertain sections. Every argument is a separate top-level parameter. The project guards the live parent plan and section. No replacement sections, anchor injection, full-file rescan or checkpoint mutation is involved.
+
+CLI aliases are explicit ULIDs, with a mandatory project guard:
+
+```sh
+dct plan set-section-type <section-ulid> prose --project <slug> --json
+dct plan set-section-type <section-ulid> uncertain --project <slug> --json
+dct plan resolve-uncertain <plan-ulid> --project <slug> --json
+```
+
+The setter returns `{id, ulid, section_type, classification_source, changed}`; same-value replay leaves revision/time unchanged. Revocation writes manual origin with uncertain type/confidence and review=true, permitting later automation while retaining the owner's origin. Batch returns `{plan_id, plan_ulid, resolved:[ids], unresolved:[{id,reason}], skipped:[{id,reason}], remaining_uncertain:n}` from actual post-operation state. Obtain strategy consent before running a configured external command. Disabled/missing/failed commands leave unresolved rows; successful rows remain saved if a later invocation fails. Rerunning targets only remaining uncertainty. Provider work holds no write transaction; unchanged row/input/revision guards prevent stale writes.
 
 ## Classification rules
 

@@ -333,8 +333,10 @@ def pickup_work(
         pass get_handoff-style reads through get_context_snapshot instead.
 
     consumed_by is REQUIRED whenever consumption is possible (auto/True) —
-    mirrors create_handoff's created_by discipline (plan #12 §14 actor
-    identity); ValueError otherwise, never a silent downgrade to "never".
+    identify the true client with only known optional components (the client
+    alone suffices; model/session/link must be host-supplied, project verified
+    by a prior DCT response or user slug, time from an actual clock/context).
+    ValueError on blank identity, never a silent downgrade to "never".
 
     handoff_id wins over scope: scope is then ignored EVERYWHERE, the returned
     handoff.latest included (K-41) — an explicit id means "this one", not "this
@@ -397,7 +399,7 @@ def _pickup_work_once(
     if may_consume and (consumed_by is None or not consumed_by.strip()):
         raise ValueError(
             "consumed_by cannot be empty when consumption is possible "
-            "(consume auto/true) — identify the session (model + timestamp), "
+            "(consume auto/true) — identify the true client with known optional components, "
             "or pass consume=false for a pure read."
         )
     if may_consume:

@@ -10,13 +10,13 @@ dct is a **cross-project tool** — every surface is user-scoped, not per-projec
 |---|---|---|
 | Database config | platform config dir (`~/.config/dctools/dct.toml`; legacy `~/.claude/dct.toml` fallback) | TOML read by `load_config()`; `dct config path` shows the resolved location |
 | Database | SQLite file or PostgreSQL | `[database].url` or `DCT_DATABASE_URL` |
-| MCP server | `~/.claude.json` | `claude mcp add --scope user` |
-| Skills | `~/.claude/skills/<name>` | Symlinks → `<dct-install>/dct/skills/<name>` |
+| MCP server | Claude: `~/.claude.json`; Codex: `$CODEX_HOME/config.toml` | User-scoped client registration |
+| Skills | Claude: `~/.claude/skills/<name>`; Codex: `~/.agents/skills/<name>` | Both inventories derive from `dct/skill_sources/manifest.toml` |
 | Claude hooks | `~/.claude/hooks/dct-*.sh` | Symlinks → `<dct-install>/dct/hooks/`, wired into `~/.claude/settings.json` |
 | Codex hooks | `$CODEX_HOME/hooks.json` | Native definitions calling the packaged Python bridge; explicit client trust is required |
-| dct reference | `~/.claude/dct-reference.md` | Symlink → `<dct-install>/dct/assets/dct-reference.md` (read on demand; the managed block in the user's `~/.claude/CLAUDE.md` points at it) |
+| dct reference | `paths.config_dir() / "dct-reference.md"` | Shared generated catalog; client instruction blocks name the resolved path; Claude retains its owned legacy alias |
 
-Register dct once and it is available in every Claude Code session. Opening a new project directory needs zero dct setup.
+Register dct once per client and it is available across that client's sessions. Opening a new project directory needs zero integration setup. These shared-reference and Codex adapters are development changes; published PyPI 1.5.0 retains its established Claude integration and legacy reference path. See [client availability](integrations.md#release-availability).
 
 ## Module map
 
@@ -136,12 +136,15 @@ dct/core/records.py      — [one impl] Shared STRICT project-row id validator
 dct/core/checkpoints.py  — Item checkpoint helpers
 dct/core/ids.py          — ULID generation
 dct/core/plans/          — Plans subsystem: parser.py (pure MD parser),
-                           classify.py (rules + optional command), crud.py, ingest.py
+                           classify.py (rules + optional command), classification.py
+                           (explicit/manual and revision-guarded batch resolution),
+                           crud.py, ingest.py
 dct/services/            — Service layer (reserved for future shared app ops)
 dct/workflows/session.py — [one impl] G1 composed ops: get_context_snapshot /
                            pickup_work / handoff_work (one impl for MCP,
                            CLI and skills; single transaction each)
 dct/workflows/task_mirror.py — Append-only client plan/task observations
+dct/workflows/changelog_import.py — Explicit validated historical changelog import
 dct/workflows/triage.py  — [one impl] Triage findings ledger (#909): cycles,
                            batch-atomic record / decide / suggest of findings,
                            close (CLOSED payload), promotion to an item,
@@ -204,7 +207,7 @@ dct/workflows/release/   — Release workflow (K-72): proof layer, read-only for
                            the ledger records it; schema: docs/release-workflow.md);
                            oplock.py (the per-repository operation lock, K-96 D7)
                            — dct/workflows never imports from dct/integrations
-dct/mcp/server.py        — MCP server, SDK 2.2 MCPServer (60 tools); the MCP
+dct/mcp/server.py        — MCP server, SDK 2.2 MCPServer (76 tools); the MCP
                            layer is client-neutral (no host names);
                            dct/server.py is a compat shim
 dct/cli.py               — argparse CLI entry point
@@ -221,6 +224,8 @@ dct/integrations/claude.py — Claude Code adapter: MCP registration, skill/hook
                            symlinks, settings.json wiring (`dct hooks wire`);
                            dct/setup.py is a compat shim
 dct/integrations/codex.py — Codex MCP, workflow skills and managed AGENTS.md
+dct/integrations/reference.py — [one impl] Shared reference ownership, installation
+                           and resolved-path instruction rendering
 dct/integrations/codex_hooks.py — Native event bridge over shared hook policies
 dct/integrations/doctor.py — Read-only per-runtime dependency diagnostics
 dct/server.py, dct/setup.py — Compat shims; tests monkeypatch the
@@ -238,7 +243,11 @@ dct/web/                 — Read-only Flask dashboard (dct web): app.py
                            DDL), blueprints/ (one per view), changes.py (SSE
                            change token), serializers.py (JSON-native +
                            sanitized markdown)
-dct/skills/              — Packaged Claude Code skills (symlinked by dct init)
+dct/skill_sources/       — Authored contracts and manifest for all 14 workflows
+dct/skill_render.py      — [one impl] Offline renderer of both clients' skills,
+                           metadata, full fallback and concise reference;
+                           scripts/render_skills.py regenerates/checks freshness
+dct/skills/              — Generated Claude Code skills (symlinked by dct init)
 dct/hooks/               — Packaged Claude Code hooks (symlinked by dct init);
                            [one impl] dct-changelog-count.lib.sh, the shared
                            changelog-count library both changelog hooks source
@@ -259,7 +268,7 @@ SQLAlchemy Core tables (not the ORM) with a `deleted_at` column for soft deletes
 
 **Plans / sprints / decisions**:
 - `plans` — ulid, project_id, slug, title, kind, source_file, source_hash, status, sprint_id, imported_at
-- `plan_sections` — ulid, plan_id, parent_section_id (self-FK), heading, depth, slug, sort_order, section_type, section_type_confidence, needs_llm_review, status, sprint_id, converted_to_item_id
+- `plan_sections` — ulid, plan_id, parent_section_id (self-FK), heading, depth, slug, sort_order, section_type, section_type_confidence, needs_llm_review, status, sprint_id, converted_to_item_id, classification_source (rules/command/manual; NULL = unknown legacy or generic add_plan_section without a typed result), classification_provider, classification_model (only when actually known), classified_at (UTC), classification_revision (non-null monotonic concurrency token, default 0). Manual resolved types survive automatic rescans until explicitly revoked; classification metadata/type/confidence/review state are written coherently. New ingested rows atomically record parser/provider provenance with type/review/time and revision 0; legacy/generic rows never infer provenance from confidence/type. The conditional classification UPDATE against identity, observed revision and heading/parent input linearizes at its SQL statement snapshot; it does not promise that parent content remains unchanged afterwards. Target-row predicates prevent concurrent manual/ABA overwrite, and no provider call holds a write transaction. Revision is neither identity nor a content hash.
 - `plan_checkpoints` — ulid, plan_section_id, text, status, sort_order, converted_to_item_id
 - `sprints` — project_id, name, code, kind, status, goal, started_at, ended_at
 - `item_sprints` — link table (item_id, sprint_id, assigned_at, removed_at)
@@ -299,6 +308,7 @@ Full DDL lives in:
 - `migrations/013_commit_trailer_preferences.sql`
 - `migrations/014_triage_findings.sql`
 - `migrations/015_finding_reviewers.sql` (also `findings.decision_text_origin`, healed at runtime through `TRIAGE_LEDGER_COLUMNS`)
+- `migrations/016_plan_classification.sql` (classification provenance and revision token)
 
 At runtime, the engine creates every MISSING table with all its indexes (`_create_missing_tables` — race-safe against a concurrent bootstrap: a duplicate table / index / relation error rolls the attempt back, the whole schema of those tables is re-checked and finished, at most `SCHEMA_CREATE_ATTEMPTS` tries, any other error propagates; tables that already exist are left to the explicit blocks below — except the release-ledger and triage-ledger tables (`INDEX_HEALED_TABLES`, K-93 A2 / #909), whose missing required indexes every bootstrap completes, warning once instead of failing when existing rows violate a unique index) plus an idempotent `_apply_schema_updates()` that:
 - adds later columns in place (e.g. `item_checkpoints.kind` for gate checkpoints; new columns go through the duplicate-safe `_add_column_if_missing` — `ADD COLUMN IF NOT EXISTS` under a 5 s `lock_timeout` on PostgreSQL, a re-checked "duplicate column" error on SQLite),
@@ -307,9 +317,9 @@ At runtime, the engine creates every MISSING table with all its indexes (`_creat
 - auto-migrates legacy `items.in_current_sprint=TRUE` flags into the new `item_sprints` table as a per-project "legacy sprint" (then drops the column), and
 - backfills `tags` / `item_tags` from the frozen `items.tags` JSON column (`_backfill_item_tags`): tolerant parse (bad JSON is dropped with a stderr note, never raised), per-item anti-join guard so re-tagged items are never re-seeded, and a one-shot stderr similarity report suggesting `dct tags merge` for near-duplicates — a suggestion, never a block.
 
-Schema updates run on the first engine bootstrap of a new-code session — verify destructive changes against a throwaway database and keep each step idempotent.
+Schema updates run on every engine bootstrap — verify destructive changes against a throwaway database and keep each step idempotent.
 
-Read-only commands (`dct release plan` / `status`, `dct clog candidates`, the previews of `dct release reconstruct` / `takeover` / `version-files`) never bootstrap (K-84): they open the database read-only (`core.engine.readonly_engine` — SQLite `mode=ro` without a journal-mode change or file creation, PostgreSQL READ ONLY transactions), check that every table and column of the current schema exists (`db.check_schema_ready`) and otherwise refuse with a message naming `dct db upgrade`, the explicit bootstrap. Caveat: on a SQLite database already in WAL mode SQLite itself may create the `-wal` / `-shm` sidecar files for any reader, also a read-only one — the database file, its schema and its data stay unchanged.
+Read-only commands (`dct pickup --consume never`, the MCP `get_context_snapshot` / `pickup_work(consume="false")` paths including project resolution, `dct release plan` / `status`, `dct clog candidates`, the previews of `dct release reconstruct` / `takeover` / `version-files`) never bootstrap (K-84): they open the database read-only (`core.engine.readonly_engine` — SQLite `mode=ro` without a journal-mode change or file creation, PostgreSQL READ ONLY transactions), check that every table and column of the current schema exists (`db.check_schema_ready`) and otherwise refuse with a message naming `dct db upgrade`, the explicit bootstrap. Caveat: on a SQLite database already in WAL mode SQLite itself may create the `-wal` / `-shm` sidecar files for any reader, also a read-only one — the database file, its schema and its data stay unchanged.
 
 SQLite URLs are built and parsed in ONE place (K-99): `dct.paths.sqlite_url(path)` renders through SQLAlchemy's own URL object and `dct.paths.sqlite_database_path(url)` parses with `make_url` — never by concatenating or slicing `sqlite:///`. SQLAlchemy 2.1 percent-decodes the database part of a URL and 2.0 does not, so a hand-built URL names another file on 2.1 as soon as the path holds a `%`; the helpers behave the same on both (the supported floor stays `sqlalchemy>=2.0.52`). A path the installed SQLAlchemy cannot express (a `?` on the 2.0 line) is refused instead of silently opening another file. A URL you write by hand into `dct.toml` follows the rules of the SQLAlchemy you run.
 
@@ -524,6 +534,9 @@ Conventions the layer is built on:
   transaction: `handoff_work` writes sprint membership FIRST and the handoff
   second — a handoff validation failure rolls the sprint write back.
   Validation lives inside the conn privates so no caller can bypass it.
+- **Project-wide gates.** Snapshots include pending gate checkpoints of every
+  live nonterminal project item, including items outside active sprints.
+  `in_current_sprint` reports membership; gate counts use the same scope.
 - **Structured data only.** Snapshots carry facts (sprint state, handoffs,
   gates, decisions, recent changes) — never interpretation like
   `recommended_action`; that belongs to the consuming skill/assistant. A

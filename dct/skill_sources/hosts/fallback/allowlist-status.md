@@ -1,0 +1,1 @@
+- the current client integration status from Step 1; report permission limitations without assuming a Claude allowlist.

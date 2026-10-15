@@ -12,9 +12,9 @@ Contract (dct/integrations/claude.py::attach_claude_md_snippet):
 - The packaged snippet's human preamble (everything above the first `---`)
   is never attached — only the instruction block below it.
 
-K-36: the attached block is a SHORT pointer naming ~/.claude/dct-reference.md
-(no `@` import); the full reference is its own packaged file that the
-installer links there (dct/integrations/claude.py::install_reference). A
+The attached block is a SHORT pointer naming the dynamically resolved canonical
+platform reference (no `@` import). Claude retains its owned legacy alias;
+both clients install the shared packaged reference there. A
 block still holding the old full body refreshes to the pointer. The
 reference's ownership is proven: a symlink into the package's assets, a link
 whose target dct recorded, or an unchanged marked copy is dct's; anything
@@ -29,13 +29,14 @@ from pathlib import Path
 
 import pytest
 
-from dct import assets, cli
+from dct import assets, cli, paths
 from dct.integrations import claude
 from dct.integrations.claude import (
     SNIPPET_END,
     SNIPPET_START,
     attach_claude_md_snippet,
 )
+from dct.skill_render import skill_names
 
 USER_HEADER = "# My global rules\n\n- always be terse\n"
 USER_FOOTER = "\n## After dct\n\nkeep this line\n"
@@ -105,7 +106,8 @@ def _assert_only_the_pointer_is_attached(source, tmp_path):
     attach_claude_md_snippet(claude_md_path=target(tmp_path))
 
     text = target(tmp_path).read_bytes().decode("utf-8")
-    assert _attached_block(text) == "\n" + pointer.strip("\n") + "\n"
+    expected_pointer = pointer.replace("{{reference_path}}", str(paths.config_dir() / "dct-reference.md"))
+    assert _attached_block(text) == "\n" + expected_pointer.strip("\n") + "\n"
 
 
 class TestAppendToExisting:
@@ -180,13 +182,12 @@ def _attached_block(text: str) -> str:
 
 
 def _old_full_body() -> str:
-    """The pre-K-36 attached body: today's reference below its separator —
-    byte-for-byte what the old snippet carried below its own `---`."""
-    return assets.dct_reference_path().read_text(encoding="utf-8").split("\n---\n", 1)[1].strip("\n")
+    """A historical full-block fixture, independent of today's reference format."""
+    return "## Cross-project tracking (dct)\n\n### Item type triggers\nLegacy full instructions."
 
 
 def _named_reference_path(block: str) -> str:
-    named = re.findall(r"`(~/[^`]*dct-reference\.md)`", block)
+    named = re.findall(r"`([^`]*dct-reference\.md)`", block)
     assert len(named) == 1, f"the block must name exactly one reference path: {named}"
     return named[0]
 
@@ -197,7 +198,7 @@ class TestPointerBlock:
 
         block = _attached_block(target(tmp_path).read_text(encoding="utf-8"))
         assert "## Cross-project tracking (dct)" in block
-        assert _named_reference_path(block) == "~/.claude/dct-reference.md"
+        assert Path(_named_reference_path(block)) == paths.config_dir() / "dct-reference.md"
         # the pointer, not the guide: no section of the reference rides along
         assert "### " not in block
         assert len(block.strip().splitlines()) <= 6
@@ -224,7 +225,7 @@ class TestPointerBlock:
         assert before == f"{USER_HEADER}\n"
         assert after == USER_FOOTER
         assert "### Item type triggers" not in text
-        assert "~/.claude/dct-reference.md" in text
+        assert str(paths.config_dir() / "dct-reference.md") in text
 
         second = attach_claude_md_snippet(claude_md_path=target(tmp_path))
         assert second["status"] == "unchanged"
@@ -237,24 +238,26 @@ class TestPointerBlock:
 
         text = target(tmp_path).read_text(encoding="utf-8")
         assert text.startswith(USER_HEADER)
-        assert "~/.claude/dct-reference.md" in _attached_block(text)
+        assert _named_reference_path(_attached_block(text)) == str(paths.config_dir() / "dct-reference.md")
 
 
 class TestPackagedReference:
-    def test_reference_is_the_old_body_under_a_read_on_demand_header(self):
+    def test_reference_is_client_neutral_read_on_demand_catalog(self):
+        """The generated guide covers the canonical inventory without a legacy body layout."""
         text = assets.dct_reference_path().read_text(encoding="utf-8")
-        header, _, body = text.partition("\n---\n")
-        assert body.lstrip("\n").startswith("## Cross-project tracking (dct)")
-        assert "read on demand" in header
-        assert "Do not paste this file into `CLAUDE.md`" in header
-        assert "paste the section below" not in text
+        assert "# DCT reference — read on demand" in text
+        assert "client-neutral reference" in text
+        assert "do not paste the full reference into global instructions" in text
+        names = set(re.findall(r"^- `([a-z-]+)` —", text, re.MULTILINE))
+        assert names == set(skill_names())
+        assert "{{reference_path}}" not in text
 
-    def test_block_path_is_the_installer_target(self):
-        """Round trip: the path the attached block tells the model to read is
-        exactly where the installer puts the reference."""
-        body = assets.claude_snippet_path().read_text(encoding="utf-8").split("\n---\n", 1)[1]
-        named = _named_reference_path(body)
-        assert Path(named).expanduser() == claude.CLAUDE_REFERENCE
+    def test_block_path_is_the_installer_target(self, tmp_path):
+        """The rendered path names the actually installed canonical guide, not its alias."""
+        attach_claude_md_snippet(claude_md_path=target(tmp_path))
+        named = _named_reference_path(_attached_block(target(tmp_path).read_text(encoding="utf-8")))
+        assert Path(named) == paths.config_dir() / "dct-reference.md"
+        assert Path(named).read_bytes() == assets.dct_reference_path().read_bytes()
 
 
 @pytest.fixture
@@ -477,6 +480,7 @@ class _Undetected:
 def test_init_installs_the_reference_when_the_attach_is_declined(home, tmp_path, monkeypatch):
     """`dct init --no-attach-snippet`: the CLAUDE.md block is the user's
     choice, the reference file is not — it is installed either way."""
+    monkeypatch.setattr(cli.sys.stdin, "isatty", lambda: True)
     answers = iter(["", "n"])  # sqlite backend, no project registration
     monkeypatch.setattr(builtins, "input", lambda prompt="": next(answers))
     monkeypatch.setattr(cli.paths, "default_db_path", lambda: tmp_path / "init.db")

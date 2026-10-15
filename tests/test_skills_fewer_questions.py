@@ -83,7 +83,8 @@ def _fallback(command: str) -> str:
     start = text.index(f"## `/{command}`")
     ends = [i for i in (text.find("\n## ", start + 1),
                         text.find("These prose descriptions", start)) if i != -1]
-    return text[start:min(ends)] if ends else text[start:]
+    section = text[start:min(ends)] if ends else text[start:]
+    return re.sub(r"(?m)^#{3}(#+)? ", lambda m: "#" * (len(m.group(1) or "") + 1) + " ", section)
 
 
 def _heading_section(text: str, title_pattern: str) -> str:
@@ -739,8 +740,9 @@ def test_commit_keeps_every_safety_rule():
     assert re.search(r"NEVER select the `Changelog:` trailer before the staging is final", flat)
     assert "NEVER use `--amend`" in flat and "NEVER use `--no-verify`" in flat
     fallback = _flat(_commit_fallback())
-    assert "Never `git add -A`" in fallback and "never `--amend`" in fallback
-    assert "never `--no-verify`" in fallback
+    assert re.search(r"never[^.]{0,50}`git add -A`", fallback, re.IGNORECASE)
+    assert re.search(r"never[^.]{0,15}`--amend`", fallback, re.IGNORECASE)
+    assert re.search(r"never[^.]{0,15}`--no-verify`", fallback, re.IGNORECASE)
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -1124,7 +1126,7 @@ def test_commit_new_files_follow_the_same_scope_rules(text):
 
 COMMIT_AND_REFERENCE = [
     *COMMIT,
-    pytest.param(lambda: _section_between(_reference(), "**Committing**", "**Releasing**"),
+    pytest.param(lambda: _reference(),
                  id="dct-reference"),
 ]
 
@@ -1262,7 +1264,7 @@ def test_handoff_fallback_saves_the_context_summary_through_mcp_and_cli():
     from dct import cli
     flat = _flat(_fallback("handoff"))
     # (the call's own text carries parenthesised notes such as "(default)")
-    assert re.search(r"handoff_work\(prompt=.{0,600}?context_summary=", flat), \
+    assert re.search(r"handoff_work\(\s*prompt=.{0,600}?context_summary=", flat), \
         "the fallback's handoff_work call drops context_summary"
     commands = re.findall(r"`dct (handoff create [^`]*)`", flat)
     assert commands and any("--context-summary" in c for c in commands), \
@@ -1310,12 +1312,11 @@ def test_pickup_a_status_question_is_a_pure_read(text):
 
 
 @pytest.mark.parametrize("text", PICKUP)
-def test_pickup_names_resume_as_a_proposed_refinement(text):
-    hits = [s for s in _sentences(text())
-            if re.search(r"\"resume\"", s)
-            and re.search(r"\bpropos\w*\b[^.]{0,40}\brefinement\b|\brefinement\b[^.]{0,40}\bpropos",
-                          s, re.IGNORECASE)]
-    assert hits, "\"resume\" consumes without saying it is a proposed refinement"
+def test_pickup_resume_is_accepted_auto_behavior_not_a_pending_refinement(text):
+    flat = _flat(text())
+    assert '"continue" / "pickup" / "resume"' in flat
+    assert "All three commands have the same accepted consume behavior" in flat
+    assert "proposed refinement" not in flat
 
 
 @pytest.mark.parametrize("text", PICKUP)

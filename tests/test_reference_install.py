@@ -177,6 +177,8 @@ def victim(tmp_path):
 def test_reference_appearing_mid_install_is_never_overwritten(
         ref, monkeypatch, victim, kind, symlinks_available):
     def racing(self, target, *args, **kwargs):
+        if self != ref:
+            return _REAL_SYMLINK_TO(self, target, *args, **kwargs)
         _intrude(self, kind, victim)
         if symlinks_available:
             return _REAL_SYMLINK_TO(self, target, *args, **kwargs)

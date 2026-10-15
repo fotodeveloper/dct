@@ -16,8 +16,9 @@ import contextlib
 from datetime import datetime
 
 from mcp.server import MCPServer
+from mcp.types import ToolAnnotations
 
-from dct.core.engine import bootstrap_engine
+from dct.core.engine import bootstrap_engine, readonly_engine
 
 # ONE preview implementation for the whole product (K-35, #413): the MCP list
 # views and the snapshot share dct.core.text.preview (re-exported by
@@ -149,6 +150,7 @@ _ALWAYS_LOAD_TOOLS = frozenset({
 })
 
 _engine = None
+_readonly_engine = None
 
 
 def _get_engine():
@@ -158,7 +160,17 @@ def _get_engine():
     return _engine
 
 
-def _resolve_project(project_arg: str, required: bool = True) -> str | None:
+def _get_readonly_engine():
+    """Server-owned read cache; never aliases the bootstrap-capable writer."""
+    global _readonly_engine
+    if _readonly_engine is None:
+        # Assign only after schema validation succeeds: an explicit upgrade
+        # after a refusal permits a fresh retry, without hidden bootstrap.
+        _readonly_engine = readonly_engine()
+    return _readonly_engine
+
+
+def _resolve_project(project_arg: str, required: bool = True, *, engine=None) -> str | None:
     """Auto-detect project from CWD when project_arg is empty.
 
     Each CC session spawns its own MCP subprocess inheriting the session's CWD,
@@ -171,7 +183,7 @@ def _resolve_project(project_arg: str, required: bool = True) -> str | None:
     from dct.core.projects import get_project_by_path
 
     cwd = os.getcwd()
-    p = get_project_by_path(_get_engine(), cwd)
+    p = get_project_by_path(engine if engine is not None else _get_engine(), cwd)
     if p:
         return p["slug"]
     if required:
@@ -1097,6 +1109,50 @@ def list_checkpoints(
 # ── Changelog tools ───────────────────────────────────────────────────────────
 
 
+@mcp.tool(structured_output=False)
+def import_released_changelog(
+    project: str, category: str, entry: str, version: str, released_at: str = "",
+    component: str = "", source_file: str = "", source_lines: str = "",
+    related_item_id: int = 0,
+) -> dict:
+    """Import ONE historical row, never stamp a release or advance current_version.
+
+    Each field is a SEPARATE top-level parameter.
+
+    Args:
+        project: Expected project slug; empty auto-detects CWD.
+        category: added / changed / fixed / removed.
+        entry: Required nonempty historical changelog line.
+        version: Original released version spelling; required. A recorded
+            release version or a version above current_version refuses.
+        released_at: Optional ISO-8601 date (midnight UTC) or timestamp with
+            explicit offset (normalized UTC). Blank uses import time.
+        component: Optional area label; blank = none.
+        source_file: Optional original source path; blank = none.
+        source_lines: Optional original source line range; blank = none.
+        related_item_id: Live item of the same project; 0 = none.
+
+    Returns: {id, project, category, version, released_at, released_at_source}.
+        released_at_source is stated or import_time; released_at is ISO UTC.
+        {"error": ...} on validation/import failure; no row written on failure.
+        Imports are per row, not a whole-file transaction or automatic dedup.
+        No current branch/worktree is attributed to a historical event.
+    """
+    if (err := _reject_toolcall_markup(entry=entry, component=component,
+                                      source_file=source_file, source_lines=source_lines)):
+        return err
+    from dct.workflows.changelog_import import import_history, parse_released_at
+
+    try:
+        stated_time = parse_released_at(released_at)
+        slug = _resolve_project(project)
+        return import_history(_get_engine(), slug, category, entry, version, stated_time,
+            component=component, source_file=source_file, source_lines=source_lines,
+            related_item_id=related_item_id)
+    except Exception as exc:
+        return {"error": str(exc)}
+
+
 @mcp.tool(structured_output=False, meta=_ALWAYS_LOAD_META)
 def add_changelog(
     category: str,
@@ -2017,8 +2073,13 @@ def create_handoff(
 
     Args:
         prompt: Free-form "for next session: ..." text. Must be non-empty.
-        created_by: REQUIRED, non-empty, ≤ 200 chars — self-identify (e.g.
-            "claude-opus-4-7 @ 2026-04-17T14:30Z").
+        created_by: REQUIRED, non-empty, ≤ 200 chars — the true client alone
+            is sufficient (e.g. "Codex" or "Claude Code");
+            identify the true client; model/session/link only when host-supplied,
+            project suffix only from a prior successful DCT response or an
+            explicit user-supplied slug, UTC only from an actual provided clock,
+            known host time context or time tool. Omit unknown components, never
+            guess from a directory/worktree/task title or approximate time.
         project: Empty = auto-detect from CWD.
         scope: Optional tag like "sprint-v0.2" or "refactor-auth" (≤ 100 chars).
         context_summary: Optional snapshot of state at handoff time.
@@ -2110,9 +2171,13 @@ def consume_handoff(handoff_id: int, consumed_by: str = "") -> dict:
 
     Args:
         handoff_id: id returned by create_handoff / list_handoffs.
-        consumed_by: optional, ≤ 200 chars (refused, never truncated) —
-            self-identify the consuming session (mirrors create_handoff's
-            `created_by` format).
+        consumed_by: Optional, ≤ 200 chars (refused, never truncated). When
+            identifying the actor, the true client alone is sufficient;
+            identify the true client; model/session/link only when host-supplied,
+            project suffix only from a prior successful DCT response or an
+            explicit user-supplied slug, UTC only from an actual provided clock,
+            known host time context or time tool. Omit unknown components, never
+            guess from a directory/worktree/task title or approximate time.
 
     Returns: slim ack {id, consumed_at} — the consumed timestamp only. NO
         prompt echo. {"error": "..."} if the handoff is missing / already
@@ -2204,7 +2269,8 @@ def update_handoff(
 # and the packaged skills — these tools only marshal MCP strings into it.
 
 
-@mcp.tool(structured_output=False, meta=_ALWAYS_LOAD_META)
+@mcp.tool(structured_output=False, meta=_ALWAYS_LOAD_META,
+          annotations=ToolAnnotations(readOnlyHint=True))
 def get_context_snapshot(
     project: str = "",
     include: str = "",
@@ -2217,7 +2283,11 @@ def get_context_snapshot(
     transaction, so every section describes the same instant. review_sprint
     remains the narrower legacy dashboard.
 
-    Structured data only; interpretation lives in the calling skill.
+    Structured data only; interpretation lives in the calling skill. This read
+    and its CWD lookup use a read-only engine: no database/directory creation,
+    DDL or journal-mode change. Missing/old schema refuses naming `dct db upgrade`;
+    explicit consent precedes that separate migration. SQLite WAL readers may
+    create WAL/SHM sidecars. This annotation makes no host-approval guarantee.
 
     Args:
         project: Slug. Empty = auto-detect from CWD. Requires a resolvable
@@ -2260,10 +2330,11 @@ def get_context_snapshot(
     from dct.workflows.session import get_context_snapshot as _snapshot
     from dct.workflows.session import parse_sections
     try:
-        project_slug = _resolve_project(project, required=True)
+        engine = _get_readonly_engine()
+        project_slug = _resolve_project(project, required=True, engine=engine)
         assert project_slug is not None
         return _snapshot(
-            _get_engine(), project_slug,
+            engine, project_slug,
             include=parse_sections(include),
             since=since,
         )
@@ -2296,13 +2367,22 @@ def pickup_work(
             candidates mean nothing is consumed, they ride back in the handoff
             section and you re-call with the chosen handoff_id. 'true' = consume
             `handoff_id` or the newest match; errors when there is nothing to
-            consume. 'false' = pure read (contradictory with handoff_id).
+            consume. 'false' = pure read (contradictory with handoff_id), including CWD
+            lookup; missing/old schema refuses with explicit `dct db upgrade`
+            remedy, without creating/migrating. SQLite WAL readers may create
+            WAL/SHM sidecars. AUTO/true retain the atomic writer path.
         consumed_by: REQUIRED whenever consumption is possible (consume ''
-            or 'true') — self-identify like create_handoff's created_by
-            ("claude-opus-4-7 @ 2026-04-17T14:30Z"). Validated whenever
-            consumption is POSSIBLE, even when nothing ends up consumed (0 or
-            several candidates): empty errors, > 200 chars is refused (never
-            truncated).
+            or 'true'), non-empty, ≤ 200 chars; the true client alone is
+            sufficient (e.g. "Codex" or "Claude Code");
+            identify the true client; model/session/link only when host-supplied,
+            project suffix only from a prior successful DCT response or an
+            explicit user-supplied slug, UTC only from an actual provided clock,
+            known host time context or time tool. Omit unknown components, never
+            guess from a directory/worktree/task title or approximate time.
+            No mandatory preflight/lookup before AUTO: optional slug/time may
+            be omitted. Validated whenever consumption is POSSIBLE, even when
+            nothing ends up consumed (0 or several candidates); empty or
+            over-long values refuse, never silently downgrade or truncate.
         handoff_id: Consume this exact handoff (0 = none given). WINS over
             scope, which is then ignored EVERYWHERE — candidate selection AND
             the returned handoff.latest. An id from another project reads as
@@ -2337,10 +2417,11 @@ def pickup_work(
     from dct.workflows.session import parse_sections
     from dct.workflows.session import pickup_work as _pickup
     try:
-        project_slug = _resolve_project(project, required=True)
+        engine = _get_readonly_engine() if consume_tokens[consume] is False else _get_engine()
+        project_slug = _resolve_project(project, required=True, engine=engine)
         assert project_slug is not None
         return _pickup(
-            _get_engine(), project_slug,
+            engine, project_slug,
             consume=consume_tokens[consume],
             handoff_id=handoff_id or None,
             scope=scope or None,
@@ -2391,8 +2472,13 @@ def handoff_work(
 
     Args:
         prompt: Free-form "for next session: ..." text (required, non-empty).
-        created_by: REQUIRED, non-empty, ≤ 200 chars — self-identify (e.g.
-            "claude-opus-4-7 @ 2026-04-17T14:30Z").
+        created_by: REQUIRED, non-empty, ≤ 200 chars — the true client alone
+            is sufficient (e.g. "Codex" or "Claude Code");
+            identify the true client; model/session/link only when host-supplied,
+            project suffix only from a prior successful DCT response or an
+            explicit user-supplied slug, UTC only from an actual provided clock,
+            known host time context or time tool. Omit unknown components, never
+            guess from a directory/worktree/task title or approximate time.
         item_ids: REPLACE mode. '__keep__' (DEFAULT) = do NOT touch the sprint;
             '22,21,6' = replace the sprint's OPEN membership with exactly those
             ids (STRICT — unknown/foreign/soft-deleted ids error and roll the
@@ -2557,6 +2643,59 @@ def get_plan(plan_id: int) -> dict:
     from dct.core.plans.crud import get_plan as _get
     row = _get(_get_engine(), plan_id)
     return row or {"error": f"Plan #{plan_id} not found"}
+
+
+@mcp.tool(structured_output=False)
+def set_plan_section_type(section_id: int, section_type: str, project: str) -> dict:
+    """Apply or revoke an explicit manual classification; preserve section identity.
+
+    Every argument is a SEPARATE top-level parameter.
+
+    Args:
+        section_id: Positive integer database primary key; ULID/string refused.
+        section_type: sprint / phase / task / block / milestone / decision /
+            prose / changelog / adr_section / reference / generic / uncertain.
+            A resolved type survives rescans until another manual choice;
+            uncertain explicitly revokes its override and marks it for review.
+        project: Expected project slug; empty auto-detects CWD. The live section
+            and its live parent plan must belong to this project.
+
+    Returns: {id, ulid, section_type, classification_source, changed}; replay
+        is a no-op. {"error": ...} on invalid type/id/project or deleted row;
+        no classification write on refusal. Heading/anchors/state/links stay.
+    """
+    from dct.core.plans.classification import set_plan_section_type as _set
+
+    try:
+        return _set(_get_engine(), _resolve_project(project), section_id, section_type)
+    except Exception as exc:
+        return {"error": str(exc)}
+
+
+@mcp.tool(structured_output=False)
+def resolve_uncertain_sections(plan_id: int, project: str) -> dict:
+    """Resolve an indexed uncertain-section snapshot using configured rules/command.
+
+    Each argument is a SEPARATE top-level parameter. Obtain strategy consent
+    before a configured external command; this operation does not choose a UI.
+
+    Args:
+        plan_id: Positive integer database primary key; ULID/string refused.
+        project: Expected project slug; empty auto-detects CWD. The live plan
+            must belong to it; invalid target/config refuses before invocation.
+
+    Returns: {plan_id, plan_ulid, resolved:[ids], unresolved:[{id,reason}],
+        skipped:[{id,reason}], remaining_uncertain:n}. Disabled/missing/failed
+        commands stay unresolved. Successful progress survives later failures;
+        stale/concurrent results are skipped. No provider-config/source-file/
+        anchor/checkpoint writes. {"error": ...} on target/config refusal.
+    """
+    from dct.core.plans.classification import resolve_uncertain_sections as _resolve
+
+    try:
+        return _resolve(_get_engine(), _resolve_project(project), plan_id)
+    except Exception as exc:
+        return {"error": str(exc)}
 
 
 @mcp.tool(structured_output=False)
@@ -3232,8 +3371,9 @@ def ingest_plan_file(
         file_path: Absolute or CWD-relative path to the file.
         project: Project slug. Empty = auto-detect from CWD.
         auto_resolve_uncertain: When True, uncertain sections go through
-            `claude --print` classification. Use False to skip LLM calls
-            (sections remain with section_type='uncertain').
+            configured rules/command classification. Disabled/missing/failed
+            commands stay uncertain. False skips optional enrichment, never
+            enables a provider or overrides a manual decision.
 
     Returns: IngestReport dict {plan_id, plan_ulid, is_first_import,
         source_hash, sections_created, sections_updated, checkpoints_created,
@@ -3278,8 +3418,11 @@ def open_triage(
         code: Cycle handle, unique among the project's live cycles (e.g.
             "rev-877-r2"; ≤ 100 chars). A duplicate is refused.
         topic: What the review was about (≤ 200 chars).
-        created_by: Who opened it — self-identify (e.g. "Claude Code
-            @ 2026-10-13T14:30Z"); ≤ 200 chars.
+        created_by: Who opened it — the true client alone suffices; ≤ 200
+            chars. Model/session/link only when host-supplied; project suffix
+            only from a prior successful DCT response or explicit user slug,
+            UTC only from an actual clock/host time context/time tool. Omit
+            unknown components rather than guess or use placeholders.
         project: Slug. Empty = auto-detect from CWD.
         scope: Optional — what was reviewed (diff range, files).
         base_commit: Optional fixed base commit of the cycle (≤ 64 chars).

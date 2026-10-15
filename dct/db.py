@@ -289,6 +289,11 @@ plan_sections = sa.Table(
     sa.Column("sort_order", sa.Integer, nullable=False, server_default="0"),
     sa.Column("section_type", sa.String(30), nullable=False, server_default="generic"),
     sa.Column("section_type_confidence", sa.String(10), server_default="high"),  # high|low|uncertain
+    sa.Column("classification_source", sa.String(16)),
+    sa.Column("classification_provider", sa.String(32)),
+    sa.Column("classification_model", sa.String(200)),
+    sa.Column("classified_at", sa.DateTime),
+    sa.Column("classification_revision", sa.Integer, nullable=False, server_default="0"),
     sa.Column("needs_llm_review", sa.Boolean, nullable=False, server_default=sa.false()),
     sa.Column("status", sa.String(20), nullable=False, server_default="pending"),
     sa.Column("source_lines", sa.String(50)),
@@ -1435,6 +1440,19 @@ def _apply_schema_updates(engine: sa.Engine) -> None:
         for column, ddl_type in additions:
             if column not in present:
                 _add_column_if_missing(engine, table, column, _ddl_type(engine, ddl_type))
+
+    # #432: unknown legacy provenance remains NULL; no history backfill.
+    if "plan_sections" in tables_now:
+        present = {c["name"] for c in inspector.get_columns("plan_sections")}
+        for column, ddl_type in (
+            ("classification_source", "VARCHAR(16)"),
+            ("classification_provider", "VARCHAR(32)"),
+            ("classification_model", "VARCHAR(200)"),
+            ("classified_at", "TIMESTAMP"),
+            ("classification_revision", "INTEGER NOT NULL DEFAULT 0"),
+        ):
+            if column not in present:
+                _add_column_if_missing(engine, "plan_sections", column, ddl_type)
 
     # #909 K-4: origin / finding_type NOT NULL on an existing findings table
     # (PostgreSQL; never a guessed value — see _heal_triage_not_null).

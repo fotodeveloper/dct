@@ -242,3 +242,12 @@ def test_derived_hook_count_excludes_shared_hook_libs(checker):
     assert any(p.name.endswith(".lib.sh") for p in hooks_dir.glob("*.sh")), (
         "precondition: a shared hook lib exists, otherwise this test proves nothing")
     assert checker.derive(repo)["hooks"] == str(len(wired))
+
+
+def test_readme_stdio_feature_total_is_checked_with_the_other_tool_claims(checker, tmp_path):
+    """The Features claim must not escape the registry-derived numbers gate."""
+    readme = tmp_path / 'README.md'
+    readme.write_text('49 MCP tools\n- **MCP server** — 48 tools over stdio via the SDK\n')
+    count, problems = checker.check_file(readme, checker.README_PATTERNS, DERIVED)
+    assert count == 2
+    assert len(problems) == 1 and 'rendered as 48' in problems[0]

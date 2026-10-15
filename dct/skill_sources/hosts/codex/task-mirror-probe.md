@@ -1,0 +1,1 @@
+- If native task/plan mirroring is installed and actual host events were observed, inspect the relevant mirror item deliberately. A generic MCP connection or conversation plan is not evidence of an active task mirror. With no mirror capability, omit the mirror decision line and probe.

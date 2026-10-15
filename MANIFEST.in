@@ -6,3 +6,6 @@ graft dct/assets
 graft dct/web/templates
 graft dct/web/static
 global-exclude *.py[cod] .DS_Store
+graft dct/skill_sources
+include scripts/render_skills.py
+include docs/assistant-fallbacks.md
