@@ -1818,14 +1818,19 @@ def _suggested_payload(rows: list[Mapping], digest: str) -> dict | None:
     if not with_suggestion:
         return None
     latest = max(with_suggestion, key=lambda r: (r["suggested_at"], r["id"]))
+    answers = _answers(
+        [{"seq": r["seq"], "suggested_decision": r["suggested_decision"],
+          "suggested_opt": r["suggested_opt"], "suggested_note": r["suggested_note"]}
+         for r in with_suggestion], "suggested_")
+    # #945: each proposal names its own proposer — the top-level `by` is only
+    # the latest one, and the page labels every card with who proposed it.
+    for r in with_suggestion:
+        answers[f"K-{r['seq']}"]["by"] = r["suggested_by"]
     return {
         "by": latest["suggested_by"],
         "digest": digest,
         "date": latest["suggested_at"].strftime("%Y-%m-%d"),
-        "answers": _answers(
-            [{"seq": r["seq"], "suggested_decision": r["suggested_decision"],
-              "suggested_opt": r["suggested_opt"], "suggested_note": r["suggested_note"]}
-             for r in with_suggestion], "suggested_"),
+        "answers": answers,
     }
 
 
@@ -1837,7 +1842,8 @@ def export_triage(engine: sa.Engine, cycle: int | str, *, project: str | None = 
     `src` when the finding has any); closed = its CLOSED when the cycle is closed
     (the payload close_triage returned — answers[K-n] carry `origin` only
     when set, _closed_payload), else None; suggested = its SUGGESTED {by, digest, date, answers} when any
-    finding carries a suggestion (by / date of the latest; digest =
+    finding carries a suggestion (by / date of the latest; answers[K-n] =
+    {dec, opt, note, by} — `by` = that proposal's own proposer; digest =
     suggestion_digest of the cards and every proposal with its author —
     the value accept_suggestions(expected_digest=…) takes back), else None. The
     values are the stored texts, unescaped; embed them in a page only

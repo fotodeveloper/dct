@@ -135,7 +135,19 @@ def test_closed_and_suggested_have_the_template_shape(engine, cycle):
     sugg = out["suggested"]
     assert set(sugg) == SUGGESTED_KEYS | SUGGESTED_DCT_EXTRA
     assert sugg["by"] == "Codex" and set(sugg["answers"]) == {"K-1"}
-    assert set(sugg["answers"]["K-1"]) == ANSWER_KEYS
+    assert set(sugg["answers"]["K-1"]) == ANSWER_KEYS | {"by"}
+    assert sugg["answers"]["K-1"]["by"] == "Codex"
+
+
+def test_each_suggested_answer_names_its_own_proposer(engine, cycle):
+    """#945: the page names the proposer per card — with two agents the
+    top-level `by` (the latest) is not the author of every proposal."""
+    record_findings(engine, cycle, [card_input(), card_input(fp="two")])
+    suggest_findings(engine, cycle, "Codex (gpt-5.5)", {"K-1": {"dec": "fix", "opt": "a", "note": "x"}})
+    suggest_findings(engine, cycle, "Claude", {"K-2": {"dec": "note", "opt": "", "note": "y"}})
+    sugg = export_triage(engine, cycle)["suggested"]
+    assert sugg["by"] == "Claude"
+    assert {k: a["by"] for k, a in sugg["answers"].items()} == {"K-1": "Codex (gpt-5.5)", "K-2": "Claude"}
 
 
 def test_the_digest_names_exactly_the_cards_and_proposals_shown(engine, cycle):

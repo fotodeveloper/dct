@@ -3528,7 +3528,9 @@ def suggest_findings(
 
     Args:
         by: Who proposes (e.g. "Codex"); ≤ 100 chars. The export's
-            SUGGESTED.by is the latest proposer.
+            SUGGESTED.by is the latest proposer; SUGGESTED.answers[K-n].by
+            names each proposal's own (name the model too, e.g.
+            "Codex (gpt-5.5)" — the page shows it on the card).
         suggestions: Non-empty JSON object keyed by "K-<n>" (or seq), each
             {dec, opt, note} and no other key — dec fix | verify | backlog |
             reject | note | discuss, opt an option key of that finding
@@ -3966,7 +3968,7 @@ def export_triage(cycle_id: int = 0, cycle: str = "", project: str = "") -> dict
         why}]} plus conflict / violation / dispute / openDesign when set,
         cls + clsWhy for an override and reviewers [token…] when recorded; closed = CLOSED {date, source, rubric,
         notes, answers {"K-n": {dec, opt, note[, origin]}}} once closed, else null; suggested = SUGGESTED {by,
-        date, answers, digest} when any finding carries a suggestion, else
+        date, answers {"K-n": {dec, opt, note, by}}, digest} when any finding carries a suggestion, else
         null — digest = the hash of the cycle's cards and proposals that
         accept_suggestions(expected_digest=…) checks; keep the one of the
         export the published page was built from.

@@ -535,8 +535,8 @@ class TestSuggest:
         assert sug["by"] == "triage-redeploy"
         assert sug["date"] == datetime.now(UTC).strftime("%Y-%m-%d")
         assert sug["answers"] == {
-            "K-1": {"dec": "fix", "opt": "a", "note": ""},
-            "K-2": {"dec": "backlog", "opt": "", "note": "n"},
+            "K-1": {"dec": "fix", "opt": "a", "note": "", "by": "Codex"},
+            "K-2": {"dec": "backlog", "opt": "", "note": "n", "by": "triage-redeploy"},
         }
 
     @pytest.mark.parametrize("by", ["", "  ", None])
