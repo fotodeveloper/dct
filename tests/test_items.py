@@ -393,3 +393,37 @@ def test_max_title_length_matches_the_column(engine):
     from dct.db import items as items_table
 
     assert MAX_TITLE_LENGTH == items_table.c.title.type.length
+
+
+# ── gate filter (#947) ─────────────────────────────────────────────────────────
+
+
+def test_list_items_gate_filter(engine, project):
+    """gate='any' keeps items with a PENDING gate checkpoint of any kind;
+    gate='<kind>' only that kind; done / rejected gates and task / cc-task
+    checkpoints never match; sprint membership plays no role."""
+    from dct.core.checkpoints import add_checkpoint, set_status
+
+    dog = create_item(engine, "proj-a", "feature", "Awaiting dogfood")
+    add_checkpoint(engine, dog["id"], "Fresh-session check", kind="dogfood")
+    rev = create_item(engine, "proj-a", "feature", "Awaiting review")
+    add_checkpoint(engine, rev["id"], "Code review", kind="review")
+    closed = create_item(engine, "proj-a", "feature", "Gate done")
+    set_status(engine, add_checkpoint(engine, closed["id"], "Dogfood", kind="dogfood")["id"], "done")
+    skipped = create_item(engine, "proj-a", "feature", "Gate rejected")
+    set_status(engine, add_checkpoint(engine, skipped["id"], "Dogfood", kind="dogfood")["id"], "rejected")
+    plain = create_item(engine, "proj-a", "feature", "Only tasks")
+    add_checkpoint(engine, plain["id"], "Step", kind="task")
+    add_checkpoint(engine, plain["id"], "Mirror", kind="cc-task")
+
+    ids = lambda **kw: sorted(i["id"] for i in list_items(engine, "proj-a", **kw))
+    assert ids(gate="any") == sorted([dog["id"], rev["id"]])
+    assert ids(gate="dogfood") == [dog["id"]]
+    assert ids(gate=" Review ") == [rev["id"]]  # normalized like a stored kind
+    assert ids(gate="approval") == []
+
+
+@pytest.mark.parametrize("gate", ["task", "cc-task", "  "])
+def test_list_items_gate_filter_refuses_non_gate_kinds(engine, project, gate):
+    with pytest.raises(ValueError, match="gate"):
+        list_items(engine, "proj-a", gate=gate)

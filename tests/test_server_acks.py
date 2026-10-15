@@ -779,3 +779,16 @@ def test_unknown_tag_error_stays_short_with_a_large_dictionary(srv):
     if "list_tags" not in out["error"]:
         pytest.skip("core K-38 (closest-tags error) has not landed yet")
     assert len(out["error"]) <= 400, out["error"]
+
+
+def test_list_items_gate_filter(srv):
+    """#947: items awaiting a gate, sprint or not; a non-gate kind is an error."""
+    keep = srv.create_item("feature", "Awaiting dogfood", project="test")
+    srv.add_checkpoint(keep["id"], "Fresh-session check", kind="dogfood")
+    other = srv.create_item("feature", "Plain", project="test")
+    srv.add_checkpoint(other["id"], "Step")
+
+    assert [r[0] for r in srv.list_items(project="test", gate="any")["rows"]] == [keep["id"]]
+    assert [r[0] for r in srv.list_items(project="test", gate="dogfood")["rows"]] == [keep["id"]]
+    out = srv.list_items(project="test", gate="task")
+    assert set(out) == {"error"} and "gate" in out["error"]

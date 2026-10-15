@@ -160,6 +160,35 @@ def normalize_short_title(short_title: str | None) -> str | None:
     return short_title.strip()
 
 
+def _pending_gate_exists(gate: str):
+    """Correlated EXISTS: the item has a live PENDING gate checkpoint —
+    of any gate kind for 'any', else of that kind (trimmed, compared
+    case-insensitively). A WHERE predicate, like _has_tag_exists, so the
+    checkpoint aggregates do not fan out. ValueError on a blank value or a
+    non-gate kind (dct.core.checkpoints.NON_GATE_KINDS)."""
+    from dct.core.checkpoints import (
+        NON_GATE_KINDS,  # local: checkpoints imports items lazily too
+    )
+
+    wanted = gate.strip().lower() if isinstance(gate, str) else ""
+    if not wanted or wanted in NON_GATE_KINDS:
+        raise ValueError(
+            f"gate must be 'any' or a gate kind (dogfood, review, security, approval, …), "
+            f"got {gate!r} — {', '.join(NON_GATE_KINDS)} never gate")
+    # An alias: the list query already joins item_checkpoints for the cp
+    # aggregates, and the bare table would auto-correlate to that join.
+    cp = item_checkpoints.alias("gate_cp")
+    q = sa.select(sa.literal(1)).select_from(cp).where(
+        cp.c.item_id == items.c.id,
+        cp.c.deleted_at.is_(None),
+        cp.c.status == "pending",
+        cp.c.kind.notin_(NON_GATE_KINDS),
+    )
+    if wanted != "any":
+        q = q.where(sa.func.lower(cp.c.kind) == wanted)
+    return q.exists()
+
+
 def _has_tag_exists(tag_id: int):
     """Correlated EXISTS: the item carries an ACTIVE link to `tag_id`.
 
@@ -350,9 +379,14 @@ def list_items(
     search: str | None = None,
     in_current_sprint: bool | None = None,
     tag: str | None = None,
+    gate: str | None = None,
     limit: int = 50,
 ) -> list[dict]:
     """Priority-ordered item page.
+
+    `gate` (#947) keeps items with a PENDING gate checkpoint, sprint or not:
+    'any' = any gate kind, else that kind (trimmed, case-insensitive). A
+    blank value or a non-gate kind (task / cc-task) raises ValueError.
 
     `tag` filters on an ACTIVE item_tags link (closed dictionary — an unknown
     name raises ValueError naming the known tags). Tags themselves come from a
@@ -397,6 +431,8 @@ def list_items(
     if search:
         pattern = f"%{search}%"
         q = q.where(sa.or_(items.c.title.ilike(pattern), items.c.description.ilike(pattern)))
+    if gate is not None:
+        q = q.where(_pending_gate_exists(gate))
     if limit:
         q = q.limit(limit)
 

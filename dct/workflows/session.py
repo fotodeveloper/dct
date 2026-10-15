@@ -38,8 +38,8 @@ import sqlalchemy as sa
 from dct.core import handoff as handoff_core
 from dct.core import sprints as sprints_core
 from dct.core.checkpoints import (
+    _query_pending_gates,
     _query_sprint_item_checkpoints,
-    _query_sprint_pending_gates,
 )
 from dct.core.decisions import _query_recent_decisions
 from dct.core.handoff import _query_unconsumed_handoffs
@@ -227,11 +227,12 @@ def _build_snapshot(
             "pending_count": len(unconsumed),
         }
 
-    gates = _query_sprint_pending_gates(conn, project_id)
+    gates = _query_pending_gates(conn, project_id)
     if "gates" in sections:
         snap["gates"] = _to_cols_rows(
             gates,
-            ["item_id", "checkpoint_id", "kind", "priority", "item_short_title", "item_title", "text"],
+            ["item_id", "checkpoint_id", "kind", "priority", "in_current_sprint",
+             "item_short_title", "item_title", "text"],
             cap=SNAPSHOT_CAPS["gates"],
         )
 
@@ -290,7 +291,8 @@ def get_context_snapshot(
     Sections (SNAPSHOT_SECTIONS, skippable via `include`): sprint (all active
     sprints, primary first + open member items with cp + their checkpoints +
     stale in_progress), handoff (latest full / others previewed / pending
-    count), gates (pending gate checkpoints of in-sprint items), decisions
+    count), gates (pending gate checkpoints of EVERY open item, sprint or
+    not, with in_current_sprint — #947), decisions
     (accepted+proposed, newest 10, decision text previewed), recent_changes.
     Always present: project, since, since_anchor, sections, summary.
     Runs in ONE transaction — a consistent view, no torn reads.

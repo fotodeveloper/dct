@@ -62,7 +62,8 @@ One call returns everything Step 2 needs:
 - **`sprint`** — ALL active sprints (`active_sprints`, `primary_sprint_id`),
   member items with `cp`, their `checkpoints` (the next pending checkpoint is
   readable directly), `stale_in_progress`.
-- **`gates`** — pending gate checkpoints of in-sprint items; **`decisions`** —
+- **`gates`** — pending gate checkpoints of EVERY open item, in a sprint or
+  not (`in_current_sprint` tells which); **`decisions`** —
   live ADRs/open questions with previews; **`summary`** — sprint_size,
   sprint_completion, handoffs_pending, gates_pending.
 
@@ -183,6 +184,7 @@ handoffs_pending, and the opened item's pending checkpoints (from
   Sprint: 3 items, 1/3 done
   Starting with #22 — "Optimize MCP response format"
   Plan: 4 pending checkpoints in this item
+  Waiting on you: #945 dogfood — "Owner reviews a real triage…"
 ```
 
 The first line names the consumed handoff by its id (`#N`): the consume
@@ -190,6 +192,12 @@ happened without a question, so this is where the user sees it. Consuming only
 marks the handoff read — the row and its prompt stay in the ledger. Nothing
 consumed → `✓ No handoff consumed` (or `left unconsumed` after a read-only
 look).
+
+**Waiting on you** — one line per pending gate whose condition is a person's
+act (`dogfood`, `approval`, or a gate whose text names the user), from the
+snapshot's `gates`, sprint or not: `#<item_id> <kind> — "<text>"`. These are
+what only the user can close; list them even when nothing else is due, and
+omit the line when there are none. Never complete such a gate here.
 
 If the project has plans with pending checkpoints, mention that
 **`/plan-status` shows overall plan progress** — a good next call when planned

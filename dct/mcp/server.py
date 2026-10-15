@@ -512,6 +512,7 @@ def list_items(
     in_current_sprint: str = "",
     search: str = "",
     tag: str = "",
+    gate: str = "",
     limit: int = 50,
     format: str = "structured",
     view: str = "brief",
@@ -545,6 +546,11 @@ def list_items(
             silently empty page.
             Composes with `project` (the dictionary is global, item lists stay
             project-scoped). Use list_tags to see what exists.
+        gate: '' (default, no filter) | 'any' | a gate kind ('dogfood',
+            'review', 'security', 'approval', …; trimmed, case-insensitive):
+            keeps only items with a PENDING gate checkpoint of that kind, in a
+            sprint or not — "what waits on a person's check". 'task' /
+            'cc-task' never gate → {"error": ...}.
         limit: Max rows (default 50). 0 = no limit.
         format: 'structured' (default, {cols,rows}), 'markdown', 'dict'.
         view: 'brief' (default) | 'full' — see VIEWS. With format='dict',
@@ -553,7 +559,7 @@ def list_items(
 
     Returns: {"cols": [...], "rows": [[...]]} by default, list[dict] for
         format="dict", or markdown str for format="markdown".
-        {"error": "..."} on an unknown tag or an unknown view.
+        {"error": "..."} on an unknown tag, a non-gate `gate` or an unknown view.
     """
     from dct.core.items import list_items as _list
 
@@ -569,6 +575,7 @@ def list_items(
     if component: kwargs["component"] = component
     if search: kwargs["search"] = search
     if tag: kwargs["tag"] = tag
+    if gate: kwargs["gate"] = gate
     sprint_filter = _parse_bool_tri(in_current_sprint)
     if sprint_filter is not None:
         kwargs["in_current_sprint"] = sprint_filter
@@ -2230,7 +2237,10 @@ def get_context_snapshot(
         SKIPPED ONES ARE OMITTED (probe with `"gates" in result` — never None):
         sprint {primary_sprint_id, active_sprints, items, checkpoints,
         stale_in_progress}, handoff {latest (FULL prompt), others (200-char
-        previews), pending_count}, gates / decisions ({cols,rows}),
+        previews), pending_count}, gates / decisions ({cols,rows}) — gates =
+        the pending gate checkpoints of EVERY open item of the project, in a
+        sprint or not (cols item_id, checkpoint_id, kind, priority,
+        in_current_sprint, item_short_title, item_title, text; P1 first),
         recent_changes {items_changed, checkpoints_completed, changelog_added}.
         LABELS: rows that ARE an item (sprint.items, sprint.stale_in_progress,
         recent_changes.items_changed) carry `short_title` (may be null); rows

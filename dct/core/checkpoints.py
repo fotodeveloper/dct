@@ -123,7 +123,7 @@ def list_pending_gates(engine: sa.Engine, item_id: int) -> list[dict]:
 
 
 def _sprint_checkpoints_base(project_id: int, *columns: sa.ColumnElement) -> sa.Select:
-    """SELECT skeleton shared by the two sprint-scoped checkpoint readers:
+    """SELECT skeleton of the sprint-scoped checkpoint reader:
     LIVE checkpoints of LIVE items that are in ANY active sprint of the
     project (membership via _current_sprint_exists, so the multi-sprint and
     terminal-member rules are defined in exactly one place).
@@ -159,36 +159,54 @@ def _with_item_label(mapping, *, title_key: str, keep_title: bool = True) -> dic
     return d
 
 
-def _query_sprint_pending_gates(conn: sa.Connection, project_id: int) -> list[dict]:
-    """Pending gate checkpoints on items in ANY active sprint of the project —
-    the project-wide companion to list_pending_gates (which stays per-item as
-    resolve_item's guard). One grouped query, no N+1. Ordered P1-first, then
-    checkpoint sort_order, id tie-break.
+def _query_pending_gates(conn: sa.Connection, project_id: int) -> list[dict]:
+    """Pending gate checkpoints on EVERY open item of the project, in a sprint
+    or not (#947: an out-of-sprint item awaiting dogfood was invisible) — the
+    project-wide companion to list_pending_gates (which stays per-item as
+    resolve_item's guard). One query, no N+1. Ordered P1-first, then
+    item id, checkpoint sort_order, id tie-break.
 
-    Row shape: {item_id, checkpoint_id, kind, priority, item_short_title,
-    item_title, text} — item_short_title is dct.core.text.item_label (the
-    item's short_title, else its title compacted to 50 chars).
+    Row shape: {item_id, checkpoint_id, kind, priority, in_current_sprint,
+    item_short_title, item_title, text} — in_current_sprint is the derived
+    flag (dct.core.items._current_sprint_exists); item_short_title is
+    dct.core.text.item_label (the item's short_title, else its title
+    compacted to 50 chars).
     """
-    from dct.core.items import _priority_order_expr  # local: items imports checkpoints
+    from dct.core.items import (  # local: items imports checkpoints
+        TERMINAL_STATUSES,
+        _current_sprint_exists,
+        _priority_order_expr,
+    )
 
     rows = conn.execute(
-        _sprint_checkpoints_base(
-            project_id,
+        sa.select(
             item_checkpoints.c.item_id,
             item_checkpoints.c.id.label("checkpoint_id"),
             item_checkpoints.c.kind,
             items.c.priority,
+            _current_sprint_exists().label("in_current_sprint"),
             items.c.short_title,
             items.c.title.label("item_title"),
             item_checkpoints.c.text,
         )
+        .select_from(item_checkpoints.join(items, items.c.id == item_checkpoints.c.item_id))
         .where(
+            items.c.project_id == project_id,
+            items.c.deleted_at.is_(None),
+            items.c.status.notin_(TERMINAL_STATUSES),
+            item_checkpoints.c.deleted_at.is_(None),
             item_checkpoints.c.kind.notin_(NON_GATE_KINDS),
             item_checkpoints.c.status == "pending",
         )
-        .order_by(_priority_order_expr(), item_checkpoints.c.sort_order, item_checkpoints.c.id)
+        .order_by(_priority_order_expr(), item_checkpoints.c.item_id,
+                  item_checkpoints.c.sort_order, item_checkpoints.c.id)
     ).fetchall()
-    return [_with_item_label(r._mapping, title_key="item_title") for r in rows]
+    out = []
+    for r in rows:
+        d = _with_item_label(r._mapping, title_key="item_title")
+        d["in_current_sprint"] = bool(d["in_current_sprint"])
+        out.append(d)
+    return out
 
 
 def _query_sprint_item_checkpoints(conn: sa.Connection, project_id: int) -> list[dict]:
@@ -221,13 +239,13 @@ def _query_sprint_item_checkpoints(conn: sa.Connection, project_id: int) -> list
     ]
 
 
-def list_sprint_pending_gates(engine: sa.Engine, project_slug: str) -> list[dict]:
-    """Public wrapper over _query_sprint_pending_gates — resolves the slug and
-    runs in its own transaction. See the conn-level docstring for the shape."""
+def list_project_pending_gates(engine: sa.Engine, project_slug: str) -> list[dict]:
+    """Public wrapper over _query_pending_gates — resolves the slug and runs
+    in its own transaction. See the conn-level docstring for the shape."""
     from dct.core.projects import resolve_project_id
 
     with engine.begin() as conn:
-        return _query_sprint_pending_gates(conn, resolve_project_id(conn, project_slug))
+        return _query_pending_gates(conn, resolve_project_id(conn, project_slug))
 
 
 def list_checkpoints(

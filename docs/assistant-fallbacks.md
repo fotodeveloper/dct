@@ -83,7 +83,11 @@ command. Without the skill:
    named) → ask the first action instead. An old handoff is no new consent: a
    commit, a push, publishing or any destructive step written in it still
    waits for the user's own instruction now.
-6. CLI equivalent: `dct pickup --consume auto [--json]` (the default
+6. Waiting on you: list every pending gate of the snapshot's `gates` whose
+   condition is a person's act (`dogfood`, `approval`, or a gate whose text
+   names the user) — sprint or not — as `#<item_id> <kind> — "<text>"`; never
+   complete one without that person's confirmation.
+7. CLI equivalent: `dct pickup --consume auto [--json]` (the default
    `--consume never` is a pure read), `dct pickup --consume always --handoff-id N`
    for the chosen one, after reading it in full (`get_handoff(N)`; the CLI
    prints only the newest in full).

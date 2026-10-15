@@ -173,26 +173,53 @@ def test_snapshot_sprint_checkpoints_expose_next_step(engine, proj):
 
 
 def test_snapshot_gates_filtering(engine, proj):
-    """dogfood gate on an in-sprint item shows; task/cc-task never gate; a gate
-    on a non-sprint item stays out."""
+    """#947: every OPEN item's pending gate shows, in a sprint or not (a gate
+    outside the sprint used to be invisible); task/cc-task never gate;
+    in_current_sprint marks sprint members; P1 first."""
     a = create_item(engine, "proj-a", "feature", "In sprint", priority="P1")
     add_checkpoint(engine, a["id"], "Plain task", kind="task")
     add_checkpoint(engine, a["id"], "Mirror", kind="cc-task")
     gate = add_checkpoint(engine, a["id"], "Fresh-session dogfood", kind="dogfood")
     outside = create_item(engine, "proj-a", "feature", "Outside")
-    add_checkpoint(engine, outside["id"], "Security review", kind="security")
+    sec = add_checkpoint(engine, outside["id"], "Security review", kind="security")
     set_current_sprint_items(engine, "proj-a", [a["id"]])
 
     snap = get_context_snapshot(engine, "proj-a")
     tbl = snap["gates"]
     rows = [dict(zip(tbl["cols"], r)) for r in tbl["rows"]]
-    assert [r["checkpoint_id"] for r in rows] == [gate["id"]]
+    assert [r["checkpoint_id"] for r in rows] == [gate["id"], sec["id"]]
     assert rows[0]["kind"] == "dogfood" and rows[0]["item_title"] == "In sprint"
+    assert [r["in_current_sprint"] for r in rows] == [True, False]
     assert tbl["cols"] == [
-        "item_id", "checkpoint_id", "kind", "priority", "item_short_title", "item_title", "text",
+        "item_id", "checkpoint_id", "kind", "priority", "in_current_sprint",
+        "item_short_title", "item_title", "text",
     ]
     # No short_title stored → the label falls back to the (short) title.
     assert rows[0]["item_short_title"] == "In sprint"
+    assert snap["summary"]["gates_pending"] == 2
+
+
+def test_snapshot_gates_drop_closed_gates_and_items(engine, proj):
+    """#947: a done or rejected gate leaves the list; a soft-deleted item's
+    gate never shows; another project's gate stays out."""
+    from dct.core.items import delete_item
+
+    a = create_item(engine, "proj-a", "feature", "A")
+    done = add_checkpoint(engine, a["id"], "Dogfood", kind="dogfood")
+    rejected = add_checkpoint(engine, a["id"], "Approval", kind="approval")
+    live = add_checkpoint(engine, a["id"], "Review", kind="review")
+    gone = create_item(engine, "proj-a", "feature", "Gone")
+    add_checkpoint(engine, gone["id"], "Dogfood", kind="dogfood")
+    delete_item(engine, gone["id"])
+    create_project(engine, "proj-z", "Z")
+    foreign = create_item(engine, "proj-z", "feature", "Foreign")
+    add_checkpoint(engine, foreign["id"], "Dogfood", kind="dogfood")
+    set_status(engine, done["id"], "done")
+    set_status(engine, rejected["id"], "rejected")
+
+    snap = get_context_snapshot(engine, "proj-a")
+    rows = [dict(zip(snap["gates"]["cols"], r)) for r in snap["gates"]["rows"]]
+    assert [r["checkpoint_id"] for r in rows] == [live["id"]]
     assert snap["summary"]["gates_pending"] == 1
 
 

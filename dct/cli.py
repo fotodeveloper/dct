@@ -828,11 +828,14 @@ def cmd_list(args):
         kwargs["search"] = args.search
     if args.tag:
         kwargs["tag"] = args.tag
+    if args.gate:
+        kwargs["gate"] = args.gate
 
     try:
         items = list_items(engine, **kwargs)
     except ValueError as e:
-        # Unknown tag — the core error carries the known-names suggestion.
+        # Unknown tag (the core error carries the known-names suggestion) or a
+        # non-gate --gate kind.
         print(f"✗ Error: {e}", file=sys.stderr)
         sys.exit(1)
     headers = ["#", "Project", "Type", "Pri", "Status", "Label", "Title"]
@@ -1131,16 +1134,17 @@ def _render_pickup(snap: dict, identity: str | None) -> None:
     if gates:
         print("\nPending gates:")
         _print_table(
-            ["#", "cp", "kind", "prio", "title", "text"],
+            ["#", "cp", "kind", "prio", "sprint", "title", "text"],
             [
                 [
                     str(g["item_id"]), str(g["checkpoint_id"]), g.get("kind") or "",
-                    g.get("priority") or "", _strip_controls(g.get("item_title")),
+                    g.get("priority") or "", "yes" if g.get("in_current_sprint") else "",
+                    _strip_controls(g.get("item_title")),
                     _strip_controls(g.get("text")),
                 ]
                 for g in gates
             ],
-            max_widths={4: 30, 5: 50},
+            max_widths={5: 30, 6: 50},
         )
 
     if summary:
@@ -3520,6 +3524,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_list.add_argument("--search", "-q")
     p_list.add_argument("--tag", help="Only items carrying this tag "
                                       "(unknown tag → error listing known tags)")
+    p_list.add_argument("--gate", help="Only items with a pending gate checkpoint: 'any' "
+                                       "or a kind (dogfood, review, security, approval…), "
+                                       "in a sprint or not")
 
     # show
     p_show = sub.add_parser("show", help="Show item details")
