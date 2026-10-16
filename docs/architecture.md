@@ -16,7 +16,7 @@ dct is a **cross-project tool** — every surface is user-scoped, not per-projec
 | Codex hooks | `$CODEX_HOME/hooks.json` | Native definitions calling the packaged Python bridge; explicit client trust is required |
 | dct reference | `paths.config_dir() / "dct-reference.md"` | Shared generated catalog; client instruction blocks name the resolved path; Claude retains its owned legacy alias |
 
-Register dct once per client and it is available across that client's sessions. Opening a new project directory needs zero integration setup. These shared-reference and Codex adapters are development changes; published PyPI 1.5.0 retains its established Claude integration and legacy reference path. See [client availability](integrations.md#release-availability).
+Register dct once per client and it is available across that client's sessions. Opening a new project directory needs zero integration setup. DCT 1.6.0 includes these shared-reference and Codex adapters; native Codex hooks remain experimental and require explicit client trust. See [client availability](integrations.md#release-availability).
 
 ## Module map
 

@@ -2,7 +2,7 @@
 
 Complete catalogue of the **76 MCP tools** the dct server exposes to MCP clients, grouped by domain. ← back to the [README](../README.md).
 
-The dct MCP server is registered at **user scope** in the supported client configuration (Claude: `~/.claude.json`; development Codex adapter: `$CODEX_HOME/config.toml`). Claude Code exposes tools as `mcp__dct__<name>`; other hosts control their namespaces and discovery. Most list/create tools accept an empty `project=""` and auto-detect the project from the session's working directory (longest-prefix match); pass `project=<slug>` to override.
+The dct MCP server is registered at **user scope** in the supported client configuration (Claude: `~/.claude.json`; Codex adapter: `$CODEX_HOME/config.toml`). Claude Code exposes tools as `mcp__dct__<name>`; other hosts control their namespaces and discovery. Most list/create tools accept an empty `project=""` and auto-detect the project from the session's working directory (longest-prefix match); pass `project=<slug>` to override.
 
 New tools become callable only after the client reconnects or the session restarts (the MCP server is a per-session subprocess). Run `dct server` in a shell to print the authoritative tool list at any time.
 

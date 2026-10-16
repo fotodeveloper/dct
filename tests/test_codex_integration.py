@@ -346,9 +346,9 @@ def test_readme_counts_and_lists_the_packaged_skills():
     claude, count = _claude_skills(), len(skill_names())
     assert claude == set(skill_names()) == set(codex.SKILLS)
     assert f'with {count} slash-command skills' in flat
-    assert f'The {count} Claude Code skills, 4 Claude hooks and {count} development-version Codex skills' in flat
-    assert f'{count} Codex workflows in development builds' in flat
-    assert f'The {count} packaged workflows are available' in flat
+    assert f'The {count} Claude Code skills, 4 Claude hooks and {count} Codex skills' in flat
+    assert f'{count} Codex workflows' in flat
+    assert f'The {count} packaged workflows' in flat
     table = readme[readme.index('### Skills'):readme.index('## Global Hooks')]
     import re
     assert set(re.findall(r'^\| `/([a-z-]+)` \|', table, re.MULTILINE)) == claude

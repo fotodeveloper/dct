@@ -7,24 +7,23 @@ where supported, hooks. A working MCP connection does not establish all three.
 
 ## Release availability
 
-The published PyPI release **1.5.0** includes the common CLI/MCP tools and the
-established Claude Code integration. This guide also describes **unreleased
-development changes**: `dct integrate`, `dct doctor`, Codex workflow skills and
-experimental native Codex hooks. Those additions are not installed by
-`uv tool install 'dctracker[mcp]'` from PyPI 1.5.0.
+DCT **1.6.0** includes the common CLI/MCP tools, Claude Code and Codex
+integration installers, `dct integrate`, `dct doctor`, and packaged workflow
+skills for both clients. Native Codex hooks remain experimental and require
+the host capabilities and explicit trust described below.
 
-To try the new commands, use a checkout containing the integration changes:
+Install DCT 1.6.0 or later, then configure the integration:
 
 ```sh
-uv tool install --editable '/path/to/dct[mcp]'
+uv tool install 'dctracker[mcp]>=1.6.0'
 dct integrate install codex
 dct integrate status codex --json
 dct doctor --client codex --json
 ```
 
-For a published installation, use `dct init` for the existing Claude setup or
-register `dct server` manually in another client's MCP configuration. Do not
-interpret the development matrix below as a claim about PyPI 1.5.0.
+Use `dct init` for the Claude setup or register `dct server` manually in
+another client's MCP configuration. The capability matrix below distinguishes
+packaged integrations from experimental hooks and generic MCP support.
 
 Integration commands never initialize or migrate the database. Use the default
 SQLite configuration or create `dct.toml` as described in the
@@ -36,7 +35,7 @@ MCP, skills, hooks and managed instructions.
 
 ### Shared reference and managed pointers
 
-Development builds install `dct/assets/dct-reference.md` at the canonical
+DCT 1.6.0 installs `dct/assets/dct-reference.md` at the canonical
 `paths.config_dir() / "dct-reference.md"`: on POSIX this is normally
 `~/.config/dctools/dct-reference.md`, honoring `XDG_CONFIG_HOME`; Windows uses
 the existing platform directory policy. `DCT_CONFIG_PATH` selects the database
@@ -64,8 +63,8 @@ is preserved. Repeating current content is a no-op. Doctor reports
 current, missing, outdated and foreign states without writing.
 
 Claude retains and refreshes its proven-owned `~/.claude/dct-reference.md`
-compatibility alias; a Codex-only installation creates no Claude alias. PyPI
-1.5.0 still uses the legacy reference path. Each client's uninstall removes
+compatibility alias; a Codex-only installation creates no Claude alias.
+Each client's uninstall removes
 only its owned assets, pointer block and any owned client-specific alias. It
 retains the shared canonical reference and reports retention in both plain CLI
 and JSON output. Plain output lists `retained` separately from `preserved`,
@@ -75,7 +74,7 @@ clients and existing instruction blocks, introducing no new hook trust or
 instruction opt-in. Installation has separately reported steps and is retryable;
 it does not promise an all-file transaction.
 
-## Codex: supported explicit workflows in development builds
+## Codex: supported explicit workflows
 
 The adapter configures `dct server` in `$CODEX_HOME/config.toml` (default
 `~/.codex/config.toml`), installs `clog`, `commit`, `dct-import`, `dct-init`, `handoff`, `pickup`, `plan-resolve-uncertain`, `plan-status`, `release`, `track`, `track-list`, `track-resolve`, `track-update`, `triage`
@@ -95,15 +94,15 @@ A nonempty `AGENTS.override.md` takes precedence over `AGENTS.md`; doctor
 reports this as an error. Merge needed override instructions manually before
 removing or emptying the override. Repair does not modify that user-owned file.
 
-The 14 packaged skills (`clog`, `commit`, `dct-import`, `dct-init`, `handoff`, `pickup`, `plan-resolve-uncertain`, `plan-status`, `release`, `track`, `track-list`, `track-resolve`, `track-update`, `triage`) are the shared workflow inventory in this checkout.
+The 14 packaged skills (`clog`, `commit`, `dct-import`, `dct-init`, `handoff`, `pickup`, `plan-resolve-uncertain`, `plan-status`, `release`, `track`, `track-list`, `track-resolve`, `track-update`, `triage`) are the shared workflow inventory in DCT 1.6.0.
 Each contains its complete contract, with native `agents/openai.yaml` metadata.
 `dct-init`, `dct-import` and `plan-resolve-uncertain` are explicit-only. Both
 adapters derive their inventory from the canonical manifest; renderer and build
 checks reject stale or missing generated assets. `triage` uses the findings
 ledger, publishes only when the host provides that capability, and preserves
 owner-only decisions. Its proposals and scoped backlog follow the same contract
-in both clients. Session resumption has [separate acceptance evidence](codex-acceptance.md);
-full fresh-client acceptance of the expanded inventory remains a separate gate.
+in both clients. Packaged availability is separate from client/runtime
+acceptance evidence; see the [session-resumption acceptance evidence](codex-acceptance.md).
 
 ### Experimental native hooks
 
@@ -167,21 +166,21 @@ upgrades, model calls or network requests.
 
 ## Capability matrix
 
-This matrix describes the development checkout. **Established** is the existing
+This matrix describes DCT 1.6.0. **Established** is the existing
 Claude integration; **packaged** denotes the shared Codex workflow inventory;
 **experimental** requires the stated native-host conditions; **generic** denotes
 manual protocol integration, without a claim of client-specific acceptance.
 
-| Capability | Claude Code — established | Codex — development | Other clients — generic MCP |
+| Capability | Claude Code — established | Codex — packaged | Other clients — generic MCP |
 |---|---|---|---|
 | Shared tracking/session MCP tools | Available | Available | Manual stdio registration; host-dependent discovery |
-| Integration installer | `init`; new `integrate` commands in development | `integrate install/repair` | Manual |
+| Integration installer | `init`; `integrate install/repair` | `integrate install/repair` | Manual |
 | Managed workflow skills | Existing collection of 14, including triage | Packaged: clog, commit, dct-import, dct-init, handoff, pickup, plan-resolve-uncertain, plan-status, release, track, track-list, track-resolve, track-update, triage | Supply client-specific instructions manually |
 | Changelog checks / stop reminders | Claude hooks | Experimental native hooks; review/trust and dependencies required | No packaged adapter |
 | Plan-file autoscan | Claude edit/write events | Experimental `apply_patch` events; shell edits need explicit rescan | CLI rescan or MCP `ingest_plan_file` |
 | Native plan mirroring | Claude TaskCreate/TodoWrite | Experimental and conditional on actual `update_plan` events | No packaged mirror |
 | Managed instructions | CLAUDE.md pointer + shared reference; owned legacy alias retained | AGENTS.md pointer + shared reference; conflicts reported | Manual |
-| Integration diagnostics | Development `doctor` | Development `doctor`; runtime trust checked separately | Core runtime checks only |
+| Integration diagnostics | `doctor` | `doctor`; runtime trust checked separately | Core runtime checks only |
 
 Hook installation and trust are separate from explicit skills. Treat each
 client/host version as its own integration surface; do not infer hook parity
