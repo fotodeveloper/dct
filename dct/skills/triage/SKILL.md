@@ -69,12 +69,14 @@ fingerprint, class derived) and every review of the diff has finished — the
 review → triage → fix gate below.
 
 1. `mcp__dct__open_triage(code, topic, created_by, project, scope,
-   base_commit)` — `code` a short handle (e.g. `rev-877-r2`), unique among
+   base_commit, language)` — `code` a short handle (e.g. `rev-877-r2`), unique among
    the project's live cycles; `created_by=<known_actor_identity>` follows
    the shared known-component rule below (true client sufficient; no guessed
    project or UTC time); `scope` what was reviewed (diff range, files);
-   `base_commit` the cycle's fixed base commit. REMEMBER the returned
-   `cycle_id`.
+   `base_commit` the cycle's fixed base commit; `language` the page
+   language of the cycle (omit it to take `[triage] language` of `dct.toml`,
+   else `en`) — fixed for the cycle's page, rebuilds and accepted-proposal
+   prefix. REMEMBER the returned `cycle_id`.
 2. **Purpose and use check** before recording (the class is a recommendation
    and the rubric's threat model is an input to it, not a constant): for every
    card say in its context who supplies the trigger input and whether the
@@ -113,9 +115,11 @@ review → triage → fix gate below.
    — the CLI refuses a missing parent directory. One page per directory: the
    build keeps its companion files (`cards.json`, `plain.json`) beside it.
 2. Build from the ledger:
-   `dct triage page <code> --project <slug> --out <path>` (add `--template
-   <path>` when `[triage] template` is not set in `dct.toml`; dct ships no
-   template — a refusal names both ways, pass it on to the user). The CLI
+   `dct triage page <code> --project <slug> --out <path>` (dct builds from
+   the template it ships, in the cycle's language, unless `--template
+   <path>` or `[triage] template` in `dct.toml` names another; a template
+   written before dct shipped its own is refused with the upgrade path —
+   pass it on to the user). The CLI
    is read-only on the database and prints `<out>: <n> cards, closed=<yes|no>,
    suggested=<by>, digest=<hex>` (or `suggested=none`) — the digest of the
    proposals exactly as this build put them on the page. It also writes
@@ -255,10 +259,12 @@ input is the `cards.json` beside the page (written by every build, see
    The text is parsed before anything is written; a parse error (it names
    the line number and the key) writes nothing — report it verbatim and ask
    the owner for the corrected line; never repair his text yourself. A card
-   the page left "— (brak decyzji)" with no note is NOT addressed: it keeps
+   the page left without a decision ("— (no decision)", "— (brak
+   decyzji)") and with no note is NOT addressed: it keeps
    its stored state and comes back in the ack's `skipped` — name every
    skipped K-n in the report (they still need the owner's answer). A
-   "Punkt wyjścia" line in the text is stored with the decisions as their
+   starting-point line ("Starting point:", "Punkt wyjścia:") in the text is
+   stored with the decisions as their
    text origin: it shows the form was seeded from proposals, not who wrote
    each note.
 2. **The owner accepts the proposals as final** →
@@ -307,7 +313,7 @@ input is the `cards.json` beside the page (written by every build, see
    NOT approve (a commit, a push, a release) and, after an acceptance, the
    owner's words of acceptance quoted verbatim plus one sentence that the
    per-card notes are the accepted proposal text, not his words. When the
-   pasted text carried a "Punkt wyjścia" line, it is stored with the decision
+   pasted text carried a starting-point line, it is stored with the decision
    and comes back as `CLOSED.answers[K-n].origin`; a note may quote it too.
    `CLOSED.answers[K-n]` includes this `origin` only when the decision came
    from a prefilled paste; later decisions without that origin reset it.
