@@ -110,17 +110,28 @@ review → triage → fix gate below.
    session scratchpad, `<scratchpad>/triage-<safe code>/<safe code>.html`.
    `<safe code>` is the cycle code with every character outside
    `[A-Za-z0-9._-]` replaced by `-`. Create the directory first (`mkdir -p`)
-   — the CLI refuses a missing parent directory.
+   — the CLI refuses a missing parent directory. One page per directory: the
+   build keeps its companion files (`cards.json`, `plain.json`) beside it.
 2. Build from the ledger:
    `dct triage page <code> --project <slug> --out <path>` (add `--template
    <path>` when `[triage] template` is not set in `dct.toml`; dct ships no
    template — a refusal names both ways, pass it on to the user). The CLI
    is read-only on the database and prints `<out>: <n> cards, closed=<yes|no>,
    suggested=<by>, digest=<hex>` (or `suggested=none`) — the digest of the
-   proposals exactly as this build put them on the page. A rebuild of THE
-   SAME cycle onto its own path adds
+   proposals exactly as this build put them on the page. It also writes
+   `cards.json` beside the page — the export the page was built from, the
+   bytes `dct triage export --json` prints — and prints `<dir>/cards.json:
+   cards export, <n> cards`. That file is what a consultant reads (the
+   cards, their options, proposals and decisions as recorded), never the
+   HTML. A rebuild of THE SAME cycle onto its own path adds
    `--force`; never `--force` onto any other path — the published or closed
    page of another cycle is never overwritten.
+2a. **The plain-language layer** (section below), when the template reads
+   it: write the cycle's plain file and add `--plain <the cycle's plain
+   file>` to the build — it validates the file against the cycle's cards,
+   copies it as `plain.json` beside the page and prints one more line
+   `<dir>/plain.json: plain layer, <n> cards` — then publish the two
+   together.
 3. When the host refuses the CLI call, give the user the exact command to run
    (in Claude Code with the `!` prefix: `! dct triage page …`) and continue
    from its output.
@@ -130,7 +141,11 @@ review → triage → fix gate below.
    ("Open — …" in English, "Otwarty — …" in Polish), and says the page
    collects the owner's answers. A republish uses the
    same `file_path`, so the URL stays the same; the page's storage key comes
-   from the cycle id, so a rebuild keeps every viewer's draft.
+   from the cycle id, so a rebuild keeps every viewer's draft. With the
+   plain-language layer, every publish (open, prefill, closed) also passes
+   `files: {"plain.json": <the copy beside the page>}` — a publish that omits
+   it keeps the earlier published copy, so a changed text would never reach
+   the page.
 5. After the FIRST publish write the URL back:
    `mcp__dct__update_triage(artifact_url=<url>, cycle_id=<id>)` (open cycles
    only).
@@ -142,9 +157,49 @@ review → triage → fix gate below.
    (`mcp__dct__list_findings(project=<slug>, cycle_id=<id>, limit=0)`, column
    `class`) — never a second set of cards.
 
+## The plain-language layer
+
+A page template may carry a plain-language layer: the page fetches a file
+`plain.json` published beside it and shows, per card, the same finding in
+plain words, with a toggle between the plain and the full text. When the
+template reads it (its header comment describes the slot), every publish of
+the page (open, prefill, closed) carries it:
+
+- **Shape:** `{by, date, cards: {"K-n": {title, problem | was + fix, opts:
+  {a: …}, codex, amends}}}` — `by` who wrote the texts
+  (`<known_actor_identity>`), `date` the day; per card `title`, then
+  `problem` for a card the owner decides, or `was` + `fix` for a card whose
+  fix is already applied; `opts` the variants in short, keyed by the card's
+  own option letters; `codex` one line summarising each agent proposal;
+  `amends` the closed decision a choice would change. Every field is
+  optional; a card the file does not name keeps its full text.
+- **Content:** two to four plain sentences per card in the language of the
+  conversation; numbers, step names and values kept; rubric vocabulary
+  (field scores, class names) and decision ids left out.
+- **Keys:** only the K-n of this cycle's cards, in `opts` only that card's
+  own option letters, only the fields above. `--plain` refuses anything else
+  (naming it) and then writes nothing, the page included — fix the file,
+  never the page.
+- **Place:** the file lives with the cycle's records, e.g.
+  `.context/review-<item>/plain-<safe code>.json` (without `.context/`, the
+  page's directory). Every build of the page passes it with `--plain`, which
+  copies it as `plain.json` into the page's directory, beside the page; a
+  `plain.json` already there is replaced only with `--force`, like the page.
+  **page** writes the file; **prefill** updates its `codex` lines; **close**
+  keeps it, refreshed where a decision changed what a text says.
+- **A reading aid, never a decision.** The layer changes no card, no state,
+  no proposal and no generated decision text; the ledger stays the source,
+  and the proposals' digest does not depend on it (a rebuild leaves it
+  unchanged). A changed text means an edited JSON file and a republish; the
+  page file is still never hand-edited.
+- A template without the slot ignores the file: skip the layer, nothing else
+  changes.
+
 ## Mode: prefill
 
-An agent (Codex, a consultant) proposed answers for an OPEN cycle.
+An agent (Codex, a consultant) proposed answers for an OPEN cycle. Its
+input is the `cards.json` beside the page (written by every build, see
+**page**), never the page's HTML.
 
 1. Read its proposals: a file it left or its answer in the chat, in the
    page's SUGGESTED shape `{by, date, answers: {"K-n": {dec, opt, note}}}`
@@ -160,7 +215,7 @@ An agent (Codex, a consultant) proposed answers for an OPEN cycle.
    NON-INTERACTIVELY (`codex exec`, a background subagent) cannot call MCP
    tools (its approval policy refuses them): ask it to write the proposals
    as a file in the SUGGESTED shape (e.g. `suggested.json` in the session
-   scratchpad, cards taken from the published page's `CARDS` constant) and
+   scratchpad, cards taken from the `cards.json` beside the page) and
    do step 2 yourself with `by` = that agent's name. The ledger records the
    proposer either way; it never records who transported the file.
 2. `mcp__dct__suggest_findings(by=<SUGGESTED.by>,
@@ -176,8 +231,9 @@ An agent (Codex, a consultant) proposed answers for an OPEN cycle.
    answers under the latest proposer. Untouched cards retain their own
    attribution. Proposals never touch a decision.
 3. Rebuild onto the same path (`dct triage page <code> --project <slug>
-   --out <path> --force`) and republish to the same URL with a description
-   saying, in the language of the conversation, that the page is open and
+   --out <path> --force`, plus `--plain` with its `codex` lines updated when
+   the page carries the plain-language layer above) and republish to the
+   same URL, with its `plain.json`, and a description saying, in the language of the conversation, that the page is open and
    carries proposals by <by>, not decisions ("Open — proposals by <by>, not
    decisions"). **Record the digest** the build printed (`digest=<hex>`):
    it identifies the proposals the owner sees on the published page. Name
@@ -255,8 +311,9 @@ An agent (Codex, a consultant) proposed answers for an OPEN cycle.
    and comes back as `CLOSED.answers[K-n].origin`; a note may quote it too.
    `CLOSED.answers[K-n]` includes this `origin` only when the decision came
    from a prefilled paste; later decisions without that origin reset it.
-5. Rebuild onto the same path with `--force` and republish to the same URL
-   with a description starting with the word "Closed" and the date, in the
+5. Rebuild onto the same path with `--force` (plus `--plain` when the page
+   carries the plain-language layer above) and republish to the same URL,
+   with its `plain.json`, and a description starting with the word "Closed" and the date, in the
    language of the conversation ("Closed <YYYY-MM-DD>" in English,
    "Zamknięty <YYYY-MM-DD>" in Polish).
 6. **Backlog → dct.** `mcp__dct__list_findings(project=<slug>,

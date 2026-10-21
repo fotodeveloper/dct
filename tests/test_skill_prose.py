@@ -269,3 +269,42 @@ def test_triage_purpose_check_keeps_the_reviewers_values_visible(which):
     assert "trust model" in flat, which
     assert "the reviewer's original O and type" in flat, which
     assert "the reason for the change" in flat, which
+
+
+@pytest.mark.parametrize("which", TRIAGE_DOCS)
+def test_triage_page_carries_the_plain_language_layer(which):
+    """#988: every version of a triage page (open, prefill, closed) is
+    published with `plain.json` beside it when the template reads it — its
+    shape, its place and the copy beside the page are named — and the layer
+    is a reading aid that changes no card, state or generated text."""
+    flat = _flat(_triage_doc(which))
+    assert "plain.json" in flat, which
+    assert '{by, date, cards: {"K-n": {title, problem | was + fix, opts: {a: …}, codex, amends}}}' \
+        in flat, which
+    assert "plain-<safe code>.json" in flat, which
+    assert re.search(r"`--plain <the cycle's plain file>`[^.]*copies it as `plain\.json`"
+                     r" beside the page", flat), which
+    assert "writes nothing, the page included" in flat, which
+    assert re.search(r"every publish[^.]*\(open, prefill, closed\)", flat), which
+    assert "a reading aid, never a decision" in flat.lower(), which
+    assert "the ledger stays the source" in flat, which
+
+
+def test_triage_skill_publishes_the_plain_layer_through_artifact_files():
+    """#988, Claude Code host: the layer travels as the Artifact tool's
+    `files` parameter, passed again on every publish."""
+    flat = _flat(_skill("triage"))
+    assert '`files: {"plain.json": <the copy beside the page>}`' in flat
+
+
+@pytest.mark.parametrize("which", TRIAGE_DOCS)
+def test_triage_consultant_reads_cards_json_not_the_page(which):
+    """Owner decision 2026-10-21 (K-4 a): every build writes cards.json beside
+    the page — the bytes of `dct triage export --json` — and a consultant
+    works from that file, never from the HTML."""
+    flat = _flat(_triage_doc(which))
+    assert "the bytes `dct triage export --json` prints" in flat, which
+    assert "never the HTML" in flat, which
+    assert "One page per directory" in flat, which
+    assert "`cards.json` beside the page" in flat, which
+    assert "CARDS` constant)" not in flat, which
