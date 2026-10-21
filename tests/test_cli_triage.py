@@ -307,7 +307,8 @@ def test_page_writes_the_export_into_the_template(monkeypatch, capsys, cli_engin
     code, stdout, _err = _run(monkeypatch, capsys, "page", "rev-2", "--project", "proj-a",
                               "--template", str(template), "--out", str(out))
     assert code == 0
-    assert stdout.strip() == f"{out}: 2 cards, closed=no, suggested=none"
+    assert stdout.splitlines() == [f"{out}: 2 cards, closed=no, suggested=none",
+                                   f"{tmp_path / 'cards.json'}: cards export, 2 cards"]
     page = out.read_text(encoding="utf-8")
     expected = export_triage(cli_engine, two_cards)
     assert _page_constant(page, "CARDS") == expected["cards"]
@@ -339,7 +340,8 @@ def test_page_reports_a_closed_cycle_and_the_proposer(monkeypatch, capsys, cli_e
                             "--template", str(template), "--out", str(out))
     assert code == 0
     digest = export_triage(cli_engine, two_cards)["suggested"]["digest"]
-    assert stdout.strip().endswith(f"2 cards, closed=yes, suggested=Codex, digest={digest}")
+    assert stdout.splitlines()[0].endswith(
+        f"2 cards, closed=yes, suggested=Codex, digest={digest}")
     assert _page_constant(out.read_text(encoding="utf-8"), "CLOSED")["source"] == \
         "chat 2026-10-14"
 
@@ -354,12 +356,14 @@ def test_page_template_comes_from_the_config_with_tilde_expanded(
     config.write_text('[triage]\ntemplate = "~/tpl.html"\n', encoding="utf-8")
     monkeypatch.setenv("DCT_CONFIG_PATH", str(config))
 
-    out = tmp_path / "from-config.html"
+    (tmp_path / "cfg").mkdir()
+    (tmp_path / "flag").mkdir()  # one page per directory: cards.json sits beside it
+    out = tmp_path / "cfg" / "from-config.html"
     assert _run(monkeypatch, capsys, "page", "rev-2", "--project", "proj-a",
                 "--out", str(out))[0] == 0
     assert "<h1 id=cfg>" in out.read_text(encoding="utf-8")
 
-    explicit = tmp_path / "from-flag.html"
+    explicit = tmp_path / "flag" / "from-flag.html"
     assert _run(monkeypatch, capsys, "page", "rev-2", "--project", "proj-a",
                 "--template", str(template), "--out", str(explicit))[0] == 0
     assert "<h1 id=cfg>" not in explicit.read_text(encoding="utf-8")  # --template wins
@@ -433,7 +437,7 @@ def test_page_into_a_directory_uses_a_safe_file_name(monkeypatch, capsys, cli_en
     code, stdout, _e = _run(monkeypatch, capsys, "page", "--cycle-id", str(cycle_id),
                             "--template", str(template), "--out", str(out_dir))
     assert code == 0
-    assert [p.name for p in out_dir.iterdir()] == ["-rev-2--.html"]
+    assert sorted(p.name for p in out_dir.iterdir()) == ["-rev-2--.html", "cards.json"]
     assert stdout.startswith(str(out_dir / "-rev-2--.html"))
 
 
@@ -850,3 +854,211 @@ def test_config_get_prints_an_unset_template_as_empty(monkeypatch, capsys, tmp_p
     monkeypatch.setenv("DCT_CONFIG_PATH", str(tmp_path / "absent.toml"))
     run_cli(monkeypatch, ["config", "get", "triage.template"])
     assert capsys.readouterr().out == "\n"
+
+
+# ── page --plain (#988): the plain-language layer beside the page ────────────
+
+# Valid for `two_cards` (K-1 options a, b; K-2 option a). Extra top-level keys
+# (cycle, note) are the author's own metadata and stay allowed; the text keeps
+# odd spacing and Polish letters so a re-serialisation would show.
+PLAIN_OK = ('{"by": "Claude Code", "date": "2026-10-21", "cycle": "rev-2",  "note": "aid",\n'
+            ' "cards": {"K-1": {"title": "Zażółć: utrata zapisu", "problem": "Dwie edycje…",\n'
+            '   "opts": {"a": "Blokada wiersza", "b": "Ponów"}, "codex": "a", "amends": ""},\n'
+            '  "K-2": {"title": "Drugi", "was": "x", "fix": "y"}}}\n')
+
+
+def _plain_page(monkeypatch, capsys, template, out, plain, *extra):
+    return _run(monkeypatch, capsys, "page", "rev-2", "--project", "proj-a",
+                "--template", str(template), "--out", str(out), "--plain", str(plain), *extra)
+
+
+@pytest.fixture
+def pages(tmp_path):
+    path = tmp_path / "pages"
+    path.mkdir()
+    return path
+
+
+def _write_plain(tmp_path, text: str):
+    path = tmp_path / "plain-rev-2.json"
+    path.write_text(text, encoding="utf-8")
+    return path
+
+
+def test_plain_is_copied_verbatim_beside_the_page(monkeypatch, capsys, two_cards, template,
+                                                  tmp_path, pages):
+    source = _write_plain(tmp_path, PLAIN_OK)
+    out = pages / "rev-2.html"
+    code, stdout, err = _plain_page(monkeypatch, capsys, template, out, source)
+    assert code == 0, err
+    assert (pages / "plain.json").read_bytes() == source.read_bytes()
+    first, _cards, plain = stdout.strip().splitlines()
+    assert first == f"{out}: 2 cards, closed=no, suggested=none"  # the parsed line unchanged
+    assert plain == f"{pages / 'plain.json'}: plain layer, 2 cards"
+    assert out.exists()
+
+
+def test_plain_with_a_directory_out_lands_beside_the_page(monkeypatch, capsys, two_cards,
+                                                          template, tmp_path, pages):
+    source = _write_plain(tmp_path, PLAIN_OK)
+    code, _o, err = _plain_page(monkeypatch, capsys, template, pages, source)
+    assert code == 0, err
+    assert sorted(p.name for p in pages.iterdir()) == ["cards.json", "plain.json", "rev-2.html"]
+
+
+def _card(text_k1: str) -> str:
+    return '{"cards": {"K-1": ' + text_k1 + "}}"
+
+
+@pytest.mark.parametrize(("text", "named"), [
+    ('{"cards": {"K-3": {"title": "t"}}}', "K-3"),                 # no such card
+    ('{"cards": {"K-1": {"title": "t"}, "k-2": {"title": "t"}}}', "k-2"),  # key spelling
+    ('{"cards": {"1": {"title": "t"}}}', "'1'"),                   # bare seq is not a card id
+    (_card('{"problme": "typo"}'), "problme"),                     # unknown card field
+    (_card('{"opts": {"c": "x"}}'), "'c'"),                        # K-1 has a, b only
+    (_card('{"title": 5}'), "title"),                              # not a string
+    (_card('{"opts": ["a"]}'), "opts"),                            # opts not an object
+    (_card('{"opts": {"a": {"t": "x"}}}'), "opts"),                # option text not a string
+    ('{"cards": {"K-1": "plain text"}}', "K-1"),                   # card not an object
+    ('{"by": 7, "cards": {"K-1": {"title": "t"}}}', "by"),         # by not a string
+    ('{"date": null, "cards": {"K-1": {"title": "t"}}}', "date"),
+    ('{"cards": {}}', "cards"),                                    # names no card
+    ('{"by": "x"}', "cards"),                                      # no cards at all
+    ('{"cards": []}', "cards"),
+    ('["K-1"]', "object"),                                         # not an object
+    ('{"cards": {"K-1": {"title": "a"}, "K-1": {"title": "b"}}}', "K-1"),  # duplicate key
+    (_card('{"title": "a", "title": "b"}'), "title"),              # duplicate field
+    ('{"cards": {"K-1": {"title": "t"}}', "JSON"),                 # broken JSON
+    ("", "JSON"),
+])
+def test_an_invalid_plain_file_writes_nothing(monkeypatch, capsys, two_cards, template,
+                                              tmp_path, pages, text, named):
+    source = _write_plain(tmp_path, text)
+    code, _o, err = _plain_page(monkeypatch, capsys, template, pages / "rev-2.html", source)
+    assert code == 1
+    assert "plain" in err and named in err, err
+    assert list(pages.iterdir()) == []  # neither the page nor plain.json
+
+
+def test_a_plain_file_that_is_not_utf8_writes_nothing(monkeypatch, capsys, two_cards,
+                                                      template, tmp_path, pages):
+    source = tmp_path / "plain.json"
+    source.write_bytes(b'{"cards": {"K-1": {"title": "\xff"}}}')
+    code, _o, err = _plain_page(monkeypatch, capsys, template, pages / "rev-2.html", source)
+    assert code == 1 and "UTF-8" in err
+    assert list(pages.iterdir()) == []
+
+
+def test_a_missing_plain_file_writes_nothing(monkeypatch, capsys, two_cards, template,
+                                             tmp_path, pages):
+    code, _o, err = _plain_page(monkeypatch, capsys, template, pages / "rev-2.html",
+                                tmp_path / "nope.json")
+    assert code == 1 and "nope.json" in err
+    assert list(pages.iterdir()) == []
+
+
+def test_an_existing_plain_json_needs_force_like_the_page(monkeypatch, capsys, two_cards,
+                                                          template, tmp_path, pages):
+    source = _write_plain(tmp_path, PLAIN_OK)
+    published = pages / "plain.json"
+    published.write_text('{"cards": {"K-1": {"title": "old"}}}', encoding="utf-8")
+    out = pages / "rev-2.html"
+    code, _o, err = _plain_page(monkeypatch, capsys, template, out, source)
+    assert code == 1 and "--force" in err and "plain.json" in err
+    assert "old" in published.read_text(encoding="utf-8")
+    assert not out.exists()  # refused before the page was written
+
+    assert _plain_page(monkeypatch, capsys, template, out, source, "--force")[0] == 0
+    assert published.read_bytes() == source.read_bytes()
+
+
+def test_a_plain_json_already_beside_the_page_is_validated_not_rewritten(
+        monkeypatch, capsys, two_cards, template, pages):
+    beside = pages / "plain.json"
+    beside.write_text(PLAIN_OK, encoding="utf-8")
+    before = os.stat(beside).st_mtime_ns
+    code, stdout, err = _plain_page(monkeypatch, capsys, template, pages / "rev-2.html", beside)
+    assert code == 0, err
+    assert os.stat(beside).st_mtime_ns == before
+    assert "plain layer, 2 cards" in stdout
+
+
+def test_a_directory_named_plain_json_beside_the_page_is_refused(
+        monkeypatch, capsys, two_cards, template, tmp_path, pages):
+    (pages / "plain.json").mkdir()
+    source = _write_plain(tmp_path, PLAIN_OK)
+    code, _o, err = _plain_page(monkeypatch, capsys, template, pages / "rev-2.html", source,
+                                "--force")
+    assert code == 1 and "directory" in err
+    assert not (pages / "rev-2.html").exists()
+
+
+def test_a_page_without_plain_writes_no_plain_json(monkeypatch, capsys, two_cards, template,
+                                                   pages):
+    code, stdout, _e = _run(monkeypatch, capsys, "page", "rev-2", "--project", "proj-a",
+                            "--template", str(template), "--out", str(pages))
+    assert code == 0 and "plain layer" not in stdout
+    assert sorted(p.name for p in pages.iterdir()) == ["cards.json", "rev-2.html"]
+
+
+# ── page: cards.json beside the page (owner decision K-4 (a), 2026-10-21) ────
+
+
+def _page_into(monkeypatch, capsys, template, out, *extra):
+    return _run(monkeypatch, capsys, "page", "rev-2", "--project", "proj-a",
+                "--template", str(template), "--out", str(out), *extra)
+
+
+def test_cards_json_is_the_export_command_output_byte_for_byte(
+        monkeypatch, capsys, cli_engine, two_cards, template, pages):
+    """The consultation file and `dct triage export --json` are one serialisation:
+    whatever a consultant reads beside the page is what the export prints, and
+    it parses back to the ledger's export."""
+    suggest_findings(cli_engine, two_cards, "Codex", {"K-1": {"dec": "fix", "opt": "b",
+                                                              "note": "`api` <b>retry</b>"}})
+    code, stdout, err = _page_into(monkeypatch, capsys, template, pages)
+    assert code == 0, err
+    assert stdout.splitlines()[1] == f"{pages / 'cards.json'}: cards export, 2 cards"
+    written = (pages / "cards.json").read_text(encoding="utf-8")
+    run_cli(monkeypatch, ["triage", "export", "rev-2", "--project", "proj-a", "--json"])
+    assert written == capsys.readouterr().out
+    assert json.loads(written) == json.loads(json.dumps(export_triage(cli_engine, two_cards)))
+    assert "`api` <b>retry</b>" in written  # texts as recorded, not page-escaped
+
+
+def test_an_existing_cards_json_needs_force_and_blocks_the_page(
+        monkeypatch, capsys, two_cards, template, pages):
+    cards = pages / "cards.json"
+    cards.write_text("an older cycle's export", encoding="utf-8")
+    out = pages / "rev-2.html"
+    code, _o, err = _page_into(monkeypatch, capsys, template, out)
+    assert code == 1 and "--force" in err and "cards.json" in err
+    assert cards.read_text(encoding="utf-8") == "an older cycle's export"
+    assert not out.exists()  # checked before the page was written
+
+    assert _page_into(monkeypatch, capsys, template, out, "--force")[0] == 0
+    assert json.loads(cards.read_text(encoding="utf-8"))["cycle"]["code"] == "rev-2"
+
+
+def test_a_directory_named_cards_json_is_refused_before_any_write(
+        monkeypatch, capsys, two_cards, template, pages):
+    (pages / "cards.json").mkdir()
+    code, _o, err = _page_into(monkeypatch, capsys, template, pages / "rev-2.html", "--force")
+    assert code == 1 and "cards.json" in err and "directory" in err
+    assert sorted(p.name for p in pages.iterdir()) == ["cards.json"]
+
+
+@pytest.mark.parametrize("name", ["cards.json", "plain.json"])
+def test_out_may_not_take_a_companion_files_name(monkeypatch, capsys, two_cards, template,
+                                                 pages, name):
+    code, _o, err = _page_into(monkeypatch, capsys, template, pages / name, "--force")
+    assert code == 1 and name in err
+    assert list(pages.iterdir()) == []
+
+
+def test_a_failed_build_writes_no_cards_json(monkeypatch, capsys, two_cards, tmp_path, pages):
+    broken = tmp_path / "broken.html"
+    broken.write_text(SKELETON.replace("const CARDS = [", "const KARDS = ["), encoding="utf-8")
+    code, _o, _e = _page_into(monkeypatch, capsys, broken, pages / "rev-2.html")
+    assert code == 1
+    assert list(pages.iterdir()) == []

@@ -2735,8 +2735,6 @@ def cmd_triage_export(args):
     as plain JSON with the texts as recorded. `dct triage page` builds the
     whole page from the same export.
     """
-    import json
-
     from dct.workflows.triage import export_triage, page_constants_json
 
     _require_one_triage_selector(args)
@@ -2749,11 +2747,25 @@ def cmd_triage_export(args):
         sys.exit(1)
 
     if args.json:
-        print(json.dumps(out, indent=2, ensure_ascii=False))
+        sys.stdout.write(_triage_export_json(out))
         return
     print(f"  const CLOSED = {page_constants_json(out['closed'])};")
     print(f"  const SUGGESTED = {page_constants_json(out['suggested'])};")
     print(f"  const CARDS = {page_constants_json(out['cards'])};")
+
+
+def _triage_export_json(export: dict) -> str:
+    """The export as `dct triage export --json` prints it — also the bytes of
+    the cards.json `dct triage page` writes beside the page (texts as
+    recorded, one trailing newline)."""
+    import json
+
+    return json.dumps(export, indent=2, ensure_ascii=False) + "\n"
+
+
+# The companion files `dct triage page` keeps beside the page: the full
+# export for consultation (owner decision 2026-10-21) and the plain layer.
+_TRIAGE_CARDS_FILENAME = "cards.json"
 
 
 # Safe file-name component of a cycle code (#930 Q2): anything outside
@@ -2796,10 +2808,28 @@ def _triage_page_target(out_arg: str, code: str, template: Path, force: bool) ->
         raise ValueError(f"{out}: --out is the template itself — refusing to overwrite it")
     if out.is_dir():
         raise ValueError(f"{out}: is a directory")
+    from dct.workflows.triage_page import PLAIN_FILENAME
+
+    if out.name in (_TRIAGE_CARDS_FILENAME, PLAIN_FILENAME):
+        raise ValueError(f"{out}: {out.name} is the name of a file kept beside the page — "
+                         "name the page differently")
     if os.path.lexists(out) and not force:
         raise ValueError(f"{out} already exists — pass --force to replace it (a published "
                          "or closed page must never be overwritten by accident)")
     return out
+
+
+def _triage_cards_target(page: Path, force: bool) -> Path:
+    """`cards.json` beside the page, checked before anything is written: a
+    directory there is refused, an existing path (a symlink too) needs
+    --force, like the page."""
+    target = page.parent / _TRIAGE_CARDS_FILENAME
+    if target.is_dir() and not target.is_symlink():
+        raise ValueError(f"{target}: is a directory")
+    if os.path.lexists(target) and not force:
+        raise ValueError(f"{target} already exists — pass --force to replace it (the "
+                         "export beside a published page is never overwritten by accident)")
+    return target
 
 
 def _write_new_file(out: Path, text: str, force: bool) -> None:
@@ -2856,6 +2886,31 @@ def _write_new_file(out: Path, text: str, force: bool) -> None:
         name.unlink(missing_ok=True)
 
 
+def _read_plain_file(path: Path) -> str:
+    """The plain layer's text, strict UTF-8 (copied byte for byte later)."""
+    try:
+        return path.read_bytes().decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValueError(f"plain: {path} is not UTF-8 ({exc.reason} at byte {exc.start})") from None
+    except OSError as exc:
+        raise ValueError(f"plain: cannot read {path}: {exc.strerror or exc}") from None
+
+
+def _triage_plain_target(page: Path, source: Path, force: bool) -> Path:
+    """`plain.json` beside the page, checked before anything is written:
+    a directory there is refused, an existing path (a symlink too) needs
+    --force — unless it already is the source file itself."""
+    from dct.workflows.triage_page import PLAIN_FILENAME
+
+    target = page.parent / PLAIN_FILENAME
+    if target.is_dir() and not target.is_symlink():
+        raise ValueError(f"{target}: is a directory")
+    if os.path.lexists(target) and not force and target.resolve() != source.resolve():
+        raise ValueError(f"{target} already exists — pass --force to replace it (the "
+                         "published plain layer is never overwritten by accident)")
+    return target
+
+
 def cmd_triage_page(args):
     """`dct triage page (<code> | --cycle-id N) --out <file>` — build a
     cycle's triage page from its export (#930 §3; read-only on the database).
@@ -2869,6 +2924,22 @@ def cmd_triage_page(args):
     read. Prints `<out>: <n> cards, closed=<yes|no>, suggested=<by>,
     digest=<hex>` (or `suggested=none`) — the digest of the very export the
     page holds.
+
+    --plain <file> (#988): the plain-language layer. The file is validated
+    against the same export (validate_plain_layer) BEFORE anything is
+    written, then copied byte for byte as `plain.json` beside the page under
+    the page's --force rule (a file already there is replaced only with
+    --force; a source that already is that file is validated, not
+    rewritten). Prints a further line `<dir>/plain.json: plain layer, <n>
+    cards`.
+
+    cards.json (owner decision 2026-10-21): every build also writes the
+    export it was built from beside the page — the bytes `dct triage export
+    --json` prints — so the cards, options, proposals and decisions can be
+    handed to a consultant without reading the HTML. Same --force rule; every
+    target (page, cards.json, plain.json) is checked before the first write,
+    and --out may not be named cards.json or plain.json. Prints a second
+    line `<dir>/cards.json: cards export, <n> cards`.
     """
     _require_one_triage_selector(args)
     if not args.out.strip():
@@ -2878,21 +2949,31 @@ def cmd_triage_page(args):
     try:
         template_path = _triage_template_path(args)
         template_text = template_path.read_text(encoding="utf-8")
+        plain_path = Path(args.plain).expanduser() if args.plain else None
+        plain_text = _read_plain_file(plain_path) if plain_path else None
     except Exception as e:
         print(f"✗ Error: {e}", file=sys.stderr)
         sys.exit(1)
 
     from dct.workflows.triage import export_triage
-    from dct.workflows.triage_page import build_triage_page
+    from dct.workflows.triage_page import build_triage_page, validate_plain_layer
 
     engine = _get_readonly_engine()
+    plain_out = plain_cards = None
     try:
         cycle, project = _triage_cycle_ref(args, engine)
         export = export_triage(engine, cycle, project=project)
         out = _triage_page_target(args.out, export["cycle"]["code"], template_path, args.force)
         page = build_triage_page(export, template_text, topic=args.topic,
                                  context=args.context, lede=args.lede)
+        cards_out = _triage_cards_target(out, args.force)
+        if plain_path is not None:
+            plain_cards = validate_plain_layer(plain_text, export)
+            plain_out = _triage_plain_target(out, plain_path, args.force)
         _write_new_file(out, page, args.force)
+        _write_new_file(cards_out, _triage_export_json(export), args.force)
+        if plain_out is not None and plain_out.resolve() != plain_path.resolve():
+            _write_new_file(plain_out, plain_text, args.force)
     except Exception as e:
         print(f"✗ Error: {e}", file=sys.stderr)
         sys.exit(1)
@@ -2902,6 +2983,9 @@ def cmd_triage_page(args):
                  if export["suggested"] else "none")
     print(f"{out}: {len(export['cards'])} cards, "
           f"closed={'yes' if export['closed'] else 'no'}, suggested={suggested}")
+    print(f"{cards_out}: cards export, {len(export['cards'])} cards")
+    if plain_out is not None:
+        print(f"{plain_out}: plain layer, {plain_cards} cards")
 
 
 def cmd_triage_decide(args):
@@ -4252,8 +4336,12 @@ def build_parser() -> argparse.ArgumentParser:
                            help="Eyebrow text (default: the cycle's scope, else its code)")
     p_tr_page.add_argument("--lede", help="Lede text (default: card count, rubric, cycle "
                                           "and the legend)")
+    p_tr_page.add_argument("--plain", metavar="FILE",
+                           help="Plain-language layer (JSON {by, date, cards: {K-n: …}}): "
+                                "validated against the cycle's cards, then copied as "
+                                "plain.json beside the page")
     p_tr_page.add_argument("--force", action="store_true",
-                           help="Replace an existing --out file")
+                           help="Replace an existing --out file (and plain.json)")
 
     p_tr_decide = p_triage_sub.add_parser(
         "decide", help="Record the owner's pasted decision text (the page's generated text)")

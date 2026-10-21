@@ -422,6 +422,79 @@ def _constant_spans(template: str) -> tuple[dict[str, tuple[int, int]], list[tup
     return spans, scripts
 
 
+# ── plain-language layer (#988) ──────────────────────────────────────────────
+
+PLAIN_FILENAME = "plain.json"
+# The fields a template's PLAIN slot reads per card; `opts` maps option keys
+# to text, every other field is text.
+_PLAIN_CARD_TEXT_FIELDS = ("title", "problem", "was", "fix", "codex", "amends")
+
+
+def _no_duplicate_keys(pairs: list) -> dict:
+    out: dict = {}
+    for key, value in pairs:
+        if key in out:
+            raise ValueError(f"plain: duplicate key {key!r}")
+        out[key] = value
+    return out
+
+
+def validate_plain_layer(text: str, export: Mapping) -> int:
+    """Check a plain-language layer (`plain.json`, #988) against a cycle's
+    export → the number of cards it names. Pure: no I/O.
+
+    Shape: a JSON object with `cards` — a non-empty object keyed by the
+    export's card ids (`K-<n>`, exactly as CARDS spells them) — and optional
+    `by` / `date` strings; any other top-level key is the author's metadata
+    and is kept. Per card an object of optional fields: title, problem, was,
+    fix, codex, amends (strings) and opts (an object mapping that card's own
+    option keys to strings). ValueError, naming the culprit, on invalid JSON,
+    a duplicate key at any level, a key no card carries, an unknown field, an
+    option key the card does not have or a non-string text — a typo would
+    otherwise make the page silently show the full text instead."""
+    import json
+
+    try:
+        data = json.loads(text, object_pairs_hook=_no_duplicate_keys)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"plain: not valid JSON — {exc}") from None
+    if not isinstance(data, dict):
+        raise ValueError("plain: the file must be a JSON object {by, date, cards}")  # noqa: TRY004 — every refusal is a ValueError
+    for key in ("by", "date"):
+        if key in data and not isinstance(data[key], str):
+            raise ValueError(f"plain: {key} must be a string")
+    cards = data.get("cards")
+    if not isinstance(cards, dict) or not cards:
+        raise ValueError("plain: cards must be a non-empty object keyed by K-<n>")
+    options = {c["id"]: {o["k"] for o in c.get("opts", [])} for c in export["cards"]}
+    unknown = [k for k in cards if k not in options]
+    if unknown:
+        raise ValueError(f"plain: no card {', '.join(map(repr, unknown))} in cycle "
+                         f"{export['cycle']['code']!r} (cards: {', '.join(options) or 'none'})")
+    for key, card in cards.items():
+        if not isinstance(card, dict):
+            raise ValueError(f"plain: {key} must be an object of texts")  # noqa: TRY004 — every refusal is a ValueError
+        for field, value in card.items():
+            if field == "opts":
+                if not isinstance(value, dict):
+                    raise ValueError(f"plain: {key}.opts must be an object {{option key: text}}")
+                for opt, opt_text in value.items():
+                    if opt not in options[key]:
+                        raise ValueError(
+                            f"plain: {key}.opts names option {opt!r}, the card has "
+                            f"{', '.join(sorted(options[key])) or 'none'}")
+                    if not isinstance(opt_text, str):
+                        raise ValueError(f"plain: {key}.opts[{opt!r}] must be a string")  # noqa: TRY004 — every refusal is a ValueError
+            elif field in _PLAIN_CARD_TEXT_FIELDS:
+                if not isinstance(value, str):
+                    raise ValueError(f"plain: {key}.{field} must be a string")
+            else:
+                raise ValueError(
+                    f"plain: {key} has unknown field {field!r} (known: "
+                    f"{', '.join((*_PLAIN_CARD_TEXT_FIELDS, 'opts'))})")
+    return len(cards)
+
+
 # ── build ────────────────────────────────────────────────────────────────────
 
 

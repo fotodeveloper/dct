@@ -249,8 +249,8 @@ the whole export with the texts as recorded.
 
 The page itself is built by `dct triage page (<cycle-code> | --cycle-id N)
 [--project <slug>] [--template <path>] --out <file> [--topic …] [--context …]
-[--lede …] [--force]` (read-only on the database; no MCP tool — a whole HTML
-page is not an MCP payload). It prints `<out>: <n> cards, closed=<yes|no>,
+[--lede …] [--plain <file>] [--force]` (read-only on the database; no MCP
+tool — a whole HTML page is not an MCP payload). It prints `<out>: <n> cards, closed=<yes|no>,
 suggested=<by>, digest=<hex>` (or `suggested=none`): the digest of the very
 export the page holds, the one `accept` later expects. An empty `--out` is
 refused before anything is read. The template comes from `--template`, else
@@ -261,6 +261,21 @@ while a new file or a replaced symlink gets the umask's default as without
 `--force`),
 a missing parent directory and the template itself are refused, and a
 directory as `--out` writes `<dir>/<safe code>.html` (`[A-Za-z0-9._-]`).
+`--plain <file>` (#988) adds the plain-language layer: the JSON file
+`{by, date, cards: {"K-n": {title, problem, was, fix, opts: {<key>: text},
+codex, amends}}}` is validated against the same export
+(`validate_plain_layer`: only the cycle's K-n, each card's own option keys,
+the known fields, string texts, no duplicate keys) before anything is
+written, then copied byte for byte as `plain.json` beside the page under the
+same `--force` rule (a source that already is that file is not rewritten);
+one more line prints `<dir>/plain.json: plain layer, <n> cards`. The layer is
+a reading aid the template may fetch; it never enters the ledger or the
+digest. Every build also writes `cards.json` beside the page — the export it
+was built from, byte for byte what `dct triage export --json` prints — for
+consultation without the HTML, and prints `<dir>/cards.json: cards export,
+<n> cards` as its second line. Every target (page, `cards.json`, `plain.json`)
+is checked before the first write under the same `--force` rule, and `--out`
+may not be named `cards.json` or `plain.json`: one page per directory.
 The owner's answers can also be recorded from a shell: `dct triage decide …
 --from-text <file|-> --decided-by <who> --source <where>`, `dct triage accept
 … --expected-by <proposer> --expected-digest <hex> --decided-by <who> --source

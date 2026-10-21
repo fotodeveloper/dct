@@ -159,6 +159,10 @@ dct/workflows/triage.py  — [one impl] Triage findings ledger (#909): cycles,
                            an open cycle serialise on its row
                            (db.lock_cycle_row)
 dct/workflows/triage_page.py — Triage page builder (#930, no DB):
+                           validate_plain_layer(text, export) checks the
+                           plain-language layer (#988, `plain.json` beside
+                           the page; `dct triage page --plain`) against the
+                           cycle's cards.
                            build_triage_page(export, template_html, ...)
                            fills the three constants (CARDS / CLOSED /
                            SUGGESTED, via page_constants_json) and the
