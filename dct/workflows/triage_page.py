@@ -1,26 +1,30 @@
 """Triage page builder (#930) — the page is derived from export_triage only.
 
-build_triage_page fills a COPY of the owner's triage template (dct ships no
-template; `dct triage page` resolves it from --template or the config's
-[triage] template) with a cycle's export: no database, no I/O, a pure
-function of (export, template, metadata).
+build_triage_page fills a COPY of a triage template — the one dct ships
+(dct/assets/triage-page.html, #991) unless `dct triage page` gets
+--template or the config's [triage] template — with a cycle's export: no
+database, no I/O, a pure function of (export, template, metadata).
 
 Contracts (spec #930 §2, §8 K-3 / K-4 / K-5, rev 4 K-33 / K-34 / K-39):
-- The three page constants — `const CARDS = …;`, `const CLOSED = …;`,
-  `const SUGGESTED = …;` — are located in the ORIGINAL template, at code
+- The four page constants — `const CARDS = …;`, `const CLOSED = …;`,
+  `const SUGGESTED = …;` and (#991) `const STRINGS = …;`, the string table
+  of the cycle's language — are located in the ORIGINAL template, at code
   level of its inline <script> elements (text inside a JS string, comment,
   regex or template literal, or inside an HTML comment, never counts).
   Exactly one declaration each; its initializer must be `null` or one
   balanced `[…]` / `{…}` literal followed by `;` — anything else (a missing
   or duplicate declaration, an unterminated string, another initializer) is
-  refused with ValueError naming it. Each declaration is replaced by the
-  export's value through page_constants_json (CLOSED / SUGGESTED `null`
-  when absent).
+  refused with ValueError naming it (a template without STRINGS — one
+  written before #991 — with the upgrade path). Each declaration is
+  replaced by its value through page_constants_json (CLOSED / SUGGESTED
+  `null` when absent).
 - Placeholders are validated in the ORIGINAL template too, outside the
-  three declarations: {{TEMAT}}, {{PROJEKT}}, {{KONTEKST}}, {{DATA}}, the
-  whole {{LEDE …}} token, {{projekt}} and {{temat}}; any other {{…}} there is
-  refused naming it. Every span of the template is substituted ONCE and the
-  inserted data is never re-scanned: a finding quoting `{{TEMAT}}` or
+  four declarations: {{TOPIC}}, {{PROJECT}}, {{CONTEXT}}, {{DATE}}, the
+  whole {{LEDE …}} token, {{project}} and {{topic}} — plus, permanently,
+  their pre-#991 Polish names {{TEMAT}}, {{PROJEKT}}, {{KONTEKST}},
+  {{DATA}}, {{projekt}}, {{temat}} (PLACEHOLDER_ALIASES); any other {{…}}
+  there is refused naming it. Every span of the template is substituted
+  ONCE and the inserted data is never re-scanned: a finding quoting `{{TOPIC}}` or
   `const CLOSED` stays literal.
 - Metadata placeholders are plain text, in one of two contexts (K-39):
   in HTML (outside <script>) they are HTML-escaped (& < > " ') and kept as
@@ -44,8 +48,8 @@ Contracts (spec #930 §2, §8 K-3 / K-4 / K-5, rev 4 K-33 / K-34 / K-39):
   guessed. A template literal holding an unescaped `${` substitution is
   refused naming its line (K-47): the scan does not follow the code inside
   it; a plain template literal and an escaped `\\${` are kept.
-- K-33: in that JS string context — the template's generate() header line
-  "Triage {{TEMAT}} ({{projekt}}) — decyzje ownera (…)" — every run of
+- K-33: in that JS string context — e.g. the topic the template's decision
+  text puts on its one header line — every run of
   whitespace, line separators included (\\n, \\r, U+2028, U+2029,
   U+0085, …: everything str.split() and str.splitlines() break on), is
   collapsed to one space and the ends are trimmed, AT BUILD TIME: the
@@ -53,8 +57,8 @@ Contracts (spec #930 §2, §8 K-3 / K-4 / K-5, rev 4 K-33 / K-34 / K-39):
   (parse_decision_batch) never meets a topic split over lines. The cycle's
   topic and a --topic override alike; the stored topic and the HTML
   context are untouched.
-- {{projekt}} / {{temat}} are the STORAGE_KEY slugs (K-34):
-  `triage-{{projekt}}-{{temat}}-v1` becomes
+- {{project}} / {{topic}} are the STORAGE_KEY slugs (K-34):
+  `triage-{{project}}-{{topic}}-v1` becomes
   `triage-<project slug>-<code slug>-c<cycle id>-v1` (`…-c<cycle id>-v1`
   when the code folds to nothing) — the immutable cycle id at the
   unambiguous end makes the key injective (slugs may contain '-' and
@@ -66,7 +70,7 @@ Contracts (spec #930 §2, §8 K-3 / K-4 / K-5, rev 4 K-33 / K-34 / K-39):
 - Defaults (deterministic — no clock): topic = the cycle's topic, project =
   the cycle's project, context = the cycle's scope, else its code, date =
   CLOSED.date of a closed cycle, else the cycle's opening date, lede =
-  default_lede(export).
+  default_lede(export) — in the cycle's language (#991), like STRINGS.
 """
 
 from __future__ import annotations
@@ -75,30 +79,32 @@ import html
 import re
 import unicodedata
 from collections.abc import Mapping
+from pathlib import Path
 
+from dct.workflows import triage_strings
 from dct.workflows.triage import page_constants_json
 
-CONSTANTS = ("CARDS", "CLOSED", "SUGGESTED")
-# The export key each constant is filled from.
+# The template dct ships (#991): used when neither --template nor the
+# config's [triage] template names another.
+SHIPPED_TEMPLATE = Path(__file__).resolve().parent.parent / "assets" / "triage-page.html"
+
+CONSTANTS = ("CARDS", "CLOSED", "SUGGESTED", "STRINGS")
+# The export key each data constant is filled from; STRINGS is the string
+# table of the cycle's language (#991, triage_strings.strings).
 _CONSTANT_SOURCE = {"CARDS": "cards", "CLOSED": "closed", "SUGGESTED": "suggested"}
 # Metadata placeholders (plain text) and the STORAGE_KEY slug placeholders;
-# {{LEDE …}} is matched as a whole token (_LEDE).
-TEXT_PLACEHOLDERS = ("TEMAT", "PROJEKT", "KONTEKST", "DATA")
-SLUG_PLACEHOLDERS = ("projekt", "temat")
+# {{LEDE …}} is matched as a whole token (_LEDE). The Polish names of the
+# templates written before #991 stay accepted as permanent aliases.
+TEXT_PLACEHOLDERS = ("TOPIC", "PROJECT", "CONTEXT", "DATE")
+SLUG_PLACEHOLDERS = ("project", "topic")
+PLACEHOLDER_ALIASES = {"TEMAT": "TOPIC", "PROJEKT": "PROJECT", "KONTEKST": "CONTEXT",
+                       "DATA": "DATE", "projekt": "project", "temat": "topic"}
 _PLACEHOLDER = re.compile(r"\{\{([^{}]*)\}\}")
 _LEDE = re.compile(r"LEDE(?:\s.*)?", re.DOTALL)
 
-# The default lede (the page speaks the template's language, Polish): the
-# card count, rubric version and cycle code, then one sentence of legend.
-LEDE_LEGEND = (
-    "Klasa karty jest rekomendacją wyliczoną z pól rubryki, nie decyzją; "
-    "decyzja (Fix teraz / Zweryfikuj / Backlog → dct / Odrzuć / Odnotuj / "
-    "Do dyskusji) należy do ownera."
-)
-
 _SCRIPT_OPEN = re.compile(r"<script\b[^>]*>", re.IGNORECASE)
 _SCRIPT_CLOSE = re.compile(r"</script", re.IGNORECASE)
-_DECLARATION = re.compile(r"(?<![A-Za-z0-9_$])const\s+(CARDS|CLOSED|SUGGESTED)\s*=")
+_DECLARATION = re.compile(r"(?<![A-Za-z0-9_$])const\s+(CARDS|CLOSED|SUGGESTED|STRINGS)\s*=")
 _IDENT_CHAR = re.compile(r"[A-Za-z0-9_$]")
 # How _mask_js classifies a `/` that opens no comment (K-39 / K-42 / K-43 /
 # K-46), by the code token before it: after one of these punctuators, at
@@ -135,21 +141,19 @@ _MASK_OTHER = "\x01"
 _JS_ESCAPED = set("'\"`$<>&/[]  ")
 
 
-def _plural_cards(n: int) -> str:
-    if n == 1:
-        return "karta"
-    if n % 10 in (2, 3, 4) and n % 100 not in (12, 13, 14):
-        return "karty"
-    return "kart"
-
-
 def default_lede(export: Mapping) -> str:
-    """The lede when none is given: '<n> kart · rubric v<v> · cykl <code>. '
-    + LEDE_LEGEND (the noun takes its Polish plural form)."""
+    """The lede when none is given, in the cycle's language: card count,
+    rubric version, cycle code and one sentence of legend (#991, from the
+    string table — triage_strings.lede)."""
     cycle = export["cycle"]
-    n = len(export["cards"])
-    return (f"{n} {_plural_cards(n)} · rubric v{cycle['rubric_version']} · "
-            f"cykl {cycle['code']}. {LEDE_LEGEND}")
+    return triage_strings.lede(cycle_language(export), len(export["cards"]),
+                               cycle["rubric_version"], cycle["code"])
+
+
+def cycle_language(export: Mapping) -> str:
+    """The page language of the exported cycle (#991) — a shipped code."""
+    return triage_strings.check_language(export["cycle"].get("language"),
+                                         "export: cycle.language")
 
 
 def storage_slug(text: str) -> str:
@@ -161,14 +165,15 @@ def storage_slug(text: str) -> str:
 
 
 def storage_key_parts(export: Mapping) -> dict[str, str]:
-    """The STORAGE_KEY placeholders of a cycle (K-34): projekt = the project
-    slug ('project' when it folds to nothing), temat = '<code slug>-' (when
-    the code folds to something) + 'c<cycle id>' — the id last."""
+    """The STORAGE_KEY placeholders of a cycle (K-34): project = the project
+    slug ('project' when it folds to nothing), topic = '<code slug>-' (when
+    the code folds to something) + 'c<cycle id>' — the id last. The cycle's
+    language never changes (#991), so the key needs no language part."""
     cycle = export["cycle"]
     code = storage_slug(str(cycle["code"]))
     return {
-        "projekt": storage_slug(str(cycle["project"])) or "project",
-        "temat": (f"{code}-" if code else "") + f"c{cycle['id']}",
+        "project": storage_slug(str(cycle["project"])) or "project",
+        "topic": (f"{code}-" if code else "") + f"c{cycle['id']}",
     }
 
 
@@ -399,7 +404,7 @@ def _initializer_end(masked: str, start: int, name: str) -> int:
 
 
 def _constant_spans(template: str) -> tuple[dict[str, tuple[int, int]], list[tuple[int, int, str]]]:
-    """→ ({NAME: (start, end)} of the three declarations, [(start, end,
+    """→ ({NAME: (start, end)} of the four declarations, [(start, end,
     masked body)] of the script bodies)."""
     scripts = []
     found: dict[str, list[tuple[int, int]]] = {name: [] for name in CONSTANTS}
@@ -413,6 +418,12 @@ def _constant_spans(template: str) -> tuple[dict[str, tuple[int, int]], list[tup
                                 start + _initializer_end(masked, m.end(), name)))
     spans = {}
     for name, hits in found.items():
+        if not hits and name == "STRINGS":
+            raise ValueError(
+                "template: no 'const STRINGS = …;' declaration in a <script> — a template "
+                "written before dct shipped its own (#991) has no string slot: drop the "
+                "[triage] template setting / --template to use the shipped template, or add "
+                "'const STRINGS = {};' and read the page texts from it")
         if not hits:
             raise ValueError(f"template: no 'const {name} = …;' declaration in a <script>")
         if len(hits) > 1:
@@ -514,7 +525,7 @@ def build_triage_page(
     lede: str | None = None,
     date: str | None = None,
 ) -> str:
-    """The triage page of one cycle: `template_html` with its three
+    """The triage page of one cycle: `template_html` with its four
     constants and its placeholders filled from `export` (export_triage's
     dict) → the page HTML. None metadata takes the defaults of the module
     docstring; every given value must be a string (shown as plain text).
@@ -528,13 +539,14 @@ def build_triage_page(
                          "(cycle, cards, closed, suggested)")
     cycle = export["cycle"]
     closed = export.get("closed")
+    language = cycle_language(export)
     values = {
-        "TEMAT": _text(cycle["topic"] if topic is None else topic, "topic"),
-        "PROJEKT": _text(cycle["project"] if project_slug is None else project_slug,
+        "TOPIC": _text(cycle["topic"] if topic is None else topic, "topic"),
+        "PROJECT": _text(cycle["project"] if project_slug is None else project_slug,
                          "project_slug"),
-        "KONTEKST": _text((cycle.get("scope") or cycle["code"]) if context is None else context,
-                          "context"),
-        "DATA": _text((closed["date"] if closed else str(cycle["opened_at"])[:10])
+        "CONTEXT": _text((cycle.get("scope") or cycle["code"]) if context is None else context,
+                         "context"),
+        "DATE": _text((closed["date"] if closed else str(cycle["opened_at"])[:10])
                       if date is None else date, "date"),
         "LEDE": _text(default_lede(export) if lede is None else lede, "lede"),
     }
@@ -545,7 +557,7 @@ def build_triage_page(
 
     def placeholder(m: re.Match, offset: int) -> str:
         """The replacement of one placeholder of the ORIGINAL template."""
-        inner = m.group(1)
+        inner = PLACEHOLDER_ALIASES.get(m.group(1), m.group(1))
         pos = offset + m.start()
         if inner in SLUG_PLACEHOLDERS:
             return slugs[inner]
@@ -572,7 +584,8 @@ def build_triage_page(
     for start, end, name in constant_at:
         segment = template_html[cursor:start]
         pieces.append(_PLACEHOLDER.sub(lambda m, o=cursor: placeholder(m, o), segment))
-        value = export.get(_CONSTANT_SOURCE[name])
+        value = (triage_strings.strings(language) if name == "STRINGS"
+                 else export.get(_CONSTANT_SOURCE[name]))
         pieces.append(f"const {name} = {page_constants_json(value)};")
         cursor = end
     pieces.append(_PLACEHOLDER.sub(lambda m, o=cursor: placeholder(m, o),

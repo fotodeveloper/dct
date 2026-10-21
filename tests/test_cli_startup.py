@@ -88,16 +88,19 @@ def test_the_parser_vocabularies_match_their_core_definitions():
     assert cli.RELEASE_FLOW == RELEASE_FLOW
 
 
-@pytest.mark.parametrize(("out_name", "refusal"), [
-    ("page.html", "no triage page template"),   # neither --template nor [triage] template
-    ("", "--out is empty"),                     # K-41: refused before anything is read
+@pytest.mark.parametrize(("out_name", "template", "refusal"), [
+    ("page.html", "absent.html", "absent.html"),  # an unreadable --template (#991: the
+                                                  # shipped one is the default, never missing)
+    ("", None, "--out is empty"),                 # K-41: refused before anything is read
 ], ids=["missing-template", "empty-out"])
-def test_triage_page_refusals_need_no_database(tmp_path, out_name, refusal):
-    """`dct triage page` refuses a missing template and an empty --out before
-    it opens the database (#930 K-41): exit 1, a readable reason, no database
-    layer loaded, nothing written."""
+def test_triage_page_refusals_need_no_database(tmp_path, out_name, template, refusal):
+    """`dct triage page` refuses an unreadable template and an empty --out
+    before it opens the database (#930 K-41): exit 1, a readable reason, no
+    database layer loaded, nothing written."""
     out = str(tmp_path / out_name) if out_name else ""
-    result, stderr = _probe(("triage", "page", "rev-1", "--project", "proj-a", "--out", out),
+    extra = ("--template", str(tmp_path / template)) if template else ()
+    result, stderr = _probe(("triage", "page", "rev-1", "--project", "proj-a", "--out", out,
+                             *extra),
                             env={"DCT_CONFIG_PATH": str(tmp_path / "absent.toml")})
     assert result == {"code": 1, "loaded": []}
     assert refusal in stderr

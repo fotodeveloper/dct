@@ -1,0 +1,752 @@
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<!--
+  TRIAGE PAGE — the template dct ships (dct #991). `dct triage page` fills it from a cycle's
+  export; nothing in it is edited by hand. Build slots (dct/workflows/triage_page.py):
+  - Four constants, replaced whole: CARDS (the findings), CLOSED (null while the cycle is open;
+    the owner's recorded answers once closed), SUGGESTED (null unless an agent proposed answers;
+    proposals are never decisions) and STRINGS (the string table of the cycle's language,
+    dct/assets/triage-strings.json).
+  - Placeholders: {{TOPIC}}, {{PROJECT}}, {{CONTEXT}}, {{DATE}}, {{LEDE …}} (plain text) and the
+    STORAGE_KEY slugs {{project}} / {{topic}}.
+  TEXT: every user-visible text comes from STRINGS. Static elements name their key in
+  data-t (text), data-t-aria (aria-label), data-t-placeholder (placeholder) or data-rich (the
+  legend: escaped, then **bold**); the script fills them. Composed texts use tx() (plain text,
+  for textContent and attribute values set through the DOM) or th() (the same, HTML-escaped,
+  for every HTML string). A table value is data, never markup. Card prose (title, context,
+  option text and why, the proposal note, CLOSED notes, plain texts) goes through textHtml:
+  escaped, then only `code` spans become <code>.
+  LAYOUT (keep): two columns (cards + a 340px sticky aside) with the panels "decision
+  progress" (overall bar, the groups "decisions to make" = classes fix / verify / quick /
+  decide / backlog and "fixes to acknowledge" = note / reject without a proposal, counts, the
+  buttons) and "text to paste" (generate, copy, read-only textarea, toast). At <=960px the
+  aside is a bottom bar (#sheet-toggle) that expands into a sheet; Escape collapses it.
+  CARDS: K-n, title, the rubric fields S O E K / origin / type as chips, the class derived by
+  classify() (rubric §4, first match; a coordinator override cls + clsWhy keeps the derived
+  class visible), fingerprint, area, source, context, options (radio variants with the tags
+  recommended / at the root | hotfix, and why), the decision segment (the class's decision
+  marked with the translated data-rec-mark), the owner's note. Cards are grouped by class.
+  DECISION TEXT: buildDecisionText() — a pure function inside the <decision-text> markers (no
+  DOM, storage or clock; tests run it from this file under node) — writes one header line,
+  an optional "starting point" line when proposals exist, and per card
+  "K-n: <decision> · <variant word> (k) [annotations] · <notes word>: <note>". Every word comes
+  from STRINGS; dct's parser reads the same table for every language.
+  SUGGESTED: a card with a proposal shows it in a dashed block (decision, the variant's key,
+  the proposer's note) with four reactions — accept, accept with changes, reject, ask; a second
+  click undoes. The owner's comment field is always the owner's own; progress counts only the
+  owner's decisions. The reaction opens the card's note in the decision text (response.*_tag).
+  Storage with SUGGESTED is { v: 3, state: {K-n: {opt, dec, note, resp, seen}} }; a reaction
+  whose proposal changed on a rebuild is dropped and the card says so.
+  CLOSED: the page reads its state from CLOSED (never from localStorage), shows the closed
+  status and panel with the full decision text, and disables its inputs.
+  PLAIN (reading aid): a plain.json published beside the page ({ by, date, cards: { K-n:
+  { title, problem, was, fix, opts: { key: text }, codex, amends } } }) adds plain-language
+  texts per card, with a side-panel toggle plain / full / both (remembered per viewer under
+  STORAGE_KEY + '-plain'). Plain texts never touch state, the decision text or the constants;
+  without the file nothing changes.
+-->
+<title>Triage {{TOPIC}}</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Serif:wght@500;600&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<style>
+  :root {
+    --bg: #f5f6f8; --surface: #ffffff; --surface-2: #eef0f4;
+    --ink: #1b2330; --ink-2: #4a5566; --ink-3: #7b8696; --line: #d9dee6;
+    --accent: #0f6b63; --accent-ink: #ffffff; --accent-soft: #dff1ee;
+    --sev-high: #a8321f; --sev-high-soft: #f8e3de; --sev-med: #9a6a12; --sev-med-soft: #f7ead0;
+    --sev-low: #4a5566; --sev-low-soft: #e6e9ee; --ok: #2f6b3a; --ok-soft: #dfeee2;
+    --focus: #0f6b63; --code-bg: #eef0f4;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #12161c; --surface: #1a2029; --surface-2: #222a35;
+      --ink: #e7ebf0; --ink-2: #b4bdc9; --ink-3: #8592a3; --line: #2f3945;
+      --accent: #4fb3a7; --accent-ink: #0e1a18; --accent-soft: #173632;
+      --sev-high: #f08a78; --sev-high-soft: #3c1f1a; --sev-med: #e4b25a; --sev-med-soft: #3a2e14;
+      --sev-low: #b4bdc9; --sev-low-soft: #2a3240; --ok: #8fd19b; --ok-soft: #1f3524;
+      --focus: #4fb3a7; --code-bg: #222a35;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #12161c; --surface: #1a2029; --surface-2: #222a35;
+    --ink: #e7ebf0; --ink-2: #b4bdc9; --ink-3: #8592a3; --line: #2f3945;
+    --accent: #4fb3a7; --accent-ink: #0e1a18; --accent-soft: #173632;
+    --sev-high: #f08a78; --sev-high-soft: #3c1f1a; --sev-med: #e4b25a; --sev-med-soft: #3a2e14;
+    --sev-low: #b4bdc9; --sev-low-soft: #2a3240; --ok: #8fd19b; --ok-soft: #1f3524;
+    --focus: #4fb3a7; --code-bg: #222a35;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--ink); font-family: "IBM Plex Sans", "Helvetica Neue", Arial, sans-serif; font-size: 15px; line-height: 1.55; }
+  code, .mono { font-family: "IBM Plex Mono", Menlo, Consolas, monospace; font-size: 0.9em; }
+  code { background: var(--code-bg); padding: 0.05em 0.35em; border-radius: 3px; }
+  h1, h2, h3 { font-family: "IBM Plex Serif", Georgia, serif; font-weight: 600; text-wrap: balance; margin: 0; }
+  h1 { font-size: 1.7rem; letter-spacing: -0.01em; } h2 { font-size: 1.05rem; } h3 { font-size: 1rem; font-weight: 600; }
+  p { margin: 0; } a { color: var(--accent); }
+  .page { max-width: 1240px; margin: 0 auto; padding-block: 28px 80px; padding-inline: 20px; }
+  header.top { display: grid; gap: 10px; margin-bottom: 22px; }
+  .eyebrow { font-size: 0.72rem; letter-spacing: 0.08em; text-transform: uppercase; color: var(--ink-3); font-weight: 600; }
+  .lede { color: var(--ink-2); max-width: 72ch; }
+  .layout { display: grid; grid-template-columns: minmax(0, 1fr) 340px; gap: 24px; align-items: start; }
+  @media (max-width: 960px) { .layout { grid-template-columns: 1fr; } }
+  [hidden] { display: none !important; }
+  .side { position: sticky; top: 16px; display: grid; gap: 14px; align-content: start; max-height: calc(100vh - 32px); overflow-y: auto; }
+  .side-panels { display: contents; }
+  .sheet-toggle { display: none; }
+  @media (max-width: 960px) {
+    .page { padding-bottom: calc(96px + env(safe-area-inset-bottom)); }
+    .side { position: fixed; top: auto; left: 0; right: 0; bottom: 0; z-index: 20; gap: 0; max-height: 85vh; overflow-y: auto; overscroll-behavior: contain;
+      background: var(--surface); border-top: 1px solid var(--line); box-shadow: 0 -6px 24px rgba(0, 0, 0, 0.14); padding: 0 12px env(safe-area-inset-bottom); }
+    .sheet-toggle { display: flex; position: sticky; top: 0; z-index: 1; width: 100%; min-height: 48px; justify-content: space-between; align-items: center; gap: 12px;
+      border: 0; border-radius: 0; background: var(--surface); padding: 12px 4px; font-variant-numeric: tabular-nums; }
+    .sheet-toggle .sheet-action { color: var(--accent); }
+    .side-panels { display: none; }
+    .side.open .side-panels { display: grid; gap: 12px; padding: 4px 0 12px; }
+  }
+  .panel { background: var(--surface); border: 1px solid var(--line); border-radius: 6px; padding: 16px; display: grid; gap: 12px; }
+  .panel h2 { font-size: 0.98rem; }
+  .progress { display: grid; gap: 6px; font-size: 0.9rem; color: var(--ink-2); }
+  .bar { height: 6px; background: var(--surface-2); border-radius: 3px; overflow: hidden; }
+  .bar > span { display: block; height: 100%; background: var(--accent); width: 0%; transition: width 160ms ease; }
+  .counts { display: flex; flex-wrap: wrap; gap: 6px 12px; font-size: 0.84rem; font-variant-numeric: tabular-nums; }
+  .counts b { color: var(--ink); font-weight: 600; }
+  .groups { display: grid; gap: 8px; padding: 8px 0 2px; border-top: 1px solid var(--line); }
+  .groups .g { display: grid; gap: 4px; font-size: 0.86rem; } .groups .g b { color: var(--ink); font-weight: 600; }
+  .groups .g .bar { height: 4px; } .groups .g .bar.g-note > span { background: var(--ink-3); }
+  button { font: inherit; font-size: 0.9rem; font-weight: 600; cursor: pointer; border: 1px solid var(--line); background: var(--surface); color: var(--ink); border-radius: 5px; padding: 8px 12px; }
+  button.primary { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); }
+  button:hover { filter: brightness(0.97); }
+  button:focus-visible, input:focus-visible, textarea:focus-visible, [tabindex]:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
+  .btnrow { display: flex; flex-wrap: wrap; gap: 8px; }
+  textarea.out { width: 100%; min-height: 220px; font-family: "IBM Plex Mono", Menlo, monospace; font-size: 0.8rem; line-height: 1.45; border: 1px solid var(--line); border-radius: 5px; padding: 10px; background: var(--surface-2); color: var(--ink); resize: vertical; }
+  .hint { font-size: 0.82rem; color: var(--ink-3); }
+  .toast { font-size: 0.84rem; color: var(--ok); min-height: 1.2em; }
+  table.sources { width: 100%; border-collapse: collapse; font-size: 0.86rem; font-variant-numeric: tabular-nums; }
+  table.sources th, table.sources td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  table.sources th { font-size: 0.72rem; letter-spacing: 0.06em; text-transform: uppercase; color: var(--ink-3); font-weight: 600; }
+  .tablewrap { overflow-x: auto; }
+  .cards { display: grid; gap: 16px; }
+  .card { background: var(--surface); border: 1px solid var(--line); border-radius: 6px; padding: 18px 18px 16px; display: grid; gap: 14px; }
+  .card.decided { border-color: var(--accent); }
+  .card-head { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 6px 12px; align-items: baseline; }
+  .kid { font-family: "IBM Plex Mono", Menlo, monospace; font-weight: 500; color: var(--accent); font-size: 0.95rem; }
+  .meta { grid-column: 2; display: flex; flex-wrap: wrap; gap: 6px 10px; align-items: center; font-size: 0.8rem; color: var(--ink-3); }
+  .chip { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 0.74rem; font-weight: 600; letter-spacing: 0.02em; }
+  .chip.high { background: var(--sev-high-soft); color: var(--sev-high); } .chip.med { background: var(--sev-med-soft); color: var(--sev-med); }
+  .chip.low { background: var(--sev-low-soft); color: var(--sev-low); } .chip.owner { background: var(--accent-soft); color: var(--accent); }
+  .chip.ok { background: var(--ok-soft); color: var(--ok); } .chip.pre { background: var(--sev-low-soft); color: var(--sev-low); font-weight: 500; }
+  .chip.mono { font-family: "IBM Plex Mono", Menlo, monospace; font-weight: 500; background: var(--code-bg); color: var(--ink-2); }
+  .fp { font-family: "IBM Plex Mono", Menlo, monospace; font-size: 0.78rem; color: var(--ink-3); overflow-wrap: anywhere; }
+  details.panel { display: block; } details.panel summary { cursor: pointer; font-family: "IBM Plex Serif", Georgia, serif; font-weight: 600; font-size: 0.98rem; list-style: none; }
+  details.panel summary::before { content: "▸ "; color: var(--ink-3); } details.panel[open] summary::before { content: "▾ "; }
+  details.panel summary::-webkit-details-marker { display: none; }
+  .legend-list { display: grid; gap: 8px; margin-top: 12px; font-size: 0.82rem; color: var(--ink-2); line-height: 1.5; }
+  .legend-list b { font-family: "IBM Plex Mono", Menlo, monospace; font-weight: 500; color: var(--ink); }
+  .section-label { font-size: 0.72rem; letter-spacing: 0.08em; text-transform: uppercase; color: var(--ink-3); font-weight: 600; margin-bottom: 6px; }
+  .ctx { color: var(--ink-2); max-width: 78ch; } .ctx p + p { margin-top: 6px; }
+  .opts { display: grid; gap: 8px; }
+  .opt { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 10px; padding: 10px 12px; border: 1px solid var(--line); border-radius: 5px; cursor: pointer; background: var(--surface); }
+  .opt.rec { box-shadow: inset 3px 0 0 var(--ok); }
+  .opt:has(input:checked) { border-color: var(--accent); background: var(--accent-soft); }
+  .opt input { margin-top: 4px; accent-color: var(--accent); }
+  .opt .optkey { font-family: "IBM Plex Mono", Menlo, monospace; font-weight: 500; }
+  .opt .tags { display: inline-flex; gap: 6px; margin-left: 8px; vertical-align: middle; }
+  .opt .optbody { display: grid; gap: 4px; } .opt .why { color: var(--ink-2); font-size: 0.92rem; }
+  .decide { display: grid; gap: 10px; }
+  .seg { display: inline-flex; flex-wrap: wrap; gap: 6px; }
+  .seg label { border: 1px solid var(--line); border-radius: 5px; padding: 6px 10px; font-size: 0.86rem; cursor: pointer; display: inline-flex; align-items: center; gap: 6px; background: var(--surface); position: relative; }
+  .seg label:has(input:checked) { border-color: var(--accent); background: var(--accent-soft); color: var(--accent); font-weight: 600; }
+  .seg label.rec { border-style: dashed; border-color: var(--ok); }
+  .seg label.rec:has(input:checked) { border-style: solid; border-color: var(--accent); }
+  .seg label.rec::after { content: attr(data-rec-mark); font-size: 0.68rem; color: var(--ok); font-weight: 600; }
+  .seg input { position: absolute; opacity: 0; pointer-events: none; }
+  .note { width: 100%; min-height: 58px; font: inherit; font-size: 0.9rem; border: 1px solid var(--line); border-radius: 5px; padding: 8px 10px; background: var(--surface); color: var(--ink); resize: vertical; }
+  .sugg { display: grid; gap: 8px; padding: 12px 14px; border: 1px dashed var(--line); border-left: 3px dashed var(--accent); border-radius: 5px; background: var(--surface-2); }
+  .sugg-head { display: flex; flex-wrap: wrap; gap: 4px 10px; align-items: baseline; font-size: 0.82rem; color: var(--ink-3); }
+  .sugg-head .section-label { margin: 0; } .sugg-head b { color: var(--ink-2); font-weight: 600; }
+  .sugg-what { font-size: 0.92rem; color: var(--ink-2); } .sugg-what b { color: var(--ink); }
+  .sugg-note { color: var(--ink-2); font-style: italic; font-size: 0.92rem; }
+  .sugg-actions { display: flex; flex-wrap: wrap; gap: 6px; }
+  .sugg-actions button { font-size: 0.84rem; padding: 6px 10px; }
+  .sugg-actions button[aria-pressed="true"] { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); }
+  .sugg-state { font-size: 0.8rem; font-weight: 600; color: var(--sev-med); margin-left: auto; }
+  .sugg-state.done { color: var(--ok); } .sugg-state.own { color: var(--ink-2); }
+  .chip.sug { background: transparent; color: var(--accent); border: 1px dashed var(--accent); font-weight: 500; }
+  .seg .sugmark { font-size: 0.68rem; color: var(--accent); font-weight: 500; border-bottom: 1px dashed var(--accent); }
+  #sugg-counts > span:first-child { flex-basis: 100%; color: var(--ink-2); font-weight: 600; }
+  .card.pending { box-shadow: inset 3px 0 0 var(--sev-med); }
+  .legend { display: flex; flex-wrap: wrap; gap: 8px 14px; font-size: 0.82rem; color: var(--ink-2); align-items: center; }
+  .group-title { margin: 10px 0 -4px; color: var(--ink-3); font-size: 0.78rem; letter-spacing: 0.08em; text-transform: uppercase; font-weight: 600; }
+  .status { justify-self: start; display: inline-flex; align-items: center; gap: 8px; padding: 3px 12px; border-radius: 999px; font-size: 0.8rem; font-weight: 600; letter-spacing: 0.02em; background: var(--sev-med-soft); color: var(--sev-med); }
+  .status.closed { background: var(--ok-soft); color: var(--ok); }
+  .panel.closed { margin-bottom: 16px; border-color: var(--ok); }
+  .panel.closed .ctx { max-width: 86ch; }
+  .note:disabled { opacity: 1; color: var(--ink); background: var(--surface-2); }
+  .layout > *, .card, .opt, .optbody { min-width: 0; }
+  .card { overflow-wrap: anywhere; }
+  @media (prefers-reduced-motion: reduce) { .bar > span { transition: none; } }
+  /* PLAIN layer (see header): prosty hides .p-full and .p-oba; pelny hides .p-plain and .p-prosty; oba hides .p-prosty. */
+  .plain-block { display: grid; gap: 6px; padding: 12px 14px; border: 1px solid var(--line); border-left: 3px solid var(--accent); border-radius: 5px; background: var(--surface-2); }
+  .plain-block .section-label { margin: 0; } .plain-block p { max-width: 78ch; } .plain-block b { font-weight: 600; }
+  .plain-block .amends { color: var(--sev-med); font-weight: 500; }
+  .plain-block ul { margin: 0; padding-left: 1.4em; display: grid; gap: 4px; } .plain-block li { max-width: 78ch; }
+  .plain-block .optkey { font-family: "IBM Plex Mono", Menlo, monospace; font-weight: 500; }
+  .t-plain { display: block; }
+  .sugg-note.p-prosty { font-style: normal; color: var(--ink); }
+  #plain-panel .seg label { font-size: 0.84rem; }
+  body[data-plain="prosty"] .p-full, body[data-plain="prosty"] .p-oba { display: none !important; }
+  body[data-plain="pelny"] .p-plain, body[data-plain="pelny"] .p-prosty { display: none !important; }
+  body[data-plain="oba"] .p-prosty { display: none !important; }
+</style>
+
+<div class="page">
+  <header class="top">
+    <div class="eyebrow">{{PROJECT}} · {{CONTEXT}} · {{DATE}}</div>
+    <div class="status" id="status" data-t="page.status_open"></div>
+    <h1>Triage {{TOPIC}}</h1>
+    <p class="lede">{{LEDE — what was reviewed, how many items, what the decisions mean}}</p>
+    <div class="legend">
+      <span class="chip mono">S O E K</span><span data-t="legend.fields"></span>
+      <span class="chip high" data-t="class.fix"></span><span class="chip med" data-t="class.verify"></span><span class="chip ok" data-t="class.quick"></span><span class="chip owner" data-t="class.decide"></span><span class="chip low" data-t="class.backlog"></span><span class="chip pre"><span data-t="class.note"></span> / <span data-t="class.reject"></span></span>
+      <span><span data-t="legend.class_note"></span> · <b data-t="tag.root"></b> <span data-t="legend.root"></span> · <b data-t="tag.hotfix_short"></b> <span data-t="legend.hotfix"></span></span>
+    </div>
+  </header>
+
+  <div class="layout">
+    <main>
+      <section class="panel closed" id="closed-panel" hidden>
+        <h2 id="closed-heading"></h2>
+        <div class="ctx" id="closed-body"></div>
+      </section>
+      <div id="cards" class="cards"></div>
+    </main>
+
+    <aside class="side">
+      <button type="button" class="sheet-toggle" id="sheet-toggle" aria-expanded="false" aria-controls="side-panels"><span id="sheet-summary">0 / 0</span><span class="sheet-action" id="sheet-action" data-t="sheet.show"></span></button>
+      <div class="side-panels" id="side-panels">
+      <section class="panel" id="plain-panel" hidden>
+        <h2 data-t="plain.heading"></h2>
+        <div class="seg" role="radiogroup" data-t-aria="plain.heading">
+          <label><input type="radio" name="plain-mode" value="prosty"><span data-t="plain.mode_prosty"></span></label>
+          <label><input type="radio" name="plain-mode" value="pelny"><span data-t="plain.mode_pelny"></span></label>
+          <label><input type="radio" name="plain-mode" value="oba"><span data-t="plain.mode_oba"></span></label>
+        </div>
+        <p class="hint" id="plain-by"></p>
+      </section>
+      <section class="panel">
+        <h2 data-t="progress.heading"></h2>
+        <div class="progress">
+          <div class="bar"><span id="bar"></span></div>
+          <div id="progress-text">0 / 0</div>
+          <div class="groups" id="progress-groups"></div>
+          <div class="counts" id="counts"></div>
+          <div class="counts" id="sugg-counts" hidden></div>
+        </div>
+        <div class="btnrow">
+          <button type="button" id="btn-rec" data-t="button.recommendations"></button>
+          <button type="button" id="btn-note-all" data-t="button.note_all" hidden></button>
+          <button type="button" id="btn-clear" data-t="button.clear"></button>
+        </div>
+        <p class="hint" id="suggest-hint" hidden></p>
+        <p class="hint" id="rec-hint" data-t="hint.recommendations"></p>
+      </section>
+      <section class="panel">
+        <h2 data-t="output.heading"></h2>
+        <div class="btnrow">
+          <button type="button" class="primary" id="btn-gen" data-t="button.generate"></button>
+          <button type="button" id="btn-copy" data-t="button.copy"></button>
+        </div>
+        <textarea class="out" id="out" readonly data-t-placeholder="output.placeholder"></textarea>
+        <div class="toast" id="toast"></div>
+        <p class="hint" data-t="hint.copy"></p>
+      </section>
+      <details class="panel">
+        <summary data-t="legend.summary"></summary>
+        <div class="legend-list">
+          <p data-rich="legend.S"></p>
+          <p data-rich="legend.O"></p>
+          <p data-rich="legend.E"></p>
+          <p data-rich="legend.K"></p>
+          <p data-rich="legend.origin"></p>
+          <p data-rich="legend.classes"></p>
+          <p data-rich="legend.marks"></p>
+        </div>
+      </details>
+      </div>
+    </aside>
+  </div>
+</div>
+
+<script>
+(function () {
+  'use strict';
+  const STORAGE_KEY = 'triage-{{project}}-{{topic}}-v1';
+  const RUBRIC_VERSION = 2; // review rubric: fields §1, classes §4
+  const META = { topic: '{{TOPIC}}', project: '{{project}}' };
+  // null while the triage is open; once closed: { date, source, rubric, notes: [...],
+  //   answers: { 'K-1': { dec: 'fix'|'verify'|'backlog'|'reject'|'note'|'discuss', opt: 'a', note: '...' } } }
+  const CLOSED = null;
+  // null unless an agent prefilled proposals; never decisions:
+  // { by, date, answers: { 'K-1': { dec, opt, note, by } } }
+  const SUGGESTED = null;
+  // The string table of the cycle's language (dct/assets/triage-strings.json), filled by dct.
+  const STRINGS = {};
+  // One entry per K-n: id, title, area, src, S, O, E, K, origin, type, fp, ctx [paragraphs],
+  // opts [{ k, rec, root, t, why }], optional flags conflict / violation / dispute / openDesign,
+  // optional override cls + clsWhy. Filled by dct.
+  const CARDS = [];
+
+  // <decision-text> — pure: no DOM, storage or clock. Tests run this region from the shipped page.
+  const DECISION_KEYS = ['fix', 'verify', 'backlog', 'reject', 'note', 'discuss'];
+  // Classes = rubric §4, in display order. dec = the decision the class recommends.
+  const CLASSES = {
+    fix:     { dec: 'fix',     chip: 'high' },
+    verify:  { dec: 'verify',  chip: 'med' },
+    quick:   { dec: 'fix',     chip: 'ok' },
+    decide:  { dec: 'discuss', chip: 'owner' },
+    backlog: { dec: 'backlog', chip: 'low' },
+    reject:  { dec: 'reject',  chip: 'pre' },
+    note:    { dec: 'note',    chip: 'pre' },
+  };
+  const CLASS_ORDER = ['fix', 'verify', 'quick', 'decide', 'backlog', 'reject', 'note'];
+  // Rubric §4, first matching rule wins.
+  function classify(c) {
+    const S = c.S, E = c.E, K = c.K, Oq = c.O === '?', O = Oq ? -1 : c.O;
+    if (c.type === 'spec-gap' || c.conflict) return 'decide';                                   // 1
+    if (c.type === 'opinion') return 'note';                                                     // 2
+    if (O === 0 || c.violation === false) return 'reject';                                      // 3
+    if (c.dispute) return 'verify';                                                             // 4
+    if (S >= 2 && (E < 2 || Oq)) return 'verify';                                               // 5
+    if (E >= 2 && ((S === 3 && O >= 1) || (S === 2 && O >= 2))) return 'fix';                   // 6
+    if (E >= 2 && O >= 1 && K === 'S' && c.defect !== false && !c.openDesign) return 'quick';   // 7
+    if (S >= 2) return 'backlog';                                                               // 8 → P2
+    if (S === 1 && O >= 2 && E >= 2) return 'backlog';                                          // 9 → P3
+    return 'note';                                                                              // 10
+  }
+  function cls(c) { return c.cls || classify(c); }
+  function recDec(c) { return CLASSES[cls(c)].dec; }
+  // The cards and the decision text follow the same class order (a stable sort).
+  function byClass(cards) { return cards.slice().sort(function (a, b) { return CLASS_ORDER.indexOf(cls(a)) - CLASS_ORDER.indexOf(cls(b)); }); }
+  // `text` with each {name} replaced by vars[name]; a parameter without a value stays as written.
+  function fill(text, vars) {
+    return String(text).replace(/\{([A-Za-z_][A-Za-z0-9_]*)\}/g, function (m, name) {
+      return vars && Object.prototype.hasOwnProperty.call(vars, name) ? String(vars[name]) : m;
+    });
+  }
+  function oneLine(t) { return String(t || '').trim().replace(/\s+/g, ' '); }
+  // input: { cards, answers: {K-n: {dec, opt, note, resp}}, proposals: {K-n: {by, note}}, proposers,
+  //   proposalsDate, strings, topic, project, rubric, stamp } → the text the owner pastes back.
+  function buildDecisionText(input) {
+    const S = input.strings;
+    function t(key, vars) { return fill(S[key], vars); }
+    const lines = [t('text.header', { topic: input.topic, project: input.project, stamp: input.stamp, rubric: input.rubric })];
+    if (input.proposers) {
+      lines.push(t('text.prefill', { by: input.proposers, date: input.proposalsDate ? t('text.prefill_date', { date: input.proposalsDate }) : '' }));
+    }
+    byClass(input.cards).forEach(function (c) {
+      const st = input.answers[c.id] || {};
+      const dec = DECISION_KEYS.indexOf(st.dec) >= 0 ? st.dec : '';
+      const opt = c.opts.find(function (o) { return o.k === st.opt; });
+      let line = c.id + ': ' + (dec ? t('decision.' + dec) : t('decision.none'));
+      if (opt) line += ' · ' + t('text.variant') + ' (' + opt.k + ')' + (opt.rec ? '' : ' ' + t('text.other_recommendation'));
+      if (dec && dec !== recDec(c)) line += ' ' + t('text.other_class', { cls: t('class.' + cls(c)) });
+      const own = oneLine(st.note);
+      const sug = dec && st.resp && input.proposals[c.id] ? input.proposals[c.id] : null;
+      let note = own;
+      if (sug) { // the reaction to the proposal opens the note; an accepted one carries the proposer's words, marked
+        const tag = t('response.' + st.resp + '_tag', { by: sug.by }); const theirs = oneLine(sug.note);
+        note = st.resp === 'accept' ? tag + (theirs ? ' ' + theirs : '') + (own ? ' ' + t('text.owner_comment') + ' ' + own : '') : tag + (own ? ' ' + own : '');
+      }
+      if (note) line += ' · ' + t('text.notes') + ': ' + note;
+      lines.push(line);
+    });
+    return lines.join('\n');
+  }
+  // </decision-text>
+
+  // <text-helpers> — tests run this region with hostile tables.
+  // The only reads of STRINGS: tx() gives plain text, th() the same text HTML-escaped.
+  function tx(key, vars) { return fill(Object.prototype.hasOwnProperty.call(STRINGS, key) ? STRINGS[key] : key, vars); }
+  function th(key, vars) { return escapeHtml(tx(key, vars)); }
+  function escapeHtml(t) { return String(t || '').replace(/[&<>"']/g, function (ch) { return ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[ch]; }); }
+  // Card prose (full and plain texts alike): escaped first, then only `code` spans become <code>.
+  function textHtml(t) { return escapeHtml(t).replace(/`([^`]+)`/g, '<code>$1</code>'); }
+  // Legend texts: escaped first, then only **bold** becomes <b>.
+  function richHtml(t) { return escapeHtml(t).replace(/\*\*([^*]+)\*\*/g, '<b>$1</b>'); }
+  // </text-helpers>
+  function applyStrings() {
+    document.querySelectorAll('[data-t]').forEach(function (el) { el.textContent = tx(el.getAttribute('data-t')); });
+    document.querySelectorAll('[data-t-aria]').forEach(function (el) { el.setAttribute('aria-label', tx(el.getAttribute('data-t-aria'))); });
+    document.querySelectorAll('[data-t-placeholder]').forEach(function (el) { el.setAttribute('placeholder', tx(el.getAttribute('data-t-placeholder'))); });
+    document.querySelectorAll('[data-rich]').forEach(function (el) { el.innerHTML = richHtml(tx(el.getAttribute('data-rich'))); });
+  }
+  function decLabel(v) { return tx('decision.' + v); }
+  function classLabel(k) { return tx('class.' + k); }
+  function prio(c) {
+    const k = cls(c);
+    if (k === 'backlog') return c.S >= 2 ? 'P2' : 'P3';
+    if (k === 'verify') return (c.S === 3 || (c.S === 2 && c.O !== '?' && c.O >= 2)) ? 'P1' : 'P2';
+    return '';
+  }
+  // A closed page shows the owner's recorded answers, never whatever a browser stored.
+  const FIELDS = ['opt', 'dec', 'note'];
+  const SUGG = !CLOSED && SUGGESTED ? SUGGESTED : null; // a closed page ignores SUGGESTED
+  // The owner's reactions to a proposal; their labels, states and note tags come from STRINGS.
+  const RESPONSES = ['accept', 'amend', 'reject', 'ask'];
+  const revised = {}; // K-n whose proposal changed since the owner reacted (this visit only)
+  const state = CLOSED ? JSON.parse(JSON.stringify(CLOSED.answers)) : loadState();
+  if (SUGG) saveState(); // store the dropped stale reactions and the v3 shape
+  function isMap(v) { return !!v && typeof v === 'object' && !Array.isArray(v); }
+  function valid(c, f, v) {
+    if (f === 'opt') return v === '' || c.opts.some(function (o) { return o.k === v; });
+    if (f === 'dec') return v === '' || DECISION_KEYS.indexOf(v) >= 0;
+    return typeof v === 'string';
+  }
+  // The card's proposal {dec, opt, note, by}, or null (none, or no valid decision in it).
+  function suggestion(c) {
+    const a = isMap(SUGG && SUGG.answers) && isMap(SUGG.answers[c.id]) ? SUGG.answers[c.id] : null;
+    if (!a || !a.dec || !valid(c, 'dec', a.dec)) return null;
+    return { dec: a.dec, opt: a.opt && valid(c, 'opt', a.opt) ? a.opt : '', note: typeof a.note === 'string' ? a.note : '',
+      by: typeof a.by === 'string' && a.by.trim() ? a.by : String(SUGG.by || 'agent') };
+  }
+  function sig(sug) { return sug ? JSON.stringify([sug.by, sug.dec, sug.opt, sug.note]) : ''; }
+  function loadState() {
+    let raw = null; try { raw = JSON.parse(localStorage.getItem(STORAGE_KEY) || 'null'); } catch (e) { raw = null; }
+    let saved = raw;
+    if (isMap(raw) && raw.v === 3) saved = raw.state;
+    else if (isMap(raw) && raw.v === 2) { // an older prefilled form: keep only what the owner changed from the proposals
+      saved = {}; const st = isMap(raw.state) ? raw.state : {}; const base = isMap(raw.baseline) ? raw.baseline : {};
+      Object.keys(st).forEach(function (id) {
+        const sv = isMap(st[id]) ? st[id] : {}; const bv = isMap(base[id]) ? base[id] : {}; saved[id] = {};
+        FIELDS.forEach(function (f) { if (typeof sv[f] === 'string' && sv[f] !== (typeof bv[f] === 'string' ? bv[f] : '')) saved[id][f] = sv[f]; });
+      });
+    }
+    const out = {};
+    if (!isMap(saved)) return out;
+    CARDS.forEach(function (c) {
+      const sv = isMap(saved[c.id]) ? saved[c.id] : null; if (!sv) return;
+      const st = { opt: '', dec: '', note: '', resp: '', seen: '' };
+      FIELDS.forEach(function (f) { if (sv[f] !== undefined && valid(c, f, sv[f])) st[f] = sv[f]; });
+      if (SUGG && RESPONSES.indexOf(sv.resp) >= 0 && typeof sv.seen === 'string') { st.resp = sv.resp; st.seen = sv.seen; }
+      if (st.resp && st.seen !== sig(suggestion(c))) { // the proposal changed or vanished since the reaction
+        if (st.resp === 'accept') { st.dec = ''; st.opt = ''; }
+        st.resp = ''; st.seen = ''; revised[c.id] = true;
+      }
+      out[c.id] = st;
+    });
+    return out;
+  }
+  function saveState() { if (CLOSED) return; try { localStorage.setItem(STORAGE_KEY, JSON.stringify(SUGG ? { v: 3, state: state } : state)); } catch (e) {} }
+  function s(id) { state[id] = state[id] || { opt: '', dec: '', note: '', resp: '', seen: '' }; return state[id]; }
+  // Grow a note to its content (border-box: add the borders scrollHeight leaves out); skip unlaid-out ones.
+  function fitNote(n) { n.style.height = 'auto'; if (n.scrollHeight) n.style.height = (n.scrollHeight + n.offsetHeight - n.clientHeight) + 'px'; }
+  function fitNotes() { document.querySelectorAll('textarea.note').forEach(fitNote); }
+  function render() {
+    const root = document.getElementById('cards'); root.innerHTML = ''; let lastGroup = '';
+    byClass(CARDS).forEach(function (c) {
+      const k = cls(c); const grp = classLabel(k);
+      if (grp !== lastGroup) { const g = document.createElement('div'); g.className = 'group-title'; g.textContent = grp; root.appendChild(g); lastGroup = grp; }
+      const st = s(c.id); const art = document.createElement('article'); const sug = SUGG ? suggestion(c) : null;
+      art.className = 'card'; art.id = 'card-' + c.id;
+      const chips = ['<span class="chip ' + CLASSES[k].chip + '">' + escapeHtml(classLabel(k)) + (prio(c) ? ' · ' + prio(c) : '') + '</span>'];
+      if (c.cls && c.cls !== classify(c)) chips.push('<span class="chip pre" title="' + escapeHtml(c.clsWhy || '') + '">' + th('card.computed_class', { cls: classLabel(classify(c)) }) + '</span>');
+      chips.push('<span class="chip mono">S' + c.S + ' O' + c.O + ' E' + c.E + ' K:' + c.K + '</span>'); // ledger-validated numbers, '?', S/M/L
+      if (c.origin && c.origin !== 'diff') chips.push('<span class="chip pre">' + escapeHtml(c.origin) + '</span>');
+      if (c.type) chips.push('<span class="chip pre">' + escapeHtml(c.type) + '</span>');
+      const optsHtml = c.opts.map(function (o) {
+        const tags = []; if (o.rec) tags.push('<span class="chip ok">' + th('tag.recommended') + '</span>');
+        tags.push(o.root ? '<span class="chip owner">' + th('tag.root') + '</span>' : '<span class="chip low">' + th('tag.hotfix') + '</span>');
+        if (sug && sug.opt === o.k) tags.push('<span class="chip sug">' + th('tag.proposal') + '</span>');
+        return '<label class="opt' + (o.rec ? ' rec' : '') + '"><input type="radio" name="opt-' + escapeHtml(c.id) + '" value="' + escapeHtml(o.k) + '"' + (st.opt === o.k ? ' checked' : '') + '>' +
+          '<span class="optbody"><span><span class="optkey">(' + escapeHtml(o.k) + ')</span> <span class="opt-t">' + textHtml(o.t) + '</span><span class="tags">' + tags.join('') + '</span></span>' +
+          '<span class="why">' + textHtml(o.why) + '</span></span></label>';
+      }).join('');
+      const decHtml = DECISION_KEYS.map(function (v) {
+        const rec = recDec(c) === v;
+        return '<label class="' + (rec ? 'rec' : '') + '"' + (rec ? ' data-rec-mark="' + th('decision.recommended_mark') + '"' : '') + '><input type="radio" name="dec-' + escapeHtml(c.id) + '" value="' + v + '"' + (st.dec === v ? ' checked' : '') + '>' + escapeHtml(decLabel(v)) +
+          (sug && sug.dec === v ? '<span class="sugmark">' + th('decision.proposed_mark') + '</span>' : '') + '</label>';
+      }).join('');
+      let suggHtml = '';
+      if (sug) {
+        const so = c.opts.find(function (o) { return o.k === sug.opt; });
+        suggHtml = '<div class="sugg"><div class="sugg-head"><span class="section-label">' + th('proposal.label') + '</span><b>' + escapeHtml(sug.by) + '</b><span class="sugg-state"></span></div>' +
+          '<div class="sugg-what">' + th('proposal.decision') + ' <b>' + escapeHtml(decLabel(sug.dec)) + '</b>' + (sug.dec !== recDec(c) ? ' <span class="chip pre">' + th('proposal.other_class', { cls: classLabel(cls(c)) }) + '</span>' : '') +
+          (so ? ' · ' + th('proposal.variant') + ' <b>(' + escapeHtml(so.k) + ')</b>' + (so.rec ? '' : ' <span class="chip pre">' + th('proposal.other_recommendation') + '</span>') : '') + '</div>' +
+          (sug.note.trim() ? '<div class="sugg-note">„' + textHtml(sug.note.trim()) + '”</div>' : '') +
+          '<div class="sugg-actions">' + RESPONSES.map(function (r) {
+            return '<button type="button" data-resp="' + r + '" aria-pressed="false">' + th('response.' + r + '_label') + '</button>';
+          }).join('') + '</div></div>';
+      }
+      art.innerHTML =
+        '<div class="card-head"><span class="kid">' + escapeHtml(c.id) + '</span><h3>' + textHtml(c.title) + '</h3>' +
+        '<div class="meta">' + chips.join('') + '<span>' + escapeHtml(c.area) + '</span><span>' + th('card.source', { src: c.src }) + '</span></div></div>' +
+        (c.fp ? '<div class="fp">⌁ ' + escapeHtml(c.fp) + '</div>' : '') +
+        '<div><div class="section-label">' + th('card.context') + '</div><div class="ctx">' + c.ctx.map(function (p) { return '<p>' + textHtml(p) + '</p>'; }).join('') + '</div></div>' +
+        '<div><div class="section-label">' + th('card.options') + '</div><div class="opts">' + optsHtml + '</div></div>' + suggHtml +
+        '<div class="decide"><div class="section-label">' + th('card.decision') + '</div><div class="seg">' + decHtml + '</div>' +
+        (sug ? '<div class="section-label" style="margin:0">' + th('card.your_comment') + '</div>' : '') +
+        '<textarea class="note" placeholder="' + th(sug ? 'card.comment_placeholder' : 'card.note_placeholder') + '">' + escapeHtml(st.note) + '</textarea></div>';
+      root.appendChild(art);
+      art.querySelectorAll('input[name="opt-' + c.id + '"]').forEach(function (r) { r.addEventListener('change', function () { s(c.id).opt = r.value; manual(c); }); });
+      art.querySelectorAll('input[name="dec-' + c.id + '"]').forEach(function (r) { r.addEventListener('change', function () { s(c.id).dec = r.value; manual(c); }); });
+      art.querySelectorAll('button[data-resp]').forEach(function (b) { b.addEventListener('click', function () { respond(c, b.getAttribute('data-resp')); }); });
+      const note = art.querySelector('textarea.note'); fitNote(note);
+      note.addEventListener('input', function () { s(c.id).note = note.value; fitNote(note); persist(); });
+      syncCard(c);
+    });
+    updateProgress();
+  }
+  // A reaction to the card's proposal; a second click on the pressed one undoes it.
+  function respond(c, r) {
+    const st = s(c.id); const sug = suggestion(c); if (!sug || RESPONSES.indexOf(r) < 0) return;
+    if (st.resp === r) {
+      if ((r === 'accept' || r === 'amend') && st.dec === sug.dec && st.opt === sug.opt) { st.dec = ''; st.opt = ''; }
+      if (r === 'ask' && st.dec === 'discuss') st.dec = '';
+      st.resp = ''; st.seen = '';
+    } else {
+      st.resp = r; st.seen = sig(sug);
+      if (r === 'accept' || r === 'amend') { st.dec = sug.dec; st.opt = sug.opt; }
+      else if (r === 'reject') { st.dec = ''; st.opt = ''; }
+      else if (r === 'ask') st.dec = 'discuss';
+    }
+    delete revised[c.id];
+    // In place, never render(): emptying #cards collapses the page and the browser drops the scroll position.
+    saveState(); syncInputs(c); syncCard(c); updateProgress();
+    const art = document.getElementById('card-' + c.id); if (!art || st.resp !== r) return;
+    const target = r === 'reject' ? art.querySelector('.seg input') : (r === 'amend' || r === 'ask') ? art.querySelector('textarea.note') : null;
+    if (target) target.focus({ preventScroll: false });
+  }
+  // A choice made by hand: changing an accepted proposal makes it "with changes"; leaving "discuss" ends the question.
+  function manual(c) {
+    const st = s(c.id); const sug = SUGG ? suggestion(c) : null;
+    if (sug && st.resp === 'accept' && (st.dec !== sug.dec || st.opt !== sug.opt)) st.resp = 'amend';
+    if (st.resp === 'ask' && st.dec !== 'discuss') { st.resp = ''; st.seen = ''; }
+    delete revised[c.id];
+    persist(); syncCard(c);
+  }
+  // The card's form controls follow its stored state (the only state-dependent part of the markup).
+  function syncInputs(c) {
+    const art = document.getElementById('card-' + c.id); if (!art) return;
+    const st = s(c.id);
+    art.querySelectorAll('input[name="opt-' + c.id + '"]').forEach(function (r) { r.checked = st.opt === r.value; });
+    art.querySelectorAll('input[name="dec-' + c.id + '"]').forEach(function (r) { r.checked = st.dec === r.value; });
+    const note = art.querySelector('textarea.note'); if (note && note.value !== (st.note || '')) { note.value = st.note || ''; fitNote(note); }
+  }
+  function syncAll() { CARDS.forEach(function (c) { syncInputs(c); syncCard(c); }); updateProgress(); }
+  function syncCard(c) {
+    const art = document.getElementById('card-' + c.id); if (!art) return;
+    const st = s(c.id); const sug = SUGG ? suggestion(c) : null;
+    art.classList.toggle('decided', !!st.dec);
+    art.classList.toggle('pending', !!sug && !st.resp && !st.dec);
+    art.querySelectorAll('button[data-resp]').forEach(function (b) { b.setAttribute('aria-pressed', String(st.resp === b.getAttribute('data-resp'))); });
+    const el = art.querySelector('.sugg-state'); if (!el) return;
+    el.className = 'sugg-state' + (st.resp === 'accept' || st.resp === 'amend' ? ' done' : (!st.resp && st.dec ? ' own' : ''));
+    el.textContent = st.resp ? tx('response.' + st.resp + '_state')
+      : revised[c.id] ? tx('proposal.revised')
+      : st.dec ? tx('proposal.own') : tx('proposal.pending');
+  }
+  function persist() { saveState(); updateProgress(); }
+  // Informational = class note or reject AND no proposal on it: a card someone proposed an answer for needs the owner's reaction.
+  function infoCard(c) { const k = cls(c); return (k === 'note' || k === 'reject') && !(SUGG && suggestion(c)); }
+  function updateProgress() {
+    const total = CARDS.length; let decided = 0; const cnt = {};
+    CARDS.forEach(function (c) { const d = s(c.id).dec; if (d) { decided++; cnt[d] = (cnt[d] || 0) + 1; } });
+    document.getElementById('bar').style.width = (total ? Math.round(100 * decided / total) : 0) + '%';
+    document.getElementById('progress-text').textContent = tx('progress.text', { n: decided, total: total });
+    document.getElementById('sheet-summary').textContent = CLOSED ? tx('sheet.closed', { date: CLOSED.date }) : tx('sheet.summary', { n: decided, total: total });
+    document.getElementById('counts').innerHTML = DECISION_KEYS.map(function (v) { return '<span>' + escapeHtml(decLabel(v)) + ': <b>' + (cnt[v] || 0) + '</b></span>'; }).join('');
+    // Two groups: the cards that need a decision and the informational ones (a fix already applied, or nothing to do).
+    const groups = [
+      { key: 'decide', label: tx('progress.group_decide'), cards: CARDS.filter(function (c) { return !infoCard(c); }) },
+      { key: 'note', label: tx('progress.group_note'), cards: CARDS.filter(infoCard) },
+    ];
+    document.getElementById('progress-groups').innerHTML = groups.filter(function (g) { return g.cards.length; }).map(function (g) {
+      const done = g.cards.filter(function (c) { return !!s(c.id).dec; }).length;
+      return '<div class="g"><span>' + escapeHtml(g.label) + ': <b>' + done + ' / ' + g.cards.length + '</b></span><div class="bar g-' + g.key + '"><span style="width:' + Math.round(100 * done / g.cards.length) + '%"></span></div></div>';
+    }).join('');
+    const bn = document.getElementById('btn-note-all'); if (bn) bn.hidden = !!CLOSED || !groups[1].cards.some(function (c) { return !s(c.id).dec; });
+    if (!SUGG) return;
+    const rc = { accept: 0, amend: 0, reject: 0, ask: 0, own: 0, none: 0 }; let withSug = 0;
+    CARDS.forEach(function (c) { if (!suggestion(c)) return; withSug++; const st = s(c.id); rc[st.resp || (st.dec ? 'own' : 'none')]++; });
+    const sc = document.getElementById('sugg-counts'); sc.hidden = !withSug;
+    sc.innerHTML = '<span>' + th('progress.proposals', { n: withSug }) + '</span>' + ['accept', 'amend', 'reject', 'ask', 'own', 'none']
+      .map(function (k) { return '<span>' + th('progress.' + k) + ': <b>' + rc[k] + '</b></span>'; }).join('');
+  }
+  function proposers() {
+    const seen = []; CARDS.forEach(function (c) { const sug = suggestion(c); if (sug && seen.indexOf(sug.by) < 0) seen.push(sug.by); });
+    return seen.length ? seen.join(', ') : String(SUGG.by || 'agent');
+  }
+  function generate() {
+    // A record carries the date of the decision, not the moment somebody opens the page.
+    const stamp = CLOSED ? CLOSED.date : new Date().toISOString().slice(0, 16).replace('T', ' ');
+    const proposals = {};
+    if (SUGG) CARDS.forEach(function (c) { const sug = suggestion(c); if (sug) proposals[c.id] = sug; });
+    const text = buildDecisionText({
+      cards: CARDS, answers: state, proposals: proposals, proposers: SUGG ? proposers() : '',
+      proposalsDate: SUGG && SUGG.date ? String(SUGG.date) : '', strings: STRINGS,
+      topic: META.topic, project: META.project, rubric: RUBRIC_VERSION, stamp: stamp,
+    });
+    const out = document.getElementById('out'); out.value = text; return text;
+  }
+  document.getElementById('btn-gen').addEventListener('click', function () {
+    generate();
+    // dct refuses a whole pasted text with a comment on an undecided card, so name those cards now.
+    const loose = byClass(CARDS).filter(function (c) { const st = s(c.id); return !st.dec && st.note && st.note.trim(); }).map(function (c) { return c.id; });
+    toast(loose.length ? tx('toast.loose', { ids: loose.join(', ') }) : tx('toast.generated'));
+  });
+  document.getElementById('btn-copy').addEventListener('click', function () {
+    const out = document.getElementById('out'); if (!out.value) generate(); out.focus(); out.select();
+    const done = function () { toast(tx('toast.copied')); };
+    if (navigator.clipboard && navigator.clipboard.writeText) { navigator.clipboard.writeText(out.value).then(done, function () { toast(tx('toast.no_clipboard')); }); }
+    else { toast(tx('toast.no_clipboard')); }
+  });
+  document.getElementById('btn-rec').addEventListener('click', function () {
+    let n = 0;
+    CARDS.forEach(function (c) {
+      const st = s(c.id);
+      if (SUGG) { // accept every proposal the owner has not touched
+        const sug = suggestion(c);
+        if (sug && !st.resp && !st.dec) { st.resp = 'accept'; st.seen = sig(sug); st.dec = sug.dec; st.opt = sug.opt; delete revised[c.id]; n++; }
+        return;
+      }
+      if (!st.opt) { const r = c.opts.find(function (o) { return o.rec; }); st.opt = r ? r.k : ''; }
+      if (!st.dec) st.dec = recDec(c);
+    });
+    saveState(); syncAll();
+    toast(SUGG ? tx('toast.accepted', { n: n }) : tx('toast.recommended'));
+  });
+  // "Note informational cards": the class's decision on every informational card still without one (its variant stays untouched).
+  document.getElementById('btn-note-all').addEventListener('click', function () {
+    let n = 0;
+    CARDS.filter(infoCard).forEach(function (c) { const st = s(c.id); if (!st.dec) { st.dec = recDec(c); n++; } });
+    saveState(); syncAll();
+    toast(tx('toast.noted', { n: n }));
+  });
+  // The artifact viewer never shows confirm(): the button asks for a second click instead.
+  let clearArmed = null;
+  document.getElementById('btn-clear').addEventListener('click', function (ev) {
+    const btn = ev.currentTarget;
+    if (!clearArmed) {
+      btn.textContent = tx('button.clear_confirm');
+      clearArmed = setTimeout(function () { clearArmed = null; btn.textContent = tx('button.clear'); }, 4000);
+      return;
+    }
+    clearTimeout(clearArmed); clearArmed = null; btn.textContent = tx('button.clear');
+    Object.keys(state).forEach(function (k) { delete state[k]; });
+    saveState(); syncAll(); document.getElementById('out').value = ''; toast(tx('toast.cleared'));
+  });
+  let toastTimer = null;
+  function toast(msg) { const el = document.getElementById('toast'); el.textContent = msg; clearTimeout(toastTimer); toastTimer = setTimeout(function () { el.textContent = ''; }, 4000); }
+  applyStrings();
+  if (SUGG) {
+    const when = SUGG.date ? tx('hint.proposals_date', { date: SUGG.date }) : '';
+    document.getElementById('status').textContent = tx('page.status_proposals', { by: proposers() });
+    document.getElementById('btn-rec').textContent = tx('button.accept_untouched');
+    document.getElementById('rec-hint').textContent = tx('hint.accept_untouched');
+    const sh = document.getElementById('suggest-hint'); sh.hidden = false;
+    sh.textContent = tx('hint.proposals', { by: proposers(), date: when });
+  }
+  // Phone: the aside is a bottom bar that expands into a sheet (desktop never shows the toggle).
+  const side = document.querySelector('.side'); const sheetToggle = document.getElementById('sheet-toggle');
+  function setSheet(open) { side.classList.toggle('open', open); sheetToggle.setAttribute('aria-expanded', String(open)); document.getElementById('sheet-action').textContent = tx(open ? 'sheet.hide' : 'sheet.show'); }
+  sheetToggle.addEventListener('click', function () { setSheet(sheetToggle.getAttribute('aria-expanded') !== 'true'); });
+  document.addEventListener('keydown', function (e) { if (e.key === 'Escape' && side.classList.contains('open')) { setSheet(false); sheetToggle.focus(); } });
+  render();
+  window.addEventListener('resize', fitNotes);
+  if (document.fonts && document.fonts.ready) document.fonts.ready.then(fitNotes);
+  if (CLOSED) {
+    const cnt = {}; const open = [];
+    CARDS.forEach(function (c) {
+      const a = CLOSED.answers[c.id];
+      if (!a || !a.dec) { open.push(c.id); return; }
+      if (a.dec === 'discuss') open.push(c.id);
+      cnt[a.dec] = (cnt[a.dec] || 0) + 1;
+    });
+    const tally = DECISION_KEYS.filter(function (v) { return cnt[v]; }).map(function (v) { return '<b>' + escapeHtml(String(cnt[v])) + ' × ' + escapeHtml(decLabel(v)) + '</b>'; }).join(', ');
+    const status = document.getElementById('status');
+    status.className = 'status closed';
+    status.textContent = tx('sheet.closed', { date: CLOSED.date }) + (open.length ? tx('closed.status_open', { ids: open.join(', ') }) : '');
+    document.getElementById('closed-heading').textContent = tx('closed.heading', { date: CLOSED.date });
+    const paras = [th('closed.decided', { n: CARDS.length - open.length, total: CARDS.length }) + ' ' + tally + '.' +
+      (open.length ? ' ' + th('closed.undecided', { ids: open.join(', ') }) : '') + ' ' + th('closed.fields'),
+      th('closed.source', { source: CLOSED.source })].concat((CLOSED.notes || []).map(function (n) { return textHtml(n); }));
+    // Every leaf above is escaped exactly once (data), the <b> tags are the template's own markup.
+    document.getElementById('closed-body').innerHTML = paras.map(function (p) { return '<p>' + p + '</p>'; }).join('');
+    document.getElementById('closed-panel').hidden = false;
+    generate();
+    document.querySelectorAll('input:not([name="plain-mode"]), textarea, button:not(#sheet-toggle)').forEach(function (el) { el.disabled = true; });
+    const out = document.getElementById('out'); out.disabled = false; out.readOnly = true;
+    document.getElementById('btn-copy').disabled = false;
+  }
+  // PLAIN layer (header comment): plain.json beside the page adds plain-language texts in place.
+  const PLAIN_MODES = ['prosty', 'pelny', 'oba'];
+  function plainText(v) { return typeof v === 'string' && v.trim() ? v.trim() : ''; }
+  // The card at the top of the viewport (the first whose bottom is below the top edge).
+  function anchorCard() {
+    const cards = document.querySelectorAll('article.card');
+    for (let i = 0; i < cards.length; i++) { if (cards[i].getBoundingClientRect().bottom > 8) return cards[i]; }
+    return null;
+  }
+  function setPlainMode(m) {
+    if (PLAIN_MODES.indexOf(m) < 0) m = 'prosty';
+    const a = anchorCard(); const before = a ? a.getBoundingClientRect().top : 0;
+    document.body.setAttribute('data-plain', m);
+    document.querySelectorAll('input[name="plain-mode"]').forEach(function (r) { r.checked = r.value === m; });
+    try { localStorage.setItem(STORAGE_KEY + '-plain', m); } catch (e) {}
+    fitNotes();
+    if (a) window.scrollBy(0, a.getBoundingClientRect().top - before); // the card you were reading stays where it was
+  }
+  function pairText(el, plain, tag) {
+    if (!el || !plain) return;
+    el.classList.add('p-full');
+    const sp = document.createElement(tag || 'span'); sp.className = (el.className.replace(/\bp-full\b/, '').trim() || '') + ' p-prosty';
+    sp.innerHTML = textHtml(plain); el.insertAdjacentElement('beforebegin', sp);
+  }
+  function applyPlain(plain) {
+    const cards = isMap(plain.cards) ? plain.cards : null; if (!cards) return 0; let n = 0;
+    CARDS.forEach(function (c) {
+      const p = isMap(cards[c.id]) ? cards[c.id] : null; const art = document.getElementById('card-' + c.id); if (!p || !art) return; n++;
+      const h3 = art.querySelector('.card-head h3'); const title = plainText(p.title);
+      if (h3 && title) h3.innerHTML = '<span class="p-full">' + h3.innerHTML + '</span><span class="t-plain p-prosty">' + textHtml(title) + '</span>';
+      const ctx = art.querySelector('.ctx'); if (ctx && ctx.parentElement) ctx.parentElement.classList.add('p-full');
+      const fp = art.querySelector('.fp'); if (fp) fp.classList.add('p-full');
+      const opts = isMap(p.opts) ? p.opts : {}; const codex = plainText(p.codex);
+      // plain: the plain texts take the place of the card's own, inside the same controls.
+      art.querySelectorAll('.opt').forEach(function (o) {
+        const input = o.querySelector('input'); const why = o.querySelector('.why'); if (why) why.classList.add('p-full');
+        pairText(o.querySelector('.opt-t'), input ? plainText(opts[input.value]) : '');
+      });
+      const sugg = art.querySelector('.sugg');
+      if (sugg) pairText(sugg.querySelector('.sugg-note'), codex, 'div');
+      // both and plain: one summary block under the head; in both it also lists the options and the proposal in short.
+      const paras = [];
+      if (plainText(p.problem)) paras.push('<p>' + textHtml(p.problem) + '</p>');
+      if (plainText(p.was)) paras.push('<p><b>' + th('plain.was') + '</b> ' + textHtml(p.was) + '</p>');
+      if (plainText(p.fix)) paras.push('<p><b>' + th('plain.fix') + '</b> ' + textHtml(p.fix) + '</p>');
+      const items = c.opts.filter(function (o) { return plainText(opts[o.k]); }).map(function (o) {
+        return '<li><span class="optkey">(' + escapeHtml(o.k) + ')</span> ' + textHtml(opts[o.k]) + (o.rec ? ' <span class="chip ok">' + th('tag.recommended') + '</span>' : '') + '</li>';
+      });
+      if (items.length) paras.push('<div class="p-oba"><b>' + th('plain.options') + '</b><ul>' + items.join('') + '</ul></div>');
+      if (codex && sugg) paras.push('<p class="p-oba"><b>' + th('plain.proposal') + '</b> ' + textHtml(codex) + '</p>');
+      if (plainText(p.amends)) paras.push('<p class="amends">' + th('plain.amends') + ' ' + textHtml(p.amends) + '</p>');
+      if (paras.length) {
+        const b = document.createElement('div'); b.className = 'plain-block p-plain';
+        b.innerHTML = '<div class="section-label">' + th('plain.section') + '</div>' + paras.join('');
+        art.querySelector('.card-head').insertAdjacentElement('afterend', b);
+      }
+    });
+    return n;
+  }
+  function loadPlain() {
+    if (typeof fetch !== 'function') return;
+    fetch('plain.json', { cache: 'no-store' }).then(function (r) { return r.ok ? r.json() : null; }).then(function (plain) {
+      if (!isMap(plain)) return; const n = applyPlain(plain); if (!n) return;
+      const panel = document.getElementById('plain-panel'); panel.hidden = false;
+      const who = plainText(plain.by) ? ' (' + plain.by + (plainText(plain.date) ? ', ' + plain.date : '') + ')' : '';
+      document.getElementById('plain-by').textContent = tx('plain.by', { n: n, total: CARDS.length, who: who });
+      let m = 'prosty'; try { m = localStorage.getItem(STORAGE_KEY + '-plain') || m; } catch (e) {}
+      setPlainMode(m);
+      panel.querySelectorAll('input[name="plain-mode"]').forEach(function (r) { r.addEventListener('change', function () { setPlainMode(r.value); }); });
+    }).catch(function () {});
+  }
+  loadPlain();
+})();
+</script>

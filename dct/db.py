@@ -451,6 +451,11 @@ triage_cycles = sa.Table(
     sa.Column("scope", sa.Text),  # what was reviewed: diff range, files
     sa.Column("base_commit", sa.String(64)),
     sa.Column("rubric_version", sa.SmallInteger, nullable=False, server_default=sa.text("2")),
+    # #991: the page language of the cycle (a code of the shipped string
+    # table), fixed when the cycle is opened. The server default 'pl' is the
+    # compatibility value of cycles opened before the column existed (all
+    # built from the Polish template); open_triage always writes it.
+    sa.Column("language", sa.String(8), nullable=False, server_default="pl"),
     sa.Column("artifact_url", sa.String(500)),
     sa.Column("created_by", sa.String(200), nullable=False),
     sa.Column("opened_at", sa.DateTime, nullable=False, server_default=sa.text("CURRENT_TIMESTAMP")),
@@ -1265,6 +1270,10 @@ RELEASE_LEDGER_COLUMNS: dict[str, tuple[tuple[str, str], ...]] = {
 # copied from the finding's creation provenance). Healed like
 # RELEASE_LEDGER_COLUMNS.
 TRIAGE_LEDGER_COLUMNS: dict[str, tuple[tuple[str, str], ...]] = {
+    # #991: existing cycles get 'pl' (built from the Polish template).
+    "triage_cycles": (
+        ("language", "VARCHAR(8) NOT NULL DEFAULT 'pl'"),
+    ),
     "findings": (
         ("decided_by", "VARCHAR(200)"),
         ("decision_source", "VARCHAR(200)"),

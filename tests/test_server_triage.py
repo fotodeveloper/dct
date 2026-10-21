@@ -111,11 +111,35 @@ def test_instructions_paragraph_names_only_real_triage_tools(srv):
 
 def test_open_triage_ack_and_empty_optionals_stored_as_null(srv):
     ack = srv.open_triage(code="rev-1", topic="t", created_by="me", project="test")
-    assert set(ack) == {"cycle_id", "code", "project"}
-    assert ack["project"] == "test"
+    assert set(ack) == {"cycle_id", "code", "project", "language"}
+    assert ack["project"] == "test" and ack["language"] == "en"  # no [triage] language set
     cycle = srv.export_triage(cycle_id=ack["cycle_id"])["cycle"]
     assert cycle["scope"] is None and cycle["base_commit"] is None
     assert cycle["artifact_url"] is None and cycle["rubric_version"] == 2
+
+
+def test_open_triage_stores_an_explicit_language_and_refuses_an_unknown_one(srv):
+    """#991: the page language belongs to the cycle — stored, exported, and
+    an unknown code is refused naming the shipped ones, nothing written."""
+    ack = srv.open_triage(code="rev-pl", topic="t", created_by="me", project="test",
+                          language=" PL ")
+    assert ack["language"] == "pl"
+    assert srv.export_triage(cycle_id=ack["cycle_id"])["cycle"]["language"] == "pl"
+    out = srv.open_triage(code="rev-xx", topic="t", created_by="me", project="test",
+                          language="xx")
+    assert "unknown language 'xx'" in out["error"] and "en, pl" in out["error"]
+    assert "error" in srv.export_triage(cycle="rev-xx", project="test")
+
+
+def test_open_triage_takes_the_configured_language_when_none_is_given(
+        srv, tmp_path, monkeypatch):
+    config = tmp_path / "dct.toml"
+    config.write_text('[triage]\nlanguage = "pl"\n', encoding="utf-8")
+    monkeypatch.setenv("DCT_CONFIG_PATH", str(config))
+    assert srv.open_triage(code="rev-cfg", topic="t", created_by="me",
+                           project="test")["language"] == "pl"
+    assert srv.open_triage(code="rev-arg", topic="t", created_by="me", project="test",
+                           language="en")["language"] == "en"  # an explicit value wins
 
 
 def test_open_triage_duplicate_code_is_an_error(srv):
@@ -725,7 +749,7 @@ def test_accept_suggestions_takes_each_proposal_with_its_authors_prefix(srv):
                    "without_suggestion": ["K-2"], "already_decided": []}
     stored = _finding_row(srv, _rows(srv.list_findings(project="test"))[0]["id"])
     assert (stored["decision"], stored["decision_opt"], stored["decision_note"]) == (
-        "fix", "b", "[zaakceptowana propozycja Codex] go")
+        "fix", "b", "[accepted proposal Codex] go")
     assert (stored["decided_by"], stored["decision_source"]) == ("owner", "owner paste 2026-10-13")
 
 
@@ -767,7 +791,7 @@ def test_accept_suggestions_with_overwrite_replaces_and_reports_the_decision(srv
     assert out["already_decided"] == ["K-1"]
     stored = _finding_row(srv, _rows(srv.list_findings(project="test"))[0]["id"])
     assert (stored["decision"], stored["decision_note"]) == (
-        "fix", "[zaakceptowana propozycja Codex]")
+        "fix", "[accepted proposal Codex]")
 
 
 def test_update_triage_sets_and_clears_the_page_link(srv):

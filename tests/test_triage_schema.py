@@ -55,7 +55,7 @@ _LEDGER_NAMES = re.compile(
 SPEC_WIDTHS = {
     "triage_cycles": {
         "code": 100, "topic": 200, "base_commit": 64, "artifact_url": 500,
-        "created_by": 200, "closed_source": 200,
+        "created_by": 200, "closed_source": 200, "language": 8,
     },
     "findings": {
         "fingerprint": 500, "fingerprint_norm": 500, "title": 500,
@@ -763,4 +763,38 @@ def test_the_reviewer_table_missing_its_unique_index_is_healed(engine, capsys):
     names = {ix["name"] for ix in sa.inspect(engine).get_indexes("finding_reviewers")}
     assert "ix_finding_reviewers_finding_reviewer_live" in names
     capsys.readouterr()
+    _assert_quiet_bootstraps(engine, capsys)
+
+
+# ── #991: the cycle's page language ──────────────────────────────────────────
+
+
+def test_a_cycle_written_without_a_language_reads_as_polish(engine):
+    """The compatibility default: a row from a writer that predates the column
+    (every such cycle was built from the Polish template)."""
+    pid = _project(engine)
+    with engine.begin() as conn:
+        cid = _cycle(conn, pid)
+        assert conn.execute(sa.select(triage_cycles.c.language)
+                            .where(triage_cycles.c.id == cid)).scalar_one() == "pl"
+
+
+def test_a_cycle_table_without_its_language_gains_it_once_then_stays_quiet(engine, capsys):
+    pid = _project(engine)
+    with engine.begin() as conn:
+        old = _cycle(conn, pid, "rev-old")
+        conn.execute(sa.text("UPDATE triage_cycles SET deleted_at = CURRENT_TIMESTAMP "
+                             "WHERE id = :i"), {"i": old})
+        live = _cycle(conn, pid, "rev-live")
+    with engine.begin() as conn:
+        conn.execute(sa.text("ALTER TABLE triage_cycles DROP COLUMN language"))
+    with pytest.raises(SchemaNotReady, match="language"):
+        check_schema_ready(engine)  # a read-only command refuses the old schema
+
+    create_tables(engine)  # bootstrap 1 adds the column
+    capsys.readouterr()
+    check_schema_ready(engine)
+    with engine.connect() as conn:
+        rows = dict(conn.execute(sa.select(triage_cycles.c.id, triage_cycles.c.language)).all())
+    assert rows == {old: "pl", live: "pl"}  # soft-deleted rows included
     _assert_quiet_bootstraps(engine, capsys)

@@ -84,6 +84,8 @@ dct = [
     "hooks/*.sh",
     "assets/*.md",
     "assets/*.yaml",
+    "assets/*.html",
+    "assets/*.json",
     "skill_sources/*.toml",
     "skill_sources/**/*.md",
     "assets/*.sh",

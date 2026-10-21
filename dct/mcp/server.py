@@ -3408,6 +3408,7 @@ def open_triage(
     base_commit: str = "",
     artifact_url: str = "",
     rubric_version: int = 2,
+    language: str = "",
 ) -> dict:
     """Open a triage cycle — one review round whose findings are recorded, decided and closed.
 
@@ -3428,17 +3429,24 @@ def open_triage(
         base_commit: Optional fixed base commit of the cycle (≤ 64 chars).
         artifact_url: Optional URL of the triage page (≤ 500 chars).
         rubric_version: Review rubric version (default 2; 1..32767).
+        language: Page language of the cycle — a code of dct's triage string
+            table ("en", "pl"). Empty = `[triage] language` of dct.toml, else
+            "en". Fixed for the cycle: its page, rebuilds and the
+            accepted-proposal prefix all use it.
 
-    Returns: slim ack {cycle_id, code, project}. {"error": "..."} on a
-        missing code / topic / created_by, a duplicate live code, an
-        over-long field (refused, never truncated), a rubric_version outside
-        1..32767, tool-call markup, or an unresolvable project.
+    Returns: slim ack {cycle_id, code, project, language} — `language` is
+        the stored one. {"error": "..."} on a missing code / topic /
+        created_by, a duplicate live code, an over-long field (refused,
+        never truncated), a rubric_version outside 1..32767, an unknown
+        language (the message names the shipped ones), tool-call markup, or
+        an unresolvable project.
     """
     if (err := _reject_toolcall_markup(
         code=code, topic=topic, created_by=created_by, scope=scope,
         base_commit=base_commit, artifact_url=artifact_url,
     )):
         return err
+    from dct.config import load_config
     from dct.workflows.triage import open_triage as _open
 
     try:
@@ -3448,6 +3456,7 @@ def open_triage(
             _get_engine(), project_slug, code, topic, created_by,
             scope=scope or None, base_commit=base_commit or None,
             rubric_version=rubric_version, artifact_url=artifact_url or None,
+            language=language.strip() or load_config().triage.language or "en",
         )
     except Exception as e:
         return {"error": str(e)}
@@ -3750,7 +3759,7 @@ def close_triage(
 
     Returns: {cycle_id, project, closed_at, closed} — closed = the CLOSED
         constant {date, source, rubric, notes, answers: {"K-n": {dec, opt,
-        note[, origin]}}} — `origin` (the pasted text's "Punkt wyjścia" line,
+        note[, origin]}}} — `origin` (the pasted text's starting-point line,
         stored as decision_text_origin) is present only when the decision
         came from a prefilled paste. {"error": "..."} — nothing written — on undecided findings
         (listed as K-n), an empty or over-long source, tool-call markup, or a
@@ -3784,23 +3793,27 @@ def decide_findings_from_text(
 ) -> dict:
     """Record the OWNER's decisions pasted as the triage page's generated text — atomically.
 
-    Pass `text` VERBATIM as the owner pasted it (the page's "Tekst do
-    wklejenia"); never compose or edit it — an agent's proposals go to
-    suggest_findings. Grammar: an optional header line "Triage …:" and an
-    optional "Punkt wyjścia: …" line (the page was seeded from proposals)
-    precede the cards; every other non-blank line is one card:
-      K-<n>: <decision>[ · wariant (<k>)][ [annotation]…][ · uwagi: <note>]
-    <decision> = the page label (Fix teraz | Zweryfikuj | Backlog → dct |
-    Odrzuć / zaakceptuj stan | Odnotuj | Do dyskusji; → -> — – / are
-    interchangeable separators) or fix | verify | backlog | reject | note |
-    discuss, case-insensitive. `wariant (k)` must be an option key of that
-    card; bracketed annotations are ignored; the note = everything after the
-    first " · uwagi:" (one leading space dropped), verbatim, one line.
-    K-01 = K-1. Skip rule: a card line "— (brak decyzji)" with an EMPTY
-    note is a card the owner did not address — skipped, its stored state
-    unchanged, listed in `skipped` (its K-n and wariant are still
-    validated); "— (brak decyzji)" WITH a note refuses the whole text. The
-    "Punkt wyjścia" line, when present, is stored verbatim with every
+    Pass `text` VERBATIM as the owner pasted it (the page's "text to
+    paste"); never compose or edit it — an agent's proposals go to
+    suggest_findings. The words come from dct's triage string table and
+    every shipped language is read (en, pl — Polish texts of older pages
+    included). Grammar: an optional header line "Triage …:" and an optional
+    starting-point line ("Starting point: …" / "Punkt wyjścia: …" — the page
+    was seeded from proposals) precede the cards; every other non-blank line
+    is one card:
+      K-<n>: <decision>[ · variant (<k>)][ [annotation]…][ · notes: <note>]
+    (variant / wariant, notes / uwagi). <decision> = a page label of any
+    language (e.g. Fix now | Fix teraz, Reject / accept as is | Odrzuć /
+    zaakceptuj stan; → -> — – / are interchangeable separators) or fix |
+    verify | backlog | reject | note | discuss, case-insensitive. The
+    variant must be an option key of that card; bracketed annotations are
+    ignored; the note = everything after the earliest note separator (one
+    leading space dropped), verbatim, one line. K-01 = K-1. Skip rule: a
+    card line with the no-decision label ("— (no decision)" / "— (brak
+    decyzji)") and an EMPTY note is a card the owner did not address —
+    skipped, its stored state unchanged, listed in `skipped` (its K-n and
+    variant are still validated); the same label WITH a note refuses the
+    whole text. The starting-point line, when present, is stored verbatim with every
     decision this text writes (findings.decision_text_origin; a later
     decision without one resets it) — it proves the form was seeded from
     proposals, not who wrote each note. The text is parsed BEFORE anything
@@ -3826,12 +3839,12 @@ def decide_findings_from_text(
 
     Returns: {cycle_id, project, decided: n, undecided: [seq…], parsed: n,
         skipped: ["K-n"…]} — undecided = the live findings still without a
-        decision after the write; skipped = the "— (brak decyzji)" lines left
+        decision after the write; skipped = the no-decision lines left
         untouched (a text of only such lines decides 0 and writes nothing).
         {"error": "..."} — nothing written — on a parse error (named
         by its 1-based line: an empty or header-only text, a line that is not
-        a card, "— (brak decyzji)" with a note or an unknown decision label, a K-n that
-        is not a card of the cycle or addressed twice, a wariant that is not
+        a card, a no-decision line with a note or an unknown decision label, a K-n that
+        is not a card of the cycle or addressed twice, a variant that is not
         an option of that card), any decide_findings refusal (reject / note
         on a finding promoted to an open item, an empty / over-long
         decided_by or decision_source), tool-call markup, or a missing /
@@ -3869,8 +3882,9 @@ def accept_suggestions(
 
     Call ONLY when the owner said so ("przyjmij propozycje jako ostateczne").
     Every live finding carrying a suggestion gets decision = the suggested
-    dec / opt and note = "[zaakceptowana propozycja <by>] " + the suggested
-    note (<by> = that finding's proposer). Bound to the proposals the owner
+    dec / opt and note = the accepted-proposal prefix in the CYCLE's language
+    ("[accepted proposal <by>] " / "[zaakceptowana propozycja <by>] ") + the
+    suggested note (<by> = that finding's proposer). Bound to the proposals the owner
     saw: refused when any proposal is by someone other than `expected_by`,
     and when the cycle's cards or proposals differ from the page he saw
     (`expected_digest` ≠ the digest recomputed under the cycle lock — a

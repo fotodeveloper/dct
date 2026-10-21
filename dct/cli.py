@@ -2782,14 +2782,14 @@ def _triage_page_filename(code: str) -> str:
 
 def _triage_template_path(args) -> Path:
     """--template, else [triage] template of dct.toml (both ~-expanded), else
-    a refusal naming both ways — dct ships no template."""
+    the template dct ships (#991, triage_page.SHIPPED_TEMPLATE)."""
     raw = args.template
     if raw is None:
         raw = load_config().triage.template
     if not raw:
-        raise ValueError(
-            "no triage page template — pass --template <path> or set it once with "
-            "[triage] template = \"<path>\" in dct.toml (dct ships no template)")
+        from dct.workflows.triage_page import SHIPPED_TEMPLATE
+
+        return SHIPPED_TEMPLATE
     return Path(raw).expanduser()
 
 
@@ -2916,7 +2916,7 @@ def cmd_triage_page(args):
     cycle's triage page from its export (#930 §3; read-only on the database).
 
     The template comes from --template, else [triage] template in dct.toml
-    (dct ships none). The page is built in memory by build_triage_page
+    (else the template dct ships, #991). The page is built in memory by build_triage_page
     (dct/workflows/triage_page.py) from export_triage only; nothing is written
     unless the build succeeds, and an existing --out is replaced only with
     --force (atomically). --out naming a directory writes
@@ -2993,9 +2993,9 @@ def cmd_triage_decide(args):
     OWNER's pasted decision text (the page's "Tekst do wklejenia") recorded
     through decide_findings_from_text: parsed first (a parse error writes
     nothing), then one transaction; only the cards the text decides change.
-    A card line left "— (brak decyzji)" with no note is skipped (K-31) and
-    listed; a "Punkt wyjścia" line is stored as the decisions' text origin
-    (K-40)."""
+    A card line left with the no-decision label and no note is skipped
+    (K-31) and listed; a starting-point line is stored as the decisions'
+    text origin (K-40). Every language of the string table is read (#991)."""
     from dct.workflows.triage import decide_findings_from_text
 
     _require_one_triage_selector(args)
@@ -4330,7 +4330,7 @@ def build_parser() -> argparse.ArgumentParser:
                            help="The page file to write (its directory must exist; a "
                                 "directory = <dir>/<safe code>.html)")
     p_tr_page.add_argument("--template", metavar="PATH",
-                           help="Page template (default: [triage] template in dct.toml)")
+                           help="Page template (default: [triage] template in dct.toml, else the template dct ships)")
     p_tr_page.add_argument("--topic", help="Page title (default: the cycle's topic)")
     p_tr_page.add_argument("--context",
                            help="Eyebrow text (default: the cycle's scope, else its code)")

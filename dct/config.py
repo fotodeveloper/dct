@@ -146,12 +146,16 @@ class UpdateConfig:
 class TriageConfig:
     """[triage] section — #930 triage page build.
 
-    template  path of the triage page template (HTML) that `dct triage page`
+    template  path of a triage page template (HTML) that `dct triage page`
               fills from the ledger when no --template is given; None =
-              unset (dct ships no template — the command then refuses,
-              naming both ways). Stored as written; the CLI expands `~`.
+              unset: the template dct ships (#991) is used. Stored as
+              written; the CLI expands `~`.
+    language  the page language of NEW triage cycles (a code of the
+              shipped string table, #991); None = unset → `en`. A cycle
+              keeps the language it was opened with.
     """
     template: str | None = None
+    language: str | None = None
 
 
 @dataclass
@@ -258,7 +262,11 @@ def load_config(config_path: Path | None = None) -> Config:
     triage_template = triage_section.get("template")
     if triage_template is not None and not isinstance(triage_template, str):
         raise ValueError("triage.template must be a string (a file path)")
-    triage = TriageConfig(template=triage_template or None)
+    triage_language = triage_section.get("language")
+    if triage_language is not None:
+        from dct.workflows.triage_strings import check_language
+        triage_language = check_language(triage_language, "triage.language")
+    triage = TriageConfig(template=triage_template or None, language=triage_language)
 
     # Env var overrides config file
     env_url = os.environ.get("DCT_DATABASE_URL")
@@ -309,10 +317,14 @@ def save_config(config: Config, config_path: Path | None = None) -> Path:
     lines.append('\n[update]\n')
     lines.append(f'check = {str(config.update.check).lower()}\n')
 
-    # TOML has no null: an unset template writes no [triage] section.
-    if config.triage.template:
+    # TOML has no null: unset fields are left out, and a section with
+    # neither field is not written (#991: language survives without template).
+    if config.triage.template or config.triage.language:
         lines.append('\n[triage]\n')
-        lines.append(f'template = {_toml_str(config.triage.template)}\n')
+        if config.triage.template:
+            lines.append(f'template = {_toml_str(config.triage.template)}\n')
+        if config.triage.language:
+            lines.append(f'language = {_toml_str(config.triage.language)}\n')
 
     path.write_text("".join(lines), encoding="utf-8")
     return path

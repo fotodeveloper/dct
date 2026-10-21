@@ -158,6 +158,13 @@ dct/workflows/triage.py  — [one impl] Triage findings ledger (#909): cycles,
                            one parser of the page's decision text; writers of
                            an open cycle serialise on its row
                            (db.lock_cycle_row)
+dct/workflows/triage_strings.py — The triage string table (#991, no DB):
+                           loads and validates dct/assets/triage-strings.json
+                           (same keys per language, no empty text, no
+                           parser spelling with two meanings), serves a
+                           language's texts (STRINGS of the page, the lede,
+                           the accepted-proposal prefix) and the parser's
+                           vocabulary over every language.
 dct/workflows/triage_page.py — Triage page builder (#930, no DB):
                            validate_plain_layer(text, export) checks the
                            plain-language layer (#988, `plain.json` beside
@@ -194,8 +201,9 @@ dct/workflows/triage_page.py — Triage page builder (#930, no DB):
                            (the immutable id last, so the key is injective;
                            drafts kept under the earlier key order are not
                            migrated — ledger decisions and proposals are
-                           unaffected). Used by `dct triage page`; dct ships
-                           no template
+                           unaffected). Used by `dct triage page`; the
+                           template dct ships is dct/assets/triage-page.html
+                           (#991; SHIPPED_TEMPLATE)
 dct/workflows/release/   — Release workflow (K-72): proof layer, read-only for
                            index, refs, work tree and database (the plan may
                            write unreferenced git objects to build the future
@@ -283,7 +291,7 @@ SQLAlchemy Core tables (not the ORM) with a `deleted_at` column for soft deletes
 - `item_tags` — link table (item_id, tag_id, assigned_at, removed_at), mirroring `item_sprints`: composite PK, links are soft-removed and reactivated in place.
 
 **Triage findings ledger** (#909, `dct/workflows/triage.py`):
-- `triage_cycles` — one review round: project_id, code (e.g. `rev-877-r2`, UNIQUE per project among live rows), topic, scope (what was reviewed), base_commit, rubric_version (default 2), artifact_url, created_by, opened_at, closed_at (NULL = open), closed_source / closed_notes (the CLOSED block's source and notes).
+- `triage_cycles` — one review round: project_id, code (e.g. `rev-877-r2`, UNIQUE per project among live rows), topic, scope (what was reviewed), base_commit, rubric_version (default 2), language (#991: the page language, a string-table code, fixed at open; `pl` for cycles that predate the column), artifact_url, created_by, opened_at, closed_at (NULL = open), closed_source / closed_notes (the CLOSED block's source and notes).
 - `findings` — cycle_id, seq (the K-n number, UNIQUE per cycle among live rows), fingerprint + fingerprint_norm (the recurrence identity, normalisation v1 below), title; the rubric v2 fields under full names: impact (S, 0-3), reachability (O, `0`-`3` \| `?`), evidence (E, 0-3), fix_cost (K, S \| M \| L), origin (diff \| pre \| latent), finding_type — all six NOT NULL (rubric §1, K-4); suggested_decision / suggested_opt / suggested_note / suggested_by / suggested_at (an agent's proposal — the template's SUGGESTED — never a decision); the template flags conflict / violation (default true) / dispute / open_design; area (where), reviewer (the CARD's `src`: `codex`, `panel:security`, … — not `source`, which is the provenance column), context; class_rec (classify()) / class_override / class_reason; decision (NULL = undecided) / decision_opt / decision_note (the owner's comment verbatim) / decided_at / decided_by (who decided) / decision_source (where the owner's words are recorded) — the last three NULL while undecided and written together (K-5 / decision_actor_type / decision_actor_client / decision_session_id / decision_actor_source (the LAST decision's writer, read from the provenance context in the same UPDATE as decided_at, refreshed as a set on every overwrite and NULL before a decision — an audit record, never backfilled, not authentication; the row's creation provenance stays untouched); an audit record distinct from the provenance columns, not authentication); decision_text_origin (TEXT, NULL — #930 K-40: the "Punkt wyjścia:" line of the pasted decision text that wrote this decision, verbatim; written with the decision stamp, reset to NULL by a later decision without one; it proves the form was seeded from proposals, not who wrote the note; exposed as CLOSED.answers[K-n].origin — key present only when non-NULL, K-45); item_id (promoted to), first_seen_id (self-FK: the earliest live finding of the project with the same fingerprint_norm; NULL = first). Indexed on cycle_id and fingerprint_norm. fingerprint_norm uses normalisation v1 (NFC + lower + whitespace collapse + fixed-point trailing punctuation strip, `triage.normalize_fingerprint`); the ledger shipped with it, so no reconciliation of earlier norms exists.
 - `finding_options` — finding_id, key (UNIQUE per finding among live rows), text, why, is_root, is_recommended (at most one per finding, checked in code).
 - `finding_reviewers` (#930, migration 015) — finding_id (FK findings, NOT NULL), reviewer (VARCHAR(50), a canonical token `^[a-z0-9][a-z0-9:._-]*$`, lowercased on write and refused otherwise — never guessed from the free-text `src`); UNIQUE (finding_id, reviewer) among live rows. The reviewer identity behind `reviewer_precision` (a finding with two reviewers counts for both; one without rows counts under `(unattributed)`) and the `reviewer` filter of `list_findings`; the CARD's `reviewers` list. No backfill: findings recorded before #930 stay unattributed.
@@ -424,10 +432,12 @@ refresh_poll_ms = 2000   # SSE change-token poll interval
 check = true
 
 [triage]
-# The triage page template used by `dct triage page` (#930) when no
-# --template is given. dct ships no template; without either the command
-# refuses and names both ways.
+# Optional: a triage page template `dct triage page` uses when no --template
+# is given (#930); unset = the template dct ships (#991).
 template = "/path/to/triage-template.html"
+# The page language of NEW triage cycles (#991): a code of the string table
+# (en, pl); unset = en. A cycle keeps the language it was opened with.
+language = "en"
 ```
 
 **Environment overrides**: `DCT_DATABASE_URL` overrides `[database].url`;

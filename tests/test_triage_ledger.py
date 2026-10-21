@@ -2213,7 +2213,7 @@ class TestClosedOrigin:
         assert closed["answers"]["K-1"] == {"dec": "fix", "opt": "a", "note": "Tak — (a).",
                                             "origin": PREFILL}
         assert closed["answers"]["K-2"] == {
-            "dec": "note", "opt": "", "note": "[zaakceptowana propozycja Codex] proposal"}
+            "dec": "note", "opt": "", "note": "[accepted proposal Codex] proposal"}
         assert export_triage(eng, cycle_id)["closed"] == closed
 
     def test_a_decision_rewritten_without_the_prefill_line_carries_no_origin(
@@ -2247,9 +2247,9 @@ class TestAcceptSuggestions:
                        "already_decided": []}
         k1, k2 = _row(eng, 1), _row(eng, 2)
         assert (k1["decision"], k1["decision_opt"], k1["decision_note"]) == (
-            "fix", "b", "[zaakceptowana propozycja Codex] bo [b] · prościej")
+            "fix", "b", "[accepted proposal Codex] bo [b] · prościej")
         assert (k2["decision"], k2["decision_opt"], k2["decision_note"]) == (
-            "backlog", None, "[zaakceptowana propozycja Codex]")
+            "backlog", None, "[accepted proposal Codex]")
         assert (k1["decided_by"], k1["decision_source"]) == (
             OWNER["decided_by"], OWNER["decision_source"])
         # the proposal itself stays recorded as a proposal
@@ -2579,3 +2579,39 @@ class TestNewWritersRace:
         assert isinstance(outcome, ValueError), outcome
         assert "changed since the export the owner saw" in str(outcome)
         assert _row(eng, 1)["decision"] is None
+
+
+# ── #991: the cycle's page language ──────────────────────────────────────────
+
+
+def _notes(eng, cycle_id):
+    with eng.connect() as conn:
+        return [r[0] for r in conn.execute(
+            sa.select(findings.c.decision_note).where(findings.c.cycle_id == cycle_id)
+            .order_by(findings.c.seq))]
+
+
+class TestCycleLanguage:
+    def test_the_accept_prefix_follows_the_language_the_cycle_was_opened_with(self, engine):
+        create_project(engine, "proj-a", "A")
+        cycles = {lang: open_triage(engine, "proj-a", f"rev-{lang}", "t", "me",
+                                    **({"language": lang} if lang != "default" else {})
+                                    )["cycle_id"] for lang in ("pl", "en", "default")}
+        for cycle_id in cycles.values():
+            _recorded(engine, cycle_id, finding())
+            suggest_findings(engine, cycle_id, "Codex", {"K-1": {"dec": "fix", "note": "go"}})
+            accept(engine, cycle_id)
+        assert _notes(engine, cycles["pl"]) == ["[zaakceptowana propozycja Codex] go"]
+        assert _notes(engine, cycles["en"]) == ["[accepted proposal Codex] go"]
+        assert _notes(engine, cycles["default"]) == ["[accepted proposal Codex] go"]
+
+    def test_the_language_is_stored_exported_and_validated(self, engine):
+        create_project(engine, "proj-a", "A")
+        ack = open_triage(engine, "proj-a", "rev-1", "t", "me", language="PL")
+        assert ack["language"] == "pl"
+        assert export_triage(engine, ack["cycle_id"])["cycle"]["language"] == "pl"
+        with pytest.raises(ValueError, match="open_triage: language: unknown language 'de'"):
+            open_triage(engine, "proj-a", "rev-2", "t", "me", language="de")
+        with engine.connect() as conn:  # nothing written for the refused one
+            assert conn.execute(sa.select(sa.func.count()).select_from(triage_cycles)
+                                .where(triage_cycles.c.code == "rev-2")).scalar_one() == 0

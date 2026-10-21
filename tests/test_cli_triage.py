@@ -369,15 +369,19 @@ def test_page_template_comes_from_the_config_with_tilde_expanded(
     assert "<h1 id=cfg>" not in explicit.read_text(encoding="utf-8")  # --template wins
 
 
-def test_page_without_any_template_names_both_ways_and_writes_nothing(
-        monkeypatch, capsys, two_cards, tmp_path):
+def test_page_without_any_template_uses_the_shipped_one(
+        monkeypatch, capsys, cli_engine, two_cards, tmp_path):
+    """#991: no --template and no [triage] template → the template dct ships,
+    in the cycle's language (en by default)."""
     monkeypatch.setenv("DCT_CONFIG_PATH", str(tmp_path / "absent.toml"))
     out = tmp_path / "p.html"
     code, _o, err = _run(monkeypatch, capsys, "page", "rev-2", "--project", "proj-a",
                          "--out", str(out))
-    assert code == 1
-    assert "--template" in err and "[triage] template" in err
-    assert not out.exists()
+    assert code == 0, err
+    page = out.read_text(encoding="utf-8")
+    assert "<title>Triage review two</title>" in page
+    assert _page_constant(page, "STRINGS")["page.status_open"] == "Open — awaiting decisions"
+    assert _page_constant(page, "CARDS") == export_triage(cli_engine, two_cards)["cards"]
 
 
 def test_page_refuses_an_existing_out_without_force(monkeypatch, capsys, two_cards, template,
@@ -665,7 +669,7 @@ def test_accept_takes_the_proposals_and_reports_the_rest(monkeypatch, capsys, cl
     assert "Accepted 1 proposal(s) by Codex" in stdout and "undecided: K-2" in stdout
     assert "without a proposal (untouched): K-2" in stdout
     assert _decisions(cli_engine, two_cards)[1] == (
-        "fix", "b", "[zaakceptowana propozycja Codex] go", "owner", "chat 2026-10-14")
+        "fix", "b", "[accepted proposal Codex] go", "owner", "chat 2026-10-14")
 
 
 def test_accept_refuses_proposals_the_owner_did_not_see(monkeypatch, capsys, cli_engine,
@@ -717,7 +721,7 @@ def test_accept_replaces_a_decision_only_with_overwrite(monkeypatch, capsys, cli
     code, stdout, _e = _run(monkeypatch, capsys, *argv, "--overwrite")
     assert code == 0 and "replaced earlier decisions: K-1" in stdout
     assert _decisions(cli_engine, two_cards)[1][:3] == (
-        "fix", None, "[zaakceptowana propozycja Codex]")
+        "fix", None, "[accepted proposal Codex]")
 
 
 # ── close ────────────────────────────────────────────────────────────────────

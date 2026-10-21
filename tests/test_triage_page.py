@@ -51,11 +51,12 @@ from dct.workflows.triage import (
     suggest_findings,
 )
 from dct.workflows.triage_page import (
-    LEDE_LEGEND,
+    SHIPPED_TEMPLATE,
     build_triage_page,
     default_lede,
     storage_key_parts,
 )
+from dct.workflows.triage_strings import strings
 
 SKELETON = """<!doctype html>
 <meta charset="utf-8">
@@ -75,6 +76,7 @@ const STORAGE_KEY = 'triage-{{projekt}}-{{temat}}-v1';
 const CLOSED = null;
 /* const SUGGESTED = 'block comment'; */
 const SUGGESTED = null;
+const STRINGS = {};
 const NOTE = "const CARDS = []; is only text here";
 const DECISIONS = [
   { v: 'fix', label: 'Fix teraz' },
@@ -100,7 +102,8 @@ HOSTILE = "</script><script>alert(1)</script> <!-- &     {{TEMAT}} const CLO
 
 def _export(**over):
     cycle = {"id": 7, "project": "proj-a", "code": "rev-1", "topic": "review of X",
-             "scope": None, "base_commit": None, "rubric_version": 2, "artifact_url": None,
+             "scope": None, "base_commit": None, "rubric_version": 2, "language": "pl",
+             "artifact_url": None,
              "created_by": "me", "opened_at": "2026-10-12T08:00:00", "closed_at": None}
     cycle.update(over.pop("cycle", {}))
     card = {"id": "K-1", "title": "T", "area": "", "src": "codex", "S": 2, "O": 1, "E": 2,
@@ -113,7 +116,8 @@ def _export(**over):
 
 def _constant(page: str, name: str):
     """The value of `const NAME = <json>;` in the built page, parsed back."""
-    starts = [m.end() for m in re.finditer(rf"^const {name} = ", page, re.MULTILINE)]
+    starts = [m.end() for m in re.finditer(rf"^const {name} = ", page, re.MULTILINE)] or [
+        m.end() for m in re.finditer(rf"^  const {name} = ", page, re.MULTILINE)]  # shipped page
     assert len(starts) == 1, (name, len(starts))
     value, end = json.JSONDecoder().raw_decode(page, starts[0])
     assert page[end] == ";"
@@ -224,7 +228,7 @@ def test_a_template_outside_the_contract_is_refused(template, match):
 
 
 @pytest.mark.parametrize(("template", "match"), [
-    (SKELETON.replace("{{DATA}}", "{{DATE}}", 1), "unknown placeholder '{{DATE}}'"),
+    (SKELETON.replace("{{DATA}}", "{{DATUM}}", 1), "unknown placeholder '{{DATUM}}'"),
     (SKELETON.replace("{{KONTEKST}}", "{{ TEMAT }}", 1), "unknown placeholder '{{ TEMAT }}'"),
     (SKELETON.replace("'use strict';", "'use strict'; const Q = '{{x}}';", 1),
      "unknown placeholder '{{x}}'"),
@@ -445,7 +449,7 @@ def test_metadata_is_escaped_as_html_text_in_markup():
 
 def test_metadata_inside_a_script_string_is_a_js_escape_that_cannot_break_out():
     page = build_triage_page(_export(), SKELETON, topic=TOPIC)
-    line = next(ln for ln in _script(page).splitlines() if "decyzje ownera" in ln)
+    line = next(ln for ln in _script(page).splitlines() if ln.startswith("  return 'Triage"))
     assert line == (
         "  return 'Triage Orders \\u003cb\\u003e\\u0026\\u003c\\u002fb\\u003e \\u0022quotes\\u0022 "
         "\\u0027single\\u0027 \\\\ back \\u0024x \\u0060tick\\u0060 line2 (proj-a) "
@@ -512,7 +516,11 @@ def test_defaults_come_from_the_export_not_the_clock():
     page = build_triage_page(_export(cycle={"scope": None}), SKELETON)
     assert "<title>Triage review of X</title>" in page
     assert '<div class="eyebrow">proj-a · rev-1 · 2026-10-12</div>' in page
-    assert f'<p class="lede">1 karta · rubric v2 · cykl rev-1. {LEDE_LEGEND}</p>' in page
+    assert ('<p class="lede">1 karta · rubric v2 · cykl rev-1. Klasa karty jest rekomendacją '
+            'wyliczoną z pól rubryki, nie decyzją; decyzja (Fix teraz / Zweryfikuj / '
+            'Backlog → dct / Odrzuć / Odnotuj / Do dyskusji) należy do ownera.</p>') in page
+    english = build_triage_page(_export(cycle={"language": "en"}), SKELETON)
+    assert '<p class="lede">1 card · rubric v2 · cycle rev-1. A card' in english
     scoped = build_triage_page(_export(cycle={"scope": "abc..def"}), SKELETON)
     assert '<div class="eyebrow">proj-a · abc..def · 2026-10-12</div>' in scoped
 
@@ -572,10 +580,10 @@ def test_the_pairs_that_collided_with_the_id_in_the_middle_get_different_keys(on
 
 
 @pytest.mark.parametrize(("project", "code", "parts"), [
-    ("proj-a", "Przegląd ŻÓŁW #2", {"projekt": "proj-a", "temat": "przeglad-zow-2-c7"}),
-    ("proj-a", "!!!", {"projekt": "proj-a", "temat": "c7"}),
-    ("My Project", "r1", {"projekt": "my-project", "temat": "r1-c7"}),
-    ("łłł", "r1", {"projekt": "project", "temat": "r1-c7"}),
+    ("proj-a", "Przegląd ŻÓŁW #2", {"project": "proj-a", "topic": "przeglad-zow-2-c7"}),
+    ("proj-a", "!!!", {"project": "proj-a", "topic": "c7"}),
+    ("My Project", "r1", {"project": "my-project", "topic": "r1-c7"}),
+    ("łłł", "r1", {"project": "project", "topic": "r1-c7"}),
 ])
 def test_storage_key_parts_are_slugs(project, code, parts):
     got = storage_key_parts(_export(cycle={"project": project, "code": code}))
@@ -613,91 +621,48 @@ def test_a_page_built_from_a_real_export_round_trips_the_ledger(engine):
     assert "</" not in _script(closed_page)
 
 
-# ── producer → parser: the page's own generate() (node) ─────────────────────
+# ── producer → parser: the shipped page's buildDecisionText (node) ──────────
 
-# A page around a VERBATIM copy of the template's generate() (the producer of
-# the "Tekst do wklejenia"), its DECISIONS / CLASSES and its state helpers;
-# only the class derivation (classify) and the DOM are stubbed. The state is
-# set by the test, the output is what the owner pastes.
-GENERATOR = """<!doctype html>
-<meta charset="utf-8">
-<title>Triage {{TEMAT}}</title>
-<script>
-(function () {
-  'use strict';
-  const STORAGE_KEY = 'triage-{{projekt}}-{{temat}}-v1';
-  const RUBRIC_VERSION = 2;
-  const CLOSED = null;
-  const SUGGESTED = null;
-  const DECISIONS = [
-    { v: 'fix', label: 'Fix teraz' },
-    { v: 'verify', label: 'Zweryfikuj' },
-    { v: 'backlog', label: 'Backlog → dct' },
-    { v: 'reject', label: 'Odrzuć / zaakceptuj stan' },
-    { v: 'note', label: 'Odnotuj' },
-    { v: 'discuss', label: 'Do dyskusji' },
-  ];
-  const CLASSES = {
-    fix:     { label: 'Fix now',   dec: 'fix',     chip: 'high' },
-    verify:  { label: 'Verify',    dec: 'verify',  chip: 'med' },
-    quick:   { label: 'Quick win', dec: 'fix',     chip: 'ok' },
-    decide:  { label: 'Decide',    dec: 'discuss', chip: 'owner' },
-    backlog: { label: 'Backlog',   dec: 'backlog', chip: 'low' },
-    reject:  { label: 'Reject',    dec: 'reject',  chip: 'pre' },
-    note:    { label: 'Note',      dec: 'note',    chip: 'pre' },
-  };
-  const CLASS_ORDER = ['fix', 'verify', 'quick', 'decide', 'backlog', 'reject', 'note'];
-  const CARDS = [];
-  function classify(c) { return 'decide'; } // stub: the page derives it from the rubric fields
-  function cls(c) { return c.cls || classify(c); }
-  function recDec(c) { return CLASSES[cls(c)].dec; }
-  const SUGG = !CLOSED && SUGGESTED ? SUGGESTED : null;
-  const state = globalThis.STATE;
-  function s(id) { state[id] = state[id] || { opt: '', dec: '', note: '' }; return state[id]; }
-  function byClass() { return CARDS.slice().sort(function (a, b) { return CLASS_ORDER.indexOf(cls(a)) - CLASS_ORDER.indexOf(cls(b)); }); }
-  const OUT = { value: '' };
-  const document = { getElementById: function () { return OUT; } };
-  function generate() {
-    // A record carries the date of the decision, not the moment somebody opens the page.
-    const stamp = CLOSED ? CLOSED.date : new Date().toISOString().slice(0, 16).replace('T', ' ');
-    const lines = ['Triage {{TEMAT}} ({{projekt}}) — decyzje ownera (' + stamp + '), rubric v' + RUBRIC_VERSION + ':'];
-    if (SUGG) lines.push('Punkt wyjścia: propozycje ' + SUGG.by + (SUGG.date ? ' z ' + SUGG.date : '') + ' — wstępnie wypełnione, to nie są decyzje; poniżej stan formularza.');
-    byClass().forEach(function (c) {
-      const st = s(c.id);
-      const dec = DECISIONS.find(function (d) { return d.v === st.dec; });
-      const opt = c.opts.find(function (o) { return o.k === st.opt; });
-      let line = c.id + ': ' + (dec ? dec.label : '— (brak decyzji)');
-      if (opt) line += ' · wariant (' + opt.k + ')' + (opt.rec ? '' : ' [inny niż rekomendacja]');
-      if (st.dec && st.dec !== recDec(c)) line += ' [inna niż klasa ' + CLASSES[cls(c)].label + ']';
-      if (st.note && st.note.trim()) line += ' · uwagi: ' + st.note.trim().replace(/\\s+/g, ' ');
-      lines.push(line);
-    });
-    const out = document.getElementById('out'); out.value = lines.join('\\n'); return out.value;
-  }
-  globalThis.generate = generate;
-})();
-</script>
-"""
+# #991 Q1: the producer under test is the SHIPPED template's own pure
+# buildDecisionText (the region between its <decision-text> markers), run
+# from the built page — never a copy — with the page's own META and STRINGS.
 
 
-def _generate(page: str, state: dict, tmp_path) -> str:
-    """Run the built page's generate() in node with the form `state`
-    ({"K-n": {dec, opt, note}}) → the decision text it emits."""
+def _region(page: str) -> str:
+    start = page.index("// <decision-text>")
+    return page[start:page.index("// </decision-text>")]
+
+
+def _decision_text(export: dict, answers: dict, tmp_path, *, stamp="2026-10-21 10:00") -> str:
+    """The decision text the shipped page writes for the form `answers`
+    ({"K-n": {dec, opt, note, resp}}) of `export`, run in node."""
     node = shutil.which("node")
     if node is None:
         pytest.skip("node not installed")
-    script = tmp_path / "generate.js"
-    script.write_text(f"globalThis.STATE = {json.dumps(state)};\n" + _script(page)
-                      + "\nprocess.stdout.write(generate());\n", encoding="utf-8")
+    page = build_triage_page(export, SHIPPED_TEMPLATE.read_text(encoding="utf-8"))
+    meta = re.search(r"^\s*const META = .*;$", page, re.MULTILINE)
+    assert meta is not None
+    suggested = (export["suggested"] or {}).get("answers") or {}
+    proposals = {k: {"by": a["by"], "note": a["note"] or ""} for k, a in suggested.items()}
+    proposers = ", ".join(dict.fromkeys(
+        suggested[c["id"]]["by"] for c in export["cards"] if c["id"] in suggested))
+    data = {"cards": export["cards"], "answers": answers, "proposals": proposals,
+            "proposers": proposers, "proposalsDate": (export["suggested"] or {}).get("date") or "",
+            "strings": _constant(page, "STRINGS"), "rubric": 2, "stamp": stamp}
+    script = tmp_path / "decision-text.js"
+    script.write_text(
+        _region(page) + "\n" + meta.group(0) + f"\nconst INPUT = {json.dumps(data)};\n"
+        "INPUT.topic = META.topic; INPUT.project = META.project;\n"
+        "process.stdout.write(buildDecisionText(INPUT));\n", encoding="utf-8")
     run = subprocess.run([node, str(script)], capture_output=True, text=True, check=False)
     assert run.returncode == 0, run.stderr
     return run.stdout
 
 
-def _ledger_cycle(engine, topic="review of X"):
+def _ledger_cycle(engine, topic="review of X", language="pl"):
     """proj-a / rev-1 with K-1 (options a, b), K-2 (option a) and K-3 (none)."""
     create_project(engine, "proj-a", "A")
-    cycle_id = open_triage(engine, "proj-a", "rev-1", topic, "me")["cycle_id"]
+    cycle_id = open_triage(engine, "proj-a", "rev-1", topic, "me", language=language)["cycle_id"]
     base = {"S": 1, "O": 1, "E": 1, "K": "S", "origin": "diff", "type": "correctness",
             "src": "codex"}
     record_findings(engine, cycle_id, [
@@ -722,18 +687,21 @@ EMPTY = {"dec": "", "opt": "", "note": ""}
 
 
 @pytest.mark.slow
+@pytest.mark.parametrize("lang", ["pl", "en"])
 class TestGeneratedTextIsDecided:
-    def test_an_untouched_card_is_skipped_and_keeps_its_earlier_decision(self, engine, tmp_path):
+    def test_an_untouched_card_is_skipped_and_keeps_its_earlier_decision(
+            self, engine, tmp_path, lang):
         """K-31: K-2 was decided earlier; the owner leaves it blank in the
-        form — its line reads "— (brak decyzji)", it is skipped, its
+        form — its line carries the no-decision label, it is skipped, its
         stored decision survives; K-1 / K-3 are written."""
-        cycle_id = _ledger_cycle(engine)
+        words = strings(lang)
+        cycle_id = _ledger_cycle(engine, language=lang)
         decide_findings(engine, cycle_id, {"K-2": {"dec": "backlog", "note": "earlier"}},
                         decided_by="owner", decision_source="chat 2026-10-13")
-        page = build_triage_page(export_triage(engine, cycle_id), GENERATOR)
-        text = _generate(page, {"K-1": {"dec": "fix", "opt": "b", "note": "  tak,\n (b)  "},
-                                "K-2": EMPTY, "K-3": {**EMPTY, "dec": "note"}}, tmp_path)
-        assert "K-2: — (brak decyzji)" in text.splitlines()
+        text = _decision_text(export_triage(engine, cycle_id),
+                              {"K-1": {"dec": "fix", "opt": "b", "note": "  tak,\n (b)  "},
+                               "K-2": EMPTY, "K-3": {**EMPTY, "dec": "note"}}, tmp_path)
+        assert f"K-2: {words['decision.none']}" in text.splitlines()
 
         out = decide_findings_from_text(engine, cycle_id, text, **OWNER)
 
@@ -743,53 +711,69 @@ class TestGeneratedTextIsDecided:
         assert stored["K-2"] == ("backlog", None, "earlier", "owner", None)
         assert stored["K-3"][:2] == ("note", None)
 
-    def test_a_note_without_a_decision_refuses_the_whole_text(self, engine, tmp_path):
-        cycle_id = _ledger_cycle(engine)
-        page = build_triage_page(export_triage(engine, cycle_id), GENERATOR)
-        text = _generate(page, {"K-1": {"dec": "fix", "opt": "a", "note": ""},
-                                "K-2": {**EMPTY, "opt": "a", "note": "jeszcze nie wiem"},
-                                "K-3": EMPTY}, tmp_path)
-        line = text.splitlines().index("K-2: — (brak decyzji) · wariant (a) · uwagi: "
-                                       "jeszcze nie wiem") + 1
+    @pytest.mark.parametrize("dec", ["fix", "verify", "backlog", "reject", "note", "discuss"])
+    def test_every_decision_round_trips(self, engine, tmp_path, lang, dec):
+        cycle_id = _ledger_cycle(engine, language=lang)
+        text = _decision_text(export_triage(engine, cycle_id),
+                              {"K-1": {"dec": dec, "opt": "b", "note": "n"}}, tmp_path)
+        assert f"K-1: {strings(lang)['decision.' + dec]}" in text
+        out = decide_findings_from_text(engine, cycle_id, text, **OWNER)
+        assert out["decided"] == 1
+        assert _stored(engine, cycle_id)["K-1"][:3] == (dec, "b", "n")
+
+    def test_a_note_without_a_decision_refuses_the_whole_text(self, engine, tmp_path, lang):
+        words = strings(lang)
+        cycle_id = _ledger_cycle(engine, language=lang)
+        text = _decision_text(export_triage(engine, cycle_id),
+                              {"K-1": {"dec": "fix", "opt": "a", "note": ""},
+                               "K-2": {**EMPTY, "opt": "a", "note": "jeszcze nie wiem"},
+                               "K-3": EMPTY}, tmp_path)
+        line = text.splitlines().index(
+            f"K-2: {words['decision.none']} · {words['text.variant']} (a) · "
+            f"{words['text.notes']}: jeszcze nie wiem") + 1
         with pytest.raises(ValueError, match=rf"line {line} \(K-2\): K-2 has a note but no"):
             decide_findings_from_text(engine, cycle_id, text, **OWNER)
         assert all(v[0] is None for v in _stored(engine, cycle_id).values())
 
-    def test_an_untouched_form_decides_nothing(self, engine, tmp_path):
-        cycle_id = _ledger_cycle(engine)
-        page = build_triage_page(export_triage(engine, cycle_id), GENERATOR)
-        text = _generate(page, {}, tmp_path)
+    def test_an_untouched_form_decides_nothing(self, engine, tmp_path, lang):
+        cycle_id = _ledger_cycle(engine, language=lang)
+        text = _decision_text(export_triage(engine, cycle_id), {}, tmp_path)
         out = decide_findings_from_text(engine, cycle_id, text, **OWNER)
         assert out == {"decided": 0, "undecided": [1, 2, 3], "parsed": 0,
                        "skipped": ["K-1", "K-2", "K-3"]}
 
-    def test_a_prefilled_form_stores_its_origin_line_and_the_notes_verbatim(
-        self, engine, tmp_path,
-    ):
-        """K-40: the page was seeded from Codex's proposals; K-1 is accepted
-        as proposed, K-2's note edited, K-3 left blank. The generated
-        "Punkt wyjścia" line lands verbatim in decision_text_origin of K-1 and
-        K-2 only; the notes stay exactly as pasted."""
-        cycle_id = _ledger_cycle(engine, topic="review\r\nof X")
+    def test_reactions_to_proposals_and_the_origin_line_are_stored_verbatim(
+            self, engine, tmp_path, lang):
+        """K-40 + #945: the page was seeded from Codex's proposals. K-1 is
+        accepted with an owner comment, K-2 accepted with changes and a note
+        quoting BOTH languages' note separators, K-3 left blank. The
+        starting-point line lands verbatim in decision_text_origin; each note
+        is the reaction tag, the proposal text and the owner's words."""
+        words = strings(lang)
+        cycle_id = _ledger_cycle(engine, topic="review\r\nof X", language=lang)
         suggest_findings(engine, cycle_id, "Codex", {
-            "K-1": {"dec": "fix", "opt": "a", "note": "propozycja"},
-            "K-2": {"dec": "backlog", "note": "później"}})
-        page = build_triage_page(export_triage(engine, cycle_id), GENERATOR)
-        text = _generate(page, {"K-1": {"dec": "fix", "opt": "a", "note": "propozycja"},
-                                "K-2": {"dec": "reject", "opt": "",
-                                        "note": "Nie — [x] · uwagi: inaczej"},
-                                "K-3": EMPTY}, tmp_path)
+            "K-1": {"dec": "fix", "opt": "a", "note": "proposal one"},
+            "K-2": {"dec": "backlog", "note": "later"}})
+        tricky = "Nie — [x] · uwagi: inaczej · notes: also"
+        text = _decision_text(export_triage(engine, cycle_id), {
+            "K-1": {"dec": "fix", "opt": "a", "note": "mine", "resp": "accept"},
+            "K-2": {"dec": "reject", "opt": "", "note": tricky, "resp": "amend"},
+            "K-3": EMPTY}, tmp_path)
         lines = text.splitlines()
-        assert lines[0].startswith("Triage review of X (proj-a) — decyzje ownera (")  # K-33
+        assert lines[0].startswith("Triage review of X (proj-a) — ")  # K-33: one header line
         prefill = lines[1]
-        assert prefill.startswith("Punkt wyjścia: propozycje Codex z ")
+        assert prefill.startswith(words["text.prefill_prefix"] + " ")
 
         out = decide_findings_from_text(engine, cycle_id, text, **OWNER)
 
         assert (out["decided"], out["skipped"]) == (2, ["K-3"])
         stored = _stored(engine, cycle_id)
-        assert stored["K-1"] == ("fix", "a", "propozycja", "owner", prefill)
-        assert stored["K-2"] == ("reject", None, "Nie — [x] · uwagi: inaczej", "owner", prefill)
+        accepted = words["response.accept_tag"].replace("{by}", "Codex")
+        amended = words["response.amend_tag"].replace("{by}", "Codex")
+        assert stored["K-1"] == (
+            "fix", "a", f"{accepted} proposal one {words['text.owner_comment']} mine",
+            "owner", prefill)
+        assert stored["K-2"] == ("reject", None, f"{amended} {tricky}", "owner", prefill)
         assert stored["K-3"] == (None, None, None, None, None)
 
 

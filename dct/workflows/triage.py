@@ -55,7 +55,8 @@ Contracts:
   are never guessed from `src`. reviewer_precision counts per token.
 - Owner decisions arrive as a dict (decide_findings), as the page's pasted
   decision text (decide_findings_from_text — parse_decision_batch is the one
-  parser of it: skipped "— (brak decyzji)" cards, K-31, and the prefill
+  parser of it, every language of the string table (#991): skipped
+  no-decision cards, K-31, and the prefill
   line stored in decision_text_origin, K-40) or as an acceptance of an
   agent's proposals (accept_suggestions, bound to the suggestion_digest of
   the export the owner saw, K-32); all three validate and write through one
@@ -92,7 +93,7 @@ from dct.db import (
     projects,
     triage_cycles,
 )
-from dct.workflows import rubric
+from dct.workflows import rubric, triage_strings
 
 # ── input vocabulary ─────────────────────────────────────────────────────────
 
@@ -611,13 +612,19 @@ def open_triage(
     base_commit: str | None = None,
     rubric_version: int = 2,
     artifact_url: str | None = None,
+    language: str = triage_strings.DEFAULT_LANGUAGE,
 ) -> dict:
-    """Open a triage cycle of `project` → {cycle_id, code, project}.
+    """Open a triage cycle of `project` → {cycle_id, code, project, language}.
 
     `code` is unique among the project's live cycles (a duplicate is refused);
     code / topic / created_by are required; every VARCHAR is width-checked.
+    `language` (#991) is the page language of the cycle — a code of the
+    shipped string table, refused otherwise — fixed for the cycle's life:
+    every page build, the lede and accept_suggestions' note prefix use it.
+    Adapters resolve an omitted value from `[triage] language`, else `en`.
     """
     where = "open_triage"
+    language = triage_strings.check_language(language, f"{where}: language")
     values = {
         "code": _required_text(code, "code", where),
         "topic": _required_text(topic, "topic", where),
@@ -645,7 +652,7 @@ def open_triage(
                     f"(#{duplicate.id})")
             cycle_id = conn.execute(
                 triage_cycles.insert().values(
-                    project_id=project_id, rubric_version=rubric_version,
+                    project_id=project_id, rubric_version=rubric_version, language=language,
                     opened_at=now, created_at=now, updated_at=now, **values,
                 )
             ).inserted_primary_key[0]
@@ -653,7 +660,7 @@ def open_triage(
         # A concurrent open of the same code won the live-unique index.
         raise ValueError(
             f"Triage cycle '{code}' already exists in project '{project}'") from exc
-    return {"cycle_id": cycle_id, "code": code, "project": project}
+    return {"cycle_id": cycle_id, "code": code, "project": project, "language": language}
 
 
 # ── record ───────────────────────────────────────────────────────────────────
@@ -970,42 +977,33 @@ def suggest_findings(
 
 # ── decision text / acceptance / cycle update (#930) ─────────────────────────
 
-# The decision labels of the triage page — the template's DECISIONS, in
-# Polish because the page emits them — and the English decision tokens,
-# each → its rubric decision. Matched case-insensitively after
-# _label_key(); the page's "— (brak decyzji)" marks an undecided card.
-DECISION_LABELS: dict[str, str] = {
-    "Fix teraz": "fix",
-    "Zweryfikuj": "verify",
-    "Backlog → dct": "backlog",
-    "Odrzuć / zaakceptuj stan": "reject",
-    "Odnotuj": "note",
-    "Do dyskusji": "discuss",
-    **{token: token for token in rubric.DECISIONS},
-}
-NO_DECISION_LABEL = "— (brak decyzji)"
-# The page's header line ("Triage <topic> (<project>) — decyzje ownera
-# (<stamp>), rubric v<n>:") and its optional prefill line ("Punkt wyjścia:
-# propozycje <by> …"), both skipped before the first card line.
+# The decision text's words come from the string table of every shipped
+# language (dct.workflows.triage_strings, #991): decision labels, the
+# no-decision label, the prefill prefix, the variant and note words — so a
+# text in any language parses, Polish texts written before the table included.
+# The header line ("Triage <topic> (<project>) — … (<stamp>), rubric v<n>:")
+# is matched by shape; it is skipped before the first card line.
 _TEXT_HEADER = re.compile(r"Triage\b.*:")
-_TEXT_PREFILL = "Punkt wyjścia:"
 _TEXT_CARD = re.compile(r"[Kk]-([0-9]+)\s*:\s*(.*)")
-_TEXT_NOTE = " · uwagi:"
 _TEXT_SEGMENT = " · "
-_TEXT_VARIANT = re.compile(r"wariant \(([^()]*)\)", re.IGNORECASE)
 _TEXT_ANNOTATION = re.compile(r"\s*\[[^\]]*\]")
-# Separators a label may be written with: → / -> / — / – / "/" are one.
-_LABEL_SEPARATOR = re.compile(r"\s*(?:→|->|—|–|/)\s*")
-# The note prefix of an accepted proposal (the template's closing rule).
-ACCEPTED_PREFIX = "[zaakceptowana propozycja {by}]"
 
 
-def _label_key(label: str) -> str:
-    return " | ".join(
-        " ".join(part.split()).casefold() for part in _LABEL_SEPARATOR.split(label.strip()))
+def _note_split(rest: str) -> tuple[str, str | None]:
+    """(head, note) at the EARLIEST ` · <note word>:` of any language; the
+    note keeps everything after it (one leading space dropped)."""
+    hits = [(rest.find(sep), sep) for sep in
+            (f"{_TEXT_SEGMENT}{word}:" for word in triage_strings.text_words("text.notes"))]
+    hits = [(at, sep) for at, sep in hits if at >= 0]
+    if not hits:
+        return rest, None
+    at, sep = min(hits)
+    return rest[:at], rest[at + len(sep):].removeprefix(" ") or None
 
 
-_LABEL_KEYS = {_label_key(label): dec for label, dec in DECISION_LABELS.items()}
+def _variant_pattern() -> re.Pattern:
+    words = "|".join(re.escape(w) for w in triage_strings.text_words("text.variant"))
+    return re.compile(rf"({words}) \(([^()]*)\)", re.IGNORECASE)
 
 
 def parse_decision_batch(text: str, *, cards: list[dict]) -> dict:
@@ -1019,26 +1017,30 @@ def parse_decision_batch(text: str, *, cards: list[dict]) -> dict:
     str.splitlines boundary; trailing whitespace of a line ignored; blank
     lines skipped):
     - before the first card line, a header line `Triage … :` and a line
-      starting `Punkt wyjścia:` are skipped (each at most once); the
+      starting with a prefill prefix (`Starting point:`, `Punkt wyjścia:` —
+      text.prefill_prefix of any language) are skipped (each at most once); the
       latter is returned verbatim (stripped) as `prefill_line` (K-40: it
       proves the form was seeded from proposals, not who wrote each note),
       None without one;
     - every other non-blank line is a card line
-      `K-<n>: <label>[ · wariant (<k>)][ [annotation]…][ · uwagi: <note>]`.
+      `K-<n>: <label>[ · <variant word> (<k>)][ [annotation]…][ · <note word>: <note>]`
+      — words of any shipped language (`variant` / `wariant`, `notes` /
+      `uwagi`).
       K-<n> is canonicalised (K-01 = K-1) and must name a card of `cards`
       (the export's CARDS: `id`, `opts[].k`); a card addressed twice is
-      refused. <label> is one of DECISION_LABELS — the page's Polish labels
-      or the English tokens fix / verify / backlog / reject / note /
-      discuss — case-insensitive, with → / -> / — / – / "/" interchangeable
-      as separators and whitespace collapsed. `wariant (<k>)` (optional)
-      must be an option key of that card. Bracketed annotations before the
-      note are ignored. The note is everything after the FIRST ` · uwagi:`
-      with one leading space dropped — brackets, `·` and a repeated
-      `uwagi:` inside it kept verbatim; an empty note is None.
-    - K-31: a card line whose label is "— (brak decyzji)" (the page's
+      refused. <label> is a decision label of any shipped language or a
+      canonical token fix / verify / backlog / reject / note / discuss —
+      case-insensitive, with → / -> / — / – / "/" interchangeable as
+      separators and whitespace collapsed. The variant (optional) must be an
+      option key of that card. Bracketed annotations before the note are
+      ignored. The note is everything after the EARLIEST note separator of
+      any language with one leading space dropped — brackets, `·` and a
+      repeated separator inside it kept verbatim; an empty note is None.
+    - K-31: a card line whose label is the no-decision label of any
+      language ("— (no decision)", "— (brak decyzji)" — the page's
       undecided card) with an empty note is NOT addressed: listed in
       `skipped` (in text order), absent from `decisions` — the card keeps
-      its stored state. Its key, duplicates and `wariant (<k>)` are still
+      its stored state. Its key, duplicates and variant are still
       validated. The same line WITH a non-empty note refuses the whole
       text (the owner wrote a comment without choosing a decision).
     Any other non-blank line, a malformed card line, an unknown K-<n> or
@@ -1053,6 +1055,8 @@ def parse_decision_batch(text: str, *, cards: list[dict]) -> dict:
         if m is None:
             raise ValueError(f"cards: card id {card.get('id')!r} is not 'K-<n>'")
         options[int(m.group(1))] = [o["k"] for o in card.get("opts") or []]
+    vocabulary = triage_strings.vocabulary()
+    variant_re = _variant_pattern()
     decisions: dict[str, dict] = {}
     skipped: list[str] = []
     prefill_line: str | None = None
@@ -1070,13 +1074,14 @@ def parse_decision_batch(text: str, *, cards: list[dict]) -> dict:
                     and _TEXT_HEADER.fullmatch(stripped):
                 header_seen = True
                 continue
-            if first and not prefill_seen and stripped.startswith(_TEXT_PREFILL):
+            if first and not prefill_seen and stripped.startswith(
+                    triage_strings.text_words("text.prefill_prefix")):
                 prefill_seen = True
                 prefill_line = stripped
                 continue
             raise ValueError(
                 f"{where}: not a decision line — expected 'K-<n>: <decision>"
-                f"[ · wariant (<k>)][ · uwagi: <note>]', got {stripped!r}")
+                f"[ · variant (<k>)][ · notes: <note>]', got {stripped!r}")
         seq = int(card.group(1))
         key = f"K-{seq}"
         where = f"{where} ({key})"
@@ -1085,36 +1090,33 @@ def parse_decision_batch(text: str, *, cards: list[dict]) -> dict:
         if key in decisions or key in skipped:
             raise ValueError(f"{where}: {key} is addressed twice")
         rest = card.group(2)
-        note = None
-        at = rest.find(_TEXT_NOTE)
-        if at >= 0:
-            note = rest[at + len(_TEXT_NOTE):].removeprefix(" ") or None
-            rest = rest[:at]
+        rest, note = _note_split(rest)
         segments = _TEXT_ANNOTATION.sub("", rest).strip().split(_TEXT_SEGMENT)
         label = segments[0].strip()
-        undecided = _label_key(label) == _label_key(NO_DECISION_LABEL)
-        dec = None if undecided else _LABEL_KEYS.get(_label_key(label))
+        meaning = vocabulary.get(triage_strings.label_key(label))
+        undecided = meaning == triage_strings.NO_DECISION
+        dec = None if undecided else meaning
         if dec is None and not undecided:
             raise ValueError(
                 f"{where}: unknown decision {label!r} (accepted: "
-                + ", ".join(DECISION_LABELS) + ")")
+                + ", ".join(triage_strings.decision_labels()) + ")")
         opt = None
         for segment in segments[1:]:
-            variant = _TEXT_VARIANT.fullmatch(segment.strip())
+            variant = variant_re.fullmatch(segment.strip())
             if variant is None or opt is not None:
                 raise ValueError(
                     f"{where}: unexpected part {segment.strip()!r} — after the decision "
-                    "only ' · wariant (<k>)', [annotations] and ' · uwagi: <note>'")
-            opt = variant.group(1)
+                    "only ' · variant (<k>)', [annotations] and ' · notes: <note>'")
+            opt = variant.group(2)
             if opt not in options[seq]:
                 raise ValueError(
-                    f"{where}: wariant ({opt}) is not an option of {key}"
+                    f"{where}: {variant.group(1)} ({opt}) is not an option of {key}"
                     + (f" (options: {', '.join(options[seq])})" if options[seq]
                        else " (it has no options)"))
         if undecided:
             if note is not None:
                 raise ValueError(
-                    f"{where}: {key} has a note but no decision ('{NO_DECISION_LABEL}') "
+                    f"{where}: {key} has a note but no decision ({label!r}) "
                     "— choose a decision for it or remove the note; nothing was recorded")
             skipped.append(key)
             continue
@@ -1126,7 +1128,7 @@ def parse_decision_batch(text: str, *, cards: list[dict]) -> dict:
 
 def parse_decision_text(text: str, *, cards: list[dict]) -> dict[str, dict]:
     """The decisions of parse_decision_batch only → {"K-<n>": {dec, opt,
-    note}} (skipped "— (brak decyzji)" lines and the prefill line are
+    note}} (skipped no-decision lines and the prefill line are
     dropped; an all-skipped text gives {})."""
     return parse_decision_batch(text, cards=cards)["decisions"]
 
@@ -1158,10 +1160,10 @@ def decide_findings_from_text(
     under the cycle lock through the step decide_findings uses
     (_decide_locked: same stamp, provenance, K-2 refusal and atomicity —
     the first invalid entry refuses the whole batch). Only the findings the
-    text decides are changed: a "— (brak decyzji)" line without a note is
+    text decides are changed: a no-decision line without a note is
     skipped (K-31, listed in `skipped`, its stored decision kept); a text of
     skipped lines only still locks and checks the open cycle, then writes
-    nothing (decided 0). The text's "Punkt wyjścia:" line, when present, is
+    nothing (decided 0). The text's starting-point line, when present, is
     stored verbatim in decision_text_origin of every finding it decides
     (K-40 — never in decision_note / decision_source; a later decision
     without it resets the field to NULL). `undecided` is the post-write
@@ -1200,8 +1202,10 @@ def accept_suggestions(
 
     `cycle` = id, or code with `project` (resolve_cycle). Every live finding
     carrying a suggestion is addressed: decision = suggested_decision, opt =
-    suggested_opt, note = "[zaakceptowana propozycja <by>] " + the suggested
-    note (just the bracketed prefix when the proposal has no note), <by>
+    suggested_opt, note = the accepted-proposal prefix in the CYCLE's
+    language (#991: "[accepted proposal <by>]", "[zaakceptowana propozycja
+    <by>]") + " " + the suggested note (just the bracketed prefix when the
+    proposal has no note), <by>
     being THAT finding's suggested_by. Bound to the proposals the owner saw:
     refused when any addressed finding's suggested_by differs from
     `expected_by` (required), and — K-32 — when `expected_digest` (the
@@ -1256,7 +1260,7 @@ def accept_suggestions(
                 "(overwrite=true replaces those decisions with the proposals)")
         decisions = {}
         for r in addressed:
-            prefix = ACCEPTED_PREFIX.format(by=r["suggested_by"])
+            prefix = triage_strings.accepted_prefix(cycle_row["language"], r["suggested_by"])
             note = r["suggested_note"]
             decisions[f"K-{r['seq']}"] = {
                 "dec": r["suggested_decision"], "opt": r["suggested_opt"],
@@ -1333,7 +1337,7 @@ def _closed_payload(cycle: Mapping, rows: list[Mapping]) -> dict:
     """The template's CLOSED constant from a closed cycle and its findings —
     the ONE builder close_triage and export_triage share. answers[K-n] =
     {dec, opt, note} plus `origin` (#930 K-45) = the stored
-    decision_text_origin verbatim — the "Punkt wyjścia" line of the pasted
+    decision_text_origin verbatim — the starting-point line of the pasted
     decision text that decided it — ONLY when that is non-NULL: a decision
     recorded any other way (decide_findings, accept_suggestions) has no
     `origin` key, never null or "". `note` stays decision_note alone."""
@@ -1861,7 +1865,8 @@ def export_triage(engine: sa.Engine, cycle: int | str, *, project: str | None = 
     cycle_out = {
         "id": cycle["id"], "project": slug, "code": cycle["code"], "topic": cycle["topic"],
         "scope": cycle["scope"], "base_commit": cycle["base_commit"],
-        "rubric_version": cycle["rubric_version"], "artifact_url": cycle["artifact_url"],
+        "rubric_version": cycle["rubric_version"], "language": cycle["language"],
+        "artifact_url": cycle["artifact_url"],
         "created_by": cycle["created_by"], "opened_at": cycle["opened_at"],
         "closed_at": cycle["closed_at"],
     }

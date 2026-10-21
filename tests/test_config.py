@@ -382,3 +382,53 @@ def test_a_malformed_triage_section_is_refused(tmp_path, body):
     path.write_text(body)
     with pytest.raises(ValueError, match="triage"):
         load_config(path)
+
+
+# ── [triage] language (#991 R-5) ─────────────────────────────────────────────
+
+
+def test_triage_language_defaults_to_unset(tmp_path):
+    path = tmp_path / "dct.toml"
+    save_config(Config(database_url="sqlite:///x.db"), path)
+    assert load_config(path).triage.language is None
+
+
+def test_triage_language_alone_survives_repeated_saves_and_other_changes(tmp_path):
+    """The section is written for the language even without a template, and a
+    rewrite by any other command keeps it."""
+    path = tmp_path / "dct.toml"
+    cfg = Config(database_url="sqlite:///x.db")
+    cfg.triage.language = "pl"
+    save_config(cfg, path)
+    assert tomllib.loads(path.read_text(encoding="utf-8"))["triage"] == {"language": "pl"}
+    for port in (9001, 9002):
+        loaded = load_config(path)
+        loaded.web.port = port
+        save_config(loaded, path)
+    final = load_config(path)
+    assert (final.triage.language, final.triage.template, final.web.port) == ("pl", None, 9002)
+
+
+def test_triage_template_and_language_round_trip_together(tmp_path):
+    path = tmp_path / "dct.toml"
+    cfg = Config(database_url="sqlite:///x.db")
+    cfg.triage.template, cfg.triage.language = "/tmp/t.html", "en"
+    save_config(cfg, path)
+    assert tomllib.loads(path.read_text(encoding="utf-8"))["triage"] == {
+        "template": "/tmp/t.html", "language": "en"}
+    loaded = load_config(path)
+    assert (loaded.triage.template, loaded.triage.language) == ("/tmp/t.html", "en")
+
+
+@pytest.mark.parametrize("value", ['"xx"', "5", '""'])
+def test_an_unknown_triage_language_is_refused_naming_the_shipped_ones(tmp_path, value):
+    path = tmp_path / "dct.toml"
+    path.write_text(f"[triage]\nlanguage = {value}\n")
+    with pytest.raises(ValueError, match=r"triage\.language: unknown language .*en, pl"):
+        load_config(path)
+
+
+def test_a_triage_language_is_normalized_on_load(tmp_path):
+    path = tmp_path / "dct.toml"
+    path.write_text('[triage]\nlanguage = " PL "\n')
+    assert load_config(path).triage.language == "pl"
