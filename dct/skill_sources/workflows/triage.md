@@ -94,7 +94,9 @@ review → triage → fix gate below.
    always pass `reviewers`; never derive them by guessing from `src`.
 4. The ack's `recorded[]` lists `{seq, finding_id, first_seen_id}`: every
    finding with a non-null `first_seen_id` is a RECURRING fingerprint —
-   name it in the summary (K-n and the finding it recurs from).
+   name it in the summary (K-n and the finding it recurs from). K-n numbers
+   start at K-1 in every cycle; the page marks a recurring card with the
+   earlier round's K-n and decision (the export's `prev`).
 5. Continue with **page** in the same turn.
 
 ## Mode: page
