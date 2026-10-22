@@ -1,6 +1,20 @@
 # Changelog
 
 
+## [1.7.0] - 2026-10-22
+
+### Added
+
+- `dct triage page --plain <file>`: validates a triage page's plain-language layer against the cycle's cards (only its K-n, each card's own option keys, known fields, string texts, no duplicate keys) before anything is written, then copies it byte for byte as `plain.json` beside the page under the page's `--force` rule; prints `<dir>/plain.json: plain layer, <n> cards` — #988 (cli/triage)
+- `dct triage page` writes `cards.json` beside the page on every build — the export the page was built from, byte for byte what `dct triage export --json` prints — so a consultant reads the cards, options, proposals and decisions without the HTML; same `--force` rule, every target checked before the first write, `--out` may not be named `cards.json` / `plain.json` (one page per directory); /triage hands the consultant that file — #988 (cli/triage)
+- dct ships its triage page template (`dct/assets/triage-page.html`) and a string table (`dct/assets/triage-strings.json`, English and Polish): `dct triage page` works without any template configured, every visible text and every word of the pasted decision text come from the table in the cycle's language, and the decision-text parser reads every language (older Polish pastes included); `--template` / `[triage] template` stay an override, the Polish placeholder names stay accepted as aliases, an override without the new `STRINGS` slot is refused with the upgrade path — #991 (triage)
+- Triage page marks a card that returns from an earlier round: `export_triage` gives each card whose fingerprint occurs in an earlier cycle of the project `prev` = `{cycle, id, dec, opt}` of the latest occurrence (one query per export, outside the proposal digest, ignored by `record_findings`), and the shipped template shows it as a chip "↻ returns from <cycle> K-<n> · <decision>" — K-n still starts at K-1 in every cycle — #992 (triage)
+
+### Changed
+
+- /triage skill: page, prefill and close publish the plain-language layer — a `plain.json` beside the page (shape `{by, date, cards: {"K-n": {title, problem | was + fix, opts, codex, amends}}}`, kept with the cycle's records, copied next to the page, passed on every publish via Artifact `files` or the host's supporting files); a reading aid that changes no card, state or generated text — #988 (skills/triage)
+- A triage cycle has a page language (`triage_cycles.language`, fixed at open): `open_triage(language=…)`, empty = `[triage] language` of `dct.toml`, else `en`; existing cycles are migrated to `pl`. The page, its rebuilds, the default lede and `accept_suggestions`' note prefix (`[accepted proposal <by>]` / `[zaakceptowana propozycja <by>]`) follow the cycle's language, never the current config; `export_triage` / `cards.json` carry `cycle.language` — #991 (triage)
+
 ## [1.6.0] - 2026-10-16
 
 ### Added
