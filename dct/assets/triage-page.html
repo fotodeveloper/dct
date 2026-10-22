@@ -21,7 +21,8 @@
   decide / backlog and "fixes to acknowledge" = note / reject without a proposal, counts, the
   buttons) and "text to paste" (generate, copy, read-only textarea, toast). At <=960px the
   aside is a bottom bar (#sheet-toggle) that expands into a sheet; Escape collapses it.
-  CARDS: K-n, title, the rubric fields S O E K / origin / type as chips, the class derived by
+  CARDS: K-n, title, the rubric fields S O E K / origin / type as chips (plus, for a finding
+  seen in an earlier round, a chip naming that round's K-n and decision — card.prev), the class derived by
   classify() (rubric §4, first match; a coordinator override cls + clsWhy keeps the derived
   class visible), fingerprint, area, source, context, options (radio variants with the tags
   recommended / at the root | hotfix, and why), the decision segment (the class's decision
@@ -451,6 +452,9 @@
       chips.push('<span class="chip mono">S' + c.S + ' O' + c.O + ' E' + c.E + ' K:' + c.K + '</span>'); // ledger-validated numbers, '?', S/M/L
       if (c.origin && c.origin !== 'diff') chips.push('<span class="chip pre">' + escapeHtml(c.origin) + '</span>');
       if (c.type) chips.push('<span class="chip pre">' + escapeHtml(c.type) + '</span>');
+      // #992: the same finding (fingerprint) in an earlier round, with that round's K-n and decision.
+      if (isMap(c.prev)) chips.push('<span class="chip owner">' + th('card.recurs', { where: c.prev.cycle + ' ' + c.prev.id }) +
+        (DECISION_KEYS.indexOf(c.prev.dec) >= 0 ? ' · ' + escapeHtml(decLabel(c.prev.dec)) : '') + '</span>');
       const optsHtml = c.opts.map(function (o) {
         const tags = []; if (o.rec) tags.push('<span class="chip ok">' + th('tag.recommended') + '</span>');
         tags.push(o.root ? '<span class="chip owner">' + th('tag.root') + '</span>' : '<span class="chip low">' + th('tag.hotfix') + '</span>');

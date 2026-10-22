@@ -120,6 +120,12 @@ def _row(eng, finding_id):
         return conn.execute(sa.select(findings).where(findings.c.id == finding_id)).mappings().one()
 
 
+def _without_prev(cards):
+    """Exported cards without #992's `prev` (a re-recorded copy of a cycle's
+    cards links back to it — the only difference a copy may show)."""
+    return [{k: v for k, v in c.items() if k != "prev"} for c in cards]
+
+
 def _recorded(eng, cycle_id, *batch):
     return record_findings(eng, cycle_id, list(batch))["recorded"]
 
@@ -953,7 +959,7 @@ class TestExport:
         c2 = open_triage(engine, "proj-a", "rev-copy", "copy", "me")["cycle_id"]
         recorded = record_findings(engine, c2, cards)["recorded"]
         assert [r["seq"] for r in recorded] == [1, 5]
-        assert export_triage(engine, c2)["cards"] == cards
+        assert _without_prev(export_triage(engine, c2)["cards"]) == cards  # #992: + prev
         assert all(_row(engine, r["finding_id"])["decision"] is None for r in recorded)
 
     @pytest.mark.parametrize(("extra", "match"), [
@@ -1769,7 +1775,7 @@ class TestReviewerTokens:
         cards = export_triage(engine, cycle_id)["cards"]
         copy = open_triage(engine, "proj-a", "rev-copy", "copy", "me")["cycle_id"]
         record_findings(engine, copy, cards)
-        assert export_triage(engine, copy)["cards"] == cards
+        assert _without_prev(export_triage(engine, copy)["cards"]) == cards  # #992: + prev
 
     def test_the_reviewer_filter_matches_live_tokens_case_insensitively(self, engine):
         cycle_id = _setup(engine)

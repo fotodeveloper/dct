@@ -14,6 +14,7 @@ producer and the consumer of the shape cannot drift apart.
 from __future__ import annotations
 
 import json
+import re
 
 import pytest
 
@@ -38,6 +39,9 @@ CARD_OPTIONAL = {"conflict", "violation", "dispute", "openDesign", "cls", "clsWh
 # Not a template key: dct's own (#930 §2a) — the canonical reviewer tokens,
 # exported only when recorded; the template ignores unknown keys.
 CARD_DCT_EXTRA = {"reviewers"}
+# #992: the card's latest earlier occurrence in the project (same fingerprint),
+# exported only when one exists; record_findings ignores it on input.
+PREV_KEYS = {"cycle", "id", "dec", "opt"}
 # "opts: k = letter, rec = recommended variant, root = removes the cause" + t, why.
 OPTION_KEYS = {"k", "rec", "root", "t", "why"}
 # CLOSED: "{ date, source, rubric, notes: [...], answers: { 'K-1': { dec, opt, note } } }"
@@ -205,7 +209,9 @@ def test_round_trip_export_rerecord_export_is_identical(engine, cycle):
 
     other = open_triage(engine, "proj-a", "rev-2", "re-run", "claude-code")["cycle_id"]
     record_findings(engine, other, [_card_to_record_input(c) for c in first])
-    assert export_triage(engine, other)["cards"] == first
+    again = export_triage(engine, other)["cards"]
+    assert [{k: v for k, v in c.items() if k != "prev"} for c in again] == first
+    assert [c["prev"]["id"] for c in again] == ["K-1", "K-2", "K-3"]  # #992: rev-1's cards
 
 
 def test_exported_cards_record_back_as_they_are(engine, cycle):
@@ -219,7 +225,9 @@ def test_exported_cards_record_back_as_they_are(engine, cycle):
 
     other = open_triage(engine, "proj-a", "rev-2", "re-run", "claude-code")["cycle_id"]
     record_findings(engine, other, first)
-    assert export_triage(engine, other)["cards"] == first
+    again = export_triage(engine, other)["cards"]
+    assert [{k: v for k, v in c.items() if k != "prev"} for c in again] == first
+    assert all(c["prev"]["cycle"] == "rev-1" for c in again)  # #992: same fingerprints
 
 
 def test_reviewer_tokens_ride_along_only_when_recorded_and_record_back(engine, cycle):
@@ -237,4 +245,86 @@ def test_reviewer_tokens_ride_along_only_when_recorded_and_record_back(engine, c
 
     other = open_triage(engine, "proj-a", "rev-2", "re-run", "claude-code")["cycle_id"]
     record_findings(engine, other, first)
-    assert export_triage(engine, other)["cards"] == first
+    again = export_triage(engine, other)["cards"]
+    assert [{k: v for k, v in c.items() if k != "prev"} for c in again] == first
+    assert all(c["prev"]["cycle"] == "rev-1" for c in again)  # #992: same fingerprints
+
+
+# ── #992: a card names its latest earlier occurrence ─────────────────────────
+
+
+def _cycle_with(engine, code, *cards):
+    cycle_id = open_triage(engine, "proj-a", code, "round", "me")["cycle_id"]
+    record_findings(engine, cycle_id, list(cards))
+    return cycle_id
+
+
+def test_a_recurring_card_names_its_latest_earlier_round_and_its_decision(engine, cycle):
+    record_findings(engine, cycle, [card_input()])
+    decide_findings(engine, cycle, {"K-1": {"dec": "note"}}, decided_by="owner",
+                    decision_source="chat")
+    r2 = _cycle_with(engine, "rev-2", card_input(fp="new one", title="New"),
+                     card_input(fp="  OWNER filter violated at order detail by a foreign pk.  "))
+    decide_findings(engine, r2, {"K-2": {"dec": "discuss", "opt": "b"}}, decided_by="owner",
+                    decision_source="chat")
+    r3 = _cycle_with(engine, "rev-3", card_input(), card_input(fp="new one", title="New"),
+                     card_input(fp="never seen", title="Fresh"))
+    cards = export_triage(engine, r3)["cards"]
+    # the latest earlier occurrence (rev-2, matched on the normalised fingerprint)
+    assert cards[0]["prev"] == {"cycle": "rev-2", "id": "K-2", "dec": "discuss", "opt": "b"}
+    assert cards[1]["prev"] == {"cycle": "rev-2", "id": "K-1", "dec": None, "opt": None}
+    assert "prev" not in cards[2]
+    assert set(cards[0]["prev"]) == PREV_KEYS
+    # an earlier round's cards never point forward
+    assert "prev" not in export_triage(engine, cycle)["cards"][0]
+
+
+def test_prev_ignores_other_projects_deleted_findings_and_later_rounds(engine, cycle):
+    create_project(engine, "proj-b", "B")
+    other = open_triage(engine, "proj-b", "rev-x", "b", "me")["cycle_id"]
+    record_findings(engine, other, [card_input()])
+    record_findings(engine, cycle, [card_input()])
+    later = _cycle_with(engine, "rev-2", card_input())
+    assert "prev" not in export_triage(engine, cycle)["cards"][0]  # rev-2 is later
+    assert export_triage(engine, later)["cards"][0]["prev"]["cycle"] == "rev-1"  # not proj-b
+    import sqlalchemy as sa
+
+    from dct.db import findings
+    with engine.begin() as conn:
+        conn.execute(findings.update().where(findings.c.cycle_id == cycle)
+                     .values(deleted_at=sa.func.current_timestamp()))
+    assert "prev" not in export_triage(engine, later)["cards"][0]
+
+
+def test_an_earlier_rounds_decision_never_changes_the_proposal_digest(engine, cycle):
+    """accept_suggestions binds to the digest of the page the owner saw; a
+    decision recorded meanwhile in an EARLIER cycle changes `prev` on the page
+    but must not invalidate that acceptance."""
+    record_findings(engine, cycle, [card_input()])
+    r2 = _cycle_with(engine, "rev-2", card_input())
+    suggest_findings(engine, r2, "Codex", {"K-1": {"dec": "fix", "opt": "a"}})
+    before = export_triage(engine, r2)
+    decide_findings(engine, cycle, {"K-1": {"dec": "backlog"}}, decided_by="owner",
+                    decision_source="chat")
+    after = export_triage(engine, r2)
+    assert before["cards"][0]["prev"]["dec"] is None and after["cards"][0]["prev"]["dec"] == "backlog"
+    assert before["suggested"]["digest"] == after["suggested"]["digest"]
+
+
+def test_the_export_finds_every_prev_in_one_query(engine, cycle):
+    record_findings(engine, cycle, [card_input(fp=f"fp {i}", title=f"T{i}") for i in range(6)])
+    r2 = _cycle_with(engine, "rev-2", *[card_input(fp=f"fp {i}", title=f"T{i}") for i in range(6)])
+    import sqlalchemy as sa
+
+    seen: list[str] = []
+
+    def record(conn, cursor, statement, *rest):
+        seen.append(statement)
+
+    sa.event.listen(engine, "before_cursor_execute", record)
+    try:
+        export_triage(engine, r2)
+    finally:
+        sa.event.remove(engine, "before_cursor_execute", record)
+    lookups = [s for s in seen if re.search(r"fingerprint_norm IN \(", s)]
+    assert len(lookups) == 1, seen  # one lookup for all six cards, never one per card

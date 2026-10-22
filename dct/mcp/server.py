@@ -4129,11 +4129,15 @@ def export_triage(cycle_id: int = 0, cycle: str = "", project: str = "") -> dict
             empty = cycle_id alone decides.
 
     Returns: {cycle, cards, closed, suggested}: cycle = {id, project, code,
-        topic, scope, base_commit, rubric_version, artifact_url, created_by,
-        opened_at, closed_at}; cards = CARDS by seq — {id "K-n", title, area,
+        topic, scope, base_commit, rubric_version, language, artifact_url,
+        created_by, opened_at, closed_at} (language = the cycle's page
+        language, #991); cards = CARDS by seq — {id "K-n", title, area,
         src, S, O, E, K, origin, type, fp, ctx [..], opts [{k, rec, root, t,
         why}]} plus conflict / violation / dispute / openDesign when set,
-        cls + clsWhy for an override and reviewers [token…] when recorded; closed = CLOSED {date, source, rubric,
+        cls + clsWhy for an override, reviewers [token…] when recorded and
+        prev {cycle, id, dec, opt} when the same fingerprint occurs in an
+        earlier cycle of the project (the latest such occurrence; #992 —
+        outside the digest, ignored by record_findings); closed = CLOSED {date, source, rubric,
         notes, answers {"K-n": {dec, opt, note[, origin]}}} once closed, else null; suggested = SUGGESTED {by,
         date, answers {"K-n": {dec, opt, note, by}}, digest} when any finding carries a suggestion, else
         null — digest = the hash of the cycle's cards and proposals that

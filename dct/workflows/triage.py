@@ -315,13 +315,16 @@ def _seq_value(value, where: str) -> int:
 
 def _card_shape(raw, where: str) -> dict:
     """Accept the exported CARD shape on input (K-13): `id` 'K-<n>' becomes
-    seq; the §4 flags at the top level join `flags`. Each field still has one
+    seq; the §4 flags at the top level join `flags`; `prev` (#992, the
+    export's link to an earlier occurrence, derived from the ledger) is
+    dropped. Each field still has one
     spelling per finding — id with seq, or a flag both at the top level and
     inside flags, is refused. Everything else passes through to _canonical
     (unknown keys are refused there)."""
     if not isinstance(raw, Mapping):
         raise ValueError(f"{where}: expected an object, got {type(raw).__name__}")  # noqa: TRY004 — every refusal is a ValueError
     out = dict(raw)
+    out.pop("prev", None)
     if "id" in out:
         if "seq" in out:
             raise ValueError(f"{where}: id and seq name the same field — pass one of them")
@@ -1774,6 +1777,34 @@ def _rows_digest(cycle_id: int, rows: list[Mapping], options: dict[int, list[dic
 # ── export ───────────────────────────────────────────────────────────────────
 
 
+def _previous_occurrences(conn: sa.Connection, cycle: Mapping,
+                          rows: list[Mapping]) -> dict[int, dict]:
+    """{finding id: {cycle, id, dec, opt}} — for each live finding of `cycle`,
+    its latest live occurrence (same fingerprint_norm) in an EARLIER live
+    cycle of the same project (#992): the code, its K-n, its decision and
+    variant (None while undecided). One query for the whole cycle."""
+    norms = sorted({r["fingerprint_norm"] for r in rows})
+    if not norms:
+        return {}
+    earlier = conn.execute(
+        sa.select(findings.c.fingerprint_norm, findings.c.seq, findings.c.decision,
+                  findings.c.decision_opt, triage_cycles.c.code)
+        .join(triage_cycles, triage_cycles.c.id == findings.c.cycle_id)
+        .where(
+            triage_cycles.c.project_id == cycle["project_id"],
+            triage_cycles.c.id < cycle["id"],
+            triage_cycles.c.deleted_at.is_(None),
+            findings.c.deleted_at.is_(None),
+            findings.c.fingerprint_norm.in_(norms),
+        )
+        .order_by(triage_cycles.c.id, findings.c.seq)
+    )
+    latest = {r.fingerprint_norm: {"cycle": r.code, "id": f"K-{r.seq}", "dec": r.decision,
+                                   "opt": r.decision_opt} for r in earlier}
+    return {r["id"]: latest[r["fingerprint_norm"]] for r in rows
+            if r["fingerprint_norm"] in latest}
+
+
 def _live_reviewers(conn: sa.Connection, finding_ids: list[int]) -> dict[int, list[str]]:
     """The live reviewer tokens per finding, in recorded order."""
     out: dict[int, list[str]] = {fid: [] for fid in finding_ids}
@@ -1843,7 +1874,9 @@ def export_triage(engine: sa.Engine, cycle: int | str, *, project: str | None = 
 
     `cycle` = id, or code with `project` (resolve_cycle). cards = the
     template's CARDS (by seq; `reviewers` — the canonical tokens — next to
-    `src` when the finding has any); closed = its CLOSED when the cycle is closed
+    `src` when the finding has any; `prev` = {cycle, id, dec, opt}, its
+    latest occurrence in an earlier cycle of the project, when one exists —
+    #992, outside the suggestion digest); closed = its CLOSED when the cycle is closed
     (the payload close_triage returned — answers[K-n] carry `origin` only
     when set, _closed_payload), else None; suggested = its SUGGESTED {by, digest, date, answers} when any
     finding carries a suggestion (by / date of the latest; answers[K-n] =
@@ -1862,6 +1895,7 @@ def export_triage(engine: sa.Engine, cycle: int | str, *, project: str | None = 
         rows = _live_findings(conn, cycle_id)
         options = _live_options(conn, [r["id"] for r in rows])
         reviewers = _live_reviewers(conn, [r["id"] for r in rows])
+        previous = _previous_occurrences(conn, cycle, rows)
     cycle_out = {
         "id": cycle["id"], "project": slug, "code": cycle["code"], "topic": cycle["topic"],
         "scope": cycle["scope"], "base_commit": cycle["base_commit"],
@@ -1872,7 +1906,9 @@ def export_triage(engine: sa.Engine, cycle: int | str, *, project: str | None = 
     }
     return {
         "cycle": _json_safe(cycle_out),
-        "cards": [_card(r, options[r["id"]], reviewers[r["id"]]) for r in rows],
+        "cards": [{**_card(r, options[r["id"]], reviewers[r["id"]]),
+                   **({"prev": previous[r["id"]]} if r["id"] in previous else {})}
+                  for r in rows],
         "closed": _closed_payload(cycle, rows) if cycle["closed_at"] is not None else None,
         "suggested": _suggested_payload(rows, _rows_digest(cycle_id, rows, options)),
     }
